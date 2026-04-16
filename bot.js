@@ -109,6 +109,7 @@ function extractMemos(text) {
     if (kiramem.facts.length > 50) kiramem.facts.splice(0, kiramem.facts.length - 50);
     kiramem.updatedAt = new Date().toISOString();
     saveJSON(MEM_FILE, kiramem);
+    saveMemoryToGist().catch(() => {});
   }
   return { cleaned, memos };
 }
@@ -195,7 +196,73 @@ async function loadDropboxStructure() {
     console.log(`📦 Dropbox chargé: ${data.entries.length} éléments à la racine`);
   } catch (e) { console.warn('⚠️ Dropbox structure:', e.message); }
 }
+
+// ─── Mémoire GitHub Gist (persistance cross-restart) ─────────────────────────
+let gistId = process.env.GIST_ID || null;
+const GIST_ID_FILE = path.join(DATA_DIR, 'gist_id.txt');
+
+async function initGistId() {
+  if (gistId) return;
+  if (fs.existsSync(GIST_ID_FILE)) {
+    gistId = fs.readFileSync(GIST_ID_FILE, 'utf8').trim();
+    return;
+  }
+  if (!process.env.GITHUB_TOKEN) {
+    console.warn('⚠️ Mémoire GitHub: GITHUB_TOKEN manquant — persistance locale seulement');
+    return;
+  }
+  try {
+    const res = await fetch('https://api.github.com/gists', {
+      method: 'POST',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: 'Kira — mémoire persistante Shawn Barrette',
+        public: false,
+        files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } }
+      })
+    });
+    if (!res.ok) { console.warn('⚠️ Gist create:', res.status); return; }
+    const data = await res.json();
+    gistId = data.id;
+    try { fs.writeFileSync(GIST_ID_FILE, gistId, 'utf8'); } catch {}
+    console.log(`✅ Gist créé: ${gistId}`);
+    console.log(`⚠️  IMPORTANT: ajouter GIST_ID=${gistId} dans les variables d'env Render!`);
+  } catch (e) { console.warn('⚠️ Gist create:', e.message); }
+}
+
+async function loadMemoryFromGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: githubHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    const content = data.files?.['memory.json']?.content;
+    if (!content) return;
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed.facts) && parsed.facts.length > 0) {
+      kiramem.facts = parsed.facts;
+      kiramem.updatedAt = parsed.updatedAt;
+      saveJSON(MEM_FILE, kiramem);
+      console.log(`🧠 Mémoire GitHub: ${kiramem.facts.length} faits chargés depuis Gist`);
+    }
+  } catch (e) { console.warn('⚠️ Gist load:', e.message); }
+}
+
+async function saveMemoryToGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      method: 'PATCH',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } } })
+    });
+    if (res.ok) console.log(`💾 Mémoire sauvegardée dans Gist (${kiramem.facts.length} faits)`);
+  } catch (e) { console.warn('⚠️ Gist save:', e.message); }
+}
+
+// Init au démarrage
 loadDropboxStructure();
+initGistId().then(() => loadMemoryFromGist());
 
 // ─── GitHub ───────────────────────────────────────────────────────────────────
 function githubHeaders() {
@@ -446,8 +513,9 @@ bot.onText(/\/status/, msg => {
   const uptime = Math.floor(process.uptime() / 60);
   const ghStatus = process.env.GITHUB_TOKEN ? '✅ Avec token (privés inclus)' : '⚠️ Sans token (publics seulement)';
   const dbStatus = dropboxToken ? '✅ Connecté' : '❌ Token manquant';
+  const memStatus = gistId ? `✅ Gist \`${gistId.substring(0, 8)}...\`` : '⚠️ Local /tmp seulement';
   bot.sendMessage(msg.chat.id,
-    `✅ *Kira opérationnelle*\nModèle: \`${MODEL}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\nGitHub: ${ghStatus}\nDropbox: ${dbStatus}\nDonnées: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
+    `✅ *Kira opérationnelle*\nModèle: \`${MODEL}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\nGitHub: ${ghStatus}\nDropbox: ${dbStatus}\nMémoire: ${memStatus}\nDonnées: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -462,7 +530,8 @@ bot.onText(/\/oublier/, msg => {
   kiramem.facts = [];
   kiramem.updatedAt = new Date().toISOString();
   saveJSON(MEM_FILE, kiramem);
-  bot.sendMessage(msg.chat.id, '🗑️ Mémoire effacée. Je repars à zéro!');
+  saveMemoryToGist().catch(() => {});
+  bot.sendMessage(msg.chat.id, '🗑️ Mémoire effacée (local + Gist). Je repars à zéro!');
 });
 
 bot.onText(/\/sonnet/, msg => {
