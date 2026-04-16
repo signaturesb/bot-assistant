@@ -156,6 +156,30 @@ async function readGitHubFile(repo, filePath) {
   return 'Fichier non textuel ou trop volumineux';
 }
 
+async function writeGitHubFile(repo, filePath, content, commitMsg) {
+  if (!process.env.GITHUB_TOKEN) return 'Erreur: GITHUB_TOKEN manquant — accès écriture impossible';
+  const p = filePath.replace(/^\//, '');
+  const url = `https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`;
+  let sha;
+  const getRes = await fetch(url, { headers: githubHeaders() });
+  if (getRes.ok) sha = (await getRes.json()).sha;
+  else if (getRes.status !== 404) return `Erreur GitHub lecture: ${getRes.status}`;
+  const putRes = await fetch(url, {
+    method: 'PUT',
+    headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message: commitMsg || `Kira: mise à jour ${p}`,
+      content: Buffer.from(content, 'utf8').toString('base64'),
+      ...(sha ? { sha } : {})
+    })
+  });
+  if (!putRes.ok) {
+    const err = await putRes.json().catch(() => ({}));
+    return `Erreur GitHub écriture: ${putRes.status} — ${err.message || ''}`;
+  }
+  return `✅ "${p}" ${sha ? 'modifié' : 'créé'} dans ${repo}.`;
+}
+
 // ─── Dropbox (avec refresh auto) ──────────────────────────────────────────────
 let dropboxToken = process.env.DROPBOX_ACCESS_TOKEN || '';
 
@@ -394,6 +418,20 @@ const TOOLS = [
     }
   },
   {
+    name: 'write_github_file',
+    description: 'Modifie ou crée un fichier dans un repo GitHub de Shawn et fait un commit. Utilise ça pour corriger du code, ajuster des templates, modifier des campagnes dans mailing-masse, chatbot-immobilier, etc.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo:       { type: 'string', description: 'Nom du repo (ex: mailing-masse, chatbot-immobilier)' },
+        path:       { type: 'string', description: 'Chemin du fichier (ex: src/templates.js)' },
+        content:    { type: 'string', description: 'Contenu complet du fichier après modification' },
+        commit_msg: { type: 'string', description: 'Message de commit (ex: "Fix: corriger template J+1")' }
+      },
+      required: ['repo', 'path', 'content']
+    }
+  },
+  {
     name: 'read_bot_file',
     description: 'Lit un fichier de configuration ou de code du bot assistant de Shawn stocké dans /data/botfiles/',
     input_schema: {
@@ -432,6 +470,7 @@ async function executeTool(name, input, chatId) {
         await bot.sendDocument(chatId, file.buffer, { caption: input.caption || '' }, { filename: file.filename });
         return `✅ Fichier "${file.filename}" envoyé à Shawn.`;
       }
+      case 'write_github_file': return await writeGitHubFile(input.repo, input.path, input.content, input.commit_msg);
       case 'read_bot_file': {
         const dir = path.join(DATA_DIR, 'botfiles');
         const fp  = path.join(dir, path.basename(input.filename));
