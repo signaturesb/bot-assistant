@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: kira-bot
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install --production
+    startCommand: node bot.js
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USER_ID
+        value: "5261213272"
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production
