@@ -7,20 +7,21 @@ const fs          = require('fs');
 const path        = require('path');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
-const ALLOWED_ID = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID || '0');
-const API_KEY    = process.env.ANTHROPIC_API_KEY;
-const PORT       = process.env.PORT || 3000;
-const MODEL      = process.env.MODEL || 'claude-haiku-4-5';
+const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
+const ALLOWED_ID  = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID || '0');
+const API_KEY     = process.env.ANTHROPIC_API_KEY;
+const PORT        = process.env.PORT || 3000;
 const GITHUB_USER = 'signaturesb';
+let   currentModel = process.env.MODEL || 'claude-haiku-4-5'; // FIX: let pas const — /sonnet /haiku fonctionnent
 
 if (!BOT_TOKEN) { console.error('❌ TELEGRAM_BOT_TOKEN manquant'); process.exit(1); }
 if (!API_KEY)   { console.error('❌ ANTHROPIC_API_KEY manquant');  process.exit(1); }
 
-// ─── Persistance ──────────────────────────────────────────────────────────────
-const DATA_DIR  = fs.existsSync('/data') ? '/data' : '/tmp';
-const HIST_FILE = path.join(DATA_DIR, 'history.json');
-const MEM_FILE  = path.join(DATA_DIR, 'memory.json');
+// ─── Persistance locale ────────────────────────────────────────────────────────
+const DATA_DIR     = fs.existsSync('/data') ? '/data' : '/tmp';
+const HIST_FILE    = path.join(DATA_DIR, 'history.json');
+const MEM_FILE     = path.join(DATA_DIR, 'memory.json');
+const GIST_ID_FILE = path.join(DATA_DIR, 'gist_id.txt');
 
 function loadJSON(file, fallback) {
   try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -33,12 +34,13 @@ function saveJSON(file, data) {
 }
 
 // ─── Clients ──────────────────────────────────────────────────────────────────
+// FIX: polling: false — démarré seulement après que tout est initialisé
 const claude = new Anthropic({ apiKey: API_KEY });
-const bot    = new TelegramBot(BOT_TOKEN, { polling: { interval: 1000, autoStart: true } });
-console.log(`✅ Kira démarrée [${MODEL}] — ${new Date().toLocaleString('fr-CA')} — données: ${DATA_DIR}`);
+const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── Mémoire persistante (faits durables) ─────────────────────────────────────
 const kiramem = loadJSON(MEM_FILE, { facts: [], updatedAt: null });
+if (!Array.isArray(kiramem.facts)) kiramem.facts = []; // FIX: guard si JSON corrompu
 
 function buildMemoryBlock() {
   if (!kiramem.facts.length) return '';
@@ -64,6 +66,8 @@ Accès aux ressources de Shawn via tes outils:
 - Dropbox: documents de propriétés, terrains, fichiers clients
 
 Si Shawn te dit quelque chose d'important à retenir (préférence, projet, info), confirme et utilise: [MEMO: le fait à retenir]`;
+
+let dropboxStructure = '';
 
 function getSystem() {
   const dbBlock = dropboxStructure ? `\n\nDropbox de Shawn (racine):\n${dropboxStructure}` : '';
@@ -114,156 +118,6 @@ function extractMemos(text) {
   return { cleaned, memos };
 }
 
-// ─── Dropbox (avec refresh auto) ──────────────────────────────────────────────
-let dropboxToken = process.env.DROPBOX_ACCESS_TOKEN || '';
-
-async function refreshDropboxToken() {
-  const { DROPBOX_APP_KEY: key, DROPBOX_APP_SECRET: secret, DROPBOX_REFRESH_TOKEN: refresh } = process.env;
-  if (!key || !secret || !refresh) return false;
-  try {
-    const res = await fetch('https://api.dropbox.com/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh, client_id: key, client_secret: secret })
-    });
-    if (!res.ok) return false;
-    const data = await res.json();
-    dropboxToken = data.access_token;
-    console.log('🔄 Dropbox token rafraîchi');
-    return true;
-  } catch { return false; }
-}
-
-async function dropboxAPI(apiUrl, body, isDownload = false) {
-  const makeReq = (token) => {
-    if (isDownload) {
-      return fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify(body) }
-      });
-    }
-    return fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-  };
-
-  let res = await makeReq(dropboxToken);
-  if (res.status === 401) {
-    const ok = await refreshDropboxToken();
-    if (!ok) return null;
-    res = await makeReq(dropboxToken);
-  }
-  return res;
-}
-
-async function listDropboxFolder(folderPath) {
-  const p = folderPath === '' ? '' : ('/' + folderPath.replace(/^\//, ''));
-  const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: p, recursive: false });
-  if (!res || !res.ok) return `Erreur Dropbox: ${res?.status || 'token invalide'}`;
-  const data = await res.json();
-  if (!data.entries?.length) return 'Dossier vide';
-  return data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
-}
-
-async function readDropboxFile(filePath) {
-  const p = '/' + filePath.replace(/^\//, '');
-  const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
-  if (!res || !res.ok) return `Erreur Dropbox: ${res?.status || 'token invalide'}`;
-  const text = await res.text();
-  return text.length > 8000 ? text.substring(0, 8000) + '\n...[tronqué]' : text;
-}
-
-async function downloadDropboxFile(filePath) {
-  const p = '/' + filePath.replace(/^\//, '');
-  const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
-  if (!res || !res.ok) return null;
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const filename = p.split('/').pop();
-  return { buffer, filename };
-}
-
-// ─── Structure Dropbox au démarrage ───────────────────────────────────────────
-let dropboxStructure = '';
-async function loadDropboxStructure() {
-  try {
-    const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
-    if (!res || !res.ok) return;
-    const data = await res.json();
-    if (!data.entries?.length) return;
-    dropboxStructure = data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
-    console.log(`📦 Dropbox chargé: ${data.entries.length} éléments à la racine`);
-  } catch (e) { console.warn('⚠️ Dropbox structure:', e.message); }
-}
-
-// ─── Mémoire GitHub Gist (persistance cross-restart) ─────────────────────────
-let gistId = process.env.GIST_ID || null;
-const GIST_ID_FILE = path.join(DATA_DIR, 'gist_id.txt');
-
-async function initGistId() {
-  if (gistId) return;
-  if (fs.existsSync(GIST_ID_FILE)) {
-    gistId = fs.readFileSync(GIST_ID_FILE, 'utf8').trim();
-    return;
-  }
-  if (!process.env.GITHUB_TOKEN) {
-    console.warn('⚠️ Mémoire GitHub: GITHUB_TOKEN manquant — persistance locale seulement');
-    return;
-  }
-  try {
-    const res = await fetch('https://api.github.com/gists', {
-      method: 'POST',
-      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        description: 'Kira — mémoire persistante Shawn Barrette',
-        public: false,
-        files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } }
-      })
-    });
-    if (!res.ok) { console.warn('⚠️ Gist create:', res.status); return; }
-    const data = await res.json();
-    gistId = data.id;
-    try { fs.writeFileSync(GIST_ID_FILE, gistId, 'utf8'); } catch {}
-    console.log(`✅ Gist créé: ${gistId}`);
-    console.log(`⚠️  IMPORTANT: ajouter GIST_ID=${gistId} dans les variables d'env Render!`);
-  } catch (e) { console.warn('⚠️ Gist create:', e.message); }
-}
-
-async function loadMemoryFromGist() {
-  if (!gistId || !process.env.GITHUB_TOKEN) return;
-  try {
-    const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: githubHeaders() });
-    if (!res.ok) return;
-    const data = await res.json();
-    const content = data.files?.['memory.json']?.content;
-    if (!content) return;
-    const parsed = JSON.parse(content);
-    if (Array.isArray(parsed.facts) && parsed.facts.length > 0) {
-      kiramem.facts = parsed.facts;
-      kiramem.updatedAt = parsed.updatedAt;
-      saveJSON(MEM_FILE, kiramem);
-      console.log(`🧠 Mémoire GitHub: ${kiramem.facts.length} faits chargés depuis Gist`);
-    }
-  } catch (e) { console.warn('⚠️ Gist load:', e.message); }
-}
-
-async function saveMemoryToGist() {
-  if (!gistId || !process.env.GITHUB_TOKEN) return;
-  try {
-    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-      method: 'PATCH',
-      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } } })
-    });
-    if (res.ok) console.log(`💾 Mémoire sauvegardée dans Gist (${kiramem.facts.length} faits)`);
-  } catch (e) { console.warn('⚠️ Gist save:', e.message); }
-}
-
-// Init au démarrage
-loadDropboxStructure();
-initGistId().then(() => loadMemoryFromGist());
-
 // ─── GitHub ───────────────────────────────────────────────────────────────────
 function githubHeaders() {
   const h = { 'User-Agent': 'Kira-Bot', 'Accept': 'application/vnd.github.v3+json' };
@@ -300,6 +154,178 @@ async function readGitHubFile(repo, filePath) {
     return content.length > 8000 ? content.substring(0, 8000) + '\n...[tronqué]' : content;
   }
   return 'Fichier non textuel ou trop volumineux';
+}
+
+// ─── Dropbox (avec refresh auto) ──────────────────────────────────────────────
+let dropboxToken = process.env.DROPBOX_ACCESS_TOKEN || '';
+
+async function refreshDropboxToken() {
+  const { DROPBOX_APP_KEY: key, DROPBOX_APP_SECRET: secret, DROPBOX_REFRESH_TOKEN: refresh } = process.env;
+  if (!key || !secret || !refresh) return false;
+  try {
+    const res = await fetch('https://api.dropbox.com/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh, client_id: key, client_secret: secret })
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    dropboxToken = data.access_token;
+    console.log('🔄 Dropbox token rafraîchi');
+    return true;
+  } catch { return false; }
+}
+
+async function dropboxAPI(apiUrl, body, isDownload = false) {
+  // FIX: ne pas appeler avec token vide — rafraîchit d'abord
+  if (!dropboxToken) {
+    const ok = await refreshDropboxToken();
+    if (!ok) return null;
+  }
+
+  const makeReq = (token) => {
+    if (isDownload) {
+      return fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify(body) }
+      });
+    }
+    return fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  };
+
+  let res = await makeReq(dropboxToken);
+  if (res.status === 401) {
+    const ok = await refreshDropboxToken();
+    if (!ok) return null;
+    res = await makeReq(dropboxToken);
+  }
+  return res;
+}
+
+async function listDropboxFolder(folderPath) {
+  const p = folderPath === '' ? '' : ('/' + folderPath.replace(/^\//, ''));
+  const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: p, recursive: false });
+  if (!res || !res.ok) return `Erreur Dropbox: ${res ? res.status : 'connexion échouée'}`;
+  const data = await res.json();
+  if (!data.entries?.length) return 'Dossier vide';
+  return data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
+}
+
+async function readDropboxFile(filePath) {
+  const p = '/' + filePath.replace(/^\//, '');
+  const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
+  if (!res || !res.ok) return `Erreur Dropbox: ${res ? res.status : 'connexion échouée'}`;
+  const text = await res.text();
+  return text.length > 8000 ? text.substring(0, 8000) + '\n...[tronqué]' : text;
+}
+
+async function downloadDropboxFile(filePath) {
+  const p = '/' + filePath.replace(/^\//, '');
+  const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
+  if (!res || !res.ok) return null;
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const filename = p.split('/').pop();
+  return { buffer, filename };
+}
+
+async function loadDropboxStructure() {
+  try {
+    const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    if (!data.entries?.length) return;
+    dropboxStructure = data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
+    console.log(`📦 Dropbox chargé: ${data.entries.length} éléments`);
+  } catch (e) { console.warn('⚠️ Dropbox structure:', e.message); }
+}
+
+// ─── Mémoire GitHub Gist (persistance cross-restart) ─────────────────────────
+let gistId = process.env.GIST_ID || null;
+
+async function initGistId() {
+  if (gistId) { console.log(`🧠 Gist configuré: ${gistId}`); return; }
+
+  // GIST_ID_FILE est dans /tmp (éphémère) mais utile si pas encore redémarré
+  if (fs.existsSync(GIST_ID_FILE)) {
+    gistId = fs.readFileSync(GIST_ID_FILE, 'utf8').trim();
+    console.log(`🧠 Gist chargé depuis fichier local: ${gistId}`);
+    return;
+  }
+
+  if (!process.env.GITHUB_TOKEN) {
+    console.warn('⚠️ Mémoire: GITHUB_TOKEN manquant — persistance locale /tmp seulement');
+    return;
+  }
+
+  try {
+    const res = await fetch('https://api.github.com/gists', {
+      method: 'POST',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: 'Kira — mémoire persistante Shawn Barrette',
+        public: false,
+        files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } }
+      })
+    });
+
+    if (!res.ok) {
+      // FIX: messages d'erreur utiles selon le code HTTP
+      if (res.status === 403 || res.status === 422) {
+        console.warn('⚠️ Gist: token GitHub sans scope "gist" — va dans GitHub Settings > Tokens et ajoute le scope gist');
+      } else {
+        const body = await res.text();
+        console.warn(`⚠️ Gist create: HTTP ${res.status} — ${body.substring(0, 200)}`);
+      }
+      return;
+    }
+
+    const data = await res.json();
+    gistId = data.id;
+    try { fs.writeFileSync(GIST_ID_FILE, gistId, 'utf8'); } catch {}
+    console.log(`✅ Gist créé: ${gistId}`);
+
+    // FIX: notifier via Telegram directement (pas juste les logs Render)
+    if (ALLOWED_ID) {
+      bot.sendMessage(ALLOWED_ID,
+        `🔑 *Gist mémoire créé\\!*\n\nAjoute cette variable dans Render:\n\`GIST\\_ID=${gistId}\`\n\n_Sans ça, la mémoire repart à zéro à chaque redémarrage_`,
+        { parse_mode: 'MarkdownV2' }
+      ).catch(() => {});
+    }
+  } catch (e) { console.warn('⚠️ Gist create:', e.message); }
+}
+
+async function loadMemoryFromGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: githubHeaders() });
+    if (!res.ok) { console.warn(`⚠️ Gist load: HTTP ${res.status}`); return; }
+    const data = await res.json();
+    const content = data.files?.['memory.json']?.content;
+    if (!content) return;
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed.facts) && parsed.facts.length > 0) {
+      kiramem.facts = parsed.facts;
+      kiramem.updatedAt = parsed.updatedAt;
+      saveJSON(MEM_FILE, kiramem);
+      console.log(`🧠 Mémoire Gist: ${kiramem.facts.length} faits chargés`);
+    }
+  } catch (e) { console.warn('⚠️ Gist load:', e.message); }
+}
+
+async function saveMemoryToGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      method: 'PATCH',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } } })
+    });
+    if (!res.ok) console.warn(`⚠️ Gist save: HTTP ${res.status}`);
+  } catch (e) { console.warn('⚠️ Gist save:', e.message); }
 }
 
 // ─── Outils Claude ────────────────────────────────────────────────────────────
@@ -369,18 +395,18 @@ const TOOLS = [
   },
   {
     name: 'read_bot_file',
-    description: 'Lit un fichier de configuration ou de code du bot assistant de Shawn (mailing-masse, chatbot, etc.) stocké sur le disque /data',
+    description: 'Lit un fichier de configuration ou de code du bot assistant de Shawn stocké dans /data/botfiles/',
     input_schema: {
       type: 'object',
       properties: {
-        filename: { type: 'string', description: 'Nom du fichier dans /data/botfiles/ (ex: campaigns_library.js, templates.js)' }
+        filename: { type: 'string', description: 'Nom du fichier dans /data/botfiles/ (ex: campaigns_library.js)' }
       },
       required: ['filename']
     }
   },
   {
     name: 'write_bot_file',
-    description: 'Modifie ou crée un fichier de configuration du bot assistant de Shawn dans /data/botfiles/. Utilise ça pour corriger des erreurs de mailing, ajuster des templates, modifier des campagnes.',
+    description: 'Modifie ou crée un fichier de configuration du bot assistant dans /data/botfiles/',
     input_schema: {
       type: 'object',
       properties: {
@@ -433,7 +459,6 @@ async function callClaude(chatId, userMsg, retries = 3) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      // Snapshot de l'historique (inclut le msg user qu'on vient d'ajouter)
       const messages = getHistory(chatId).map(m => ({ role: m.role, content: m.content }));
       let finalReply = null;
       let allMemos   = [];
@@ -441,7 +466,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
       // Boucle agentique (max 8 rounds)
       for (let round = 0; round < 8; round++) {
         const res = await claude.messages.create({
-          model: MODEL, max_tokens: 4096,
+          model: currentModel, max_tokens: 4096, // FIX: currentModel (let)
           system: getSystem(), tools: TOOLS, messages,
         });
 
@@ -457,7 +482,6 @@ async function callClaude(chatId, userMsg, retries = 3) {
           continue;
         }
 
-        // end_turn ou autre — extraire le texte final
         const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
         const { cleaned, memos } = extractMemos(text);
         finalReply = cleaned;
@@ -465,7 +489,10 @@ async function callClaude(chatId, userMsg, retries = 3) {
         break;
       }
 
-      if (!finalReply) finalReply = '_(pas de réponse)_';
+      if (!finalReply) {
+        console.warn(`⚠️ Boucle agentique: 8 rounds sans réponse finale (chatId: ${chatId})`);
+        finalReply = '_(délai dépassé — réessaie)_';
+      }
       addMsg(chatId, 'assistant', finalReply);
       return { reply: finalReply, memos: allMemos };
 
@@ -494,103 +521,121 @@ async function send(chatId, text) {
   }
 }
 
-// ─── Commandes ────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, msg =>
-  bot.sendMessage(msg.chat.id,
-    `👋 Salut Shawn\\! Je suis *Kira*, ton assistante IA 24/7\\.\n\nJ'ai accès à ton *GitHub* et ton *Dropbox* — demande\\-moi n'importe quoi\\!\n\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Ma mémoire persistante\n/oublier — Effacer ma mémoire\n/sonnet — Mode puissant\n/haiku — Mode rapide \\(défaut\\)`,
-    { parse_mode: 'MarkdownV2' }
-  )
-);
+// ─── Guard: seul Shawn peut utiliser le bot ───────────────────────────────────
+function isAllowed(msg) {
+  if (!msg.from) return false; // FIX: guard msg.from undefined (messages de canaux, etc.)
+  return !ALLOWED_ID || msg.from.id === ALLOWED_ID;
+}
 
-bot.onText(/\/reset/, msg => {
-  chats.delete(msg.chat.id);
-  scheduleHistSave();
-  bot.sendMessage(msg.chat.id, '🔄 Nouvelle conversation. Je t\'écoute!');
-});
+// ─── Enregistrement des handlers (appelé après init) ─────────────────────────
+function registerHandlers() {
 
-bot.onText(/\/status/, msg => {
-  const h = getHistory(msg.chat.id);
-  const uptime = Math.floor(process.uptime() / 60);
-  const ghStatus = process.env.GITHUB_TOKEN ? '✅ Avec token (privés inclus)' : '⚠️ Sans token (publics seulement)';
-  const dbStatus = dropboxToken ? '✅ Connecté' : '❌ Token manquant';
-  const memStatus = gistId ? `✅ Gist \`${gistId.substring(0, 8)}...\`` : '⚠️ Local /tmp seulement';
-  bot.sendMessage(msg.chat.id,
-    `✅ *Kira opérationnelle*\nModèle: \`${MODEL}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\nGitHub: ${ghStatus}\nDropbox: ${dbStatus}\nMémoire: ${memStatus}\nDonnées: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
-    { parse_mode: 'Markdown' }
-  );
-});
+  // FIX: isAllowed() sur toutes les commandes, pas seulement les messages texte
+  bot.onText(/\/start/, msg => {
+    if (!isAllowed(msg)) return;
+    bot.sendMessage(msg.chat.id,
+      `👋 Salut Shawn\\! Je suis *Kira*, ton assistante IA 24/7\\.\n\nJ'ai accès à ton *GitHub* et ton *Dropbox* — demande\\-moi n'importe quoi\\!\n\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Ma mémoire persistante\n/oublier — Effacer ma mémoire\n/sonnet — Mode puissant\n/haiku — Mode rapide \\(défaut\\)`,
+      { parse_mode: 'MarkdownV2' }
+    );
+  });
 
-bot.onText(/\/memoire/, msg => {
-  if (!kiramem.facts.length) return bot.sendMessage(msg.chat.id, '🧠 Aucun fait mémorisé pour l\'instant.');
-  const list = kiramem.facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
-  bot.sendMessage(msg.chat.id, `🧠 *Ma mémoire persistante:*\n\n${list}`, { parse_mode: 'Markdown' });
-});
+  bot.onText(/\/reset/, msg => {
+    if (!isAllowed(msg)) return;
+    chats.delete(msg.chat.id);
+    scheduleHistSave();
+    bot.sendMessage(msg.chat.id, '🔄 Nouvelle conversation. Je t\'écoute!');
+  });
 
-bot.onText(/\/oublier/, msg => {
-  kiramem.facts = [];
-  kiramem.updatedAt = new Date().toISOString();
-  saveJSON(MEM_FILE, kiramem);
-  saveMemoryToGist().catch(() => {});
-  bot.sendMessage(msg.chat.id, '🗑️ Mémoire effacée (local + Gist). Je repars à zéro!');
-});
+  bot.onText(/\/status/, msg => {
+    if (!isAllowed(msg)) return;
+    const h = getHistory(msg.chat.id);
+    const uptime = Math.floor(process.uptime() / 60);
+    const ghStatus = process.env.GITHUB_TOKEN ? '✅ Avec token' : '⚠️ Sans token';
+    const dbStatus = dropboxToken ? '✅ Connecté' : '❌ Token manquant';
+    const memStatus = gistId ? `✅ Gist \`${gistId.substring(0, 8)}...\`` : '⚠️ /tmp seulement';
+    bot.sendMessage(msg.chat.id,
+      `✅ *Kira opérationnelle*\nModèle: \`${currentModel}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\nGitHub: ${ghStatus}\nDropbox: ${dbStatus}\nMémoire: ${memStatus}\nDonnées: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
+      { parse_mode: 'Markdown' }
+    );
+  });
 
-bot.onText(/\/sonnet/, msg => {
-  process.env.MODEL = 'claude-sonnet-4-6';
-  bot.sendMessage(msg.chat.id, '🧠 Mode Sonnet activé — plus puissant, légèrement plus lent.');
-});
+  bot.onText(/\/memoire/, msg => {
+    if (!isAllowed(msg)) return;
+    if (!kiramem.facts.length) return bot.sendMessage(msg.chat.id, '🧠 Aucun fait mémorisé pour l\'instant.');
+    const list = kiramem.facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
+    bot.sendMessage(msg.chat.id, `🧠 *Ma mémoire persistante:*\n\n${list}`, { parse_mode: 'Markdown' });
+  });
 
-bot.onText(/\/haiku/, msg => {
-  process.env.MODEL = 'claude-haiku-4-5';
-  bot.sendMessage(msg.chat.id, '⚡ Mode Haiku activé — rapide et efficace.');
-});
+  bot.onText(/\/oublier/, msg => {
+    if (!isAllowed(msg)) return;
+    kiramem.facts = [];
+    kiramem.updatedAt = new Date().toISOString();
+    saveJSON(MEM_FILE, kiramem);
+    saveMemoryToGist().catch(() => {});
+    bot.sendMessage(msg.chat.id, '🗑️ Mémoire effacée (local + Gist). Je repars à zéro!');
+  });
 
-// ─── Messages texte ───────────────────────────────────────────────────────────
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const text   = msg.text;
+  bot.onText(/\/sonnet/, msg => {
+    if (!isAllowed(msg)) return;
+    currentModel = 'claude-sonnet-4-6'; // FIX: modifie currentModel (let), pas process.env
+    bot.sendMessage(msg.chat.id, '🧠 Mode Sonnet activé — plus puissant, légèrement plus lent.');
+  });
 
-  if (ALLOWED_ID && msg.from.id !== ALLOWED_ID) return;
-  if (!text || text.startsWith('/')) return;
-  if (isDuplicate(msg.message_id)) return;
+  bot.onText(/\/haiku/, msg => {
+    if (!isAllowed(msg)) return;
+    currentModel = 'claude-haiku-4-5'; // FIX: modifie currentModel (let), pas process.env
+    bot.sendMessage(msg.chat.id, '⚡ Mode Haiku activé — rapide et efficace.');
+  });
 
-  console.log(`[${new Date().toLocaleTimeString('fr-CA')}] ${text.substring(0, 80)}`);
+  // ─── Messages texte ─────────────────────────────────────────────────────────
+  bot.on('message', async (msg) => {
+    if (!isAllowed(msg)) return;
+    const chatId = msg.chat.id;
+    const text   = msg.text;
+    if (!text || text.startsWith('/')) return;
+    if (isDuplicate(msg.message_id)) return;
 
-  const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
-  bot.sendChatAction(chatId, 'typing').catch(() => {});
+    console.log(`[${new Date().toLocaleTimeString('fr-CA')}] ${text.substring(0, 80)}`);
 
-  try {
-    const { reply, memos } = await callClaude(chatId, text);
-    clearInterval(typing);
-    await send(chatId, reply);
-    if (memos.length) {
-      await bot.sendMessage(chatId, `📝 *Mémorisé:* ${memos.join(' | ')}`, { parse_mode: 'Markdown' });
+    const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+    try {
+      const { reply, memos } = await callClaude(chatId, text);
+      clearInterval(typing);
+      await send(chatId, reply);
+      if (memos.length) {
+        await bot.sendMessage(chatId, `📝 *Mémorisé:* ${memos.join(' | ')}`, { parse_mode: 'Markdown' });
+      }
+    } catch (err) {
+      clearInterval(typing);
+      console.error('❌', err.status || '', err.message);
+      if (err.status === 400) {
+        chats.delete(chatId);
+        scheduleHistSave();
+        await bot.sendMessage(chatId, '⚠️ Conversation réinitialisée. Réessaie!');
+      } else {
+        await bot.sendMessage(chatId, '❌ Erreur temporaire. Réessaie dans quelques secondes.');
+      }
     }
-  } catch (err) {
-    clearInterval(typing);
-    console.error('❌', err.status || '', err.message);
-    if (err.status === 400) {
-      chats.delete(chatId);
-      scheduleHistSave();
-      await bot.sendMessage(chatId, '⚠️ Conversation réinitialisée. Réessaie!');
-    } else {
-      await bot.sendMessage(chatId, '❌ Erreur temporaire. Réessaie dans quelques secondes.');
-    }
-  }
-});
+  });
 
-// ─── Reconnexion auto polling ──────────────────────────────────────────────────
-let pollingErrors = 0;
-bot.on('polling_error', err => {
-  console.error(`Polling #${++pollingErrors}:`, err.message);
-  if (pollingErrors >= 10) { console.log('🔄 Restart forcé...'); process.exit(1); }
-});
-bot.on('message', () => { pollingErrors = 0; });
+  // ─── Reconnexion auto polling ────────────────────────────────────────────────
+  let pollingErrors = 0;
+  bot.on('polling_error', err => {
+    console.error(`Polling #${++pollingErrors}:`, err.message);
+    if (pollingErrors >= 10) { console.log('🔄 Restart forcé...'); process.exit(1); }
+  });
+  bot.on('message', () => { pollingErrors = 0; });
+}
 
-// ─── Arrêt propre ────────────────────────────────────────────────────────────
-process.on('SIGTERM', () => {
+// ─── Arrêt propre ─────────────────────────────────────────────────────────────
+// FIX: sauvegarde vers Gist avant arrêt (était manquant)
+process.on('SIGTERM', async () => {
   if (saveTimer) clearTimeout(saveTimer);
   saveJSON(HIST_FILE, Object.fromEntries(chats));
-  console.log('💾 Historique sauvegardé — arrêt propre');
+  await saveMemoryToGist().catch(() => {});
+  console.log('💾 Sauvegardé — arrêt propre');
   process.exit(0);
 });
 
@@ -599,3 +644,21 @@ http.createServer((req, res) => {
   res.writeHead(200);
   res.end(`Kira OK — ${new Date().toISOString()}`);
 }).listen(PORT);
+
+// ─── Démarrage séquentiel ─────────────────────────────────────────────────────
+// FIX: tout est initialisé (Dropbox + Gist + mémoire) AVANT le premier message
+async function main() {
+  await loadDropboxStructure();
+  await initGistId();
+  await loadMemoryFromGist();
+
+  registerHandlers();
+  bot.startPolling({ interval: 1000, autoStart: true });
+
+  console.log(`✅ Kira démarrée [${currentModel}] — ${new Date().toLocaleString('fr-CA')} — données: ${DATA_DIR} — mémos: ${kiramem.facts.length}`);
+}
+
+main().catch(err => {
+  console.error('❌ Erreur démarrage:', err);
+  process.exit(1);
+});
