@@ -65,7 +65,10 @@ Accès aux ressources de Shawn via tes outils:
 
 Si Shawn te dit quelque chose d'important à retenir (préférence, projet, info), confirme et utilise: [MEMO: le fait à retenir]`;
 
-function getSystem() { return SYSTEM_BASE + buildMemoryBlock(); }
+function getSystem() {
+  const dbBlock = dropboxStructure ? `\n\nDropbox de Shawn (racine):\n${dropboxStructure}` : '';
+  return SYSTEM_BASE + dbBlock + buildMemoryBlock();
+}
 
 // ─── Historique (max 40 messages, persistant) ─────────────────────────────────
 const MAX_HIST = 40;
@@ -171,6 +174,29 @@ async function readDropboxFile(filePath) {
   return text.length > 8000 ? text.substring(0, 8000) + '\n...[tronqué]' : text;
 }
 
+async function downloadDropboxFile(filePath) {
+  const p = '/' + filePath.replace(/^\//, '');
+  const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
+  if (!res || !res.ok) return null;
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const filename = p.split('/').pop();
+  return { buffer, filename };
+}
+
+// ─── Structure Dropbox au démarrage ───────────────────────────────────────────
+let dropboxStructure = '';
+async function loadDropboxStructure() {
+  try {
+    const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    if (!data.entries?.length) return;
+    dropboxStructure = data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
+    console.log(`📦 Dropbox chargé: ${data.entries.length} éléments à la racine`);
+  } catch (e) { console.warn('⚠️ Dropbox structure:', e.message); }
+}
+loadDropboxStructure();
+
 // ─── GitHub ───────────────────────────────────────────────────────────────────
 function githubHeaders() {
   const h = { 'User-Agent': 'Kira-Bot', 'Accept': 'application/vnd.github.v3+json' };
@@ -261,10 +287,45 @@ const TOOLS = [
       },
       required: ['path']
     }
+  },
+  {
+    name: 'send_dropbox_file',
+    description: 'Télécharge un fichier (PDF, image, etc.) depuis Dropbox et l\'envoie directement à Shawn par Telegram',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Chemin complet du fichier Dropbox (ex: /Terrain en ligne/fiche-rawdon.pdf)' },
+        caption: { type: 'string', description: 'Message à joindre au fichier (optionnel)' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'read_bot_file',
+    description: 'Lit un fichier de configuration ou de code du bot assistant de Shawn (mailing-masse, chatbot, etc.) stocké sur le disque /data',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: 'Nom du fichier dans /data/botfiles/ (ex: campaigns_library.js, templates.js)' }
+      },
+      required: ['filename']
+    }
+  },
+  {
+    name: 'write_bot_file',
+    description: 'Modifie ou crée un fichier de configuration du bot assistant de Shawn dans /data/botfiles/. Utilise ça pour corriger des erreurs de mailing, ajuster des templates, modifier des campagnes.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: 'Nom du fichier (ex: campaigns_library.js)' },
+        content: { type: 'string', description: 'Contenu complet du fichier' }
+      },
+      required: ['filename', 'content']
+    }
   }
 ];
 
-async function executeTool(name, input) {
+async function executeTool(name, input, chatId) {
   try {
     switch (name) {
       case 'list_github_repos':   return await listGitHubRepos();
@@ -272,6 +333,26 @@ async function executeTool(name, input) {
       case 'read_github_file':    return await readGitHubFile(input.repo, input.path);
       case 'list_dropbox_folder': return await listDropboxFolder(input.path);
       case 'read_dropbox_file':   return await readDropboxFile(input.path);
+      case 'send_dropbox_file': {
+        const file = await downloadDropboxFile(input.path);
+        if (!file) return `Erreur: impossible de télécharger ${input.path}`;
+        await bot.sendDocument(chatId, file.buffer, { caption: input.caption || '' }, { filename: file.filename });
+        return `✅ Fichier "${file.filename}" envoyé à Shawn.`;
+      }
+      case 'read_bot_file': {
+        const dir = path.join(DATA_DIR, 'botfiles');
+        const fp  = path.join(dir, path.basename(input.filename));
+        if (!fs.existsSync(fp)) return `Fichier introuvable: ${input.filename}`;
+        const content = fs.readFileSync(fp, 'utf8');
+        return content.length > 8000 ? content.substring(0, 8000) + '\n...[tronqué]' : content;
+      }
+      case 'write_bot_file': {
+        const dir = path.join(DATA_DIR, 'botfiles');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const fp = path.join(dir, path.basename(input.filename));
+        fs.writeFileSync(fp, input.content, 'utf8');
+        return `✅ Fichier "${input.filename}" sauvegardé (${input.content.length} chars).`;
+      }
       default: return `Outil inconnu: ${name}`;
     }
   } catch (err) {
@@ -302,7 +383,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
           const results = await Promise.all(toolBlocks.map(async b => {
             console.log(`🔧 ${b.name}(${JSON.stringify(b.input).substring(0, 100)})`);
-            const result = await executeTool(b.name, b.input);
+            const result = await executeTool(b.name, b.input, chatId);
             return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
           }));
           messages.push({ role: 'user', content: results });
