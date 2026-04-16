@@ -12,22 +12,21 @@ const ALLOWED_ID = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID || '0');
 const API_KEY    = process.env.ANTHROPIC_API_KEY;
 const PORT       = process.env.PORT || 3000;
 const MODEL      = process.env.MODEL || 'claude-haiku-4-5';
+const GITHUB_USER = 'signaturesb';
 
 if (!BOT_TOKEN) { console.error('❌ TELEGRAM_BOT_TOKEN manquant'); process.exit(1); }
 if (!API_KEY)   { console.error('❌ ANTHROPIC_API_KEY manquant');  process.exit(1); }
 
 // ─── Persistance ──────────────────────────────────────────────────────────────
-const DATA_DIR    = fs.existsSync('/data') ? '/data' : '/tmp';
-const HIST_FILE   = path.join(DATA_DIR, 'history.json');
-const MEM_FILE    = path.join(DATA_DIR, 'memory.json');
+const DATA_DIR  = fs.existsSync('/data') ? '/data' : '/tmp';
+const HIST_FILE = path.join(DATA_DIR, 'history.json');
+const MEM_FILE  = path.join(DATA_DIR, 'memory.json');
 
 function loadJSON(file, fallback) {
-  try {
-    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch { console.warn(`⚠️ Impossible de lire ${file} — réinitialisation`); }
+  try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { console.warn(`⚠️ Impossible de lire ${file} — réinitialisation`); }
   return fallback;
 }
-
 function saveJSON(file, data) {
   try { fs.writeFileSync(file, JSON.stringify(data), 'utf8'); }
   catch (e) { console.error(`❌ Sauvegarde ${file}:`, e.message); }
@@ -38,7 +37,7 @@ const claude = new Anthropic({ apiKey: API_KEY });
 const bot    = new TelegramBot(BOT_TOKEN, { polling: { interval: 1000, autoStart: true } });
 console.log(`✅ Kira démarrée [${MODEL}] — ${new Date().toLocaleString('fr-CA')} — données: ${DATA_DIR}`);
 
-// ─── Mémoire persistante (faits durables sur Shawn) ───────────────────────────
+// ─── Mémoire persistante (faits durables) ─────────────────────────────────────
 const kiramem = loadJSON(MEM_FILE, { facts: [], updatedAt: null });
 
 function buildMemoryBlock() {
@@ -60,32 +59,28 @@ Infos Shawn : shawn@signaturesb.com | 514-927-1340 | Assistante : Julie
 Spécialités : terrains Lanaudière, maisons, construction neuve
 Partenaire ProFab : Jordan Brouillette 514-291-3018 (0$ comptant Desjardins)
 
-Si Shawn te dit quelque chose d'important à retenir (préférence, projet, info), confirme que tu l'as mis en mémoire et utilise la commande: [MEMO: le fait à retenir]`;
+Accès aux ressources de Shawn via tes outils:
+- GitHub (signaturesb): repos de code, scripts d'automatisation
+- Dropbox: documents de propriétés, terrains, fichiers clients
 
-function getSystem() {
-  return SYSTEM_BASE + buildMemoryBlock();
-}
+Si Shawn te dit quelque chose d'important à retenir (préférence, projet, info), confirme et utilise: [MEMO: le fait à retenir]`;
+
+function getSystem() { return SYSTEM_BASE + buildMemoryBlock(); }
 
 // ─── Historique (max 40 messages, persistant) ─────────────────────────────────
 const MAX_HIST = 40;
 const rawChats = loadJSON(HIST_FILE, {});
 const chats    = new Map(Object.entries(rawChats));
-
-// Nettoyer les vieux historiques (> 7 jours sans activité) au démarrage
-const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
 for (const [id, hist] of chats.entries()) {
-  if (!Array.isArray(hist) || hist.length === 0) { chats.delete(id); }
+  if (!Array.isArray(hist) || hist.length === 0) chats.delete(id);
 }
 
 let saveTimer = null;
 function scheduleHistSave() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveJSON(HIST_FILE, Object.fromEntries(chats));
-  }, 1000);
+  saveTimer = setTimeout(() => saveJSON(HIST_FILE, Object.fromEntries(chats)), 1000);
 }
-
-function getHistory(id)           { if (!chats.has(id)) chats.set(id, []); return chats.get(id); }
+function getHistory(id) { if (!chats.has(id)) chats.set(id, []); return chats.get(id); }
 function addMsg(id, role, content) {
   const h = getHistory(id);
   h.push({ role, content });
@@ -93,52 +88,239 @@ function addMsg(id, role, content) {
   scheduleHistSave();
 }
 
-// ─── Déduplication (évite double-réponse si Telegram renvoie le même message) ─
+// ─── Déduplication ────────────────────────────────────────────────────────────
 const processed = new Set();
 function isDuplicate(msgId) {
   if (processed.has(msgId)) return true;
   processed.add(msgId);
-  if (processed.size > 500) {
-    const first = processed.values().next().value;
-    processed.delete(first);
-  }
+  if (processed.size > 500) processed.delete(processed.values().next().value);
   return false;
 }
 
-// ─── Extraction de mémos dans la réponse Claude ───────────────────────────────
+// ─── Extraction de mémos ──────────────────────────────────────────────────────
 function extractMemos(text) {
-  const memoRegex = /\[MEMO:\s*([^\]]+)\]/gi;
-  const found = [];
-  let cleaned = text;
-  let match;
-  while ((match = memoRegex.exec(text)) !== null) {
-    found.push(match[1].trim());
-  }
-  if (found.length) {
-    cleaned = text.replace(/\[MEMO:[^\]]+\]/gi, '').trim();
-    kiramem.facts.push(...found);
+  const memos = [];
+  const cleaned = text.replace(/\[MEMO:\s*([^\]]+)\]/gi, (_, fact) => { memos.push(fact.trim()); return ''; }).trim();
+  if (memos.length) {
+    kiramem.facts.push(...memos);
     if (kiramem.facts.length > 50) kiramem.facts.splice(0, kiramem.facts.length - 50);
     kiramem.updatedAt = new Date().toISOString();
     saveJSON(MEM_FILE, kiramem);
   }
-  return { cleaned, memos: found };
+  return { cleaned, memos };
 }
 
-// ─── Retry Anthropic (429/529 = surcharge temporaire) ────────────────────────
+// ─── Dropbox (avec refresh auto) ──────────────────────────────────────────────
+let dropboxToken = process.env.DROPBOX_ACCESS_TOKEN || '';
+
+async function refreshDropboxToken() {
+  const { DROPBOX_APP_KEY: key, DROPBOX_APP_SECRET: secret, DROPBOX_REFRESH_TOKEN: refresh } = process.env;
+  if (!key || !secret || !refresh) return false;
+  try {
+    const res = await fetch('https://api.dropbox.com/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh, client_id: key, client_secret: secret })
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    dropboxToken = data.access_token;
+    console.log('🔄 Dropbox token rafraîchi');
+    return true;
+  } catch { return false; }
+}
+
+async function dropboxAPI(apiUrl, body, isDownload = false) {
+  const makeReq = (token) => {
+    if (isDownload) {
+      return fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify(body) }
+      });
+    }
+    return fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  };
+
+  let res = await makeReq(dropboxToken);
+  if (res.status === 401) {
+    const ok = await refreshDropboxToken();
+    if (!ok) return null;
+    res = await makeReq(dropboxToken);
+  }
+  return res;
+}
+
+async function listDropboxFolder(folderPath) {
+  const p = folderPath === '' ? '' : ('/' + folderPath.replace(/^\//, ''));
+  const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: p, recursive: false });
+  if (!res || !res.ok) return `Erreur Dropbox: ${res?.status || 'token invalide'}`;
+  const data = await res.json();
+  if (!data.entries?.length) return 'Dossier vide';
+  return data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
+}
+
+async function readDropboxFile(filePath) {
+  const p = '/' + filePath.replace(/^\//, '');
+  const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
+  if (!res || !res.ok) return `Erreur Dropbox: ${res?.status || 'token invalide'}`;
+  const text = await res.text();
+  return text.length > 8000 ? text.substring(0, 8000) + '\n...[tronqué]' : text;
+}
+
+// ─── GitHub ───────────────────────────────────────────────────────────────────
+function githubHeaders() {
+  const h = { 'User-Agent': 'Kira-Bot', 'Accept': 'application/vnd.github.v3+json' };
+  if (process.env.GITHUB_TOKEN) h['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
+  return h;
+}
+
+async function listGitHubRepos() {
+  const url = process.env.GITHUB_TOKEN
+    ? `https://api.github.com/user/repos?per_page=50&sort=updated`
+    : `https://api.github.com/users/${GITHUB_USER}/repos?per_page=50&sort=updated`;
+  const res = await fetch(url, { headers: githubHeaders() });
+  if (!res.ok) return `Erreur GitHub: ${res.status}`;
+  const data = await res.json();
+  return data.map(r => `${r.private ? '🔒' : '🌐'} ${r.name}${r.description ? ' — ' + r.description : ''}`).join('\n');
+}
+
+async function listGitHubFiles(repo, filePath) {
+  const p = (filePath || '').replace(/^\//, '');
+  const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`, { headers: githubHeaders() });
+  if (!res.ok) return `Erreur GitHub: ${res.status} — repo "${repo}", path "${filePath}"`;
+  const data = await res.json();
+  if (Array.isArray(data)) return data.map(f => `${f.type === 'dir' ? '📁' : '📄'} ${f.name}`).join('\n');
+  return JSON.stringify(data).substring(0, 2000);
+}
+
+async function readGitHubFile(repo, filePath) {
+  const p = filePath.replace(/^\//, '');
+  const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`, { headers: githubHeaders() });
+  if (!res.ok) return `Erreur GitHub: ${res.status}`;
+  const data = await res.json();
+  if (data.encoding === 'base64' && data.content) {
+    const content = Buffer.from(data.content, 'base64').toString('utf8');
+    return content.length > 8000 ? content.substring(0, 8000) + '\n...[tronqué]' : content;
+  }
+  return 'Fichier non textuel ou trop volumineux';
+}
+
+// ─── Outils Claude ────────────────────────────────────────────────────────────
+const TOOLS = [
+  {
+    name: 'list_github_repos',
+    description: 'Liste tous les repos GitHub de Shawn (signaturesb)',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'list_github_files',
+    description: 'Liste les fichiers dans un dossier d\'un repo GitHub de Shawn',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Nom du repo (ex: kira-bot)' },
+        path: { type: 'string', description: 'Sous-dossier à lister (vide = racine)' }
+      },
+      required: ['repo']
+    }
+  },
+  {
+    name: 'read_github_file',
+    description: 'Lit le contenu d\'un fichier dans un repo GitHub de Shawn',
+    input_schema: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Nom du repo (ex: kira-bot)' },
+        path: { type: 'string', description: 'Chemin du fichier (ex: bot.js, src/templates.js)' }
+      },
+      required: ['repo', 'path']
+    }
+  },
+  {
+    name: 'list_dropbox_folder',
+    description: 'Liste les fichiers dans un dossier Dropbox de Shawn (documents propriétés, terrains, etc.)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Chemin Dropbox (ex: "Terrain en ligne" ou "" pour la racine)' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'read_dropbox_file',
+    description: 'Lit un fichier texte depuis le Dropbox de Shawn',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Chemin complet du fichier (ex: /Terrain en ligne/rawdon.txt)' }
+      },
+      required: ['path']
+    }
+  }
+];
+
+async function executeTool(name, input) {
+  try {
+    switch (name) {
+      case 'list_github_repos':   return await listGitHubRepos();
+      case 'list_github_files':   return await listGitHubFiles(input.repo, input.path || '');
+      case 'read_github_file':    return await readGitHubFile(input.repo, input.path);
+      case 'list_dropbox_folder': return await listDropboxFolder(input.path);
+      case 'read_dropbox_file':   return await readDropboxFile(input.path);
+      default: return `Outil inconnu: ${name}`;
+    }
+  } catch (err) {
+    return `Erreur outil ${name}: ${err.message}`;
+  }
+}
+
+// ─── Appel Claude (boucle agentique avec outils) ──────────────────────────────
 async function callClaude(chatId, userMsg, retries = 3) {
   addMsg(chatId, 'user', userMsg);
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const res = await claude.messages.create({
-        model:      MODEL,
-        max_tokens: 2048,
-        system:     getSystem(),
-        messages:   getHistory(chatId),
-      });
-      const raw   = res.content[0]?.text || '_(vide)_';
-      const { cleaned, memos } = extractMemos(raw);
-      addMsg(chatId, 'assistant', cleaned);
-      return { reply: cleaned, memos };
+      // Snapshot de l'historique (inclut le msg user qu'on vient d'ajouter)
+      const messages = getHistory(chatId).map(m => ({ role: m.role, content: m.content }));
+      let finalReply = null;
+      let allMemos   = [];
+
+      // Boucle agentique (max 8 rounds)
+      for (let round = 0; round < 8; round++) {
+        const res = await claude.messages.create({
+          model: MODEL, max_tokens: 4096,
+          system: getSystem(), tools: TOOLS, messages,
+        });
+
+        if (res.stop_reason === 'tool_use') {
+          messages.push({ role: 'assistant', content: res.content });
+          const toolBlocks = res.content.filter(b => b.type === 'tool_use');
+          const results = await Promise.all(toolBlocks.map(async b => {
+            console.log(`🔧 ${b.name}(${JSON.stringify(b.input).substring(0, 100)})`);
+            const result = await executeTool(b.name, b.input);
+            return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
+          }));
+          messages.push({ role: 'user', content: results });
+          continue;
+        }
+
+        // end_turn ou autre — extraire le texte final
+        const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
+        const { cleaned, memos } = extractMemos(text);
+        finalReply = cleaned;
+        allMemos   = memos;
+        break;
+      }
+
+      if (!finalReply) finalReply = '_(pas de réponse)_';
+      addMsg(chatId, 'assistant', finalReply);
+      return { reply: finalReply, memos: allMemos };
+
     } catch (err) {
       const retryable = err.status === 429 || err.status === 529 || err.status >= 500;
       if (retryable && attempt < retries) {
@@ -167,7 +349,7 @@ async function send(chatId, text) {
 // ─── Commandes ────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, msg =>
   bot.sendMessage(msg.chat.id,
-    `👋 Salut Shawn\\! Je suis *Kira*, ton assistante IA 24/7\\.\n\nParle\\-moi de n'importe quoi\\!\n\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Ma mémoire persistante\n/oublier — Effacer ma mémoire\n/sonnet — Mode puissant \\(tâches complexes\\)\n/haiku — Mode rapide \\(défaut\\)`,
+    `👋 Salut Shawn\\! Je suis *Kira*, ton assistante IA 24/7\\.\n\nJ'ai accès à ton *GitHub* et ton *Dropbox* — demande\\-moi n'importe quoi\\!\n\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Ma mémoire persistante\n/oublier — Effacer ma mémoire\n/sonnet — Mode puissant\n/haiku — Mode rapide \\(défaut\\)`,
     { parse_mode: 'MarkdownV2' }
   )
 );
@@ -181,16 +363,16 @@ bot.onText(/\/reset/, msg => {
 bot.onText(/\/status/, msg => {
   const h = getHistory(msg.chat.id);
   const uptime = Math.floor(process.uptime() / 60);
+  const ghStatus = process.env.GITHUB_TOKEN ? '✅ Avec token (privés inclus)' : '⚠️ Sans token (publics seulement)';
+  const dbStatus = dropboxToken ? '✅ Connecté' : '❌ Token manquant';
   bot.sendMessage(msg.chat.id,
-    `✅ *Kira opérationnelle*\nModèle: \`${MODEL}\`\nMessages en mémoire: ${h.length}\nFaits mémorisés: ${kiramem.facts.length}\nDonnées: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
+    `✅ *Kira opérationnelle*\nModèle: \`${MODEL}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\nGitHub: ${ghStatus}\nDropbox: ${dbStatus}\nDonnées: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
     { parse_mode: 'Markdown' }
   );
 });
 
 bot.onText(/\/memoire/, msg => {
-  if (!kiramem.facts.length) {
-    return bot.sendMessage(msg.chat.id, '🧠 Aucun fait mémorisé pour l\'instant.');
-  }
+  if (!kiramem.facts.length) return bot.sendMessage(msg.chat.id, '🧠 Aucun fait mémorisé pour l\'instant.');
   const list = kiramem.facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
   bot.sendMessage(msg.chat.id, `🧠 *Ma mémoire persistante:*\n\n${list}`, { parse_mode: 'Markdown' });
 });
@@ -250,14 +432,11 @@ bot.on('message', async (msg) => {
 let pollingErrors = 0;
 bot.on('polling_error', err => {
   console.error(`Polling #${++pollingErrors}:`, err.message);
-  if (pollingErrors >= 10) {
-    console.log('🔄 Restart forcé...');
-    process.exit(1);
-  }
+  if (pollingErrors >= 10) { console.log('🔄 Restart forcé...'); process.exit(1); }
 });
 bot.on('message', () => { pollingErrors = 0; });
 
-// ─── Sauvegarde propre à l'arrêt ──────────────────────────────────────────────
+// ─── Arrêt propre ────────────────────────────────────────────────────────────
 process.on('SIGTERM', () => {
   if (saveTimer) clearTimeout(saveTimer);
   saveJSON(HIST_FILE, Object.fromEntries(chats));
