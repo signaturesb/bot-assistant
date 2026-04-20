@@ -80,6 +80,9 @@ const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
 const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
 
+// ─── Mode réflexion (Opus 4.7 thinking) ──────────────────────────────────────
+let thinkingMode = false; // toggle via /penser
+
 // ─── Mémoire persistante ──────────────────────────────────────────────────────
 const kiramem = loadJSON(MEM_FILE, { facts: [], updatedAt: null });
 if (!Array.isArray(kiramem.facts)) kiramem.facts = [];
@@ -245,6 +248,30 @@ DROPBOX — STRUCTURE CLÉS:
 • /Liste de contact/email_templates/ — master_template_signature_sb.html
 • /Contacts/contacts.vcf — contacts iPhone (ou /Contacts/contacts.csv, /contacts.vcf)
 • Dropbox Refresh: DROPBOX_APP_KEY + DROPBOX_APP_SECRET + DROPBOX_REFRESH_TOKEN dans Render
+
+════ VISION — PHOTOS ET DOCUMENTS ════
+
+Tu peux recevoir et analyser des images et PDFs directement dans Telegram:
+
+PHOTOS → analyser activement:
+• Propriété ou terrain → état général, points forts pour mise en marché, défauts à cacher ou corriger
+• Screenshot Centris/DuProprio → extraire prix, superficie, délai vente, calculer $/pi², identifier si bon comparable
+• Extérieur maison → évaluer attrait visuel, recommander home staging, identifier rénovations ROI
+• Terrain brut → estimer potentiel constructible, identifier contraintes visuelles (pente, drainage, accès)
+• Photo client/prospect → jamais commenter l'apparence — focus sur le projet immobilier discuté
+
+PDFs → extraire et analyser:
+• Offre d'achat → identifier prix, conditions, délais, clauses inhabituelles, signaler risques pour Shawn
+• Certificat de localisation → dimensions, servitudes, empiètements, non-conformités
+• Évaluation foncière → comparer valeur marchande vs valeur foncière, implications fiscales
+• Rapport inspection → prioriser défauts majeurs, estimer coûts correction, impact sur prix
+• Contrat de courtage → identifier clauses importantes pour Shawn
+
+Dès qu'une image/PDF arrive → analyser immédiatement avec le contexte immobilier Québec.
+Toujours conclure avec une recommandation actionnable pour Shawn.
+
+Mode réflexion (/penser): activé = Opus 4.7 raisonne en profondeur avant de répondre.
+Idéal pour: stratégie de prix complexe, analyse marché multi-facteurs, négociation délicate.
 
 ════ MÉMOIRE ════
 Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]`;
@@ -994,8 +1021,11 @@ const TOOLS = [
   { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
   // ── Diagnostics ──
   { name: 'tester_dropbox',  description: 'Tester la connexion Dropbox et diagnostiquer les problèmes de tokens. Utiliser quand Dropbox semble brisé.', input_schema: { type: 'object', properties: {} } },
-  { name: 'voir_template_dropbox', description: 'Lire les informations du master template email depuis Dropbox (/Liste de contact/email_templates/master_template_signature_sb.html). Pour vérifier les placeholders disponibles.', input_schema: { type: 'object', properties: {} } }
+  { name: 'voir_template_dropbox', description: 'Lire les informations du master template email depuis Dropbox (/Liste de contact/email_templates/master_template_signature_sb.html). Pour vérifier les placeholders disponibles.', input_schema: { type: 'object', properties: {} }, cache_control: { type: 'ephemeral' } }
 ];
+
+// Cache les tools (statiques) — réduit coût API
+const TOOLS_WITH_CACHE = TOOLS;
 
 async function executeTool(name, input, chatId) {
   try {
@@ -1086,7 +1116,7 @@ async function executeTool(name, input, chatId) {
   }
 }
 
-// ─── Appel Claude (boucle agentique + prompt caching) ────────────────────────
+// ─── Appel Claude (boucle agentique, prompt caching, Opus 4.7) ───────────────
 async function callClaude(chatId, userMsg, retries = 3) {
   addMsg(chatId, 'user', userMsg);
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -1094,12 +1124,15 @@ async function callClaude(chatId, userMsg, retries = 3) {
       const messages = getHistory(chatId).map(m => ({ role: m.role, content: m.content }));
       let finalReply = null;
       let allMemos   = [];
-      for (let round = 0; round < 8; round++) {
-        const res = await claude.messages.create({
-          model: currentModel, max_tokens: 4096,
+      let localThinking = thinkingMode; // snapshot — peut être désactivé en cas d'erreur
+      for (let round = 0; round < 12; round++) {
+        const params = {
+          model: currentModel, max_tokens: 16384,
           system: [{ type: 'text', text: getSystem(), cache_control: { type: 'ephemeral' } }],
-          tools: TOOLS, messages,
-        });
+          tools: TOOLS_WITH_CACHE, messages,
+        };
+        if (localThinking) params.thinking = { type: 'enabled', budget_tokens: 10000 };
+        const res = await claude.messages.create(params);
         if (res.stop_reason === 'tool_use') {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
@@ -1111,6 +1144,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
           messages.push({ role: 'user', content: results });
           continue;
         }
+        // Extraire seulement les blocs texte (ignorer les blocs thinking)
         const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
         const { cleaned, memos } = extractMemos(text);
         finalReply = cleaned;
@@ -1121,6 +1155,13 @@ async function callClaude(chatId, userMsg, retries = 3) {
       addMsg(chatId, 'assistant', finalReply);
       return { reply: finalReply, memos: allMemos };
     } catch (err) {
+      // Opus 4.7: si erreur 400 avec thinking activé, désactiver et réessayer
+      if (err.status === 400 && thinkingMode && attempt < retries) {
+        log('WARN', 'CLAUDE', 'Thinking rejeté par API — retry sans thinking');
+        thinkingMode = false;
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
       const retryable = err.status === 429 || err.status === 529 || err.status >= 500;
       if (retryable && attempt < retries) {
         await new Promise(r => setTimeout(r, attempt * 3000));
@@ -1130,6 +1171,60 @@ async function callClaude(chatId, userMsg, retries = 3) {
         throw err;
       }
     }
+  }
+}
+
+// ─── Appel Claude direct (vision/multimodal — sans historique alourdi) ────────
+async function callClaudeVision(chatId, content, contextLabel) {
+  const h = getHistory(chatId);
+  // Ajouter le contenu multimodal temporairement
+  h.push({ role: 'user', content });
+  if (h.length > MAX_HIST) h.splice(0, h.length - MAX_HIST);
+
+  try {
+    const messages = h.map(m => ({ role: m.role, content: m.content }));
+    const params = {
+      model: currentModel, max_tokens: 16384,
+      system: [{ type: 'text', text: getSystem(), cache_control: { type: 'ephemeral' } }],
+      tools: TOOLS_WITH_CACHE, messages,
+    };
+    if (thinkingMode) params.thinking = { type: 'enabled', budget_tokens: 10000 };
+
+    let finalReply = null;
+    let allMemos   = [];
+    for (let round = 0; round < 6; round++) {
+      const res = await claude.messages.create(params);
+      if (res.stop_reason === 'tool_use') {
+        messages.push({ role: 'assistant', content: res.content });
+        const toolBlocks = res.content.filter(b => b.type === 'tool_use');
+        const results = await Promise.all(toolBlocks.map(async b => {
+          log('INFO', 'TOOL', `vision:${b.name}(${JSON.stringify(b.input).substring(0, 60)})`);
+          const result = await executeTool(b.name, b.input, chatId);
+          return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
+        }));
+        params.messages = messages;
+        params.messages.push({ role: 'user', content: results });
+        continue;
+      }
+      const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
+      const { cleaned, memos } = extractMemos(text);
+      finalReply = cleaned;
+      allMemos   = memos;
+      break;
+    }
+    finalReply = finalReply || '_(délai dépassé)_';
+
+    // Remplacer le contenu multimodal dans l'historique par un placeholder compact
+    h[h.length - 1] = { role: 'user', content: contextLabel };
+    h.push({ role: 'assistant', content: finalReply });
+    if (h.length > MAX_HIST) h.splice(0, h.length - MAX_HIST);
+    scheduleHistSave();
+
+    return { reply: finalReply, memos: allMemos };
+  } catch (err) {
+    // Rollback — retirer l'entrée ajoutée
+    if (h[h.length - 1]?.role === 'user') h.pop();
+    throw err;
   }
 }
 
@@ -1190,7 +1285,7 @@ function registerHandlers() {
   bot.onText(/\/start/, msg => {
     if (!isAllowed(msg)) return;
     bot.sendMessage(msg.chat.id,
-      `👋 Salut Shawn\\! Je suis ton assistante IA 24/7\\.\n\n*Accès:* GitHub · Dropbox · Pipedrive · Gmail · Contacts iPhone · Mailing\\-masse · Recherche web\n\n*Commandes:*\n/pipeline — Pipeline Pipedrive\n/stats — Tableau de bord\n/emails — Emails récents\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Mémoire persistante\n/oublier — Effacer mémoire\n/opus — Opus 4\\.7 \\(défaut\\)\n/sonnet — Sonnet 4\\.6\n/haiku — Haiku 4\\.5`,
+      `👋 Salut Shawn\\! Je suis ton assistante IA 24/7\\.\n\n*Accès:* GitHub · Dropbox · Pipedrive · Gmail · Contacts iPhone · Mailing\\-masse · Recherche web\n\n*Tu peux m'envoyer:*\n📸 Photos \\(propriétés, terrains, listings\\) → analyse immédiate\n📄 PDFs \\(contrats, offres, rapports\\) → extraction clés\n🎤 Messages vocaux → transcription \\+ action\n\n*Commandes:*\n/pipeline — Pipeline Pipedrive\n/stats — Tableau de bord\n/emails — Emails récents\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Mémoire persistante\n/oublier — Effacer mémoire\n/penser — Mode réflexion profonde \\(Opus 4\\.7\\)\n/opus — Opus 4\\.7 \\(défaut\\)\n/sonnet — Sonnet 4\\.6\n/haiku — Haiku 4\\.5`,
       { parse_mode: 'MarkdownV2' }
     );
   });
@@ -1211,7 +1306,7 @@ function registerHandlers() {
     const whisperOk = !!(process.env.OPENAI_API_KEY);
     const dbxRefreshOk = !!(process.env.DROPBOX_REFRESH_TOKEN && process.env.DROPBOX_APP_KEY && process.env.DROPBOX_APP_SECRET);
     bot.sendMessage(msg.chat.id,
-      `✅ *Kira opérationnelle*\nModèle: \`${currentModel}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\n\nGitHub: ${process.env.GITHUB_TOKEN ? '✅' : '⚠️'} | Brevo: ${BREVO_KEY ? '✅' : '❌'}\nPipedrive: ${PD_KEY ? '✅' : '❌'} | Gmail: ${gmailOk ? '✅' : '⚠️'}\nDropbox: ${dropboxToken ? '✅ actif' : '❌ token absent'} ${dbxRefreshOk ? '(refresh ✅)' : '⚠️ refresh vars manquantes'}\nWhisper: ${whisperOk ? '✅' : '⚠️'} | Mémoire: ${gistId ? `✅ Gist` : '⚠️ /tmp'}\nUptime: ${uptime} min | Tools: ${TOOLS.length}`,
+      `✅ *Kira opérationnelle — Opus 4.7*\nModèle: \`${currentModel}\` | Réflexion: ${thinkingMode ? '🧠 ON' : '⚡ OFF'}\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\n\nGitHub: ${process.env.GITHUB_TOKEN ? '✅' : '⚠️'} | Brevo: ${BREVO_KEY ? '✅' : '❌'}\nPipedrive: ${PD_KEY ? '✅' : '❌'} | Gmail: ${gmailOk ? '✅' : '⚠️'}\nDropbox: ${dropboxToken ? '✅ actif' : '❌'} ${dbxRefreshOk ? '(refresh ✅)' : '⚠️ vars manquantes'}\nWhisper: ${whisperOk ? '✅' : '⚠️'} | Mémoire: ${gistId ? '✅ Gist' : '⚠️ /tmp'}\nUptime: ${uptime} min | Tools: ${TOOLS.length}`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -1272,6 +1367,16 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     currentModel = 'claude-haiku-4-5';
     bot.sendMessage(msg.chat.id, '⚡ Mode Haiku activé — ultra-rapide et léger.');
+  });
+
+  bot.onText(/\/penser/, msg => {
+    if (!isAllowed(msg)) return;
+    thinkingMode = !thinkingMode;
+    bot.sendMessage(msg.chat.id, thinkingMode
+      ? '🧠 *Mode réflexion ON* — Opus 4.7 pense en profondeur avant chaque réponse.\nIdéal: stratégie de prix, analyse marché complexe, négociation.\nPlus lent mais beaucoup plus précis.'
+      : '⚡ *Mode réflexion OFF* — Réponses rapides.',
+      { parse_mode: 'Markdown' }
+    );
   });
 
   // ─── Messages texte ──────────────────────────────────────────────────────────
@@ -1347,6 +1452,97 @@ function registerHandlers() {
     } catch (err) {
       log('ERR', 'VOICE', err.message);
       await bot.sendMessage(chatId, `❌ Erreur vocal: ${err.message}`);
+    }
+  });
+
+  // ─── Photos (vision Opus 4.7) ────────────────────────────────────────────────
+  bot.on('photo', async (msg) => {
+    if (!isAllowed(msg)) return;
+    const chatId = msg.chat.id;
+    if (isDuplicate(msg.message_id)) return;
+
+    const photo   = msg.photo[msg.photo.length - 1]; // Résolution max
+    const caption = msg.caption || 'Analyse cette photo en contexte immobilier québécois. Qu\'est-ce que tu vois? Qu\'est-ce que je dois savoir?';
+
+    log('IN', 'PHOTO', `${photo.width}x${photo.height} — "${caption.substring(0, 60)}"`);
+    const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+    try {
+      const fileInfo = await bot.getFile(photo.file_id);
+      const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+      const fetchRes = await fetch(fileUrl);
+      const buffer   = Buffer.from(await fetchRes.arrayBuffer());
+
+      if (buffer.length > 5 * 1024 * 1024) {
+        clearInterval(typing);
+        await bot.sendMessage(chatId, '⚠️ Image trop grosse (max 5MB). Compresse et réessaie.');
+        return;
+      }
+
+      const base64    = buffer.toString('base64');
+      const mediaType = fileInfo.file_path.endsWith('.png') ? 'image/png' : 'image/jpeg';
+      const content   = [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+        { type: 'text', text: caption }
+      ];
+      const contextLabel = `[PHOTO envoyée: ${photo.width}x${photo.height}] "${caption.substring(0, 80)}"`;
+
+      const { reply, memos } = await callClaudeVision(chatId, content, contextLabel);
+      clearInterval(typing);
+      await send(chatId, reply);
+      if (memos.length) await bot.sendMessage(chatId, `📝 *Mémorisé:* ${memos.join(' | ')}`, { parse_mode: 'Markdown' });
+
+    } catch (err) {
+      clearInterval(typing);
+      log('ERR', 'PHOTO', err.message);
+      await bot.sendMessage(chatId, `❌ Erreur analyse photo: ${err.message.substring(0, 200)}`);
+    }
+  });
+
+  // ─── Documents PDF (analyse contrats, rapports, évaluations) ─────────────────
+  bot.on('document', async (msg) => {
+    if (!isAllowed(msg)) return;
+    const chatId = msg.chat.id;
+    if (isDuplicate(msg.message_id)) return;
+
+    const doc     = msg.document;
+    const caption = msg.caption || 'Analyse ce document. Extrais les informations clés et dis-moi ce que je dois savoir.';
+
+    if (doc.mime_type !== 'application/pdf') {
+      await bot.sendMessage(chatId, `⚠️ Format non supporté: \`${doc.mime_type || 'inconnu'}\`. Envoie un PDF.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    if (doc.file_size > 10 * 1024 * 1024) {
+      await bot.sendMessage(chatId, '⚠️ PDF trop gros (max 10MB).');
+      return;
+    }
+
+    log('IN', 'PDF', `${doc.file_name} — ${Math.round(doc.file_size / 1024)}KB`);
+    const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+    try {
+      const fileInfo = await bot.getFile(doc.file_id);
+      const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+      const fetchRes = await fetch(fileUrl);
+      const buffer   = Buffer.from(await fetchRes.arrayBuffer());
+      const base64   = buffer.toString('base64');
+      const content  = [
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+        { type: 'text', text: caption }
+      ];
+      const contextLabel = `[PDF: ${doc.file_name}] "${caption.substring(0, 80)}"`;
+
+      const { reply, memos } = await callClaudeVision(chatId, content, contextLabel);
+      clearInterval(typing);
+      await send(chatId, reply);
+      if (memos.length) await bot.sendMessage(chatId, `📝 *Mémorisé:* ${memos.join(' | ')}`, { parse_mode: 'Markdown' });
+
+    } catch (err) {
+      clearInterval(typing);
+      log('ERR', 'PDF', err.message);
+      await bot.sendMessage(chatId, `❌ Erreur analyse PDF: ${err.message.substring(0, 200)}`);
     }
   });
 
