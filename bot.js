@@ -2680,16 +2680,33 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     const h = getHistory(msg.chat.id);
     const uptime = Math.floor(process.uptime() / 60);
-    const gmailOk = !!(process.env.GMAIL_CLIENT_ID);
-    const whisperOk = !!(process.env.OPENAI_API_KEY);
-    const dbxRefreshOk = !!(process.env.DROPBOX_REFRESH_TOKEN && process.env.DROPBOX_APP_KEY && process.env.DROPBOX_APP_SECRET);
+    const gmailOk      = !!(process.env.GMAIL_CLIENT_ID);
+    const whisperOk    = !!(process.env.OPENAI_API_KEY);
+    const centrisOk    = !!(process.env.CENTRIS_USER && centrisSession.authenticated);
+    const dbxOk        = !!(dropboxToken && process.env.DROPBOX_REFRESH_TOKEN);
+    const pollerLast   = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun).toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' }) : 'jamais';
     bot.sendMessage(msg.chat.id,
-      `✅ *Kira opérationnelle — Opus 4.7*\nModèle: \`${currentModel}\` | Réflexion: ${thinkingMode ? '🧠 ON' : '⚡ OFF'}\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\n\nGitHub: ${process.env.GITHUB_TOKEN ? '✅' : '⚠️'} | Brevo: ${BREVO_KEY ? '✅' : '❌'}\nPipedrive: ${PD_KEY ? '✅' : '❌'} | Gmail: ${gmailOk ? '✅' : '⚠️'}\nDropbox: ${dropboxToken ? '✅ actif' : '❌'} ${dbxRefreshOk ? '(refresh ✅)' : '⚠️ vars manquantes'}\nWhisper: ${whisperOk ? '✅' : '⚠️'} | Mémoire: ${gistId ? '✅ Gist' : '⚠️ /tmp'}\nUptime: ${uptime} min | Tools: ${TOOLS.length}`,
+      `✅ *Kira — Opus 4.7 — ${TOOLS.length} outils*\nModèle: \`${currentModel}\` ${thinkingMode?'🧠 think':'⚡'}\nUptime: ${uptime}min | Mémos: ${kiramem.facts.length}\n\nPipedrive: ${PD_KEY?'✅':'❌'} | Brevo: ${BREVO_KEY?'✅':'❌'}\nGmail: ${gmailOk?'✅':'⚠️'} | Dropbox: ${dbxOk?'✅':'❌'}\nCentris agent: ${centrisOk?`✅ (${process.env.CENTRIS_USER})`:'⏳ à connecter'}\nWhisper: ${whisperOk?'✅':'⚠️ OPENAI_API_KEY manquant'}\nPoller: ${gmailOk?`✅ dernier: ${pollerLast} (${gmailPollerState.totalLeads||0} leads)`:'❌'}\nGist: ${gistId?'✅':'⚠️ /tmp'}`,
       { parse_mode: 'Markdown' }
     );
   });
 
   // ─── Commandes poller ────────────────────────────────────────────────────────
+  // ─── Test Centris agent ────────────────────────────────────────────────────────
+  bot.onText(/\/centris/, async msg => {
+    if (!isAllowed(msg)) return;
+    if (!process.env.CENTRIS_USER) {
+      return bot.sendMessage(msg.chat.id, '❌ CENTRIS_USER non configuré dans Render.');
+    }
+    await bot.sendMessage(msg.chat.id, `🔐 Test connexion Centris (agent ${process.env.CENTRIS_USER})...`);
+    const ok = await centrisLogin();
+    if (ok) {
+      await bot.sendMessage(msg.chat.id, `✅ *Centris connecté!*\nAgent: ${process.env.CENTRIS_USER}\nSession active 2h\n\nEssaie: "comparables terrains Rawdon 14 jours"`, { parse_mode: 'Markdown' });
+    } else {
+      await bot.sendMessage(msg.chat.id, `❌ *Centris: connexion échouée*\nVérifier:\n• CENTRIS_USER=${process.env.CENTRIS_USER}\n• CENTRIS_PASS configuré\n• Compte actif sur centris.ca`, { parse_mode: 'Markdown' });
+    }
+  });
+
   bot.onText(/\/checkemail/, async msg => {
     if (!isAllowed(msg)) return;
     await bot.sendMessage(msg.chat.id, '🔍 Scan des emails leads en cours...');
@@ -3563,6 +3580,13 @@ async function main() {
     log('OK', 'BOOT', 'Gmail Lead Poller activé (toutes les 5min)');
   } else {
     log('WARN', 'BOOT', 'Gmail Lead Poller désactivé — GMAIL_CLIENT_ID manquant');
+  }
+
+  // Pre-login Centris au démarrage si credentials disponibles
+  if (process.env.CENTRIS_USER && process.env.CENTRIS_PASS) {
+    centrisLogin()
+      .then(ok => log(ok ? 'OK' : 'WARN', 'CENTRIS', ok ? `Pré-login réussi (agent ${process.env.CENTRIS_USER})` : 'Pré-login échoué — retry automatique à la première requête'))
+      .catch(() => {});
   }
 
   registerHandlers();
