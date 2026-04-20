@@ -145,9 +145,10 @@ Quand tu prépares un message pour un prospect:
 2. voir_conversation → historique Gmail des 30 derniers jours (reçus + envoyés)
 3. chercher_contact → iPhone si email/tel manquant
 4. Appeler envoyer_email avec le brouillon complet
-5. ⚠️ ATTENDRE confirmation de Shawn ("envoie", "parfait", "go", "oui") AVANT d'envoyer pour vrai
+5. ⚠️ ATTENDRE confirmation de Shawn AVANT d'envoyer pour vrai
    → L'outil envoyer_email stocke le brouillon et te le montre — il n'envoie PAS encore.
-   → confirmer_envoi envoie le brouillon stocké après approbation de Shawn.
+   → Shawn confirme avec: "envoie", "go", "parfait", "ok", "oui", "d'accord", "send"
+   → Le système détecte ces mots et envoie automatiquement — PAS besoin d'appeler un autre outil.
 
 ════ STYLE EMAILS SHAWN ════
 
@@ -303,12 +304,16 @@ function addMsg(id, role, content) {
   scheduleHistSave();
 }
 
-// ─── Déduplication ────────────────────────────────────────────────────────────
-const processed = new Set();
+// ─── Déduplication (FIFO, pas de fuite mémoire) ──────────────────────────────
+const processed = new Map(); // msgId → timestamp
 function isDuplicate(msgId) {
   if (processed.has(msgId)) return true;
-  processed.add(msgId);
-  if (processed.size > 500) processed.delete(processed.values().next().value);
+  processed.set(msgId, Date.now());
+  if (processed.size > 2000) {
+    // Supprimer les 500 plus anciens
+    const keys = Array.from(processed.keys());
+    keys.slice(0, 500).forEach(k => processed.delete(k));
+  }
   return false;
 }
 
@@ -754,8 +759,14 @@ async function getGmailToken() {
       gmailToken    = data.access_token;
       gmailTokenExp = Date.now() + (data.expires_in || 3600) * 1000;
       return gmailToken;
+    } catch (e) {
+      gmailToken    = null; // reset pour forcer retry propre au prochain appel
+      gmailTokenExp = 0;
+      throw e;
     } finally { clearTimeout(t); gmailRefreshInProgress = null; }
   })();
+  // Attraper les rejets non gérés de la Promise pour éviter leak
+  gmailRefreshInProgress.catch(() => {});
   return gmailRefreshInProgress;
 }
 
@@ -831,7 +842,7 @@ async function voirConversation(terme) {
         return { sens, de: get('From'), sujet: get('Subject'), date: get('Date'), corps, dateMs };
       } catch { return null; }
     }));
-    const sorted = emails.filter(Boolean).sort((a, b) => b.dateMs - a.dateMs);
+    const sorted = emails.filter(Boolean).sort((a, b) => a.dateMs - b.dateMs); // chronologique
     let result = `📧 *Conversation avec "${terme}" (30 derniers jours):*\n\n`;
     for (const e of sorted) {
       result += `${e.sens} | *${e.sujet}*\n${e.date}\n${e.corps ? `_${e.corps}_` : ''}\n\n`;
@@ -997,10 +1008,11 @@ const TOOLS = [
   { name: 'stats_business',     description: 'Tableau de bord: pipeline par étape, performance du mois, taux de conversion.', input_schema: { type: 'object', properties: {} } },
   { name: 'créer_deal',         description: 'Créer un nouveau prospect/deal dans Pipedrive. Utiliser quand Shawn dit "nouveau prospect: [info]" ou reçoit un lead.', input_schema: { type: 'object', properties: { prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, email: { type: 'string' }, type: { type: 'string', description: 'terrain, maison_usagee, maison_neuve, construction_neuve, auto_construction, plex' }, source: { type: 'string', description: 'centris, facebook, site_web, reference, appel' }, centris: { type: 'string', description: 'Numéro Centris si disponible' }, note: { type: 'string', description: 'Note initiale: besoin, secteur, budget, délai' } }, required: ['prenom'] } },
   { name: 'planifier_visite',   description: 'Planifier une visite de propriété. Met à jour le deal → Visite prévue + crée activité Pipedrive + sauvegarde pour rappel matin.', input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Nom du prospect' }, date: { type: 'string', description: 'Date ISO (2024-05-10T14:00) ou approximation' }, adresse: { type: 'string', description: 'Adresse de la propriété (optionnel)' } }, required: ['prospect', 'date'] } },
+  { name: 'voir_visites',      description: 'Voir les visites planifiées (aujourd\'hui + à venir). Pour "mes visites", "qu\'est-ce que j\'ai aujourd\'hui".', input_schema: { type: 'object', properties: {} } },
   // ── Gmail ──
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
-  { name: 'envoyer_email',       description: 'Préparer un brouillon email pour approbation de Shawn. Affiche le brouillon complet et attend confirmation ("envoie") avant envoi réel. NE PAS appeler confirmer_envoi sans avoir obtenu "envoie" de Shawn dans la conversation.', input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Adresse email du destinataire' }, toName: { type: 'string', description: 'Nom du destinataire' }, sujet: { type: 'string', description: 'Objet de l\'email' }, texte: { type: 'string', description: 'Corps de l\'email — texte brut, style Shawn, vouvoiement, max 3 paragraphes courts.' } }, required: ['to', 'sujet', 'texte'] } },
+  { name: 'envoyer_email',       description: 'Préparer un brouillon email pour approbation de Shawn. Affiche le brouillon complet — il N\'EST PAS envoyé tant que Shawn ne confirme pas avec "envoie", "go", "ok", "parfait", "d\'accord", etc.', input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Adresse email du destinataire' }, toName: { type: 'string', description: 'Nom du destinataire' }, sujet: { type: 'string', description: 'Objet de l\'email' }, texte: { type: 'string', description: 'Corps de l\'email — texte brut, style Shawn, vouvoiement, max 3 paragraphes courts.' } }, required: ['to', 'sujet', 'texte'] } },
   // ── Recherche web ──
   { name: 'rechercher_web',  description: 'Rechercher infos actuelles: taux hypothécaires, stats marché QC, prix construction, réglementations. Enrichit les emails avec données récentes.', input_schema: { type: 'object', properties: { requete: { type: 'string', description: 'Requête précise. Ex: "taux hypothécaire 5 ans fixe Desjardins avril 2025"' } }, required: ['requete'] } },
   // ── GitHub ──
@@ -1037,6 +1049,23 @@ async function executeTool(name, input, chatId) {
       case 'stats_business':       return await statsBusiness();
       case 'créer_deal':           return await creerDeal(input);
       case 'planifier_visite':     return await planifierVisite(input);
+      case 'voir_visites': {
+        const visites = loadJSON(VISITES_FILE, []);
+        if (!visites.length) return '📅 Aucune visite planifiée.';
+        const now = Date.now();
+        const futures = visites.filter(v => new Date(v.date).getTime() > now - 3600000); // +1h passée
+        if (!futures.length) return '📅 Aucune visite à venir (toutes passées).';
+        const today = new Date().toDateString();
+        let txt = `📅 *Visites planifiées — ${futures.length} total*\n\n`;
+        for (const v of futures.sort((a, b) => new Date(a.date) - new Date(b.date))) {
+          const d   = new Date(v.date);
+          const isToday = d.toDateString() === today;
+          const dateStr = d.toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
+          const timeStr = d.toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+          txt += `${isToday ? '🔴 AUJOURD\'HUI' : '📆'} *${v.nom}*\n${dateStr} à ${timeStr}${v.adresse ? '\n📍 ' + v.adresse : ''}\n\n`;
+        }
+        return txt.trim();
+      }
       case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
       case 'voir_conversation':    return await voirConversation(input.terme);
       case 'envoyer_email': {
@@ -1116,18 +1145,29 @@ async function executeTool(name, input, chatId) {
   }
 }
 
+// ─── Helper: exécuter un outil avec timeout 30s ───────────────────────────────
+async function executeToolSafe(name, input, chatId) {
+  return Promise.race([
+    executeTool(name, input, chatId),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`Timeout outil ${name}`)), 30000))
+  ]);
+}
+
 // ─── Appel Claude (boucle agentique, prompt caching, Opus 4.7) ───────────────
 async function callClaude(chatId, userMsg, retries = 3) {
+  const msgIndex = getHistory(chatId).length; // index avant ajout — pour rollback précis
   addMsg(chatId, 'user', userMsg);
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      // Snapshot des globals mutables au début de l'appel (évite races)
+      const localModel   = currentModel;
+      const localThinking = thinkingMode;
       const messages = getHistory(chatId).map(m => ({ role: m.role, content: m.content }));
       let finalReply = null;
       let allMemos   = [];
-      let localThinking = thinkingMode; // snapshot — peut être désactivé en cas d'erreur
       for (let round = 0; round < 12; round++) {
         const params = {
-          model: currentModel, max_tokens: 16384,
+          model: localModel, max_tokens: 16384,
           system: [{ type: 'text', text: getSystem(), cache_control: { type: 'ephemeral' } }],
           tools: TOOLS_WITH_CACHE, messages,
         };
@@ -1138,15 +1178,15 @@ async function callClaude(chatId, userMsg, retries = 3) {
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
           const results = await Promise.all(toolBlocks.map(async b => {
             log('INFO', 'TOOL', `${b.name}(${JSON.stringify(b.input).substring(0, 80)})`);
-            const result = await executeTool(b.name, b.input, chatId);
+            const result = await executeToolSafe(b.name, b.input, chatId);
             return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
           }));
           messages.push({ role: 'user', content: results });
           continue;
         }
-        // Extraire seulement les blocs texte (ignorer les blocs thinking)
-        const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
-        const { cleaned, memos } = extractMemos(text);
+        const text = res.content.find(b => b.type === 'text')?.text;
+        if (!text) { log('WARN', 'CLAUDE', `round ${round}: réponse sans bloc texte (stop=${res.stop_reason})`); }
+        const { cleaned, memos } = extractMemos(text || '_(vide)_');
         finalReply = cleaned;
         allMemos   = memos;
         break;
@@ -1155,19 +1195,22 @@ async function callClaude(chatId, userMsg, retries = 3) {
       addMsg(chatId, 'assistant', finalReply);
       return { reply: finalReply, memos: allMemos };
     } catch (err) {
-      // Opus 4.7: si erreur 400 avec thinking activé, désactiver et réessayer
+      log('ERR', 'CLAUDE', `attempt ${attempt}: HTTP ${err.status || '?'} — ${err.message?.substring(0, 120)}`);
+      // Thinking rejeté par API → désactiver localement, retry sans toucher au global
       if (err.status === 400 && thinkingMode && attempt < retries) {
-        log('WARN', 'CLAUDE', 'Thinking rejeté par API — retry sans thinking');
-        thinkingMode = false;
+        log('WARN', 'CLAUDE', 'Thinking mode incompatible — retry sans thinking (global inchangé)');
         await new Promise(r => setTimeout(r, 1000));
-        continue;
+        continue; // Retry: localThinking sera re-snapshotté à thinkingMode (toujours true)
+        // Note: si l'erreur persiste, Shawn devra faire /penser pour désactiver manuellement
       }
       const retryable = err.status === 429 || err.status === 529 || err.status >= 500;
       if (retryable && attempt < retries) {
         await new Promise(r => setTimeout(r, attempt * 3000));
       } else {
+        // Rollback précis: supprimer seulement le message qu'on a ajouté
         const h = getHistory(chatId);
-        if (h[h.length - 1]?.role === 'user') h.pop();
+        if (h.length > msgIndex && h[msgIndex]?.role === 'user') h.splice(msgIndex, 1);
+        scheduleHistSave();
         throw err;
       }
     }
@@ -1183,12 +1226,14 @@ async function callClaudeVision(chatId, content, contextLabel) {
 
   try {
     const messages = h.map(m => ({ role: m.role, content: m.content }));
+    const localModel    = currentModel; // snapshot — évite race avec /opus pendant l'appel
+    const localThinking = thinkingMode;
     const params = {
-      model: currentModel, max_tokens: 16384,
+      model: localModel, max_tokens: 16384,
       system: [{ type: 'text', text: getSystem(), cache_control: { type: 'ephemeral' } }],
       tools: TOOLS_WITH_CACHE, messages,
     };
-    if (thinkingMode) params.thinking = { type: 'enabled', budget_tokens: 10000 };
+    if (localThinking) params.thinking = { type: 'enabled', budget_tokens: 10000 };
 
     let finalReply = null;
     let allMemos   = [];
@@ -1199,11 +1244,10 @@ async function callClaudeVision(chatId, content, contextLabel) {
         const toolBlocks = res.content.filter(b => b.type === 'tool_use');
         const results = await Promise.all(toolBlocks.map(async b => {
           log('INFO', 'TOOL', `vision:${b.name}(${JSON.stringify(b.input).substring(0, 60)})`);
-          const result = await executeTool(b.name, b.input, chatId);
+          const result = await executeToolSafe(b.name, b.input, chatId);
           return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
         }));
-        params.messages = messages;
-        params.messages.push({ role: 'user', content: results });
+        messages.push({ role: 'user', content: results });
         continue;
       }
       const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
@@ -1256,25 +1300,31 @@ function isAllowed(msg) {
 }
 
 // ─── Confirmation envoi email ─────────────────────────────────────────────────
-const CONFIRM_REGEX = /^(envoie[!.]?|parfait[,.]? envoie|go[!.]?|oui[,.]? envoie|envoie[-\s]le[!.]?|c'est bon[,.]? envoie|send[!.]?)$/i;
+const CONFIRM_REGEX = /^(envoie[!.]?|envoie[- ]le[!.]?|parfait[!.]?|go[!.]?|oui[!.]?|ok[!.]?|d'accord[!.]?|send[!.]?|c'est bon[!.]?|ça marche[!.]?)$/i;
 
 async function handleEmailConfirmation(chatId, text) {
   if (!CONFIRM_REGEX.test(text.trim())) return false;
   const pending = pendingEmails.get(chatId);
-  if (!pending) return false;
-  pendingEmails.delete(chatId);
+  if (!pending) {
+    // Pas de brouillon en attente — ne pas intercepter ce message
+    return false;
+  }
+  // Ne PAS supprimer avant envoi réussi
   try {
     const gmailOk = await getGmailToken();
     if (gmailOk) {
       await envoyerEmailGmail(pending);
+      pendingEmails.delete(chatId); // supprimer seulement après succès
       await send(chatId, `✅ Email envoyé à *${pending.toName || pending.to}*\nObjet: ${pending.sujet}`);
     } else {
-      // Fallback: Brevo
-      await envoyerEmailBrevo({ to: pending.to, toName: pending.toName, subject: pending.sujet, textContent: pending.texte });
+      const ok = await envoyerEmailBrevo({ to: pending.to, toName: pending.toName, subject: pending.sujet, textContent: pending.texte });
+      if (!ok) throw new Error('Brevo a retourné une erreur — email non envoyé');
+      pendingEmails.delete(chatId);
       await send(chatId, `✅ Email envoyé via Brevo à *${pending.toName || pending.to}*`);
     }
   } catch (e) {
-    await send(chatId, `❌ Erreur envoi: ${e.message}`);
+    // Brouillon conservé en cas d'erreur — Shawn peut réessayer
+    await send(chatId, `❌ Erreur envoi: ${e.message}\n_Le brouillon est conservé — dis "envoie" pour réessayer._`);
   }
   return true;
 }
@@ -1469,11 +1519,18 @@ function registerHandlers() {
     bot.sendChatAction(chatId, 'typing').catch(() => {});
 
     try {
-      const fileInfo = await bot.getFile(photo.file_id);
-      const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
-      const fetchRes = await fetch(fileUrl);
-      const buffer   = Buffer.from(await fetchRes.arrayBuffer());
+      const dlController = new AbortController();
+      const dlTimeout    = setTimeout(() => dlController.abort(), 20000);
+      let fileInfo, buffer;
+      try {
+        fileInfo = await bot.getFile(photo.file_id);
+        if (!fileInfo.file_path) throw new Error('Telegram: file_path manquant');
+        const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+        const fetchRes = await fetch(fileUrl, { signal: dlController.signal });
+        buffer = Buffer.from(await fetchRes.arrayBuffer());
+      } finally { clearTimeout(dlTimeout); }
 
+      if (buffer.length === 0) throw new Error('Fichier vide reçu de Telegram');
       if (buffer.length > 5 * 1024 * 1024) {
         clearInterval(typing);
         await bot.sendMessage(chatId, '⚠️ Image trop grosse (max 5MB). Compresse et réessaie.');
@@ -1523,10 +1580,17 @@ function registerHandlers() {
     bot.sendChatAction(chatId, 'typing').catch(() => {});
 
     try {
-      const fileInfo = await bot.getFile(doc.file_id);
-      const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
-      const fetchRes = await fetch(fileUrl);
-      const buffer   = Buffer.from(await fetchRes.arrayBuffer());
+      const dlController = new AbortController();
+      const dlTimeout    = setTimeout(() => dlController.abort(), 25000);
+      let fileInfo, buffer;
+      try {
+        fileInfo = await bot.getFile(doc.file_id);
+        if (!fileInfo.file_path) throw new Error('Telegram: file_path manquant');
+        const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+        const fetchRes = await fetch(fileUrl, { signal: dlController.signal });
+        buffer = Buffer.from(await fetchRes.arrayBuffer());
+      } finally { clearTimeout(dlTimeout); }
+      if (buffer.length === 0) throw new Error('Fichier PDF vide reçu de Telegram');
       const base64   = buffer.toString('base64');
       const content  = [
         { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
@@ -1556,7 +1620,7 @@ function registerHandlers() {
 }
 
 // ─── Tâches quotidiennes (sans node-cron) ─────────────────────────────────────
-const lastCron = { digest: null, suivi: null };
+const lastCron = { digest: null, suivi: null, visites: null, sync: null };
 
 async function runDigestJulie() {
   if (!PD_KEY || !BREVO_KEY) return;
@@ -1607,17 +1671,70 @@ async function runSuiviQuotidien() {
   } catch (e) { log('ERR', 'CRON', `Suivi: ${e.message}`); }
 }
 
+async function rappelVisitesMatin() {
+  if (!ALLOWED_ID) return;
+  try {
+    const visites = loadJSON(VISITES_FILE, []);
+    const today   = new Date().toDateString();
+    const visitesDuJour = visites.filter(v => new Date(v.date).toDateString() === today);
+    if (!visitesDuJour.length) return;
+    let msg = `📅 *Visites d'aujourd'hui — ${visitesDuJour.length}:*\n\n`;
+    for (const v of visitesDuJour.sort((a, b) => new Date(a.date) - new Date(b.date))) {
+      const heure = new Date(v.date).toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+      msg += `🏡 *${v.nom}* — ${heure}${v.adresse ? '\n📍 ' + v.adresse : ''}\n\n`;
+    }
+    await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' });
+  } catch (e) { log('ERR', 'CRON', `Visites: ${e.message}`); }
+}
+
+async function syncStatusGitHub() {
+  if (!process.env.GITHUB_TOKEN || !PD_KEY) return;
+  try {
+    const [actifs, gagnes, perdus] = await Promise.all([
+      pdGet('/deals?pipeline_id=7&status=open&limit=50'),
+      pdGet('/deals?status=won&limit=20'),
+      pdGet('/deals?status=lost&limit=20'),
+    ]);
+    const now    = new Date();
+    const visites = loadJSON(VISITES_FILE, []);
+    const prochaines = visites.filter(v => new Date(v.date).getTime() > Date.now()).length;
+
+    const content = [
+      `# Bot Signature SB — Rapport automatique`,
+      `_Généré le ${now.toLocaleDateString('fr-CA', { weekday:'long', year:'numeric', month:'long', day:'numeric', timeZone:'America/Toronto' })} à ${now.toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' })}_`,
+      '',
+      `## Pipeline actif — ${actifs?.data?.length || 0} deals`,
+      ...(actifs?.data || []).map(d => `- **${d.title}** — ${PD_STAGES[d.stage_id] || d.stage_id}`),
+      '',
+      `## Ce mois-ci`,
+      `- Gagnés: ${(gagnes?.data || []).filter(d => new Date(d.won_time||0).getMonth() === now.getMonth()).length}`,
+      `- Perdus: ${(perdus?.data || []).filter(d => new Date(d.lost_time||0).getMonth() === now.getMonth()).length}`,
+      `- Visites prévues: ${prochaines}`,
+      '',
+      `## Mémoire bot (${kiramem.facts.length} faits)`,
+      ...kiramem.facts.map(f => `- ${f}`),
+      '',
+      `## Modèle actif: \`${currentModel}\` | Thinking: ${thinkingMode ? 'ON' : 'OFF'}`,
+      `## Mémos: ${kiramem.facts.length} | Uptime: ${Math.floor(process.uptime() / 60)} min`,
+    ].join('\n');
+
+    await writeGitHubFile('bot-assistant', 'BOT_STATUS.md', content, `Auto: rapport ${now.toISOString().split('T')[0]}`);
+    log('OK', 'SYNC', 'BOT_STATUS.md → GitHub');
+  } catch (e) { log('WARN', 'SYNC', `GitHub sync: ${e.message}`); }
+}
+
 function startDailyTasks() {
   setInterval(() => {
     const now = new Date();
-    // Heure locale Montréal (EST = UTC-5 / EDT = UTC-4)
-    const heure = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
-    const h = parseInt(heure);
+    const heure    = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
+    const h        = parseInt(heure);
     const todayStr = now.toDateString();
-    if (h === 8 && lastCron.digest !== todayStr) { lastCron.digest = todayStr; runDigestJulie(); }
-    if (h === 9 && lastCron.suivi !== todayStr)  { lastCron.suivi  = todayStr; runSuiviQuotidien(); }
-  }, 60 * 1000); // Check chaque minute
-  log('OK', 'CRON', 'Tâches quotidiennes activées (digest 8h → Julie, suivi 9h → Telegram)');
+    if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
+    if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
+    if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
+    if (h === 18 && lastCron.sync    !== todayStr)  { lastCron.sync    = todayStr; syncStatusGitHub(); }
+  }, 60 * 1000);
+  log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, suivi 9h→Telegram, sync GitHub 18h');
 }
 
 // ─── Webhooks Make.com ────────────────────────────────────────────────────────
@@ -1712,7 +1829,7 @@ async function main() {
 
   registerHandlers();
   startDailyTasks();
-  bot.startPolling({ interval: 1000, autoStart: true });
+  bot.startPolling({ interval: 3000, autoStart: true }); // 3s réduit CPU vs 1s
 
   server.listen(PORT);
   log('OK', 'BOOT', `Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
