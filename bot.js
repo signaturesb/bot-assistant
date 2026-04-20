@@ -388,35 +388,36 @@ Idéal pour: stratégie de prix complexe, analyse marché multi-facteurs, négoc
 ════ MÉMOIRE ════
 Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]
 
-════ COMPARABLES VENDUS — SOURCE: PIPEDRIVE ════
+════ CENTRIS — COMPARABLES + PROPRIÉTÉS EN VIGUEUR ════
 
-Toute l'information sort de l'application prospect (Pipedrive) — deals avec status=won.
-Pas de scraping externe. Données: deals gagnés de Shawn.
+Connexion DIRECTE à Centris.ca avec le compte agent de Shawn.
+Credentials: CENTRIS_USER=110509 / CENTRIS_PASS (dans Render)
+
+DEUX TYPES DE RAPPORTS:
+
+[1] VENDUS (comparables): propriétés récemment vendues
+→ chercher_comparables(type, ville, jours)
+→ envoyer_rapport_comparables(type, ville, jours, email, statut="vendu")
+
+[2] EN VIGUEUR (actifs): listings actuellement à vendre
+→ proprietes_en_vigueur(type, ville)
+→ envoyer_rapport_comparables(type, ville, email, statut="actif")
 
 SOUS-ENTENDUS → ACTIONS:
-• "comparables terrains Sainte-Julienne" → chercher_comparables(type=terrain, ville=Sainte-Julienne)
-• "envoie-moi les terrains vendus depuis 2 semaines à Rawdon" → envoyer_rapport_comparables(terrain, Rawdon, 14)
-• "maisons vendues 30 jours" → chercher_comparables(type=maison, jours=30)
-• "envoie rapport à [email]" → envoyer_rapport_comparables(..., email=[email])
-• "stats de mes ventes" → chercher_comparables() sans filtre → tous les types/villes
-• "combien j'ai vendu de terrains ce mois-ci" → chercher_comparables(terrain, jours=30)
-
-DONNÉES DISPONIBLES PAR DEAL:
-• Titre deal (nom prospect ou description propriété)
-• Valeur deal (prix de vente si entré dans Pipedrive)
-• Date gagné (won_time)
-• Type propriété (champ custom: terrain/maison/plex/etc.)
-• Numéro Centris (champ custom)
-• Notes du deal (adresse, superficie, détails)
+• "comparables terrains Sainte-Julienne 14 jours" → chercher_comparables(terrain, Sainte-Julienne, 14)
+• "envoie-moi les terrains vendus depuis 2 semaines à Rawdon à [email]" → envoyer_rapport_comparables(terrain, Rawdon, 14, email)
+• "terrains actifs à vendre à Chertsey" → proprietes_en_vigueur(terrain, Chertsey)
+• "envoie rapport en vigueur Rawdon à shawn@signaturesb.com" → envoyer_rapport_comparables(terrain, Rawdon, email, statut=actif)
 
 RAPPORT EMAIL:
-• Template Signature SB officiel (logos base64, fond #0a0a0a, rouge #aa0721)
-• Lu depuis Dropbox: /Liste de contact/email_templates/master_template_signature_sb.html
-• Tableau: titre/adresse · prix vendu · superficie · $/pi² · date · Centris#
-• Stats: nb ventes · prix moyen · fourchette · superficie moyenne
-• Envoyé via Gmail avec branding complet
+• Template Signature SB officiel (logos base64 depuis Dropbox)
+• Fond #0a0a0a · Rouge #aa0721 · Typographie officielle
+• Tableau: adresse · Centris# · prix · superficie · $/pi² · date
+• Stats: nb propriétés · prix moyen · fourchette · superficie moy.
+• Envoyé via Gmail avec BCC à shawn@signaturesb.com
 
-NOTE: Plus Shawn entre les infos dans Pipedrive (valeur, type, Centris#, notes avec adresse), plus le rapport est détaillé.
+VILLES: Rawdon, Sainte-Julienne, Chertsey, Saint-Didace, Sainte-Marcelline, Saint-Jean-de-Matha, Saint-Calixte, Joliette, Repentigny, Montréal, Laval...
+TYPES: terrain, maison, plex, duplex, triplex, condo, bungalow
 
 ════ CAPACITÉS OPUS 4.7 ════
 Tu es claude-opus-4-7. Utilise tes capacités au maximum:
@@ -1721,292 +1722,399 @@ async function rechercherWeb(requete) {
   return `Aucun résultat trouvé pour: "${requete}"`;
 }
 
-// ─── COMPARABLES VENDUS — Scraping Centris ───────────────────────────────────
+// ─── CENTRIS AGENT — Connexion authentifiée + Comparables + Actifs ───────────
+// Credentials: CENTRIS_USER + CENTRIS_PASS dans Render env vars
 
-// Cache scraping (30min TTL, max 100 entrées)
-const SCRAPE_CACHE = new Map();
-async function fetchHTML(url) {
-  const cached = SCRAPE_CACHE.get(url);
-  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return cached;
-  if (SCRAPE_CACHE.size >= 100) SCRAPE_CACHE.delete(SCRAPE_CACHE.keys().next().value);
+const CENTRIS_BASE = 'https://www.centris.ca';
+
+// Session Centris (expire 2h)
+let centrisSession = { cookies: '', expiry: 0, authenticated: false };
+
+// Headers communs Centris (simule mobile app)
+const CENTRIS_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'fr-CA,fr;q=0.9,en-CA;q=0.8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+};
+
+async function centrisLogin() {
+  const user = process.env.CENTRIS_USER;
+  const pass = process.env.CENTRIS_PASS;
+  if (!user || !pass) return false;
+
+  try {
+    // 1. Charger la page login pour obtenir le token CSRF et les cookies de session
+    const pageController = new AbortController();
+    const pageTimeout    = setTimeout(() => pageController.abort(), 15000);
+    const pageRes = await fetch(`${CENTRIS_BASE}/fr/connexion`, {
+      signal: pageController.signal,
+      headers: CENTRIS_HEADERS,
+    }).finally(() => clearTimeout(pageTimeout));
+
+    if (!pageRes.ok && pageRes.status !== 200) {
+      log('WARN', 'CENTRIS', `Page login HTTP ${pageRes.status}`);
+    }
+
+    const pageHtml   = await pageRes.text();
+    const pageCookie = pageRes.headers.get('set-cookie') || '';
+
+    // Extraire token anti-forgery
+    const csrf = pageHtml.match(/name="__RequestVerificationToken"[^>]*value="([^"]+)"/i)?.[1]
+              || pageHtml.match(/"RequestVerificationToken"\s*content="([^"]+)"/i)?.[1]
+              || '';
+
+    // 2. POST les credentials
+    const loginController = new AbortController();
+    const loginTimeout    = setTimeout(() => loginController.abort(), 15000);
+    const loginRes = await fetch(`${CENTRIS_BASE}/fr/connexion`, {
+      method:   'POST',
+      redirect: 'manual',
+      signal:   loginController.signal,
+      headers: {
+        ...CENTRIS_HEADERS,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie':   pageCookie,
+        'Referer':  `${CENTRIS_BASE}/fr/connexion`,
+        'Origin':   CENTRIS_BASE,
+      },
+      body: new URLSearchParams({
+        UserName:                   user,
+        Password:                   pass,
+        __RequestVerificationToken: csrf,
+        ReturnUrl:                  '/fr/',
+        'Remember':                 'false',
+      }),
+    }).finally(() => clearTimeout(loginTimeout));
+
+    const respCk = loginRes.headers.get('set-cookie') || '';
+    // Combiner tous les cookies
+    const allCookies = [pageCookie, respCk]
+      .join('; ')
+      .split(';')
+      .map(c => c.trim().split(';')[0])
+      .filter(c => c.includes('='))
+      .join('; ');
+
+    // Détecter le succès (redirect 302, cookie auth, ou header Location)
+    const location = loginRes.headers.get('location') || '';
+    const isOk = loginRes.status === 302
+              || respCk.toLowerCase().includes('aspxauth')
+              || respCk.toLowerCase().includes('.centris.')
+              || (location && !location.includes('connexion'));
+
+    if (isOk) {
+      centrisSession = { cookies: allCookies, expiry: Date.now() + 2 * 3600000, authenticated: true };
+      log('OK', 'CENTRIS', `Connecté ✓ (code agent: ${user})`);
+      return true;
+    }
+
+    log('WARN', 'CENTRIS', `Login: HTTP ${loginRes.status} — location: ${location.substring(0,80)}`);
+    return false;
+  } catch (e) {
+    log('ERR', 'CENTRIS', `Login exception: ${e.message}`);
+    return false;
+  }
+}
+
+async function centrisGet(path, options = {}) {
+  // Auto-relogin si session expirée
+  if (!centrisSession.cookies || Date.now() > centrisSession.expiry) {
+    const ok = await centrisLogin();
+    if (!ok) throw new Error('Centris: impossible de se connecter — vérifier CENTRIS_USER/CENTRIS_PASS');
+  }
+
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 20000);
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${CENTRIS_BASE}${path}`, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'fr-CA,fr;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-      }
+        ...CENTRIS_HEADERS,
+        'Cookie': centrisSession.cookies,
+        'Referer': CENTRIS_BASE,
+        ...(options.headers || {}),
+      },
+      ...options,
     });
-    if (!res.ok) return { html: '', status: res.status };
-    const html = await res.text();
-    const entry = { html, ts: Date.now(), url };
-    SCRAPE_CACHE.set(url, entry);
-    setTimeout(() => SCRAPE_CACHE.delete(url), 30 * 60 * 1000);
-    return entry;
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Timeout scraping (20s)');
-    throw e;
+
+    // Session expirée → re-login une fois
+    if (res.status === 401 || (res.url && res.url.includes('connexion'))) {
+      centrisSession.expiry = 0;
+      const ok = await centrisLogin();
+      if (!ok) throw new Error('Re-login Centris échoué');
+      return centrisGet(path, options); // retry
+    }
+    return res;
   } finally { clearTimeout(t); }
 }
 
-// Normalisation des villes → slugs Centris
+// Normalisation villes → slugs URL Centris
 const VILLES_CENTRIS = {
-  'rawdon':'rawdon', 'raw':'rawdon',
-  'sainte-julienne':'sainte-julienne','saint-julienne':'sainte-julienne','julienne':'sainte-julienne',
+  'rawdon':'rawdon','raw':'rawdon',
+  'sainte-julienne':'sainte-julienne','saint-julienne':'sainte-julienne','julienne':'sainte-julienne','ste-julienne':'sainte-julienne',
   'chertsey':'chertsey',
   'saint-didace':'saint-didace','didace':'saint-didace',
   'sainte-marcelline':'sainte-marcelline-de-kildare','sainte-marcelline-de-kildare':'sainte-marcelline-de-kildare','marcelline':'sainte-marcelline-de-kildare',
   'saint-jean-de-matha':'saint-jean-de-matha','matha':'saint-jean-de-matha',
   'saint-calixte':'saint-calixte','calixte':'saint-calixte',
-  'saint-lin':'saint-lin-laurentides','laurentides':'saint-lin-laurentides',
+  'saint-lin':'saint-lin-laurentides','saint-lin-laurentides':'saint-lin-laurentides',
   'joliette':'joliette',
   'repentigny':'repentigny',
-  'terrebonne':'terrebonne',
+  'terrebonne':'terrebonne','lachenaie':'terrebonne',
   'mascouche':'mascouche',
-  'lachenaie':'terrebonne',
   'berthierville':'berthierville',
   'montreal':'montreal','mtl':'montreal',
   'laval':'laval',
   'longueuil':'longueuil',
   'saint-jerome':'saint-jerome','saint-jérôme':'saint-jerome',
-  'mirabel':'mirabel',
-  'blainville':'blainville',
-  'boisbriand':'boisbriand',
-  'lanaudiere':'lanaudiere','lanaudière':'lanaudiere',
+  'mirabel':'mirabel','blainville':'blainville','boisbriand':'boisbriand',
 };
 
-// Types → slugs Centris + genre (vendu/vendue)
+// Types propriété → slugs Centris
 const TYPES_CENTRIS = {
-  'terrain':           { slug:'terrain',              genre:'vendu'  },
-  'lot':               { slug:'terrain',              genre:'vendu'  },
-  'land':              { slug:'terrain',              genre:'vendu'  },
-  'maison':            { slug:'maison',               genre:'vendue' },
-  'maison_usagee':     { slug:'maison',               genre:'vendue' },
-  'unifamiliale':      { slug:'maison',               genre:'vendue' },
-  'bungalow':          { slug:'bungalow',             genre:'vendu'  },
-  'plex':              { slug:'immeuble-a-revenus',   genre:'vendu'  },
-  'duplex':            { slug:'duplex',               genre:'vendu'  },
-  'triplex':           { slug:'triplex',              genre:'vendu'  },
-  'multiplex':         { slug:'immeuble-a-revenus',   genre:'vendu'  },
-  'condo':             { slug:'appartement-condo',    genre:'vendu'  },
-  'commercial':        { slug:'commercial-industriel',genre:'vendu'  },
+  'terrain':         { slug:'terrain',               genre:'vendu'  },
+  'lot':             { slug:'terrain',               genre:'vendu'  },
+  'maison':          { slug:'maison',                genre:'vendue' },
+  'maison_usagee':   { slug:'maison',                genre:'vendue' },
+  'unifamiliale':    { slug:'maison',                genre:'vendue' },
+  'bungalow':        { slug:'bungalow',              genre:'vendu'  },
+  'plex':            { slug:'immeuble-a-revenus',    genre:'vendu'  },
+  'duplex':          { slug:'duplex',                genre:'vendu'  },
+  'triplex':         { slug:'triplex',               genre:'vendu'  },
+  'condo':           { slug:'appartement-condo',     genre:'vendu'  },
 };
 
-function slugVille(ville) {
-  const k = ville.toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g,'-');
-  return VILLES_CENTRIS[k] || VILLES_CENTRIS[ville.toLowerCase().trim()] || ville.toLowerCase().replace(/\s+/g,'-');
+function slugVille(v) {
+  const k = (v||'').toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,'-');
+  return VILLES_CENTRIS[k] || VILLES_CENTRIS[v.toLowerCase().trim()] || k;
 }
-function slugType(type) {
-  return TYPES_CENTRIS[type?.toLowerCase()] || TYPES_CENTRIS['terrain'];
-}
+function slugType(t) { return TYPES_CENTRIS[(t||'terrain').toLowerCase()] || TYPES_CENTRIS['terrain']; }
 
-// Extraire les comparables depuis HTML Centris
-function parseCentrisComparables(html, ville, jours) {
+// Parser les listings depuis HTML Centris
+function parseCentrisHTML(html, ville, jours) {
+  const cutoff  = new Date(Date.now() - jours * 86400000);
   const listings = [];
-  const cutoff = new Date(Date.now() - jours * 86400000);
-  const seen = new Set();
+  const seen     = new Set();
 
-  // Stratégie 1 — JSON-LD schema.org
+  // Stratégie 1 — JSON-LD schema.org (le plus fiable)
   for (const m of html.matchAll(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
     try {
       const d = JSON.parse(m[1]);
       const items = Array.isArray(d) ? d.flat() : [d];
       for (const item of items) {
-        if (!item['@type']) continue;
+        if (!item?.['@type']) continue;
         const id = item.identifier || item['@id'] || '';
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const prixRaw = item.offers?.price || item.price;
-        const prix = prixRaw ? parseInt(String(prixRaw).replace(/[^\d]/g,'')) : null;
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        const prix = item.offers?.price ? parseInt(String(item.offers.price).replace(/[^\d]/g,'')) : null;
         const adresse = item.name || item.address?.streetAddress || '';
-        const superficie = item.floorSize?.value || null;
+        const sup = item.floorSize?.value ? parseInt(item.floorSize.value) : null;
         const dateStr = item.dateModified || item.dateCreated || '';
         if (dateStr) { try { if (new Date(dateStr) < cutoff) continue; } catch {} }
-        if (prix || adresse) listings.push({ mls:id, adresse, ville: item.address?.addressLocality || ville, prix, superficie: superficie ? parseInt(superficie) : null, dateVente: dateStr ? new Date(dateStr).toLocaleDateString('fr-CA') : '', source:'json-ld' });
+        if (prix || adresse) listings.push({ mls:id, adresse, ville: item.address?.addressLocality || ville, prix, superficie: sup, dateVente: dateStr ? new Date(dateStr).toLocaleDateString('fr-CA') : '', dateISO: dateStr });
       }
     } catch {}
   }
 
-  // Stratégie 2 — HTML cards avec data-id
-  if (listings.length < 3) {
-    for (const m of html.matchAll(/data-(?:id|mlsnumber|listing-id|listingid)="(\d{6,9})"/gi)) {
+  // Stratégie 2 — data-id + contexte HTML
+  if (listings.length < 2) {
+    for (const m of html.matchAll(/data-(?:id|mlsnumber|listing-id)="(\d{6,9})"/gi)) {
       const mls = m[1];
       if (seen.has(mls)) continue;
       seen.add(mls);
-      // Extraire le contexte autour (500 chars)
-      const start = Math.max(0, m.index - 50);
-      const ctx = html.substring(start, start + 800);
+      const ctx   = html.substring(Math.max(0, m.index - 100), m.index + 1000);
       const priceM = ctx.match(/(\d{2,3}[\s\u00a0,]\d{3})\s*\$/);
-      const prix = priceM ? parseInt(priceM[1].replace(/[^\d]/g,'')) : null;
-      const adresseM = ctx.match(/(?:address|adresse)[^>]*>\s*<[^>]+>\s*([^<]{5,60})/i);
-      listings.push({ mls, adresse: adresseM?.[1]?.trim() || '', ville, prix, superficie: null, dateVente: '', source:'data-id' });
+      const prix   = priceM ? parseInt(priceM[1].replace(/[^\d]/g,'')) : null;
+      const addrM  = ctx.match(/(?:address|adresse)[^>]{0,50}>([^<]{5,80})/i);
+      listings.push({ mls, adresse: addrM?.[1]?.trim() || '', ville, prix, superficie:null, dateVente:'', dateISO:'' });
     }
   }
 
-  // Stratégie 3 — prix + contexte
-  if (listings.length < 2) {
-    const priceBlocks = [...html.matchAll(/(\d{2,3}[\s\u00a0,]\d{3})\s*\$[^"]*?(?:rue|avenue|ch\.|chemin|rang|route|place|boul|blvd)[^\n<]{5,50}/gi)];
-    for (const m of priceBlocks.slice(0, 15)) {
-      const prix = parseInt(m[1].replace(/[^\d]/g,''));
-      const adresseM = m[0].match(/(?:rue|avenue|ch\.|chemin|rang|route|place|boul|blvd)\s+[^\n<,"]{5,50}/i);
-      if (prix > 10000 && !seen.has(String(prix))) {
-        seen.add(String(prix));
-        listings.push({ mls:'', adresse: adresseM?.[0]?.trim() || '', ville, prix, superficie: null, dateVente: '', source:'prix' });
-      }
-    }
+  return listings.slice(0, 30);
+}
+
+// Chercher les VENDUS sur Centris (avec session agent)
+async function centrisSearchVendus(type, ville, jours) {
+  const ti  = slugType(type);
+  const vs  = slugVille(ville);
+  const paths = [
+    `/fr/${ti.slug}~${ti.genre}~${vs}?view=Vg==&uc=1`,
+    `/fr/${ti.slug}~${ti.genre}~${vs}`,
+    `/fr/${ti.slug}~vendu~${vs}?view=Vg==`,
+    `/fr/${ti.slug}~vendue~${vs}?view=Vg==`,
+  ];
+  for (const p of paths) {
+    try {
+      const res = await centrisGet(p);
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (html.length < 1000) continue;
+      const list = parseCentrisHTML(html, ville, jours);
+      if (list.length) { log('OK', 'CENTRIS', `${list.length} vendus: ${p}`); return list; }
+    } catch (e) { log('WARN', 'CENTRIS', `${p}: ${e.message}`); }
+  }
+  return [];
+}
+
+// Chercher les ACTIFS (en vigueur) sur Centris
+async function centrisSearchActifs(type, ville) {
+  const ti  = slugType(type);
+  const vs  = slugVille(ville);
+  const paths = [
+    `/fr/${ti.slug}~a-vendre~${vs}?view=Vg==&uc=1`,
+    `/fr/${ti.slug}~a-vendre~${vs}`,
+  ];
+  for (const p of paths) {
+    try {
+      const res = await centrisGet(p);
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (html.length < 1000) continue;
+      const list = parseCentrisHTML(html, ville, 9999); // pas de filtre date pour actifs
+      if (list.length) { log('OK', 'CENTRIS', `${list.length} actifs: ${p}`); return list; }
+    } catch (e) { log('WARN', 'CENTRIS', `${p}: ${e.message}`); }
+  }
+  return [];
+}
+
+// Télécharger la fiche PDF d'un listing
+async function centrisGetFiche(mls) {
+  if (!mls) return null;
+  const paths = [
+    `/fr/listing/pdf/${mls}`,
+    `/fr/pdf/listing/${mls}`,
+    `/Fiche/${mls}.pdf`,
+  ];
+  for (const p of paths) {
+    try {
+      const res = await centrisGet(p);
+      if (!res.ok) continue;
+      const ct = res.headers.get('content-type') || '';
+      if (!ct.includes('pdf') && !ct.includes('application/octet')) continue;
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > 5000) { log('OK', 'CENTRIS', `Fiche PDF ${mls}: ${Math.round(buf.length/1024)}KB`); return { buffer: buf, filename: `Centris_${mls}.pdf` }; }
+    } catch {}
+  }
+  return null;
+}
+
+// Détails complets d'un listing (données propriété)
+async function centrisGetDetails(mls) {
+  if (!mls) return {};
+  try {
+    const res = await centrisGet(`/fr/listing/${mls}`);
+    if (!res.ok) return {};
+    const html = await res.text();
+    return {
+      superficie: html.match(/(\d[\d\s,]*)\s*(?:pi²|pi2|sq\.?\s*ft)/i)?.[1]?.replace(/[^\d]/g,'') || null,
+      dateVente:  html.match(/(?:vendu?e?|sold)\s*(?:le\s*)?:?\s*(\d{1,2}\s+\w+\s+\d{4})/i)?.[1] || null,
+      prixVente:  html.match(/prix\s*(?:de\s*vente)?\s*:?\s*([\d\s,]+)\s*\$/i)?.[1]?.replace(/[^\d]/g,'') || null,
+      chambres:   html.match(/(\d+)\s*chambre/i)?.[1] || null,
+      sdb:        html.match(/(\d+)\s*salle?\s*(?:de\s*)?bain/i)?.[1] || null,
+      annee:      html.match(/(?:année|ann[eé]e?\s+de\s+construction|built)\s*:?\s*(\d{4})/i)?.[1] || null,
+    };
+  } catch { return {}; }
+}
+
+// Fonction principale — chercher comparables (vendus OU actifs)
+async function chercherComparablesVendus({ type = 'terrain', ville, jours = 14, statut = 'vendu' }) {
+  if (!process.env.CENTRIS_USER) {
+    return `❌ CENTRIS_USER/CENTRIS_PASS non configurés dans Render.\nAjouter:\n• CENTRIS_USER=110509\n• CENTRIS_PASS=REDACTED_PASSWORD`;
+  }
+  if (!ville) return '❌ Précise la ville: ex. "Sainte-Julienne", "Rawdon"';
+
+  const listings = statut === 'actif'
+    ? await centrisSearchActifs(type, ville)
+    : await centrisSearchVendus(type, ville, jours);
+
+  if (!listings.length) {
+    return `Aucun résultat Centris pour "${type}" ${statut === 'actif' ? 'en vigueur' : 'vendu'} à "${ville}".\nEssaie: ${jours+7} jours, ou une ville voisine.`;
   }
 
-  return listings.slice(0, 25);
-}
-
-// ─── Comparables depuis Pipedrive (deals gagnés) — SOURCE PRINCIPALE ─────────
-const PD_TYPE_LABELS = { 37:'Terrain', 38:'Construction neuve', 39:'Maison neuve', 40:'Maison usagée', 41:'Plex' };
-const PD_TYPE_IDS    = { terrain:37, construction_neuve:38, maison_neuve:39, maison_usagee:40, plex:41, maison:40, lot:37, land:37, duplex:41, triplex:41 };
-
-// Extraire infos propriété des notes d'un deal
-function extraireInfosNote(notes) {
-  const txt = (notes || []).map(n => n.content || '').join(' ');
-  const superficie = txt.match(/(\d[\d\s,]*)\s*(?:pi²|pi2|sq\.?\s*ft|pieds?\s*carrés?)/i)?.[1];
-  const adresse    = txt.match(/(?:adresse|propriété|terrain|lot)\s*:?\s*([^\n,;|<>]{10,80})/i)?.[1]
-                  || txt.match(/\b(\d+[,\s]+(?:rue|avenue|ch\.|chemin|rang|route|boul)[^\n,;|<>]{5,60})/i)?.[1];
-  const superficie_pi = superficie ? parseInt(superficie.replace(/[^\d]/g,'')) : null;
-  return { adresse: adresse?.trim() || '', superficie: superficie_pi };
-}
-
-async function chercherComparablesVendus({ type, ville, jours = 14 }) {
-  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
-
-  // 1. Charger tous les deals gagnés
-  const wonRes = await pdGet(`/deals?status=won&limit=200&sort=close_time+DESC`);
-  const deals  = wonRes?.data || [];
-  if (!deals.length) return `Aucun deal gagné dans Pipedrive. Entre tes ventes dans l'application.`;
-
-  const cutoff   = new Date(Date.now() - jours * 86400000);
-  const typeId   = type ? (PD_TYPE_IDS[type.toLowerCase()] || null) : null;
-  const villeNorm = ville ? ville.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,'-') : '';
-
-  // 2. Filtrer par date + type + ville
-  let filtered = deals.filter(d => {
-    const wonDate = new Date(d.won_time || d.close_time || d.update_time || 0);
-    if (wonDate < cutoff) return false;
-    if (typeId && d[PD_FIELD_TYPE] !== typeId) return false;
-    if (villeNorm) {
-      const titre = (d.title || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-      if (!titre.includes(villeNorm) && !titre.includes(villeNorm.split('-')[0])) return false;
-    }
-    return true;
+  // Enrichir les 6 premiers avec détails complets
+  const toEnrich = listings.slice(0, 6);
+  const details  = await Promise.all(toEnrich.map(async (l, i) => {
+    await new Promise(r => setTimeout(r, i * 300));
+    return l.mls ? centrisGetDetails(l.mls) : {};
+  }));
+  toEnrich.forEach((l, i) => {
+    const d = details[i];
+    if (d.superficie && !l.superficie) l.superficie = parseInt(d.superficie);
+    if (d.dateVente  && !l.dateVente)  l.dateVente  = d.dateVente;
+    if (d.prixVente  && !l.prix)       l.prix       = parseInt(d.prixVente);
+    if (d.annee) l.annee = d.annee;
   });
 
-  if (!filtered.length && ville) {
-    // Pas de résultat strict → relâcher le filtre ville et avertir
-    const sansVille = deals.filter(d => {
-      const wonDate = new Date(d.won_time || d.close_time || d.update_time || 0);
-      if (wonDate < cutoff) return false;
-      if (typeId && d[PD_FIELD_TYPE] !== typeId) return false;
-      return true;
-    });
-    if (!sansVille.length) return `Aucune vente dans les ${jours} derniers jours${type ? ` pour "${type}"` : ''}.\nTout Pipedrive: ${deals.length} deals gagnés au total.`;
-    return `Aucune vente à "${ville}" dans les ${jours}j.\n${sansVille.length > 0 ? `${sansVille.length} vente(s) trouvée(s) sans filtre ville — essaie sans préciser la ville.` : ''}`;
-  }
-
-  // 3. Enrichir avec les notes de chaque deal (pour adresse + superficie)
-  const enriched = await Promise.all(filtered.slice(0, 20).map(async d => {
-    const notesRes = await pdGet(`/notes?deal_id=${d.id}&limit=5`).catch(() => null);
-    const { adresse, superficie } = extraireInfosNote(notesRes?.data);
-    return {
-      titre:     d.title    || '',
-      adresse:   adresse    || d.title || '',
-      ville:     ville      || '',
-      centris:   d[PD_FIELD_CENTRIS] || '',
-      type:      PD_TYPE_LABELS[d[PD_FIELD_TYPE]] || 'Propriété',
-      prix:      d.value    || null,
-      superficie,
-      dateVente: d.won_time ? new Date(d.won_time).toLocaleDateString('fr-CA', { timeZone: 'America/Toronto' }) : '',
-      dealId:    d.id,
-    };
-  }));
-
-  log('OK', 'COMP', `${enriched.length} comparables Pipedrive${ville ? ' — ' + ville : ''}${type ? ' — ' + type : ''}`);
-  return enriched;
+  return listings;
 }
 
-// Générer le HTML du rapport (style template SB)
-function genererRapportHTML(listings, { type, ville, jours }) {
-  const typeLabel  = type === 'terrain' ? 'Terrains' : type === 'maison' || type === 'maison_usagee' ? 'Maisons' : type;
+// Générer le HTML du rapport (style template Signature SB)
+function genererRapportHTML(listings, { type, ville, jours, statut = 'vendu' }) {
+  const modeLabel  = statut === 'actif' ? 'en vigueur' : 'vendus';
+  const typeLabel  = type === 'terrain' ? 'Terrains' : type === 'maison' || type === 'maison_usagee' ? 'Maisons' : (type || 'Propriétés');
   const fmt        = n => n ? `${Number(n).toLocaleString('fr-CA')} $` : '—';
   const fmtSup     = n => n ? `${Number(n).toLocaleString('fr-CA')} pi²` : '—';
-  const fmtPiePi   = (p,s) => (p && s && s > 100) ? `${(p/s).toFixed(2)} $/pi²` : '—';
+  const fmtPp      = (p,s) => (p && s && s > 100) ? `${(p/s).toFixed(2)} $/pi²` : '—';
 
-  // Stats globales
-  const avecPrix   = listings.filter(l => l.prix > 1000);
-  const prixMoyen  = avecPrix.length ? Math.round(avecPrix.reduce((s,l) => s+l.prix, 0) / avecPrix.length) : 0;
-  const prixMin    = avecPrix.length ? Math.min(...avecPrix.map(l => l.prix)) : 0;
-  const prixMax    = avecPrix.length ? Math.max(...avecPrix.map(l => l.prix)) : 0;
-  const avecSup    = listings.filter(l => l.superficie > 100);
-  const supMoy     = avecSup.length ? Math.round(avecSup.reduce((s,l) => s+l.superficie, 0) / avecSup.length) : 0;
+  const avecPrix  = listings.filter(l => l.prix > 1000);
+  const prixMoy   = avecPrix.length ? Math.round(avecPrix.reduce((s,l)=>s+l.prix,0)/avecPrix.length) : 0;
+  const prixMin   = avecPrix.length ? Math.min(...avecPrix.map(l=>l.prix)) : 0;
+  const prixMax   = avecPrix.length ? Math.max(...avecPrix.map(l=>l.prix)) : 0;
+  const avecSup   = listings.filter(l => l.superficie > 100);
+  const supMoy    = avecSup.length ? Math.round(avecSup.reduce((s,l)=>s+l.superficie,0)/avecSup.length) : 0;
 
   const statsBloc = `
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:12px 0;">
 <tr>
-  <td width="25%" style="padding:4px;">
-    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
-      <div style="color:#aa0721;font-size:24px;font-weight:900;">${listings.length}</div>
-      <div style="color:#666;font-size:11px;line-height:1.4;">${typeLabel} vendus<br>${jours} derniers jours</div>
-    </div>
-  </td>
-  <td width="25%" style="padding:4px;">
-    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
-      <div style="color:#aa0721;font-size:18px;font-weight:800;">${fmt(prixMoyen)}</div>
-      <div style="color:#666;font-size:11px;line-height:1.4;">Prix moyen</div>
-    </div>
-  </td>
-  <td width="25%" style="padding:4px;">
-    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
-      <div style="color:#aa0721;font-size:15px;font-weight:800;">${fmt(prixMin)}<br><span style="font-size:11px;color:#666;">min</span></div>
-      <div style="color:#aa0721;font-size:15px;font-weight:800;margin-top:4px;">${fmt(prixMax)}<br><span style="font-size:11px;color:#666;">max</span></div>
-    </div>
-  </td>
-  ${supMoy ? `<td width="25%" style="padding:4px;">
-    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
-      <div style="color:#aa0721;font-size:18px;font-weight:800;">${fmtSup(supMoy)}</div>
-      <div style="color:#666;font-size:11px;line-height:1.4;">Superficie moy.</div>
-    </div>
-  </td>` : '<td width="25%"></td>'}
-</tr>
-</table>`;
+  <td width="25%" style="padding:4px;"><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+    <div style="color:#aa0721;font-size:24px;font-weight:900;">${listings.length}</div>
+    <div style="color:#666;font-size:11px;">${typeLabel} ${modeLabel}${statut==='vendu'?`<br>${jours} derniers jours`:''}</div>
+  </div></td>
+  <td width="25%" style="padding:4px;"><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+    <div style="color:#aa0721;font-size:18px;font-weight:800;">${fmt(prixMoy)||'—'}</div>
+    <div style="color:#666;font-size:11px;">${statut==='actif'?'Prix demandé moyen':'Prix vendu moyen'}</div>
+  </div></td>
+  <td width="25%" style="padding:4px;"><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+    <div style="color:#f5f5f7;font-size:13px;">${fmt(prixMin)}</div>
+    <div style="color:#666;font-size:10px;margin-bottom:6px;">min</div>
+    <div style="color:#f5f5f7;font-size:13px;">${fmt(prixMax)}</div>
+    <div style="color:#666;font-size:10px;">max</div>
+  </div></td>
+  ${supMoy ? `<td width="25%" style="padding:4px;"><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+    <div style="color:#aa0721;font-size:18px;font-weight:800;">${fmtSup(supMoy)}</div>
+    <div style="color:#666;font-size:11px;">Superficie moy.</div>
+  </div></td>` : '<td width="25%"></td>'}
+</tr></table>`;
 
   const lignes = listings.map(l => `
 <tr style="border-bottom:1px solid #1a1a1a;">
   <td style="padding:10px 12px;color:#f5f5f7;font-size:13px;vertical-align:top;">
-    ${l.adresse || 'Adresse N/D'}
-    ${l.mls ? `<div style="color:#444;font-size:11px;margin-top:2px;">#${l.mls}</div>` : ''}
+    ${l.adresse || l.titre || 'N/D'}
+    ${l.mls ? `<div style="color:#444;font-size:11px;margin-top:2px;">Centris #${l.mls}</div>` : ''}
+    ${l.annee ? `<div style="color:#444;font-size:11px;">Année: ${l.annee}</div>` : ''}
   </td>
   <td style="padding:10px 12px;color:#aa0721;font-size:14px;font-weight:800;white-space:nowrap;">${fmt(l.prix)}</td>
   <td style="padding:10px 12px;color:#888;font-size:12px;white-space:nowrap;">${fmtSup(l.superficie)}</td>
-  <td style="padding:10px 12px;color:#888;font-size:12px;white-space:nowrap;">${fmtPiePi(l.prix, l.superficie)}</td>
+  <td style="padding:10px 12px;color:#888;font-size:12px;white-space:nowrap;">${fmtPp(l.prix,l.superficie)}</td>
   <td style="padding:10px 12px;color:#555;font-size:11px;white-space:nowrap;">${l.dateVente || '—'}</td>
 </tr>`).join('');
 
   const tableau = `
-<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;overflow:hidden;margin-top:16px;">
+<div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;overflow:hidden;margin-top:16px;">
   <div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:12px 16px 10px;border-bottom:1px solid #1a1a1a;">
-    ${typeLabel} vendus · ${ville} · ${jours} derniers jours · Source: Centris.ca
+    ${typeLabel} ${modeLabel} · ${ville} · Source: Centris.ca (agent ${process.env.CENTRIS_USER||''})
   </div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-    <thead>
-      <tr style="background:#0d0d0d;">
-        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">ADRESSE</th>
-        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">PRIX VENDU</th>
-        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">SUPERFICIE</th>
-        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">$/PI²</th>
-        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">DATE</th>
-      </tr>
-    </thead>
+    <thead><tr style="background:#0d0d0d;">
+      <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">PROPRIÉTÉ</th>
+      <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">PRIX</th>
+      <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">SUPERFICIE</th>
+      <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">$/PI²</th>
+      <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">${statut==='actif'?'INSCRIT':'VENDU'}</th>
+    </tr></thead>
     <tbody>${lignes}</tbody>
   </table>
 </div>`;
@@ -2014,95 +2122,91 @@ function genererRapportHTML(listings, { type, ville, jours }) {
   return statsBloc + tableau;
 }
 
-async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, email }) {
-  const dest = email || AGENT.email;
-  const typeLabel = type === 'terrain' ? 'Terrains' : type === 'maison' || type === 'maison_usagee' ? 'Maisons' : type;
+// Envoyer le rapport par email avec template Signature SB
+async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, email, statut = 'vendu' }) {
+  const dest       = email || AGENT.email;
+  const modeLabel  = statut === 'actif' ? 'en vigueur' : 'vendus';
+  const typeLabel  = type === 'terrain' ? 'Terrains' : type === 'maison' || type === 'maison_usagee' ? 'Maisons' : (type || 'Propriétés');
+  const now        = new Date();
+  const dateMois   = now.toLocaleDateString('fr-CA', { month:'long', year:'numeric', timeZone:'America/Toronto' });
 
-  // 1. Chercher les comparables
-  const result = await chercherComparablesVendus({ type, ville, jours, enrichir: true });
-  if (typeof result === 'string') return result; // message d'erreur
+  // 1. Chercher les données via Centris (agent authentifié)
+  const result = await chercherComparablesVendus({ type, ville, jours, statut });
+  if (typeof result === 'string') return result;
   const listings = result;
 
-  // 2. Générer le HTML du rapport
-  const rapportHTML = genererRapportHTML(listings, { type, ville, jours });
+  // 2. HTML rapport
+  const rapportHTML = genererRapportHTML(listings, { type, ville, jours, statut });
 
-  // 3. Lire le master template depuis Dropbox
+  // 3. Lire master template Dropbox
   const tplPath = `${AGENT.dbx_templates}/master_template_signature_sb.html`;
-  let template  = '';
-  const tplRes  = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: tplPath.startsWith('/') ? tplPath : '/' + tplPath }, true);
-  if (tplRes?.ok) {
-    template = await tplRes.text();
-  } else {
-    // Fallback: template HTML minimal brandé
-    template = null;
-  }
+  let template  = null;
+  try {
+    const tplRes = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: tplPath.startsWith('/') ? tplPath : '/' + tplPath }, true);
+    if (tplRes?.ok) template = await tplRes.text();
+  } catch {}
 
-  const now       = new Date();
-  const dateMois  = now.toLocaleDateString('fr-CA', { month: 'long', year: 'numeric' });
-  const sujet     = `${typeLabel} vendus — ${ville} — ${jours} derniers jours | ${dateMois}`;
+  const sujet = `${typeLabel} ${modeLabel} — ${ville} — ${statut==='vendu'?jours+'j':dateMois} | ${AGENT.compagnie}`;
 
   let htmlFinal;
   if (template && template.length > 5000) {
-    // Remplir les placeholders du master template
-    const fillTemplate = (tpl, params) => {
-      let h = tpl;
-      for (const [k, v] of Object.entries(params)) h = h.split(`{{ params.${k} }}`).join(v ?? '');
-      return h;
-    };
-    htmlFinal = fillTemplate(template, {
-      TITRE_EMAIL:         `${typeLabel} vendus — ${ville}`,
-      LABEL_SECTION:       `Comparables · ${ville} · Lanaudière`,
+    const fill = (tpl, params) => { let h = tpl; for (const [k,v] of Object.entries(params)) h = h.split(`{{ params.${k} }}`).join(v??''); return h; };
+    const prixMoy = listings.filter(l=>l.prix>1000).length ? Math.round(listings.filter(l=>l.prix>1000).reduce((s,l)=>s+l.prix,0)/listings.filter(l=>l.prix>1000).length).toLocaleString('fr-CA')+' $' : 'N/D';
+    htmlFinal = fill(template, {
+      TITRE_EMAIL:         `${typeLabel} ${modeLabel} — ${ville}`,
+      LABEL_SECTION:       `Centris.ca · ${ville} · ${dateMois}`,
       DATE_MOIS:           dateMois,
       TERRITOIRES:         ville,
-      SOUS_TITRE_ANALYSE:  `Marché ${typeLabel.toLowerCase()} · ${dateMois}`,
-      HERO_TITRE:          `${typeLabel} vendus<br>à ${ville} — ${jours} derniers jours.`,
-      INTRO_TEXTE:         `<p style="margin:0 0 16px;color:#cccccc;font-size:14px;">Voici les ${listings.length} ${typeLabel.toLowerCase()} vendus à ${ville} au cours des ${jours} derniers jours. Données extraites de Centris.ca.</p>`,
+      SOUS_TITRE_ANALYSE:  `${typeLabel} ${modeLabel} · ${dateMois}`,
+      HERO_TITRE:          `${typeLabel} ${modeLabel}<br>à ${ville}.`,
+      INTRO_TEXTE:         `<p style="margin:0 0 16px;color:#cccccc;font-size:14px;">${listings.length} ${typeLabel.toLowerCase()} ${modeLabel} à ${ville}${statut==='vendu'?' dans les '+jours+' derniers jours':''}. Source: Centris.ca — accès agent ${process.env.CENTRIS_USER||''}.</p>`,
       TITRE_SECTION_1:     `Résultats · ${ville} · ${dateMois}`,
-      MARCHE_LABEL:        `${typeLabel} vendus`,
-      PRIX_MEDIAN:         listings.filter(l=>l.prix).length ? `${Math.round(listings.filter(l=>l.prix).reduce((s,l)=>s+l.prix,0)/listings.filter(l=>l.prix).length).toLocaleString('fr-CA')} $` : 'N/D',
-      VARIATION_PRIX:      `${listings.length} ventes · ${jours}j · Source: Centris.ca`,
-      SOURCE_STAT:         `Centris.ca · ${dateMois}`,
+      MARCHE_LABEL:        `${typeLabel} ${modeLabel}`,
+      PRIX_MEDIAN:         prixMoy,
+      VARIATION_PRIX:      `${listings.length} propriétés · Centris.ca`,
+      SOURCE_STAT:         `Centris.ca · Accès agent · ${dateMois}`,
       LABEL_TABLEAU:       `Liste complète`,
       TABLEAU_STATS_HTML:  rapportHTML,
-      TITRE_SECTION_2:     `À retenir`,
-      CITATION:            `Ces comparables représentent le marché actuel à ${ville}. Pour une analyse personnalisée de votre propriété, contactez-moi.`,
+      TITRE_SECTION_2:     `Analyse`,
+      CITATION:            `Ces données proviennent directement de Centris.ca via votre accès agent. Pour une analyse complète, contactez-moi.`,
       CONTENU_STRATEGIE:   '',
-      CTA_TITRE:           `Besoin d'une évaluation?`,
-      CTA_SOUS_TITRE:      `Gratuite, sans engagement. 20 minutes pour faire le point.`,
+      CTA_TITRE:           `Questions sur le marché?`,
+      CTA_SOUS_TITRE:      `Évaluation gratuite, sans engagement.`,
       CTA_URL:             `tel:${AGENT.telephone.replace(/[^\d]/g,'')}`,
       CTA_BOUTON:          `Appeler ${AGENT.prenom} — ${AGENT.telephone}`,
       CTA_NOTE:            `${AGENT.nom} · ${AGENT.compagnie}`,
       REFERENCE_URL:       `tel:${AGENT.telephone.replace(/[^\d]/g,'')}`,
-      SOURCES:             `Centris.ca · ${dateMois}`,
+      SOURCES:             `Centris.ca · Accès agent no ${process.env.CENTRIS_USER||''} · ${dateMois}`,
       DESINSCRIPTION_URL:  '',
     });
   } else {
-    // Fallback HTML direct (sans template Dropbox)
-    htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+    // Fallback HTML inline brandé
+    htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px;">
 <table width="600" style="max-width:600px;background:#0a0a0a;color:#f5f5f7;">
 <tr><td style="background:#aa0721;height:4px;font-size:1px;">&nbsp;</td></tr>
 <tr><td style="padding:28px 32px 20px;">
-  <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">${AGENT.nom} · ${AGENT.compagnie}</div>
-  <h1 style="color:#f5f5f7;font-size:26px;margin:16px 0 8px;">${typeLabel} vendus<br>à ${ville} — ${jours} derniers jours</h1>
-  <p style="color:#888;font-size:13px;margin:0 0 24px;">Source: Centris.ca · ${dateMois}</p>
+  <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;">${AGENT.nom} · ${AGENT.compagnie}</div>
+  <h1 style="color:#f5f5f7;font-size:26px;margin:0 0 8px;">${typeLabel} ${modeLabel}<br>à ${ville}</h1>
+  <p style="color:#666;font-size:12px;margin:0 0 24px;">Centris.ca · Accès agent · ${dateMois}</p>
   ${rapportHTML}
   <div style="margin-top:24px;padding-top:16px;border-top:1px solid #1e1e1e;color:#555;font-size:12px;">
     ${AGENT.nom} · ${AGENT.telephone} · ${AGENT.site}
   </div>
 </td></tr>
-</table>
-</td></tr></table>
+</table></td></tr></table>
 </body></html>`;
   }
 
-  // 4. Envoyer par Gmail (avec branding complet)
+  // 4. Envoyer via Gmail
   const token = await getGmailToken();
-  if (!token) return `❌ Gmail non configuré.\n\nRapport prêt (${listings.length} comparables):\n${listings.slice(0,5).map(l=>`• ${l.adresse || 'N/D'} — ${l.prix ? l.prix.toLocaleString('fr-CA')+' $' : '?'}`).join('\n')}`;
+  if (!token) return `❌ Gmail non configuré.\nRapport prêt (${listings.length} propriétés) — configure Gmail dans Render.`;
 
   const boundary = `sb${Date.now()}`;
   const enc      = s => `=?UTF-8?B?${Buffer.from(s,'utf-8').toString('base64')}?=`;
+  const plainTxt = `${typeLabel} ${modeLabel} — ${ville}\nSource: Centris.ca (agent ${process.env.CENTRIS_USER||''})\n\n${listings.map((l,i)=>`${i+1}. ${l.adresse||l.titre||'N/D'}${l.mls?' (#'+l.mls+')':''}${l.prix?' — '+Number(l.prix).toLocaleString('fr-CA')+' $':''}${l.superficie?' — '+Number(l.superficie).toLocaleString('fr-CA')+' pi²':''}${l.dateVente?' — '+l.dateVente:''}`).join('\n')}\n\n${AGENT.nom} · ${AGENT.telephone}`;
+
   const msgLines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${dest}`,
@@ -2113,23 +2217,23 @@ async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, 
     '',
     `--${boundary}`,
     'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
     '',
-    `${typeLabel} vendus — ${ville} — ${jours} derniers jours\n\n${listings.map((l,i)=>`${i+1}. ${l.adresse||'N/D'} — ${l.prix?l.prix.toLocaleString('fr-CA')+' $':'N/D'}${l.superficie?' — '+l.superficie.toLocaleString('fr-CA')+' pi²':''}`).join('\n')}\n\n${AGENT.nom} · ${AGENT.telephone}`,
+    plainTxt,
     '',
     `--${boundary}`,
     'Content-Type: text/html; charset=UTF-8',
     'Content-Transfer-Encoding: base64',
     '',
-    Buffer.from(htmlFinal, 'utf-8').toString('base64'),
+    Buffer.from(htmlFinal,'utf-8').toString('base64'),
     `--${boundary}--`,
   ];
-  const raw = Buffer.from(msgLines.join('\r\n'), 'utf-8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-  await gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
+  const raw = Buffer.from(msgLines.join('\r\n'),'utf-8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  await gmailAPI('/messages/send', { method:'POST', body: JSON.stringify({ raw }) });
 
-  const statsLine = listings.filter(l=>l.prix).length
-    ? `Prix moyen: ${Math.round(listings.filter(l=>l.prix).reduce((s,l)=>s+l.prix,0)/listings.filter(l=>l.prix).length).toLocaleString('fr-CA')} $`
-    : '';
-  return `✅ *Rapport envoyé* à ${dest}\n\n📊 ${listings.length} ${typeLabel.toLowerCase()} vendus — ${ville||'tous secteurs'} — ${jours}j\n${statsLine ? statsLine + '\n' : ''}📧 Template Signature SB · Source: Pipedrive`;
+  const prixMoyNum = listings.filter(l=>l.prix>1000);
+  const pm = prixMoyNum.length ? Math.round(prixMoyNum.reduce((s,l)=>s+l.prix,0)/prixMoyNum.length).toLocaleString('fr-CA')+' $' : '';
+  return `✅ *Rapport envoyé* à ${dest}\n\n📊 ${listings.length} ${typeLabel.toLowerCase()} ${modeLabel} — ${ville}${statut==='vendu'?' — '+jours+'j':''}\n${pm?'Prix moyen: '+pm+'\n':''}🏠 Source: Centris.ca (agent ${process.env.CENTRIS_USER||''})\n📧 Template Signature SB`;
 }
 
 // ─── Outils Claude ────────────────────────────────────────────────────────────
@@ -2155,9 +2259,10 @@ const TOOLS = [
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
   { name: 'envoyer_email',       description: 'Préparer un brouillon email pour approbation de Shawn. Affiche le brouillon complet — il N\'EST PAS envoyé tant que Shawn ne confirme pas avec "envoie", "go", "ok", "parfait", "d\'accord", etc.', input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Adresse email du destinataire' }, toName: { type: 'string', description: 'Nom du destinataire' }, sujet: { type: 'string', description: 'Objet de l\'email' }, texte: { type: 'string', description: 'Corps de l\'email — texte brut, style Shawn, vouvoiement, max 3 paragraphes courts.' } }, required: ['to', 'sujet', 'texte'] } },
-  // ── Comparables vendus ──
-  { name: 'chercher_comparables',         description: 'Sortir les comparables vendus depuis Pipedrive (deals gagnés) filtrés par type, ville et période. Source: application prospect mobile (Pipedrive). Pour "comparables terrains Sainte-Julienne 14 jours", "maisons vendues Rawdon 30j". Retourne prix, type, date vendu, Centris#.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, maison_usagee, plex, construction_neuve (optionnel)' }, ville: { type: 'string', description: 'Ville (optionnel — si absent, tous secteurs)' }, jours: { type: 'number', description: 'Nombre de jours (défaut: 14)' } }, required: [] } },
-  { name: 'envoyer_rapport_comparables',  description: 'Chercher comparables depuis Pipedrive ET envoyer par email avec template Signature SB (logos, couleurs officielles). Pour "envoie-moi les terrains vendus à Sainte-Julienne par email". Source: application prospect mobile.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex (optionnel)' }, ville: { type: 'string', description: 'Ville (optionnel)' }, jours: { type: 'number', description: 'Nombre de jours (défaut: 14)' }, email: { type: 'string', description: 'Email destination (défaut: shawn@signaturesb.com)' } }, required: [] } },
+  // ── Centris — Comparables + En vigueur ──
+  { name: 'chercher_comparables',         description: 'Chercher propriétés VENDUES sur Centris.ca via accès agent (code 110509). Pour "comparables terrains Sainte-Julienne 14 jours", "maisons vendues Rawdon". Retourne prix, superficie, $/pi², date vendue.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex, condo (défaut: terrain)' }, ville: { type: 'string', description: 'Ville: Sainte-Julienne, Rawdon, Chertsey, etc.' }, jours: { type: 'number', description: 'Jours en arrière (défaut: 14)' } }, required: ['ville'] } },
+  { name: 'proprietes_en_vigueur',        description: 'Chercher propriétés ACTIVES à vendre sur Centris.ca via accès agent. Pour "terrains actifs Sainte-Julienne", "maisons à vendre Rawdon en ce moment". Listings actuels avec prix demandé.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex (défaut: terrain)' }, ville: { type: 'string', description: 'Ville' } }, required: ['ville'] } },
+  { name: 'envoyer_rapport_comparables',  description: 'Chercher sur Centris.ca (agent authentifié) ET envoyer par email avec template Signature SB (logos officiels). Pour "envoie les terrains vendus Sainte-Julienne à [email]". statut: vendu (défaut) ou actif.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex' }, ville: { type: 'string', description: 'Ville' }, jours: { type: 'number', description: 'Jours (défaut: 14)' }, email: { type: 'string', description: 'Email destination (obligatoire)' }, statut: { type: 'string', description: '"vendu" ou "actif"' } }, required: ['ville', 'email'] } },
   // ── Recherche web ──
   { name: 'rechercher_web',  description: 'Rechercher infos actuelles: taux hypothécaires, stats marché QC, prix construction, réglementations. Enrichit les emails avec données récentes.', input_schema: { type: 'object', properties: { requete: { type: 'string', description: 'Requête précise. Ex: "taux hypothécaire 5 ans fixe Desjardins avril 2025"' } }, required: ['requete'] } },
   // ── GitHub ──
@@ -2243,7 +2348,19 @@ async function executeTool(name, input, chatId) {
         else txt += ` · _Dis "envoie rapport" pour recevoir par email avec template Signature SB._`;
         return txt;
       }
-      case 'envoyer_rapport_comparables': return await envoyerRapportComparables({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14, email: input.email });
+      case 'proprietes_en_vigueur': {
+        const res = await chercherComparablesVendus({ type: input.type || 'terrain', ville: input.ville, jours: 9999, statut: 'actif' });
+        if (typeof res === 'string') return res;
+        const fmt = n => n ? `${Number(n).toLocaleString('fr-CA')} $` : '—';
+        const fmtS = n => n ? `${Number(n).toLocaleString('fr-CA')} pi²` : '—';
+        let txt = `🏡 *${res.length} ${input.type||'terrain'}(s) en vigueur — ${input.ville}*\nSource: Centris.ca (agent ${process.env.CENTRIS_USER||''})\n\n`;
+        res.slice(0,15).forEach((l,i) => {
+          txt += `${i+1}. ${l.adresse||'N/D'}${l.mls?' (#'+l.mls+')':''}\n   ${fmt(l.prix)} · ${fmtS(l.superficie)}\n`;
+        });
+        if (res.length > 15) txt += `\n_+ ${res.length-15} autres — dis "envoie rapport actifs ${input.ville}" pour tout par email._`;
+        return txt;
+      }
+      case 'envoyer_rapport_comparables': return await envoyerRapportComparables({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14, email: input.email, statut: input.statut || 'vendu' });
       case 'chercher_listing_dropbox': return await chercherListingDropbox(input.terme);
       case 'envoyer_docs_prospect':    return await envoyerDocsProspect(input.terme, input.email, input.fichier);
       case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
