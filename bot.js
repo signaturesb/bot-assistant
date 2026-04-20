@@ -388,28 +388,35 @@ Idéal pour: stratégie de prix complexe, analyse marché multi-facteurs, négoc
 ════ MÉMOIRE ════
 Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]
 
-════ COMPARABLES VENDUS — CENTRIS ════
+════ COMPARABLES VENDUS — SOURCE: PIPEDRIVE ════
 
-Tu peux scraper Centris.ca pour les propriétés vendues et envoyer des rapports.
+Toute l'information sort de l'application prospect (Pipedrive) — deals avec status=won.
+Pas de scraping externe. Données: deals gagnés de Shawn.
 
 SOUS-ENTENDUS → ACTIONS:
-• "comparables terrains Sainte-Julienne" → chercher_comparables(type=terrain, ville=Sainte-Julienne, jours=14)
-• "envoie-moi les terrains vendus depuis 2 semaines à Rawdon" → envoyer_rapport_comparables(type=terrain, ville=Rawdon, jours=14)
-• "maisons vendues Rawdon 30 jours" → chercher_comparables(type=maison, ville=Rawdon, jours=30)
-• "envoie rapport comparables à [email]" → envoyer_rapport_comparables(..., email=[email])
-• "stats vendus Lanaudière" → chercher_comparables plusieurs villes
+• "comparables terrains Sainte-Julienne" → chercher_comparables(type=terrain, ville=Sainte-Julienne)
+• "envoie-moi les terrains vendus depuis 2 semaines à Rawdon" → envoyer_rapport_comparables(terrain, Rawdon, 14)
+• "maisons vendues 30 jours" → chercher_comparables(type=maison, jours=30)
+• "envoie rapport à [email]" → envoyer_rapport_comparables(..., email=[email])
+• "stats de mes ventes" → chercher_comparables() sans filtre → tous les types/villes
+• "combien j'ai vendu de terrains ce mois-ci" → chercher_comparables(terrain, jours=30)
+
+DONNÉES DISPONIBLES PAR DEAL:
+• Titre deal (nom prospect ou description propriété)
+• Valeur deal (prix de vente si entré dans Pipedrive)
+• Date gagné (won_time)
+• Type propriété (champ custom: terrain/maison/plex/etc.)
+• Numéro Centris (champ custom)
+• Notes du deal (adresse, superficie, détails)
 
 RAPPORT EMAIL:
-• Template Signature SB (logos, couleurs #aa0721, fond #0a0a0a)
-• Tableau: adresse · prix vendu · superficie · $/pi² · date vendu
+• Template Signature SB officiel (logos base64, fond #0a0a0a, rouge #aa0721)
+• Lu depuis Dropbox: /Liste de contact/email_templates/master_template_signature_sb.html
+• Tableau: titre/adresse · prix vendu · superficie · $/pi² · date · Centris#
 • Stats: nb ventes · prix moyen · fourchette · superficie moyenne
-• Envoyé via Gmail ou Brevo
+• Envoyé via Gmail avec branding complet
 
-VILLES SUPPORTÉES: Rawdon, Sainte-Julienne, Chertsey, Saint-Didace, Sainte-Marcelline, Saint-Jean-de-Matha, Saint-Calixte, Joliette, Repentigny, Montréal, Laval, et plus
-
-TYPES SUPPORTÉS: terrain, maison, plex, duplex, triplex, condo, bungalow
-
-LIMITES: Centris peut limiter l'accès public aux vendus — si données insuffisantes, informer Shawn et suggérer d'augmenter la période ou changer de ville.
+NOTE: Plus Shawn entre les infos dans Pipedrive (valeur, type, Centris#, notes avec adresse), plus le rapport est détaillé.
 
 ════ CAPACITÉS OPUS 4.7 ════
 Tu es claude-opus-4-7. Utilise tes capacités au maximum:
@@ -1857,69 +1864,75 @@ function parseCentrisComparables(html, ville, jours) {
   return listings.slice(0, 25);
 }
 
-// Détails d'un listing (superficie, date vente exacte)
-async function fetchListingDetails(mls) {
-  if (!mls || mls.length < 6) return {};
-  try {
-    const { html } = await fetchHTML(`https://www.centris.ca/fr/listing/${mls}`);
-    if (!html) return {};
-    const sup   = html.match(/(\d[\d\s,]*)\s*(?:pi²|pi2|sq\.?\s*ft|pieds?\s*carr[eé]s?)/i)?.[1];
-    const date  = html.match(/(?:vendu?e?|sold)\s*(?:le\s*)?:?\s*(\d{1,2}\s+\w+\s+\d{4})/i)?.[1];
-    const prix  = html.match(/(?:prix\s*(?:de\s*vente)?|sold\s*for)\s*:?\s*([\d\s,]+)\s*\$/i)?.[1];
-    return {
-      superficie: sup ? parseInt(sup.replace(/[^\d]/g,'')) : null,
-      dateVente:  date || null,
-      prixExact:  prix ? parseInt(prix.replace(/[^\d]/g,'')) : null,
-    };
-  } catch { return {}; }
+// ─── Comparables depuis Pipedrive (deals gagnés) — SOURCE PRINCIPALE ─────────
+const PD_TYPE_LABELS = { 37:'Terrain', 38:'Construction neuve', 39:'Maison neuve', 40:'Maison usagée', 41:'Plex' };
+const PD_TYPE_IDS    = { terrain:37, construction_neuve:38, maison_neuve:39, maison_usagee:40, plex:41, maison:40, lot:37, land:37, duplex:41, triplex:41 };
+
+// Extraire infos propriété des notes d'un deal
+function extraireInfosNote(notes) {
+  const txt = (notes || []).map(n => n.content || '').join(' ');
+  const superficie = txt.match(/(\d[\d\s,]*)\s*(?:pi²|pi2|sq\.?\s*ft|pieds?\s*carrés?)/i)?.[1];
+  const adresse    = txt.match(/(?:adresse|propriété|terrain|lot)\s*:?\s*([^\n,;|<>]{10,80})/i)?.[1]
+                  || txt.match(/\b(\d+[,\s]+(?:rue|avenue|ch\.|chemin|rang|route|boul)[^\n,;|<>]{5,60})/i)?.[1];
+  const superficie_pi = superficie ? parseInt(superficie.replace(/[^\d]/g,'')) : null;
+  return { adresse: adresse?.trim() || '', superficie: superficie_pi };
 }
 
-async function chercherComparablesVendus({ type = 'terrain', ville, jours = 14, enrichir = true }) {
-  if (!ville) return '❌ Indique une ville: ex. "Sainte-Julienne", "Rawdon"';
+async function chercherComparablesVendus({ type, ville, jours = 14 }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
 
-  const typeInfo  = slugType(type);
-  const villeSlug = slugVille(ville);
-  const typeLabel = type === 'terrain' ? 'terrains' : type === 'maison' || type === 'maison_usagee' ? 'maisons' : type;
+  // 1. Charger tous les deals gagnés
+  const wonRes = await pdGet(`/deals?status=won&limit=200&sort=close_time+DESC`);
+  const deals  = wonRes?.data || [];
+  if (!deals.length) return `Aucun deal gagné dans Pipedrive. Entre tes ventes dans l'application.`;
 
-  // Essayer les deux formes (vendu/vendue) et vue liste
-  const urls = [
-    `https://www.centris.ca/fr/${typeInfo.slug}~${typeInfo.genre}~${villeSlug}?view=Vg==&uc=1`,
-    `https://www.centris.ca/fr/${typeInfo.slug}~${typeInfo.genre}~${villeSlug}`,
-    `https://www.centris.ca/fr/${typeInfo.slug}~vendu~${villeSlug}?view=Vg==`,
-    `https://www.centris.ca/fr/${typeInfo.slug}~vendue~${villeSlug}?view=Vg==`,
-  ];
+  const cutoff   = new Date(Date.now() - jours * 86400000);
+  const typeId   = type ? (PD_TYPE_IDS[type.toLowerCase()] || null) : null;
+  const villeNorm = ville ? ville.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,'-') : '';
 
-  let listings = [];
-  let htmlFetched = '';
-  for (const url of urls) {
-    try {
-      const { html } = await fetchHTML(url);
-      if (!html || html.length < 1000) continue;
-      htmlFetched = html;
-      listings = parseCentrisComparables(html, ville, jours);
-      if (listings.length > 0) { log('OK', 'COMP', `${listings.length} comparables via ${url}`); break; }
-    } catch (e) { log('WARN', 'COMP', `${url}: ${e.message}`); }
-  }
+  // 2. Filtrer par date + type + ville
+  let filtered = deals.filter(d => {
+    const wonDate = new Date(d.won_time || d.close_time || d.update_time || 0);
+    if (wonDate < cutoff) return false;
+    if (typeId && d[PD_FIELD_TYPE] !== typeId) return false;
+    if (villeNorm) {
+      const titre = (d.title || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+      if (!titre.includes(villeNorm) && !titre.includes(villeNorm.split('-')[0])) return false;
+    }
+    return true;
+  });
 
-  if (!listings.length) {
-    return `Aucun comparable trouvé pour *${typeLabel}* vendus à *${ville}* (${jours}j).\n\nPossibles raisons:\n• Aucune vente récente dans ce secteur\n• Ville non reconnue — essaie avec un nom différent\n• Centris limite l'accès aux vendus publics\n\nDis "essaie [ville voisine]" ou "augmente à 30 jours".`;
-  }
-
-  // Enrichir les 8 premiers avec les détails (superficie, date exacte)
-  if (enrichir && listings.some(l => l.mls)) {
-    const toEnrich = listings.filter(l => l.mls).slice(0, 8);
-    const details  = await Promise.all(toEnrich.map(async (l, i) => {
-      await new Promise(r => setTimeout(r, i * 400)); // rate limit gentil
-      return fetchListingDetails(l.mls);
-    }));
-    toEnrich.forEach((l, i) => {
-      if (details[i].superficie) l.superficie = details[i].superficie;
-      if (details[i].dateVente)  l.dateVente  = details[i].dateVente;
-      if (details[i].prixExact)  l.prix       = details[i].prixExact;
+  if (!filtered.length && ville) {
+    // Pas de résultat strict → relâcher le filtre ville et avertir
+    const sansVille = deals.filter(d => {
+      const wonDate = new Date(d.won_time || d.close_time || d.update_time || 0);
+      if (wonDate < cutoff) return false;
+      if (typeId && d[PD_FIELD_TYPE] !== typeId) return false;
+      return true;
     });
+    if (!sansVille.length) return `Aucune vente dans les ${jours} derniers jours${type ? ` pour "${type}"` : ''}.\nTout Pipedrive: ${deals.length} deals gagnés au total.`;
+    return `Aucune vente à "${ville}" dans les ${jours}j.\n${sansVille.length > 0 ? `${sansVille.length} vente(s) trouvée(s) sans filtre ville — essaie sans préciser la ville.` : ''}`;
   }
 
-  return listings;
+  // 3. Enrichir avec les notes de chaque deal (pour adresse + superficie)
+  const enriched = await Promise.all(filtered.slice(0, 20).map(async d => {
+    const notesRes = await pdGet(`/notes?deal_id=${d.id}&limit=5`).catch(() => null);
+    const { adresse, superficie } = extraireInfosNote(notesRes?.data);
+    return {
+      titre:     d.title    || '',
+      adresse:   adresse    || d.title || '',
+      ville:     ville      || '',
+      centris:   d[PD_FIELD_CENTRIS] || '',
+      type:      PD_TYPE_LABELS[d[PD_FIELD_TYPE]] || 'Propriété',
+      prix:      d.value    || null,
+      superficie,
+      dateVente: d.won_time ? new Date(d.won_time).toLocaleDateString('fr-CA', { timeZone: 'America/Toronto' }) : '',
+      dealId:    d.id,
+    };
+  }));
+
+  log('OK', 'COMP', `${enriched.length} comparables Pipedrive${ville ? ' — ' + ville : ''}${type ? ' — ' + type : ''}`);
+  return enriched;
 }
 
 // Générer le HTML du rapport (style template SB)
@@ -2116,7 +2129,7 @@ async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, 
   const statsLine = listings.filter(l=>l.prix).length
     ? `Prix moyen: ${Math.round(listings.filter(l=>l.prix).reduce((s,l)=>s+l.prix,0)/listings.filter(l=>l.prix).length).toLocaleString('fr-CA')} $`
     : '';
-  return `✅ *Rapport envoyé* à ${dest}\n\n📊 ${listings.length} ${typeLabel.toLowerCase()} vendus — ${ville} — ${jours}j\n${statsLine ? statsLine + '\n' : ''}📧 Template Signature SB · Centris.ca`;
+  return `✅ *Rapport envoyé* à ${dest}\n\n📊 ${listings.length} ${typeLabel.toLowerCase()} vendus — ${ville||'tous secteurs'} — ${jours}j\n${statsLine ? statsLine + '\n' : ''}📧 Template Signature SB · Source: Pipedrive`;
 }
 
 // ─── Outils Claude ────────────────────────────────────────────────────────────
@@ -2143,8 +2156,8 @@ const TOOLS = [
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
   { name: 'envoyer_email',       description: 'Préparer un brouillon email pour approbation de Shawn. Affiche le brouillon complet — il N\'EST PAS envoyé tant que Shawn ne confirme pas avec "envoie", "go", "ok", "parfait", "d\'accord", etc.', input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Adresse email du destinataire' }, toName: { type: 'string', description: 'Nom du destinataire' }, sujet: { type: 'string', description: 'Objet de l\'email' }, texte: { type: 'string', description: 'Corps de l\'email — texte brut, style Shawn, vouvoiement, max 3 paragraphes courts.' } }, required: ['to', 'sujet', 'texte'] } },
   // ── Comparables vendus ──
-  { name: 'chercher_comparables',         description: 'Scraper Centris.ca pour trouver les propriétés vendues (comparables) par type, ville et période. Pour "comparables terrains Sainte-Julienne 14 jours", "maisons vendues Rawdon". Retourne liste avec prix, superficie, $/pi², date.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex, condo, bungalow (défaut: terrain)' }, ville: { type: 'string', description: 'Nom de la ville: Rawdon, Sainte-Julienne, Chertsey, etc.' }, jours: { type: 'number', description: 'Nombre de jours en arrière (défaut: 14)' } }, required: ['ville'] } },
-  { name: 'envoyer_rapport_comparables',  description: 'Chercher comparables Centris ET envoyer par email avec le template Signature SB (logos, couleurs). Pour "envoie-moi les terrains vendus à Sainte-Julienne par email". Template officiel avec branding complet.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex (défaut: terrain)' }, ville: { type: 'string', description: 'Ville' }, jours: { type: 'number', description: 'Nombre de jours (défaut: 14)' }, email: { type: 'string', description: 'Email destination (défaut: shawn@signaturesb.com)' } }, required: ['ville'] } },
+  { name: 'chercher_comparables',         description: 'Sortir les comparables vendus depuis Pipedrive (deals gagnés) filtrés par type, ville et période. Source: application prospect mobile (Pipedrive). Pour "comparables terrains Sainte-Julienne 14 jours", "maisons vendues Rawdon 30j". Retourne prix, type, date vendu, Centris#.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, maison_usagee, plex, construction_neuve (optionnel)' }, ville: { type: 'string', description: 'Ville (optionnel — si absent, tous secteurs)' }, jours: { type: 'number', description: 'Nombre de jours (défaut: 14)' } }, required: [] } },
+  { name: 'envoyer_rapport_comparables',  description: 'Chercher comparables depuis Pipedrive ET envoyer par email avec template Signature SB (logos, couleurs officielles). Pour "envoie-moi les terrains vendus à Sainte-Julienne par email". Source: application prospect mobile.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex (optionnel)' }, ville: { type: 'string', description: 'Ville (optionnel)' }, jours: { type: 'number', description: 'Nombre de jours (défaut: 14)' }, email: { type: 'string', description: 'Email destination (défaut: shawn@signaturesb.com)' } }, required: [] } },
   // ── Recherche web ──
   { name: 'rechercher_web',  description: 'Rechercher infos actuelles: taux hypothécaires, stats marché QC, prix construction, réglementations. Enrichit les emails avec données récentes.', input_schema: { type: 'object', properties: { requete: { type: 'string', description: 'Requête précise. Ex: "taux hypothécaire 5 ans fixe Desjardins avril 2025"' } }, required: ['requete'] } },
   // ── GitHub ──
@@ -2225,8 +2238,9 @@ async function executeTool(name, input, chatId) {
           txt += `${i+1}. ${l.adresse||'Adresse N/D'}${l.mls?' (#'+l.mls+')':''}\n`;
           txt += `   ${fmt(l.prix)} · ${fmtS(l.superficie)} · ${fmtPp(l.prix,l.superficie)}${l.dateVente?' · '+l.dateVente:''}\n`;
         });
-        if (listings.length > 12) txt += `\n_+ ${listings.length-12} autres — dis "envoie rapport" pour tout recevoir par email._`;
-        else txt += `\n_Dis "envoie rapport ${input.ville}" pour recevoir ça par email avec le template Signature SB._`;
+        txt += `\n_Source: Pipedrive (deals gagnés)_`;
+        if (listings.length > 12) txt += ` · _+ ${listings.length-12} autres — dis "envoie rapport" pour tout par email._`;
+        else txt += ` · _Dis "envoie rapport" pour recevoir par email avec template Signature SB._`;
         return txt;
       }
       case 'envoyer_rapport_comparables': return await envoyerRapportComparables({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14, email: input.email });
