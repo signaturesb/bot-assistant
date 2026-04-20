@@ -134,7 +134,7 @@ CHAMPS PERSONNALISÉS:
 • Type propriété: terrain(37) construction_neuve(38) maison_neuve(39) maison_usagee(40) plex(41)
 • Séquence active: 42=Oui 43=Non
 • Numéro Centris: texte libre
-• Suivi J+1/J+3/J+7: dates → cochées = envoyé
+• Suivi J+1/J+3/J+7: champs disponibles (système sur pause — ne pas utiliser)
 
 RÈGLES D'AVANCEMENT D'ÉTAPE:
 • Lead créé → TOUJOURS activer séquence (42=Oui)
@@ -149,7 +149,6 @@ RÈGLES D'AVANCEMENT D'ÉTAPE:
 COMPORTEMENT PROACTIF OBLIGATOIRE:
 → Quand tu vois le pipeline: signaler IMMÉDIATEMENT les deals stagnants (>3j sans action)
 → Après chaque action sur un prospect: proposer la prochaine étape logique
-→ J+1 dû? "Veux-tu que je rédige la relance pour [nom]?"
 → Deal en discussion >7j sans visite: "Jean est là depuis 8j — je propose une visite?"
 → Visite faite hier sans suivi: "Suite à la visite avec Marie hier — je rédige le follow-up?"
 
@@ -806,7 +805,7 @@ async function voirProspectComplet(terme) {
   txt += `👤 *${d.title}* (ID: ${d.id})\n`;
   txt += `📊 ${stageLabel} | ${typeLabel}${centris ? ` | #${centris}` : ''}\n`;
   txt += `📅 Créé: ${created} (${ageJours}j)${valeur ? ` | ${valeur}` : ''}\n`;
-  txt += `🔄 Séquence: ${seqActive} | J+1:${j1} J+3:${j3} J+7:${j7}\n`;
+  txt += `🔄 Séquence: ${seqActive}\n`; // J+1/J+3/J+7 sur glace
 
   // Coordonnées complètes
   const p = emails?.data;
@@ -933,19 +932,13 @@ async function statsBusiness() {
     const s = PD_STAGES[d.stage_id] || `Étape ${d.stage_id}`;
     parEtape[s] = (parEtape[s] || 0) + 1;
   }
-  // Relances dues (J+1/J+3/J+7)
-  const relances = [];
+  // Stagnants (J+1/J+3/J+7 sur glace)
+  const relances = []; // désactivé — réactiver quand prêt
   const stagnants = [];
   const nowTs = Date.now();
   for (const d of dealsActifs) {
     if (d.stage_id > 51) continue;
     const created = new Date(d.add_time).getTime();
-    const ageJ    = (nowTs - created) / 86400000;
-    const j1 = d[PD_FIELD_SUIVI_J1], j3 = d[PD_FIELD_SUIVI_J3], j7 = d[PD_FIELD_SUIVI_J7];
-    if (!j1 && ageJ >= 1)            relances.push(`🟢 J+1 *${d.title}*`);
-    else if (j1 && !j3 && ageJ >= 3) relances.push(`🟡 J+3 *${d.title}*`);
-    else if (j1 && j3 && !j7 && ageJ >= 7) relances.push(`🔴 J+7 *${d.title}*`);
-    // Stagnants
     const last = d.last_activity_date ? new Date(d.last_activity_date).getTime() : created;
     if ((nowTs - last) > 3 * 86400000) stagnants.push({ title: d.title, j: Math.floor((nowTs - last) / 86400000) });
   }
@@ -1016,7 +1009,7 @@ async function creerDeal({ prenom, nom, telephone, email, type, source, centris,
   if (note) await pdPost('/notes', { deal_id: deal.id, content: note });
 
   const typeLabel = { terrain: 'Terrain', maison_usagee: 'Maison usagée', maison_neuve: 'Maison neuve', construction_neuve: 'Construction neuve', auto_construction: 'Auto-construction', plex: 'Plex' }[type] || 'Propriété';
-  return `✅ Deal créé: *${titre}*\nType: ${typeLabel} | ID: ${deal.id}\nSéquence J+1/J+3/J+7 activée.`;
+  return `✅ Deal créé: *${titre}*\nType: ${typeLabel} | ID: ${deal.id}`;
 }
 
 async function planifierVisite({ prospect, date, adresse }) {
@@ -2055,11 +2048,7 @@ function registerHandlers() {
     await send(msg.chat.id, result);
   });
 
-  bot.onText(/\/relances/, async msg => {
-    if (!isAllowed(msg)) return;
-    await callClaude(msg.chat.id, 'Montre-moi les relances J+1/J+3/J+7 qui sont dues aujourd\'hui dans le pipeline.')
-      .then(({ reply }) => send(msg.chat.id, reply)).catch(() => {});
-  });
+  // /relances — sur glace (J+1/J+3/J+7 désactivé temporairement)
 
   bot.onText(/\/lead (.+)/, async (msg, match) => {
     if (!isAllowed(msg)) return;
@@ -2372,7 +2361,8 @@ function startDailyTasks() {
     const todayStr = now.toDateString();
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
-    if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
+    // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
+    // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
     if (h === 18 && lastCron.sync    !== todayStr)  { lastCron.sync    = todayStr; syncStatusGitHub(); }
   }, 60 * 1000);
   log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, suivi 9h→Telegram, sync GitHub 18h');
