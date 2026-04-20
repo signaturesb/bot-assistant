@@ -176,6 +176,53 @@ STATS PIPELINE — INTERPRÉTER:
 • Peu en "Visite prévue/faite" → pousser les visites
 • Taux conversion <30% → revoir le discours qualification
 
+════ MOBILE — SHAWN EN DÉPLACEMENT ════
+
+Shawn utilise Telegram sur mobile toute la journée. Optimiser chaque réponse pour ça.
+
+FORMAT MOBILE OBLIGATOIRE:
+• Réponses ≤ 5 lignes par défaut — plus long = Shawn scroll inutilement
+• 1 action proposée max à la fois, pas 3 options
+• Emojis comme marqueurs visuels: ✅ ❌ 📞 📧 🏡 🔴 🟢
+• Chiffres en gras, noms en italique ou souligné
+• Jamais de théorie — action directe
+
+DÉTECTION AUTO DE CONTEXTE:
+Si Shawn mentionne un prénom/nom → chercher_prospect silencieusement avant de répondre
+Si Shawn mentionne "visite faite" → changer_etape + ajouter_note + brouillon relance J+1
+Si Shawn mentionne "offre" ou "deal" → changer_etape + ajouter_note
+Si Shawn mentionne "pas intéressé" / "cause perdue" → marquer_perdu + ajouter_brevo
+Si Shawn mentionne "nouveau: [prénom] [tel/email]" → créer_deal immédiatement
+
+QUICK ACTIONS (Shawn dicte, bot exécute):
+• "visite faite avec Marie" → changer_etape Marie→visite faite + note + brouillon relance
+• "Jean veut faire une offre" → changer_etape Jean→offre + note
+• "deal closé avec Pierre" → changer_etape Pierre→gagné + mémo [MEMO: Gagné deal Pierre]
+• "réponds à Marie que le terrain est disponible" → email rapide style Shawn
+• "appelle-moi Jean" → voir_prospect_complet Jean → donne le numéro direct
+• "c'est qui qui avait appelé hier?" → voir_emails_recents + voir pipeline récent
+• "envoie les docs à Jean" → envoyer_docs_prospect Jean
+
+QUAND UN LEAD ARRIVE (webhook Centris/SMS/email):
+→ Le bot affiche IMMÉDIATEMENT:
+  1. Nom + téléphone + email du prospect
+  2. Type de propriété demandée
+  3. Deal créé dans Pipedrive: OUI / NON
+  4. Message J+0 prêt à envoyer (pré-rédigé)
+→ Shawn répond juste "envoie" → c'est parti
+
+RÉPONSE RAPIDE MOBILE:
+Si Shawn dit "réponds [quelques mots]" ou dicte un message court:
+1. Identifier le prospect (contexte ou chercher_prospect)
+2. Trouver son email dans Pipedrive
+3. Mettre en forme en style Shawn (vouvoiement, court, "Au plaisir,")
+4. Afficher le brouillon + attendre "envoie"
+NE PAS demander "à qui?", "quel email?" si l'info est dans Pipedrive
+
+CONTEXTE DISPONIBLE EN TOUT TEMPS:
+Tous les prospects Pipedrive, toutes les notes, tous les emails Gmail 30j,
+tous les contacts iPhone, tous les docs Dropbox, tous les terrains actifs
+
 ════ TES DEUX MODES ════
 
 MODE OPÉRATIONNEL (tâches, commandes): exécute vite, confirme en 1-2 phrases. "C'est fait ✅" pas "L'opération a été effectuée".
@@ -1366,6 +1413,85 @@ ${texte.replace(/\n/g, '<br>')}
   await gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
 }
 
+// ─── Réponse rapide mobile (trouve email auto + brouillon) ────────────────────
+async function repondreVite(chatId, terme, messageTexte) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+  const deals = sr?.data?.items || [];
+  if (!deals.length) return `❌ Prospect "${terme}" introuvable dans Pipedrive.`;
+  const deal = deals[0].item;
+
+  // Trouver l'email
+  let toEmail = '', toName = deal.title;
+  if (deal.person_id) {
+    const p = await pdGet(`/persons/${deal.person_id}`);
+    toEmail  = p?.data?.email?.find(e => e.primary)?.value || p?.data?.email?.[0]?.value || '';
+    toName   = p?.data?.name || deal.title;
+  }
+  if (!toEmail) return `❌ Pas d'email pour *${deal.title}* dans Pipedrive.\nAjoute-le via "modifie deal ${terme} email [adresse]" ou crée la personne.`;
+
+  // Mettre en forme selon style Shawn
+  const texteFormate = messageTexte.trim().endsWith(',')
+    ? messageTexte.trim()
+    : messageTexte.trim();
+  const sujet = `${deal.title} — ${AGENT.compagnie}`;
+
+  // Stocker comme brouillon en attente
+  pendingEmails.set(chatId, { to: toEmail, toName, sujet, texte: texteFormate });
+
+  return `📧 *Brouillon prêt pour ${deal.title}*\nDest: ${toEmail}\n\n---\n${texteFormate}\n---\n\nDis *"envoie"* pour confirmer.`;
+}
+
+// ─── Historique complet d'un prospect (timeline mobile-friendly) ──────────────
+async function historiqueContact(terme) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+  const deals = sr?.data?.items || [];
+  if (!deals.length) return `Aucun prospect "${terme}"`;
+  const deal = deals[0].item;
+
+  const [notes, activities, person] = await Promise.all([
+    pdGet(`/notes?deal_id=${deal.id}&limit=20`),
+    pdGet(`/activities?deal_id=${deal.id}&limit=20`),
+    deal.person_id ? pdGet(`/persons/${deal.person_id}`) : Promise.resolve(null),
+  ]);
+
+  // Construire timeline unifiée
+  const events = [];
+
+  // Notes
+  (notes?.data || []).forEach(n => {
+    if (!n.content?.trim()) return;
+    events.push({ ts: new Date(n.add_time).getTime(), type: '📝', text: n.content.trim().substring(0, 150), date: n.add_time });
+  });
+
+  // Activités
+  (activities?.data || []).forEach(a => {
+    const done = a.done ? '✅' : (new Date(`${a.due_date}T${a.due_time||'23:59'}`).getTime() < Date.now() ? '⚠️' : '🔲');
+    events.push({ ts: new Date(a.due_date || a.add_time).getTime(), type: done, text: `${a.subject || a.type} (${a.type})`, date: a.due_date || a.add_time });
+  });
+
+  // Trier chronologique
+  events.sort((a, b) => b.ts - a.ts);
+
+  const stageLabel = PD_STAGES[deal.stage_id] || deal.stage_id;
+  const phones = person?.data?.phone?.filter(p => p.value).map(p => p.value) || [];
+  const emails = person?.data?.email?.filter(e => e.value).map(e => e.value) || [];
+
+  let txt = `📋 *Historique — ${deal.title}*\n${stageLabel}\n`;
+  if (phones.length) txt += `📞 ${phones.join(' · ')}\n`;
+  if (emails.length) txt += `✉️ ${emails.join(' · ')}\n`;
+  txt += `\n`;
+
+  if (!events.length) return txt + '_Aucun historique._';
+  events.slice(0, 10).forEach(e => {
+    const date = new Date(e.date).toLocaleDateString('fr-CA', { day:'numeric', month:'short' });
+    txt += `${e.type} [${date}] ${e.text}\n`;
+  });
+  if (events.length > 10) txt += `\n_+ ${events.length - 10} événements plus anciens_`;
+  return txt.trim();
+}
+
 // ─── Whisper (voix → texte) ───────────────────────────────────────────────────
 async function transcrire(audioBuffer) {
   const key = process.env.OPENAI_API_KEY;
@@ -1483,6 +1609,8 @@ const TOOLS = [
   { name: 'voir_activites',         description: 'Voir les activités et tâches planifiées pour un deal. "c\'est quoi le prochain step avec Jean?"', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
   { name: 'voir_prospect_complet',  description: 'Vue COMPLÈTE d\'un prospect: stade, coordonnées, notes, activités, séquence J+1/3/7, alerte stagnation. Utiliser pour tout suivi ou décision sur un prospect.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, email ou téléphone du prospect' } }, required: ['terme'] } },
   { name: 'prospects_stagnants',    description: 'Voir les prospects sans action depuis X jours. Pour "c\'est quoi qui stagne", "qui j\'ai pas touché". Défaut: 3 jours.', input_schema: { type: 'object', properties: { jours: { type: 'number', description: 'Nombre de jours minimum (défaut: 3)' } } } },
+  { name: 'historique_contact',     description: 'Timeline complète d\'un prospect: notes, activités, étapes. Format compact mobile. Pour "c\'est quoi le background de Jean", "montre-moi tout sur Marie".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
+  { name: 'repondre_vite',          description: 'Réponse rapide à un prospect: trouve son email dans Pipedrive automatiquement et prépare le brouillon. Pour mobile quand Shawn dicte sa réponse.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, message: { type: 'string', description: 'Texte de la réponse (style Shawn — sera mis en forme)' } }, required: ['terme', 'message'] } },
   { name: 'modifier_deal',          description: 'Modifier la valeur, le titre ou la date de clôture d\'un deal.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction' }, titre: { type: 'string' }, dateClose: { type: 'string', description: 'Date ISO YYYY-MM-DD' } }, required: ['terme'] } },
   { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'YYYY-MM-DD' }, heure: { type: 'string', description: 'HH:MM' } }, required: ['terme', 'type'] } },
   // ── Gmail ──
@@ -1549,6 +1677,8 @@ async function executeTool(name, input, chatId) {
       case 'voir_activites':          return await voirActivitesDeal(input.terme);
       case 'voir_prospect_complet':   return await voirProspectComplet(input.terme);
       case 'prospects_stagnants':     return await prospectStagnants(input.jours || 3);
+      case 'historique_contact':      return await historiqueContact(input.terme);
+      case 'repondre_vite':           return await repondreVite(chatId, input.terme, input.message);
       case 'modifier_deal':           return await modifierDeal(input.terme, input);
       case 'creer_activite':          return await creerActivite(input);
       case 'chercher_listing_dropbox': return await chercherListingDropbox(input.terme);
@@ -1822,7 +1952,7 @@ function registerHandlers() {
   bot.onText(/\/start/, msg => {
     if (!isAllowed(msg)) return;
     bot.sendMessage(msg.chat.id,
-      `👋 Salut Shawn\\! Je suis ton assistante IA 24/7\\.\n\n*Accès:* GitHub · Dropbox · Pipedrive · Gmail · Contacts iPhone · Mailing\\-masse · Recherche web\n\n*Tu peux m'envoyer:*\n📸 Photos \\(propriétés, terrains, listings\\) → analyse immédiate\n📄 PDFs \\(contrats, offres, rapports\\) → extraction clés\n🎤 Messages vocaux → transcription \\+ action\n\n*Commandes:*\n/pipeline — Pipeline Pipedrive\n/stats — Tableau de bord\n/emails — Emails récents\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Mémoire persistante\n/oublier — Effacer mémoire\n/penser — Mode réflexion profonde \\(Opus 4\\.7\\)\n/opus — Opus 4\\.7 \\(défaut\\)\n/sonnet — Sonnet 4\\.6\n/haiku — Haiku 4\\.5`,
+      `👋 Salut Shawn\\!\n\n*Accès complet:* Pipedrive · Dropbox · Gmail · Contacts · Brevo · GitHub · Centris\n\n*Envoie directement:*\n📸 Photo propriété/terrain → analyse immédiate\n📄 PDF offre/contrat/rapport → extraction clés\n🎤 Message vocal → transcription \\+ action\n\n*Commandes rapides:*\n/pipeline — Pipeline complet\n/stats — Dashboard \\(stagnants \\+ relances \\+ visites\\)\n/stagnants — Prospects sans action 3j\\+\n/relances — J\\+1/J\\+3/J\\+7 dues\n/lead \\[info\\] — Créer prospect rapidement\n/emails — Emails récents\n/reset — Nouvelle conversation\n/status — État du bot\n/penser — Réflexion profonde Opus 4\\.7`,
       { parse_mode: 'MarkdownV2' }
     );
   });
@@ -1914,6 +2044,30 @@ function registerHandlers() {
       : '⚡ *Mode réflexion OFF* — Réponses rapides.',
       { parse_mode: 'Markdown' }
     );
+  });
+
+  // ─── Commandes rapides mobile ────────────────────────────────────────────────
+  bot.onText(/\/stagnants/, async msg => {
+    if (!isAllowed(msg)) return;
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    const result = await prospectStagnants(3);
+    clearInterval(typing);
+    await send(msg.chat.id, result);
+  });
+
+  bot.onText(/\/relances/, async msg => {
+    if (!isAllowed(msg)) return;
+    await callClaude(msg.chat.id, 'Montre-moi les relances J+1/J+3/J+7 qui sont dues aujourd\'hui dans le pipeline.')
+      .then(({ reply }) => send(msg.chat.id, reply)).catch(() => {});
+  });
+
+  bot.onText(/\/lead (.+)/, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const info = match[1];
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    const { reply } = await callClaude(msg.chat.id, `Nouveau prospect: ${info}. Crée le deal dans Pipedrive immédiatement.`);
+    clearInterval(typing);
+    await send(msg.chat.id, reply);
   });
 
   // ─── Messages texte ──────────────────────────────────────────────────────────
@@ -2224,39 +2378,149 @@ function startDailyTasks() {
   log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, suivi 9h→Telegram, sync GitHub 18h');
 }
 
-// ─── Webhooks Make.com ────────────────────────────────────────────────────────
+// ─── Webhooks intelligents ────────────────────────────────────────────────────
 async function handleWebhook(route, data) {
   if (!ALLOWED_ID) return;
   try {
+
+    // ── CENTRIS — Lead entrant → deal auto + J+0 prêt ────────────────────────
     if (route === '/webhook/centris') {
-      const nom     = data.nom || data.name || 'Inconnu';
+      const nom     = (data.nom || data.name || 'Inconnu').trim();
       const tel     = data.telephone || data.tel || data.phone || '';
       const email   = data.email || '';
       const listing = data.url_listing || data.url || data.centris_url || '';
-      const type    = data.type || 'propriété';
-      await bot.sendMessage(ALLOWED_ID,
-        `🏡 *Nouveau lead Centris!*\n\n👤 ${nom}${tel ? '\n📞 ' + tel : ''}${email ? '\n✉️ ' + email : ''}${listing ? '\n🔗 ' + listing : ''}\nType: ${type}\n\nDis "crée deal pour ${nom}" pour l'ajouter à Pipedrive.`,
-        { parse_mode: 'Markdown' }
-      );
+      const typeRaw = (data.type || listing).toLowerCase();
+
+      // Détecter le type depuis l'URL ou les données
+      let type = 'terrain';
+      if (/maison|house|résidentiel|residential/.test(typeRaw))    type = 'maison_usagee';
+      else if (/plex|duplex|triplex|quadruplex/.test(typeRaw))     type = 'plex';
+      else if (/construction|neuve?|new/.test(typeRaw))            type = 'construction_neuve';
+
+      // Extraire numéro Centris de l'URL
+      const centrisMatch = listing.match(/\/(\d{7,9})\b/);
+      const centrisNum   = centrisMatch?.[1] || data.centris || '';
+
+      // AUTO-CRÉER le deal dans Pipedrive
+      let dealResult = null;
+      let dealId     = null;
+      if (PD_KEY) {
+        try {
+          const parts = nom.split(' ');
+          dealResult = await creerDeal({
+            prenom: parts[0], nom: parts.slice(1).join(' '),
+            telephone: tel, email, type,
+            source: 'centris', centris: centrisNum,
+            note: `Lead Centris — ${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}\nURL: ${listing}`
+          });
+          // Récupérer l'ID du deal créé pour le J+0
+          const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nom)}&limit=1`);
+          dealId = sr?.data?.items?.[0]?.item?.id;
+        } catch(e) { dealResult = `⚠️ Erreur deal: ${e.message}`; }
+      }
+
+      // Brouillon J+0 automatique
+      const typeLabel = { terrain:'terrain', maison_usagee:'propriété', plex:'plex', construction_neuve:'construction neuve' }[type] || 'propriété';
+      const j0texte = `Bonjour,\n\nMerci de votre intérêt pour ce ${typeLabel}${centrisNum ? ` (Centris #${centrisNum})` : ''}.\n\nJe communique avec vous pour vous donner plus d'informations et répondre à vos questions. Quand seriez-vous disponible pour qu'on se parle?\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+
+      if (email) {
+        pendingEmails.set(ALLOWED_ID, { to: email, toName: nom, sujet: `${typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1)} — ${AGENT.compagnie}`, texte: j0texte });
+      }
+
+      let msg = `🏡 *Nouveau lead Centris!*\n\n👤 *${nom}*${tel ? '\n📞 ' + tel : ''}${email ? '\n✉️ ' + email : ''}${listing ? '\n🔗 ' + listing : ''}\nType: ${type}${centrisNum ? ' | #' + centrisNum : ''}\n\n`;
+      msg += dealResult ? `${dealResult}\n\n` : '';
+      if (email) {
+        msg += `📧 *J+0 prêt:*\n_"${j0texte.substring(0, 120)}..."_\n\nDis *"envoie"* pour envoyer maintenant.`;
+      } else {
+        msg += `⚠️ Pas d'email — appelle directement: ${tel || 'tel non fourni'}`;
+      }
+      await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' });
     }
+
+    // ── SMS ENTRANT — Match Pipedrive + contexte + brouillon réponse ──────────
     if (route === '/webhook/sms') {
-      const from = data.from || data.numero || '';
-      const msg  = data.body || data.message || '';
-      const nom  = data.nom || '';
-      await bot.sendMessage(ALLOWED_ID,
-        `📱 *SMS entrant*\n\nDe: ${nom || from}\n"${msg}"\n\nDis "cherche ${nom || from} dans Pipedrive" pour voir le prospect.`,
-        { parse_mode: 'Markdown' }
-      );
+      const from  = data.from || data.numero || '';
+      const msg   = data.body || data.message || '';
+      const nom   = data.nom || '';
+
+      let contextMsg = `📱 *SMS entrant*\n\nDe: *${nom || from}*\n_"${msg.substring(0, 300)}"_\n\n`;
+
+      // Chercher dans Pipedrive par téléphone ou nom
+      let dealContext = '';
+      if (PD_KEY && (from || nom)) {
+        try {
+          const terme = nom || from.replace(/\D/g, '');
+          const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=1`);
+          const deal = sr?.data?.items?.[0]?.item;
+          if (deal) {
+            const stage = PD_STAGES[deal.stage_id] || deal.stage_id;
+            dealContext = `📊 *Pipedrive:* ${deal.title} — ${stage}\n\n`;
+            // Brouillon réponse rapide
+            const reponse = `Bonjour,\n\nMerci pour votre message. Je vous reviens rapidement.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+            if (deal.person_id) {
+              const person = await pdGet(`/persons/${deal.person_id}`);
+              const emailP = person?.data?.email?.[0]?.value;
+              if (emailP) {
+                pendingEmails.set(ALLOWED_ID, { to: emailP, toName: deal.title, sujet: 'RE: votre message', texte: reponse });
+                dealContext += `📧 Réponse email prête — dis *"envoie"* ou modifie d'abord.\n\n`;
+              }
+            }
+          } else {
+            dealContext = `❓ *Pas trouvé dans Pipedrive* — dis "crée prospect ${nom || from}" si nouveau.\n\n`;
+          }
+        } catch {}
+      }
+
+      await bot.sendMessage(ALLOWED_ID, contextMsg + dealContext + `_Dis "voir ${nom || from}" pour le contexte complet._`, { parse_mode: 'Markdown' });
+
+      // Ajouter note Pipedrive si deal trouvé
+      if (PD_KEY && (nom || from)) {
+        const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nom || from)}&limit=1`).catch(() => null);
+        const deal = sr?.data?.items?.[0]?.item;
+        if (deal) await pdPost('/notes', { deal_id: deal.id, content: `SMS reçu: "${msg}"` }).catch(() => {});
+      }
     }
+
+    // ── REPLY EMAIL — Prospect a répondu → contexte + brouillon ─────────────
     if (route === '/webhook/reply') {
       const de    = data.from || data.email || '';
       const sujet = data.subject || '';
-      const corps = data.body || data.text || '';
-      await bot.sendMessage(ALLOWED_ID,
-        `📧 *Réponse prospect!*\n\nDe: ${de}\nObjet: ${sujet}\n\n_"${corps.substring(0, 300)}${corps.length > 300 ? '...' : ''}"_\n\nDis "rédige réponse à ${de}" pour répondre.`,
-        { parse_mode: 'Markdown' }
-      );
+      const corps = (data.body || data.text || '').trim();
+      const nom   = data.nom || de.split('@')[0];
+
+      let contextMsg = `📧 *Réponse de prospect!*\n\nDe: *${nom}* (${de})\nObjet: ${sujet}\n\n_"${corps.substring(0, 400)}${corps.length > 400 ? '...' : ''}"_\n\n`;
+
+      // Chercher dans Pipedrive + charger contexte
+      let dealContext = '';
+      if (PD_KEY && de) {
+        try {
+          const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nom)}&limit=1`);
+          const deal = sr?.data?.items?.[0]?.item;
+          if (deal) {
+            const stage = PD_STAGES[deal.stage_id] || deal.stage_id;
+            dealContext = `📊 *Pipedrive:* ${deal.title} — ${stage}\n`;
+            // Avancer l'étape si premier contact
+            if (deal.stage_id === 49) {
+              await pdPut(`/deals/${deal.id}`, { stage_id: 50 }).catch(() => {});
+              dealContext += `➡️ Étape: Nouveau lead → *Contacté* ✅\n`;
+            }
+            // Ajouter note
+            await pdPost('/notes', { deal_id: deal.id, content: `Email reçu [${sujet}]: "${corps.substring(0, 500)}"` }).catch(() => {});
+            dealContext += `📝 Note ajoutée dans Pipedrive\n\n`;
+
+            // Brouillon réponse
+            const reponse = `Bonjour,\n\nMerci pour votre réponse. Je vous reviens dès que possible.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+            pendingEmails.set(ALLOWED_ID, { to: de, toName: nom, sujet: `RE: ${sujet}`, texte: reponse });
+            dealContext += `📧 Brouillon réponse prêt — dis *"envoie"* ou précise ce que tu veux répondre.`;
+          } else {
+            dealContext = `❓ *${nom}* pas dans Pipedrive.\nDis "crée prospect ${nom}" si c'est un nouveau lead.\n\nBrouillon réponse? Dis "réponds à ${nom}"`;
+          }
+        } catch(e) { dealContext = `_(Pipedrive: ${e.message.substring(0,80)})_`; }
+      }
+
+      await bot.sendMessage(ALLOWED_ID, contextMsg + dealContext, { parse_mode: 'Markdown' });
     }
+
   } catch (e) { log('ERR', 'WEBHOOK', e.message); }
 }
 
