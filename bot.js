@@ -125,14 +125,56 @@ Tu es son bras droit stratégique ET opérateur business — pas juste un assist
 • Partenaire construction: ${AGENT.partenaire} — programme unique, aucun autre courtier offre ça
 • Vend 2-3 terrains/semaine dans Lanaudière | Prix: 180-240$/pi² clé en main (nivelé, services, accès)
 
-════ PIPELINE PIPEDRIVE (ID: 7) ════
-49: Nouveau lead → 50: Contacté → 51: En discussion → 52: Visite prévue → 53: Visite faite → 54: Offre déposée → 55: Gagné
+════ PIPEDRIVE — CONNAISSANCE COMPLÈTE ════
 
-Shawn en sous-entendus:
-• "ça marche pas avec lui" → marquer_perdu
-• "c'est quoi mes hot leads" → voir_pipeline, focus 51-53
-• "nouveau prospect: [info]" → créer_deal automatiquement
-• "relance [nom]" → chercher_prospect + voir_conversation + brouillon email
+PIPELINE ID: ${AGENT.pipeline_id}
+49 Nouveau lead → 50 Contacté → 51 En discussion → 52 Visite prévue → 53 Visite faite → 54 Offre déposée → 55 Gagné
+
+CHAMPS PERSONNALISÉS:
+• Type propriété: terrain(37) construction_neuve(38) maison_neuve(39) maison_usagee(40) plex(41)
+• Séquence active: 42=Oui 43=Non
+• Numéro Centris: texte libre
+• Suivi J+1/J+3/J+7: dates → cochées = envoyé
+
+RÈGLES D'AVANCEMENT D'ÉTAPE:
+• Lead créé → TOUJOURS activer séquence (42=Oui)
+• Premier contact fait → passer à "Contacté" (50)
+• Conversation entamée → "En discussion" (51)
+• Visite confirmée → planifier_visite → "Visite prévue" (52) auto
+• Après visite → "Visite faite" (53) + note + relance J+1
+• Offre signée → "Offre déposée" (54)
+• Transaction conclue → "Gagné" (55)
+• Pas de réponse × 3 → marquer_perdu + ajouter_brevo (nurture)
+
+COMPORTEMENT PROACTIF OBLIGATOIRE:
+→ Quand tu vois le pipeline: signaler IMMÉDIATEMENT les deals stagnants (>3j sans action)
+→ Après chaque action sur un prospect: proposer la prochaine étape logique
+→ J+1 dû? "Veux-tu que je rédige la relance pour [nom]?"
+→ Deal en discussion >7j sans visite: "Jean est là depuis 8j — je propose une visite?"
+→ Visite faite hier sans suivi: "Suite à la visite avec Marie hier — je rédige le follow-up?"
+
+SOUS-ENTENDUS DE SHAWN → ACTIONS:
+• "ça marche pas avec lui/elle" → marquer_perdu
+• "c'est quoi mes hot leads" → voir_pipeline focus 51-53
+• "nouveau prospect: [info]" → créer_deal auto
+• "relance [nom]" → voir_prospect_complet + voir_conversation + brouillon email
+• "c'est quoi le deal avec [nom]" → voir_prospect_complet
+• "bouge [nom] à [étape]" → changer_etape
+• "ajoute un call pour [nom]" → creer_activite
+• "c'est quoi qui stagne" → prospects_stagnants
+• "envoie les docs à [nom]" → envoyer_docs_prospect
+
+POUR TOUT PROSPECT — WORKFLOW STANDARD:
+1. voir_prospect_complet → état complet (notes + coordonnées + activités + séquence)
+2. voir_conversation → historique Gmail 30j
+3. Décider: relance email? changer étape? planifier visite? marquer perdu?
+4. Exécuter + proposer prochaine action
+
+STATS PIPELINE — INTERPRÉTER:
+• Beaucoup en "Nouveau lead" → problème de conversion J+1
+• Beaucoup en "En discussion" → problème de closing → proposer visites
+• Peu en "Visite prévue/faite" → pousser les visites
+• Taux conversion <30% → revoir le discours qualification
 
 ════ TES DEUX MODES ════
 
@@ -680,13 +722,157 @@ async function ajouterNote(terme, note) {
   return `✅ Note ajoutée sur "${deal.title || terme}".`;
 }
 
+async function voirProspectComplet(terme) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=5`);
+  const items = sr?.data?.items || [];
+  if (!items.length) return `Aucun prospect "${terme}" dans Pipedrive.`;
+
+  // Afficher brièvement les autres résultats si plusieurs
+  let autre = '';
+  if (items.length > 1) {
+    autre = `_Autres résultats: ${items.slice(1).map(i => i.item.title).join(', ')}_\n\n`;
+  }
+
+  const deal = items[0].item;
+  const [fullDeal, notes, activities, emails] = await Promise.all([
+    pdGet(`/deals/${deal.id}`),
+    pdGet(`/notes?deal_id=${deal.id}&limit=10`),
+    pdGet(`/activities?deal_id=${deal.id}&limit=10&done=0`),
+    deal.person_id ? pdGet(`/persons/${deal.person_id}`) : Promise.resolve(null),
+  ]);
+
+  const d          = fullDeal?.data || deal;
+  const stageLabel = PD_STAGES[d.stage_id] || `Étape ${d.stage_id}`;
+  const typeMap    = { 37:'Terrain', 38:'Construction neuve', 39:'Maison neuve', 40:'Maison usagée', 41:'Plex' };
+  const typeLabel  = typeMap[d[PD_FIELD_TYPE]] || 'Propriété';
+  const centris    = d[PD_FIELD_CENTRIS] || '';
+  const seqActive  = d[PD_FIELD_SEQ] === 42 ? '✅ Oui' : '❌ Non';
+  const j1 = d[PD_FIELD_SUIVI_J1] ? '✅' : '⏳';
+  const j3 = d[PD_FIELD_SUIVI_J3] ? '✅' : '⏳';
+  const j7 = d[PD_FIELD_SUIVI_J7] ? '✅' : '⏳';
+  const created    = d.add_time ? new Date(d.add_time).toLocaleDateString('fr-CA') : '?';
+  const ageJours   = d.add_time ? Math.floor((Date.now() - new Date(d.add_time).getTime()) / 86400000) : '?';
+  const valeur     = d.value ? `${Number(d.value).toLocaleString('fr-CA')} $` : '';
+
+  let txt = `${autre}━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  txt += `👤 *${d.title}* (ID: ${d.id})\n`;
+  txt += `📊 ${stageLabel} | ${typeLabel}${centris ? ` | #${centris}` : ''}\n`;
+  txt += `📅 Créé: ${created} (${ageJours}j)${valeur ? ` | ${valeur}` : ''}\n`;
+  txt += `🔄 Séquence: ${seqActive} | J+1:${j1} J+3:${j3} J+7:${j7}\n`;
+
+  // Coordonnées complètes
+  const p = emails?.data;
+  if (p) {
+    const phones = (p.phone || []).filter(x => x.value).map(x => x.value);
+    const mails  = (p.email || []).filter(x => x.value).map(x => x.value);
+    if (phones.length || mails.length) {
+      txt += `\n📞 *Coordonnées:*\n`;
+      if (phones.length) txt += `  Tel: ${phones.join(' · ')}\n`;
+      if (mails.length)  txt += `  Email: ${mails.join(' · ')}\n`;
+    }
+  }
+
+  // Notes récentes
+  const notesList = (notes?.data || []).filter(n => n.content?.trim());
+  if (notesList.length) {
+    txt += `\n📝 *Notes (${notesList.length}):*\n`;
+    notesList.slice(0, 5).forEach(n => {
+      const dt = n.add_time ? new Date(n.add_time).toLocaleDateString('fr-CA') : '';
+      txt += `  [${dt}] ${n.content.trim().substring(0, 250)}\n`;
+    });
+  }
+
+  // Activités à faire
+  const now   = Date.now();
+  const acts  = (activities?.data || []).sort((a, b) =>
+    new Date(`${a.due_date}T${a.due_time||'23:59'}`) - new Date(`${b.due_date}T${b.due_time||'23:59'}`)
+  );
+  if (acts.length) {
+    txt += `\n📋 *Activités à venir (${acts.length}):*\n`;
+    acts.slice(0, 4).forEach(a => {
+      const late = new Date(`${a.due_date}T${a.due_time||'23:59'}`).getTime() < now ? '⚠️' : '🔲';
+      txt += `  ${late} ${a.subject || a.type} — ${a.due_date}${a.due_time ? ' ' + a.due_time.substring(0,5) : ''}\n`;
+    });
+  }
+
+  // Alerte stagnation
+  const lastAct = d.last_activity_date ? new Date(d.last_activity_date).getTime() : new Date(d.add_time).getTime();
+  const j = Math.floor((now - lastAct) / 86400000);
+  if (j >= 3 && d.stage_id <= 51) txt += `\n⚠️ *Aucune action depuis ${j} jours — relance recommandée*`;
+
+  txt += `\n━━━━━━━━━━━━━━━━━━━━━━━`;
+  return txt;
+}
+
+async function prospectStagnants(jours = 3) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const data  = await pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=100`);
+  const deals = data?.data || [];
+  const now   = Date.now();
+  const seuil = jours * 86400000;
+  const stag  = deals
+    .filter(d => d.stage_id <= 51) // avant visite prévue
+    .map(d => {
+      const last = d.last_activity_date
+        ? new Date(d.last_activity_date).getTime()
+        : new Date(d.add_time).getTime();
+      return { title: d.title, stage: PD_STAGES[d.stage_id] || d.stage_id, j: Math.floor((now - last) / 86400000) };
+    })
+    .filter(d => d.j >= jours)
+    .sort((a, b) => b.j - a.j);
+
+  if (!stag.length) return `✅ Tous les prospects ont été contactés dans les ${jours} derniers jours.`;
+  let txt = `⚠️ *${stag.length} prospect(s) sans action depuis ${jours}j+:*\n\n`;
+  stag.forEach(s => txt += `  🔴 *${s.title}* — ${s.stage} — ${s.j}j\n`);
+  txt += `\nDis "relance [nom]" ou "voir [nom]" pour chacun.`;
+  return txt;
+}
+
+async function modifierDeal(terme, { valeur, titre, dateClose, raison }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+  const deals = sr?.data?.items || [];
+  if (!deals.length) return `Aucun deal: "${terme}"`;
+  const deal = deals[0].item;
+  const body = {};
+  if (valeur !== undefined) body.value = parseFloat(String(valeur).replace(/[^0-9.]/g, ''));
+  if (titre)     body.title      = titre;
+  if (dateClose) body.close_time = dateClose;
+  if (Object.keys(body).length === 0) return '❌ Rien à modifier — précise valeur, titre ou date.';
+  await pdPut(`/deals/${deal.id}`, body);
+  const changes = Object.entries(body).map(([k, v]) => `${k}: ${v}`).join(', ');
+  return `✅ *${deal.title}* mis à jour\n${changes}`;
+}
+
+async function creerActivite({ terme, type, sujet, date, heure }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const TYPES = { appel:'call', call:'call', email:'email', réunion:'meeting', meeting:'meeting', tâche:'task', task:'task', visite:'meeting', texte:'task' };
+  const actType = TYPES[type?.toLowerCase()?.trim()] || 'task';
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+  const deals = sr?.data?.items || [];
+  if (!deals.length) return `Aucun deal: "${terme}"`;
+  const deal = deals[0].item;
+  const body = {
+    deal_id: deal.id,
+    subject: sujet || `${actType.charAt(0).toUpperCase() + actType.slice(1)} — ${deal.title}`,
+    type: actType,
+    done: 0,
+  };
+  if (date) body.due_date = date;
+  if (heure) body.due_time = heure;
+  await pdPost('/activities', body);
+  return `✅ Activité créée: *${body.subject}*\n${deal.title}${date ? ` — ${date}${heure ? ' ' + heure : ''}` : ''}`;
+}
+
 async function statsBusiness() {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   const now = new Date();
-  const [gagnes, perdus, actifs] = await Promise.all([
+  const [gagnes, perdus, actifs, visitesData] = await Promise.all([
     pdGet('/deals?status=won&limit=100'),
     pdGet('/deals?status=lost&limit=100'),
-    pdGet('/deals?pipeline_id=7&status=open&limit=100')
+    pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=100`),
+    Promise.resolve(loadJSON(VISITES_FILE, [])),
   ]);
   const filtrerMois = d => {
     const date = new Date(d.close_time || d.won_time || d.lost_time || 0);
@@ -700,15 +886,52 @@ async function statsBusiness() {
     const s = PD_STAGES[d.stage_id] || `Étape ${d.stage_id}`;
     parEtape[s] = (parEtape[s] || 0) + 1;
   }
-  let txt = `📊 *Tableau de bord Signature SB*\n_${now.toLocaleDateString('fr-CA', { weekday:'long', day:'numeric', month:'long' })}_\n\n`;
+  // Relances dues (J+1/J+3/J+7)
+  const relances = [];
+  const stagnants = [];
+  const nowTs = Date.now();
+  for (const d of dealsActifs) {
+    if (d.stage_id > 51) continue;
+    const created = new Date(d.add_time).getTime();
+    const ageJ    = (nowTs - created) / 86400000;
+    const j1 = d[PD_FIELD_SUIVI_J1], j3 = d[PD_FIELD_SUIVI_J3], j7 = d[PD_FIELD_SUIVI_J7];
+    if (!j1 && ageJ >= 1)            relances.push(`🟢 J+1 *${d.title}*`);
+    else if (j1 && !j3 && ageJ >= 3) relances.push(`🟡 J+3 *${d.title}*`);
+    else if (j1 && j3 && !j7 && ageJ >= 7) relances.push(`🔴 J+7 *${d.title}*`);
+    // Stagnants
+    const last = d.last_activity_date ? new Date(d.last_activity_date).getTime() : created;
+    if ((nowTs - last) > 3 * 86400000) stagnants.push({ title: d.title, j: Math.floor((nowTs - last) / 86400000) });
+  }
+
+  // Visites aujourd'hui
+  const today      = now.toDateString();
+  const visitesToday = visitesData.filter(v => new Date(v.date).toDateString() === today);
+
+  const dateStr = now.toLocaleDateString('fr-CA', { weekday:'long', day:'numeric', month:'long', timeZone:'America/Toronto' });
+  let txt = `📊 *Tableau de bord ${AGENT.compagnie}*\n_${dateStr}_\n\n`;
   txt += `🔥 *Pipeline actif — ${dealsActifs.length} deals*\n`;
   for (const [etape, nb] of Object.entries(parEtape)) txt += `  ${etape}: *${nb}*\n`;
-  txt += `\n📈 *Ce mois-ci*\n  ✅ Gagnés: *${gagnésMois.length}*\n  ❌ Perdus: ${perdusMois.length}\n`;
+  txt += `\n📈 *${now.toLocaleString('fr-CA', { month:'long', year:'numeric' })}*\n`;
+  txt += `  ✅ Gagnés: *${gagnésMois.length}*  ❌ Perdus: ${perdusMois.length}\n`;
   if (gagnésMois.length + perdusMois.length > 0) {
-    const taux = Math.round(gagnésMois.length / (gagnésMois.length + perdusMois.length) * 100);
-    txt += `  🎯 Taux conversion: ${taux}%\n`;
+    txt += `  🎯 Taux: ${Math.round(gagnésMois.length / (gagnésMois.length + perdusMois.length) * 100)}%\n`;
   }
-  return txt;
+  if (visitesToday.length) {
+    txt += `\n📅 *Visites aujourd'hui (${visitesToday.length}):*\n`;
+    visitesToday.forEach(v => {
+      const h = new Date(v.date).toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' });
+      txt += `  🏡 ${v.nom} — ${h}${v.adresse ? ' @ ' + v.adresse : ''}\n`;
+    });
+  }
+  if (relances.length) {
+    txt += `\n⏰ *Relances à faire (${relances.length}):*\n`;
+    relances.forEach(r => txt += `  ${r}\n`);
+  }
+  if (stagnants.length) {
+    txt += `\n⚠️ *Sans contact 3j+ (${stagnants.length}):*\n`;
+    stagnants.sort((a,b) => b.j - a.j).slice(0,5).forEach(s => txt += `  🔴 ${s.title} — ${s.j}j\n`);
+  }
+  return txt.trim();
 }
 
 async function creerDeal({ prenom, nom, telephone, email, type, source, centris, note }) {
@@ -1256,8 +1479,12 @@ const TOOLS = [
   { name: 'créer_deal',         description: 'Créer un nouveau prospect/deal dans Pipedrive. Utiliser quand Shawn dit "nouveau prospect: [info]" ou reçoit un lead.', input_schema: { type: 'object', properties: { prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, email: { type: 'string' }, type: { type: 'string', description: 'terrain, maison_usagee, maison_neuve, construction_neuve, auto_construction, plex' }, source: { type: 'string', description: 'centris, facebook, site_web, reference, appel' }, centris: { type: 'string', description: 'Numéro Centris si disponible' }, note: { type: 'string', description: 'Note initiale: besoin, secteur, budget, délai' } }, required: ['prenom'] } },
   { name: 'planifier_visite',   description: 'Planifier une visite de propriété. Met à jour le deal → Visite prévue + crée activité Pipedrive + sauvegarde pour rappel matin.', input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Nom du prospect' }, date: { type: 'string', description: 'Date ISO (2024-05-10T14:00) ou approximation' }, adresse: { type: 'string', description: 'Adresse de la propriété (optionnel)' } }, required: ['prospect', 'date'] } },
   { name: 'voir_visites',      description: 'Voir les visites planifiées (aujourd\'hui + à venir). Pour "mes visites", "c\'est quoi aujourd\'hui".', input_schema: { type: 'object', properties: {} } },
-  { name: 'changer_etape',     description: 'Changer l\'étape d\'un deal Pipedrive. Options: nouveau, contacté, discussion, visite prévue, visite faite, offre, gagné.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, etape: { type: 'string', description: 'Nouvelle étape' } }, required: ['terme', 'etape'] } },
-  { name: 'voir_activites',    description: 'Voir les activités et tâches planifiées pour un deal Pipedrive. Pour "c\'est quoi le prochain step avec Jean".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
+  { name: 'changer_etape',          description: 'Changer l\'étape d\'un deal Pipedrive. Options: nouveau, contacté, discussion, visite prévue, visite faite, offre, gagné.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, etape: { type: 'string' } }, required: ['terme', 'etape'] } },
+  { name: 'voir_activites',         description: 'Voir les activités et tâches planifiées pour un deal. "c\'est quoi le prochain step avec Jean?"', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
+  { name: 'voir_prospect_complet',  description: 'Vue COMPLÈTE d\'un prospect: stade, coordonnées, notes, activités, séquence J+1/3/7, alerte stagnation. Utiliser pour tout suivi ou décision sur un prospect.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, email ou téléphone du prospect' } }, required: ['terme'] } },
+  { name: 'prospects_stagnants',    description: 'Voir les prospects sans action depuis X jours. Pour "c\'est quoi qui stagne", "qui j\'ai pas touché". Défaut: 3 jours.', input_schema: { type: 'object', properties: { jours: { type: 'number', description: 'Nombre de jours minimum (défaut: 3)' } } } },
+  { name: 'modifier_deal',          description: 'Modifier la valeur, le titre ou la date de clôture d\'un deal.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction' }, titre: { type: 'string' }, dateClose: { type: 'string', description: 'Date ISO YYYY-MM-DD' } }, required: ['terme'] } },
+  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'YYYY-MM-DD' }, heure: { type: 'string', description: 'HH:MM' } }, required: ['terme', 'type'] } },
   // ── Gmail ──
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
@@ -1318,8 +1545,12 @@ async function executeTool(name, input, chatId) {
         }
         return txt.trim();
       }
-      case 'changer_etape':        return await changerEtape(input.terme, input.etape);
-      case 'voir_activites':       return await voirActivitesDeal(input.terme);
+      case 'changer_etape':           return await changerEtape(input.terme, input.etape);
+      case 'voir_activites':          return await voirActivitesDeal(input.terme);
+      case 'voir_prospect_complet':   return await voirProspectComplet(input.terme);
+      case 'prospects_stagnants':     return await prospectStagnants(input.jours || 3);
+      case 'modifier_deal':           return await modifierDeal(input.terme, input);
+      case 'creer_activite':          return await creerActivite(input);
       case 'chercher_listing_dropbox': return await chercherListingDropbox(input.terme);
       case 'envoyer_docs_prospect':    return await envoyerDocsProspect(input.terme, input.email, input.fichier);
       case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
