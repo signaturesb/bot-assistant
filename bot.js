@@ -78,11 +78,12 @@ process.on('unhandledRejection', reason => {
 });
 
 // ─── Persistance ──────────────────────────────────────────────────────────────
-const DATA_DIR     = fs.existsSync('/data') ? '/data' : '/tmp';
-const HIST_FILE    = path.join(DATA_DIR, 'history.json');
-const MEM_FILE     = path.join(DATA_DIR, 'memory.json');
-const GIST_ID_FILE = path.join(DATA_DIR, 'gist_id.txt');
-const VISITES_FILE = path.join(DATA_DIR, 'visites.json');
+const DATA_DIR        = fs.existsSync('/data') ? '/data' : '/tmp';
+const HIST_FILE       = path.join(DATA_DIR, 'history.json');
+const MEM_FILE        = path.join(DATA_DIR, 'memory.json');
+const GIST_ID_FILE    = path.join(DATA_DIR, 'gist_id.txt');
+const VISITES_FILE    = path.join(DATA_DIR, 'visites.json');
+const POLLER_FILE     = path.join(DATA_DIR, 'gmail_poller.json');
 
 function loadJSON(file, fallback) {
   try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -2079,7 +2080,7 @@ function registerHandlers() {
   bot.onText(/\/start/, msg => {
     if (!isAllowed(msg)) return;
     bot.sendMessage(msg.chat.id,
-      `👋 Salut Shawn\\!\n\n*Accès complet:* Pipedrive · Dropbox · Gmail · Contacts · Brevo · GitHub · Centris\n\n*Envoie directement:*\n📸 Photo propriété/terrain → analyse immédiate\n📄 PDF offre/contrat/rapport → extraction clés\n🎤 Message vocal → transcription \\+ action\n\n*Commandes rapides:*\n/pipeline — Pipeline complet\n/stats — Dashboard \\(stagnants \\+ relances \\+ visites\\)\n/stagnants — Prospects sans action 3j\\+\n/relances — J\\+1/J\\+3/J\\+7 dues\n/lead \\[info\\] — Créer prospect rapidement\n/emails — Emails récents\n/reset — Nouvelle conversation\n/status — État du bot\n/penser — Réflexion profonde Opus 4\\.7`,
+      `👋 Salut Shawn\\!\n\n*Surveillance automatique:*\n📧 Leads Gmail \\(Centris/RE\\-MAX\\) → deal \\+ J\\+0 auto\n📸 Photo/terrain → analyse Opus 4\\.7\n📄 PDF contrat/offre → extraction clés\n🎤 Vocal → action\n\n*Commandes:*\n/pipeline · /stats · /stagnants · /emails\n/checkemail — Scanner leads manqués\n/poller — Statut du poller Gmail\n/lead \\[info\\] — Créer prospect\n/status · /reset · /penser`,
       { parse_mode: 'MarkdownV2' }
     );
   });
@@ -2101,6 +2102,29 @@ function registerHandlers() {
     const dbxRefreshOk = !!(process.env.DROPBOX_REFRESH_TOKEN && process.env.DROPBOX_APP_KEY && process.env.DROPBOX_APP_SECRET);
     bot.sendMessage(msg.chat.id,
       `✅ *Kira opérationnelle — Opus 4.7*\nModèle: \`${currentModel}\` | Réflexion: ${thinkingMode ? '🧠 ON' : '⚡ OFF'}\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\n\nGitHub: ${process.env.GITHUB_TOKEN ? '✅' : '⚠️'} | Brevo: ${BREVO_KEY ? '✅' : '❌'}\nPipedrive: ${PD_KEY ? '✅' : '❌'} | Gmail: ${gmailOk ? '✅' : '⚠️'}\nDropbox: ${dropboxToken ? '✅ actif' : '❌'} ${dbxRefreshOk ? '(refresh ✅)' : '⚠️ vars manquantes'}\nWhisper: ${whisperOk ? '✅' : '⚠️'} | Mémoire: ${gistId ? '✅ Gist' : '⚠️ /tmp'}\nUptime: ${uptime} min | Tools: ${TOOLS.length}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // ─── Commandes poller ────────────────────────────────────────────────────────
+  bot.onText(/\/checkemail/, async msg => {
+    if (!isAllowed(msg)) return;
+    await bot.sendMessage(msg.chat.id, '🔍 Scan des emails leads en cours...');
+    // Forcer un scan étendu (48h)
+    const savedLastRun = gmailPollerState.lastRun;
+    gmailPollerState.lastRun = new Date(Date.now() - 48 * 3600000).toISOString();
+    await runGmailLeadPoller().catch(e => bot.sendMessage(msg.chat.id, `❌ Poller: ${e.message}`));
+    if (!savedLastRun || gmailPollerState.lastRun !== savedLastRun) {
+      await bot.sendMessage(msg.chat.id, `✅ Scan terminé — ${gmailPollerState.totalLeads || 0} lead(s) total traité(s).`);
+    }
+  });
+
+  bot.onText(/\/poller/, msg => {
+    if (!isAllowed(msg)) return;
+    const last    = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun).toLocaleTimeString('fr-CA', { timeZone: 'America/Toronto' }) : 'jamais';
+    const gmailOk = !!(process.env.GMAIL_CLIENT_ID);
+    bot.sendMessage(msg.chat.id,
+      `📧 *Gmail Lead Poller*\nStatut: ${gmailOk ? '✅ Actif' : '❌ Gmail non configuré'}\nDernier scan: ${last}\nLeads traités: ${gmailPollerState.totalLeads || 0}\nIDs mémorisés: ${gmailPollerState.processed?.length || 0}\n\nSources surveillées:\n• Centris.ca\n• RE/MAX Québec\n• Realtor.ca · DuProprio\n• Demandes directes\n\nDis /checkemail pour scanner maintenant.`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -2691,6 +2715,240 @@ const server = http.createServer((req, res) => {
   res.writeHead(404); res.end('not found');
 });
 
+// ─── Gmail Lead Poller — surveille les emails entrants toutes les 5min ────────
+let gmailPollerState = loadJSON(POLLER_FILE, { processed: [], lastRun: null, totalLeads: 0 });
+
+// Sources d'emails → leads immobiliers
+const LEAD_EMAIL_PATTERNS = [
+  { re: /centris/i,               source: 'centris',   label: 'Centris.ca' },
+  { re: /remax/i,                 source: 'remax',     label: 'RE/MAX Québec' },
+  { re: /realtor|crea\.ca/i,      source: 'realtor',   label: 'Realtor.ca' },
+  { re: /duproprio/i,             source: 'duproprio', label: 'DuProprio' },
+  { re: /kijiji|facebook/i,       source: 'social',    label: 'Réseau social' },
+];
+
+// Sujets → signal que c'est un lead
+const LEAD_SUBJECT_RE = /demande|lead|prospect|contact|information|intéress|inquiry|visite|acheteur|request/i;
+
+function detectLeadSource(from, subject) {
+  const txt = `${from} ${subject}`.toLowerCase();
+  for (const s of LEAD_EMAIL_PATTERNS) {
+    if (s.re.test(txt)) return s;
+  }
+  // Email direct avec sujet lead-like
+  if (LEAD_SUBJECT_RE.test(subject)) return { source: 'direct', label: 'Demande directe' };
+  return null;
+}
+
+function parseLeadEmail(body, subject, from) {
+  const clean = body.replace(/\r/g, '').replace(/&nbsp;/g, ' ').replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ');
+  const full  = `${subject} ${clean}`;
+
+  const extract = (...patterns) => {
+    for (const p of patterns) {
+      const m = full.match(p);
+      if (m?.[1]?.trim()) return m[1].trim().substring(0, 100);
+    }
+    return '';
+  };
+
+  // Nom
+  const nom = extract(
+    /(?:nom(?:\s+complet)?|name|client|acheteur|vendeur|prénom\s+et\s+nom)\s*:?\s*([A-ZÀ-Ü][^\n\r:;|<>]{2,50})/i,
+    /(?:bonjour|salut),?\s+([A-ZÀ-Ü][a-zà-ü]+ [A-ZÀ-Ü][a-zà-ü]+)/i,
+  );
+
+  // Téléphone — tous les formats québécois
+  const telMatch = full.match(/\b((?:\+1[-.\s]?)?(?:\d{3}[-.\s]?\d{3}[-.\s]?\d{4}|\(\d{3}\)\s*\d{3}[-.\s]\d{4}|\d{10}))\b/);
+  const telephone = telMatch?.[1]?.replace(/[^\d+]/g, '').replace(/^1/, '') || '';
+
+  // Email (ignorer les emails connus de Shawn)
+  const emailRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
+  const allEmails = [...full.matchAll(emailRe)].map(m => m[1].toLowerCase())
+    .filter(e => !e.includes('signaturesb') && !e.includes('remax') && !e.includes('centris') && !e.includes('noreply'));
+  const email = allEmails[0] || '';
+
+  // Numéro Centris
+  const centris = extract(
+    /(?:centris|mls|inscription|listing)\s*[#no\.]*\s*:?\s*(\d{7,9})/i,
+    /\b(\d{8})\b/, // 8 chiffres = probablement Centris
+  );
+
+  // Adresse
+  const adresse = extract(
+    /(?:adresse|propriét[eé]|property|address|bien)\s*:?\s*([^\n\r:;|<>]{10,80})/i,
+    /\b(\d+[,\s]+(?:rue|avenue|boul\.?|chemin|ch\.|rang|route|rte|place|pl\.|cour|court|dr\.?|blvd)[^\n\r:;|<>]{5,60})/i,
+  );
+
+  // Type de propriété
+  let type = 'terrain';
+  const typeText = full.toLowerCase();
+  if (/maison|unifamili|résidenti|bungalow|cottage|chalet/i.test(typeText))  type = 'maison_usagee';
+  else if (/plex|duplex|triplex|quadruplex|multilogement/i.test(typeText))   type = 'plex';
+  else if (/construction\s+neuve|neuve?|new\s+build/i.test(typeText))        type = 'construction_neuve';
+  else if (/terrain|lot\b|land/i.test(typeText))                             type = 'terrain';
+
+  return { nom, telephone, email, centris, adresse, type };
+}
+
+async function traiterNouveauLead(lead, msgId, from, subject, source) {
+  const { nom, telephone, email, centris, adresse, type } = lead;
+  log('OK', 'POLLER', `Lead ${source.label}: ${nom || email || telephone} | Centris: ${centris || '?'}`);
+
+  // 1. Créer deal Pipedrive
+  let dealTxt = '';
+  let dealId  = null;
+  if (PD_KEY) {
+    try {
+      const noteBase = [
+        `Lead ${source.label} reçu le ${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}`,
+        adresse ? `Propriété: ${adresse}` : '',
+        centris ? `Centris: #${centris}` : '',
+        `Email source: ${from}`,
+        `Sujet: ${subject}`,
+      ].filter(Boolean).join('\n');
+
+      dealTxt = await creerDeal({
+        prenom: nom?.split(' ')[0] || nom || '',
+        nom:    nom?.split(' ').slice(1).join(' ') || '',
+        telephone, email, type, source: source.source, centris,
+        note: noteBase,
+      });
+
+      // Récupérer l'ID du deal créé
+      const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nom || email || telephone)}&limit=1`);
+      dealId = sr?.data?.items?.[0]?.item?.id;
+    } catch (e) { dealTxt = `⚠️ Deal: ${e.message.substring(0, 80)}`; }
+  }
+
+  // 2. Chercher les docs Dropbox et préparer J+0
+  let docsTxt   = '';
+  let j0Brouillon = null;
+
+  // Trouver le dossier listing
+  if (centris || adresse) {
+    const searchTerm = centris || (adresse?.split(',')[0]?.trim()) || '';
+    if (searchTerm) {
+      try {
+        const docsInfo = await chercherListingDropbox(searchTerm);
+        if (!docsInfo.includes('Aucun')) docsTxt = `📁 Docs trouvés: ${docsInfo.substring(0, 150)}`;
+      } catch {}
+    }
+  }
+
+  // Préparer brouillon J+0
+  const prospectNom   = nom || (email?.split('@')[0]) || 'Madame/Monsieur';
+  const typeLabel     = { terrain:'terrain', maison_usagee:'propriété', plex:'plex', construction_neuve:'construction neuve' }[type] || 'propriété';
+  const j0Texte = `Bonjour,\n\nMerci de votre intérêt${centris ? ` pour la propriété Centris #${centris}` : adresse ? ` pour la propriété au ${adresse}` : ''}.\n\nJ'aimerais vous contacter pour vous donner plus d'informations et répondre à vos questions. Quand seriez-vous disponible pour qu'on se parle?\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+
+  // Si email dispo → stocker brouillon (Shawn dit "envoie")
+  if (email) {
+    const sujetJ0 = centris
+      ? `Centris #${centris} — ${AGENT.compagnie}`
+      : `Votre demande — ${AGENT.compagnie}`;
+    j0Brouillon = { to: email, toName: prospectNom, sujet: sujetJ0, texte: j0Texte };
+    pendingEmails.set(ALLOWED_ID, j0Brouillon);
+  }
+
+  // 3. Notifier Shawn immédiatement
+  if (!ALLOWED_ID) return;
+  let msg = `🔔 *Nouveau lead ${source.label}!*\n\n`;
+  if (nom)       msg += `👤 *${nom}*\n`;
+  if (telephone) msg += `📞 ${telephone}\n`;
+  if (email)     msg += `✉️ ${email}\n`;
+  if (adresse)   msg += `📍 ${adresse}\n`;
+  if (centris)   msg += `🏡 Centris #${centris}\n`;
+  msg += `\n${dealTxt || '⚠️ Pipedrive non configuré'}\n`;
+  if (docsTxt) msg += `\n${docsTxt}\n`;
+  if (j0Brouillon) {
+    msg += `\n📧 *Brouillon J+0 prêt* — dis *"envoie"* pour l'envoyer à ${email}`;
+  } else if (!email) {
+    msg += `\n⚠️ Pas d'email — appelle directement: ${telephone || '(non fourni)'}`;
+  }
+
+  await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' }).catch(e => {
+    log('WARN', 'POLLER', `Telegram notify: ${e.message}`);
+    bot.sendMessage(ALLOWED_ID, msg.replace(/\*/g, '').replace(/_/g, '')).catch(() => {});
+  });
+}
+
+async function runGmailLeadPoller() {
+  try {
+    const token = await getGmailToken();
+    if (!token) return; // Gmail pas configuré ou token fail
+
+    // Construire les queries: chercher leads non lus des dernières 24h max
+    const since = gmailPollerState.lastRun
+      ? Math.max(1, Math.ceil((Date.now() - new Date(gmailPollerState.lastRun).getTime()) / 60000) + 1) + 'm'
+      : '6h'; // Au boot: regarder 6h en arrière
+
+    const queries = [
+      `is:unread newer_than:${since} (from:centris OR from:remax) NOT from:shawn@signaturesb.com`,
+      `is:unread newer_than:${since} subject:(demande OR lead OR prospect OR information OR visite) NOT from:shawn@signaturesb.com NOT from:noreply NOT from:no-reply`,
+    ];
+
+    let newLeads = 0;
+    const processedThisRun = new Set();
+
+    for (const q of queries) {
+      let list;
+      try {
+        list = await gmailAPI(`/messages?maxResults=15&q=${encodeURIComponent(q)}`);
+      } catch (e) { log('WARN', 'POLLER', `Query fail: ${e.message}`); continue; }
+      if (!list?.messages?.length) continue;
+
+      for (const msgRef of list.messages) {
+        const id = msgRef.id;
+        if (gmailPollerState.processed.includes(id) || processedThisRun.has(id)) continue;
+        processedThisRun.add(id);
+
+        try {
+          const full = await gmailAPI(`/messages/${id}?format=full`);
+          const hdrs = full.payload?.headers || [];
+          const get  = n => hdrs.find(h => h.name.toLowerCase() === n)?.value || '';
+          const from    = get('from');
+          const subject = get('subject');
+          const body    = gmailExtractBody(full.payload);
+
+          // Ignorer les emails de Shawn lui-même
+          if (from.includes(AGENT.email) || from.includes('shawnbarrette@icloud')) {
+            gmailPollerState.processed.push(id); continue;
+          }
+
+          const source = detectLeadSource(from, subject);
+          if (!source) { gmailPollerState.processed.push(id); continue; }
+
+          const lead = parseLeadEmail(body, subject, from);
+          // Ignorer si vraiment aucune info exploitable
+          if (!lead.nom && !lead.email && !lead.telephone && !lead.centris) {
+            gmailPollerState.processed.push(id); continue;
+          }
+
+          await traiterNouveauLead(lead, id, from, subject, source);
+          gmailPollerState.processed.push(id);
+          gmailPollerState.totalLeads = (gmailPollerState.totalLeads || 0) + 1;
+          newLeads++;
+          await new Promise(r => setTimeout(r, 1500)); // pause entre leads
+        } catch (e) {
+          log('WARN', 'POLLER', `msg ${id}: ${e.message}`);
+          gmailPollerState.processed.push(id); // marquer pour ne pas réessayer
+        }
+      }
+    }
+
+    // Garder max 500 IDs processed (FIFO)
+    if (gmailPollerState.processed.length > 500) {
+      gmailPollerState.processed = gmailPollerState.processed.slice(-500);
+    }
+    gmailPollerState.lastRun = new Date().toISOString();
+    saveJSON(POLLER_FILE, gmailPollerState);
+
+    if (newLeads > 0) log('OK', 'POLLER', `${newLeads} lead(s) traité(s) | Total: ${gmailPollerState.totalLeads}`);
+  } catch (e) {
+    log('WARN', 'POLLER', `Erreur générale: ${e.message}`);
+  }
+}
+
 // ─── Démarrage séquentiel ─────────────────────────────────────────────────────
 async function main() {
   // Refresh Dropbox proactif — évite les erreurs 401 au démarrage
@@ -2713,9 +2971,20 @@ async function main() {
     await loadDropboxStructure().catch(e => log('WARN', 'DROPBOX', `Refresh structure: ${e.message}`));
   }, 30 * 60 * 1000);
 
+  // ── Gmail Lead Poller — surveille les leads entrants ──────────────────────
+  if (process.env.GMAIL_CLIENT_ID) {
+    // Boot: scan les 6 dernières heures en arrière
+    setTimeout(() => runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`)), 8000);
+    // Polling toutes les 5 minutes
+    setInterval(() => runGmailLeadPoller().catch(() => {}), 5 * 60 * 1000);
+    log('OK', 'BOOT', 'Gmail Lead Poller activé (toutes les 5min)');
+  } else {
+    log('WARN', 'BOOT', 'Gmail Lead Poller désactivé — GMAIL_CLIENT_ID manquant');
+  }
+
   registerHandlers();
   startDailyTasks();
-  bot.startPolling({ interval: 3000, autoStart: true }); // 3s réduit CPU vs 1s
+  bot.startPolling({ interval: 3000, autoStart: true });
 
   server.listen(PORT);
   log('OK', 'BOOT', `Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
