@@ -13,13 +13,29 @@ const API_KEY     = process.env.ANTHROPIC_API_KEY;
 const PORT        = process.env.PORT || 3000;
 const GITHUB_USER = 'signaturesb';
 const PD_KEY      = process.env.PIPEDRIVE_API_KEY || '';
-let   currentModel = process.env.MODEL || 'claude-haiku-4-5';
+const BREVO_KEY   = process.env.BREVO_API_KEY || '';
+const SHAWN_EMAIL = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
+const JULIE_EMAIL = process.env.JULIE_EMAIL || 'julie@signaturesb.com';
+let   currentModel = process.env.MODEL || 'claude-opus-4-7';
+
+// Pipedrive custom field IDs (from .env.shared / Render)
+const PD_FIELD_TYPE     = process.env.PD_FIELD_TYPE     || 'd8961ad7b8b9bf9866befa49ff2afae58f9a888e';
+const PD_FIELD_SOURCE   = process.env.PD_FIELD_SOURCE   || 'df69049da6f662bee6a3211068b993f6e465da71';
+const PD_FIELD_CENTRIS  = process.env.PD_FIELD_CENTRIS  || '22d305edf31135fc455a032e81582b98afc80104';
+const PD_FIELD_SEQ      = process.env.PD_FIELD_SEQUENCE || '17a20076566919bff80b59f06866251ed250fcab';
+const PD_FIELD_SUIVI_J1 = process.env.PD_FIELD_SUIVI_J1 || 'f4d00fafcf7b73ff51fdc767049b3cbd939fc0de';
+const PD_FIELD_SUIVI_J3 = process.env.PD_FIELD_SUIVI_J3 || 'a5ec34bcc22f2e82d2f528a88104c61c860e303e';
+const PD_FIELD_SUIVI_J7 = process.env.PD_FIELD_SUIVI_J7 || '1d2861c540b698fce3e5638112d0af51d000d648';
+const PD_TYPE_MAP = { terrain: 37, construction_neuve: 38, maison_neuve: 39, maison_usagee: 40, plex: 41, auto_construction: 37 };
 
 if (!BOT_TOKEN) { console.error('❌ TELEGRAM_BOT_TOKEN manquant'); process.exit(1); }
 if (!API_KEY)   { console.error('❌ ANTHROPIC_API_KEY manquant');  process.exit(1); }
-if (!PD_KEY)    { console.warn('⚠️  PIPEDRIVE_API_KEY absent — outils Pipedrive désactivés'); }
+if (!PD_KEY)    { console.warn('⚠️  PIPEDRIVE_API_KEY absent'); }
+if (!BREVO_KEY) { console.warn('⚠️  BREVO_API_KEY absent'); }
+if (!process.env.GMAIL_CLIENT_ID)  { console.warn('⚠️  GMAIL_CLIENT_ID absent — Gmail désactivé'); }
+if (!process.env.OPENAI_API_KEY)   { console.warn('⚠️  OPENAI_API_KEY absent — Whisper désactivé'); }
 
-// ─── Logging structuré ────────────────────────────────────────────────────────
+// ─── Logging ──────────────────────────────────────────────────────────────────
 function log(niveau, cat, msg) {
   const ts  = new Date().toLocaleTimeString('fr-CA', { hour12: false });
   const ico = { INFO:'📋', OK:'✅', WARN:'⚠️ ', ERR:'❌', IN:'📥', OUT:'📤' }[niveau] || '•';
@@ -32,7 +48,7 @@ process.stderr.on('error', e => { if (e.code !== 'EPIPE') console.error(e); });
 process.on('uncaughtException', err => {
   if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) return;
   log('ERR', 'CRASH', `uncaughtException: ${err.message}`);
-  if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `⚠️ Erreur interne: ${err.message.substring(0, 200)}`).catch(() => {});
+  if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `⚠️ Erreur: ${err.message.substring(0, 200)}`).catch(() => {});
 });
 process.on('unhandledRejection', reason => {
   const msg = reason instanceof Error ? reason.message : String(reason);
@@ -40,11 +56,12 @@ process.on('unhandledRejection', reason => {
   log('ERR', 'CRASH', `unhandledRejection: ${msg}`);
 });
 
-// ─── Persistance locale ────────────────────────────────────────────────────────
+// ─── Persistance ──────────────────────────────────────────────────────────────
 const DATA_DIR     = fs.existsSync('/data') ? '/data' : '/tmp';
 const HIST_FILE    = path.join(DATA_DIR, 'history.json');
 const MEM_FILE     = path.join(DATA_DIR, 'memory.json');
 const GIST_ID_FILE = path.join(DATA_DIR, 'gist_id.txt');
+const VISITES_FILE = path.join(DATA_DIR, 'visites.json');
 
 function loadJSON(file, fallback) {
   try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -58,139 +75,194 @@ function saveJSON(file, data) {
 
 // ─── Clients ──────────────────────────────────────────────────────────────────
 const claude = new Anthropic({ apiKey: API_KEY });
-const bot    = new TelegramBot(BOT_TOKEN, { polling: false }); // démarré après init
+const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ─── Mémoire persistante (faits durables) ─────────────────────────────────────
+// ─── Brouillons email en attente d'approbation ────────────────────────────────
+const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
+
+// ─── Mémoire persistante ──────────────────────────────────────────────────────
 const kiramem = loadJSON(MEM_FILE, { facts: [], updatedAt: null });
 if (!Array.isArray(kiramem.facts)) kiramem.facts = [];
 
 function buildMemoryBlock() {
   if (!kiramem.facts.length) return '';
-  return `\n\n📝 Mémoire persistante (faits importants à retenir):\n${kiramem.facts.map(f => `- ${f}`).join('\n')}`;
+  return `\n\n📝 Mémoire persistante:\n${kiramem.facts.map(f => `- ${f}`).join('\n')}`;
 }
 
-// ─── System prompt riche ──────────────────────────────────────────────────────
+// ─── System prompt ────────────────────────────────────────────────────────────
 const SYSTEM_BASE = `Tu es l'assistant IA personnel de Shawn Barrette, courtier immobilier RE/MAX Prestige Rawdon.
-Tu n'es PAS un bot à commandes. Tu es son bras droit virtuel, toujours disponible.
+Tu es son bras droit stratégique ET opérateur business — pas juste un assistant.
 
-═══ IDENTITÉ DE SHAWN ═══
-- Shawn Barrette | 514-927-1340 | shawn@signaturesb.com | signatureSB.com
-- Assistante: Julie (julie@signaturesb.com)
-- Bureau: RE/MAX PRESTIGE Rawdon
-- Spécialités: terrains (Rawdon/Saint-Julienne/Chertsey/Saint-Didace/Saint-Jean-de-Matha), maisons usagées, plexs, construction neuve
-- Partenaire construction: ProFab — Jordan Brouillette 514-291-3018 (0$ comptant via Desjardins, programme unique)
-- Vend 2-3 terrains par semaine dans Lanaudière
-- Prix terrains: 180-240$/pi² clé en main
+════ IDENTITÉ SHAWN ════
+• Shawn Barrette | 514-927-1340 | shawn@signaturesb.com | signatureSB.com
+• Assistante: Julie (julie@signaturesb.com) | Bureau: RE/MAX PRESTIGE Rawdon
+• Spécialités: terrains (Rawdon/Saint-Julienne/Chertsey/Saint-Didace/Saint-Jean-de-Matha), maisons usagées, plexs, construction neuve
+• Partenaire construction: ProFab — Jordan Brouillette 514-291-3018 (0$ comptant via Desjardins — programme unique, aucun autre courtier offre ça)
+• Vend 2-3 terrains/semaine dans Lanaudière | Prix: 180-240$/pi² clé en main (nivelé, services, accès)
 
-═══ PIPELINE PIPEDRIVE (ID: 7) ═══
+════ PIPELINE PIPEDRIVE (ID: 7) ════
 49: Nouveau lead → 50: Contacté → 51: En discussion → 52: Visite prévue → 53: Visite faite → 54: Offre déposée → 55: Gagné
 
-═══ TON RÔLE ═══
-Tu comprends le québécois naturel, les raccourcis, les sous-entendus de Shawn.
-"ça marche pas avec lui" = marquer_perdu
-"c'est quoi mes hot leads" = voir_pipeline, focus étapes 51-53
-Tu anticipes: si Shawn dit "nouveau prospect: Marie 514-555-1234 terrain" tu proposes de créer le deal.
+Shawn en sous-entendus:
+• "ça marche pas avec lui" → marquer_perdu
+• "c'est quoi mes hot leads" → voir_pipeline, focus 51-53
+• "nouveau prospect: [info]" → créer_deal automatiquement
+• "relance [nom]" → chercher_prospect + voir_conversation + brouillon email
 
-Accès aux ressources de Shawn via tes outils:
-- GitHub (signaturesb): repos de code, scripts d'automatisation — lire ET écrire
-- Dropbox: documents de propriétés, terrains, fichiers clients — lire ET envoyer par Telegram
-- Pipedrive: CRM complet — pipeline, prospects, notes, marquer perdu
-- Contacts iPhone: exportés dans Dropbox (/Contacts/contacts.vcf) — chercher nom, tel, email avant tout suivi
-- Recherche web: stats marché, taux hypothécaires, réglementations Québec
+════ TES DEUX MODES ════
 
-Quand tu prépares un suivi ou un message pour un prospect:
-1. chercher_prospect dans Pipedrive (notes, étape, historique)
-2. chercher_contact dans iPhone (téléphone cell, email perso)
-3. Combiner les deux pour rédiger le message le plus personnalisé possible
-→ Si contact trouvé dans iPhone mais pas Pipedrive: mentionner qu'il n'est pas encore dans le CRM.
+MODE OPÉRATIONNEL (tâches, commandes): exécute vite, confirme en 1-2 phrases. "C'est fait ✅" pas "L'opération a été effectuée".
+MODE STRATÈGE (prospects, business): applique le framework ci-dessous.
 
-═══ STYLE DE RÉPONSE ═══
-- Court et direct: 1-3 phrases max pour confirmer une action
-- Langage naturel québécois, pas corporatif. "C'est fait ✅" pas "L'opération a été effectuée"
-- Tutoiement avec Shawn
-- Emojis légers: ✅ ❌ 📋 💬 🏡 — pas d'excès
-- Pour les résultats longs (pipeline, stats): inclus le contenu complet exactement comme retourné par l'outil
+════ FRAMEWORK COMMERCIAL SIGNATURE SB ════
 
-═══ VRAIS EMAILS DE SHAWN (analysés sur 100+ échanges réels) ═══
+Chaque interaction prospect suit ce schéma:
+1. COMPRENDRE → Vrai besoin? Niveau de sérieux? Où dans le processus?
+2. POSITIONNER → Clarifier, éliminer la confusion, installer l'expertise
+3. ORIENTER → Guider vers la décision logique, simplifier les choix
+4. FAIRE AVANCER → Toujours pousser vers UNE action: appel, visite, offre
 
-SUIVI PROSPECT — TEMPLATES SELON CONTEXTE:
-1. Relance générale: "Bonjour, j'espère que vous allez bien. J'ai plusieurs options en ce moment. Laissez-moi savoir si vous voulez qu'on en discute. Au plaisir!"
-2. Après visite: "Bonjour, j'espère que vous allez bien. Le terrain que vous avez regardé — est-ce qu'il vous intéresse toujours? Sinon je peux regarder ailleurs. Laissez-moi savoir. Au plaisir!"
-3. Qualification: "Juste pour que je cherche dans la bonne direction — c'est quoi votre délai idéal? Laissez-moi savoir. Au plaisir!"
-4. Suivi simple: "Bonjour, j'espère que vous allez bien. Je voulais savoir si vous aimeriez qu'on se parle cette semaine. Laissez-moi savoir. Au plaisir!"
-5. Relance sans réponse longue: "Bonjour, j'espère que vous allez bien. Si jamais vous voulez qu'on regarde d'autres options, je suis là. Laissez-moi savoir. Au plaisir!"
-6. Lendemain visite: "Salut, j'espère que vous allez bien. Je voulais savoir suite à la visite si jamais vous avez besoin d'autres informations ou si vous aimeriez faire une offre. Laissez-moi savoir. Au plaisir!"
-7. Relance 3e fois: "3e courriel, en attente d'un retour SVP de votre part."
+RÈGLE ABSOLUE: Chaque message = avancement. Jamais passif. Jamais flou. Toujours une prochaine étape.
 
-ENVOI SIMPLE DE DOCUMENTS:
-"Bonjour William, Voici les trois plans. Merci, au plaisir,"
-"Bonjour Dan, Voici le terrain que je te parlais, reviens-moi. Merci, au plaisir,"
+PSYCHOLOGIE CLIENT — Identifier rapidement:
+• acheteur chaud / tiède / froid
+• niveau de compréhension immobilier
+• émotionnel vs rationnel
+• capacité financière implicite
+→ Adapter le ton instantanément. Créer: clarté + confiance + urgence contrôlée.
 
-AVEC COLLÈGUES COURTIERS (tutoiement, court):
-"Salut j'espère que ça va bien avais-tu eu le temps de regarder ça? Laisse-moi savoir au plaisir!"
-"Dimanche 14h ?"
+SI LE CLIENT HÉSITE: clarifier → recadrer → avancer
+CLOSING: Enlever objections AVANT. Rendre la décision logique. Réduire la friction.
+Questions clés: "Qu'est-ce qui vous bloque concrètement?" / "Si tout fait du sens, on avance comment?"
 
-CONSEIL MARCHÉ (valeur + chiffre):
-"Le marché est très actif en ce moment — on est vraiment dans un gros momentum. Je vends présentement 2-3 terrains par semaine dans Lanaudière."
+════ FLUX EMAIL — PROCÉDURE OBLIGATOIRE ════
 
-CE QU'ON RETIENT:
-1. Jamais de formule longue — "Salut," ou "Bonjour," et c'est parti
-2. "Au plaisir!" ou "Merci, au plaisir," — toujours en fermeture
-3. "Laissez-moi savoir" / "Laisse-moi savoir" — son CTA préféré
-4. Chiffres concrets: "200 000 $", "60 000 pieds carrés", "2-3 terrains par semaine"
-5. Tutoiement avec collègues, vouvoiement avec prospects/clients
+Quand tu prépares un message pour un prospect:
+1. chercher_prospect → notes Pipedrive (historique, étape, date création)
+2. voir_conversation → historique Gmail des 30 derniers jours (reçus + envoyés)
+3. chercher_contact → iPhone si email/tel manquant
+4. Appeler envoyer_email avec le brouillon complet
+5. ⚠️ ATTENDRE confirmation de Shawn ("envoie", "parfait", "go", "oui") AVANT d'envoyer pour vrai
+   → L'outil envoyer_email stocke le brouillon et te le montre — il n'envoie PAS encore.
+   → confirmer_envoi envoie le brouillon stocké après approbation de Shawn.
 
-═══ RÈGLES EMAIL ═══
-- JAMAIS "Bonjour [Prénom]" — toujours "Bonjour," seulement
-- Vouvoiement strict dans tous les emails clients (sauf si Shawn a dicté avec "tu/t'as/toi")
-- Max 3 paragraphes courts
-- Chaque email = 1 info concrète de valeur
-- Terminer: "Au plaisir," ou "Merci, au plaisir"
-- NEVER modifier ce que Shawn a dicté — corriger fautes/ponctuation seulement
+════ STYLE EMAILS SHAWN ════
 
-═══ ARGUMENTS TERRAIN ═══
-- "Je vends 2-3 terrains par semaine dans Lanaudière — c'est le marché qui bouge le plus"
-- Prix clé en main: 180-240$/pi² (tout inclus: nivelé, services, accès)
-- ProFab (Jordan 514-291-3018): programme unique 0$ comptant via Desjardins — aucun autre courtier offre ça
-- Rawdon: 1h de Montréal, ski, randonnée, Lac Ouareau — qualité de vie exceptionnelle
+RÈGLES INVIOLABLES:
+• Commencer: "Bonjour," jamais "Bonjour [Prénom],"
+• Vouvoiement strict (sauf si Shawn dicte avec "tu")
+• Max 3 paragraphes courts — 1 info concrète de valeur
+• Fermer: "Au plaisir," ou "Merci, au plaisir"
+• CTA: "Laissez-moi savoir" — jamais de pression
 
-═══ OBJECTIONS ET RÉPONSES ═══
-- "Trop cher": "Le prix reflète le marché — les terrains Rawdon ont augmenté 40% en 3 ans. Attendre coûte plus cher."
-- "Je vais réfléchir": "Parfait, prenez le temps. Je vous réserve l'info si ça bouge."
-- "Pas de budget": "ProFab permet de commencer sans mise de fonds. Voulez-vous qu'on regarde?"
-- "J'ai vu moins cher": "C'est intéressant! Souvent les terrains moins chers ont une pente — excavation 30k-50k$ de plus. On peut analyser ensemble."
+TEMPLATES ÉPROUVÉS:
+• Envoi docs: "Bonjour, voici l'information concernant le terrain. N'hésitez pas si vous avez des questions. Au plaisir,"
+• J+1: "Bonjour, avez-vous eu la chance de regarder? Laissez-moi savoir si vous avez des questions. Au plaisir,"
+• J+3: "Bonjour, j'espère que vous allez bien. Je voulais prendre de vos nouvelles. Laissez-moi savoir. Au plaisir,"
+• J+7: "Bonjour, j'espère que vous allez bien. Si jamais vous voulez qu'on regarde d'autres options, je suis là. Laissez-moi savoir. Au plaisir,"
+• Après visite: "Bonjour, j'espère que vous allez bien. Suite à notre visite, avez-vous eu le temps de réfléchir? Laissez-moi savoir. Au plaisir,"
 
-═══ NOTES PIPEDRIVE — CE QU'IL FAUT CAPTURER ═══
-Après chaque contact: secteur voulu, type projet (auto-construction / clé en main), superficie, puits ou ville, délai, situation actuelle, raison si perdu, date re-contact.
-Ces notes permettent de closer si le prospect revient 6 mois plus tard.
+ARGUMENTS TERRAIN:
+• "2-3 terrains/semaine dans Lanaudière — marché le plus actif"
+• "180-240$/pi² clé en main — tout inclus: nivelé, services, accès"
+• "ProFab: 0$ comptant via Desjardins — programme unique, aucun autre courtier offre ça"
+• Rawdon: 1h de Montréal, ski, randonnée, Lac Ouareau — qualité de vie exceptionnelle
 
-═══ CONTEXTE JURIDIQUE QUÉBEC ═══
-TOUTES les lois, règlements, normes s'appliquent au QUÉBEC uniquement.
-- Lois: Code civil QC, Loi sur le courtage immobilier (OACIQ), LAU
-- Fosse septique: règlement Q-2, r.22 du Québec
-- Permis de construction: municipalité + MRC + province
-- Taxes: TPS + TVQ (pas TPS/TVH)
-Quand Shawn demande une info légale: toujours répondre avec les règles québécoises.
+OBJECTIONS:
+• "Trop cher" → "Le marché a augmenté 40% en 3 ans. Attendre coûte plus cher."
+• "Je réfléchis" → "Parfait, prenez le temps. Je vous réserve l'info si ça bouge."
+• "Pas de budget" → "ProFab: 0$ comptant via Desjardins. On peut regarder?"
+• "Moins cher ailleurs" → "Souvent pente + excavation 30k-50k$ de plus. On analyse?"
 
-═══ MÉMOIRE PERSISTANTE ═══
-Si Shawn te dit quelque chose d'important à retenir (préférence, projet, info, prospect important), mémorise-le avec: [MEMO: le fait à retenir]
-La mémoire survit aux redémarrages — utilise-la pour personnaliser les réponses.`;
+════ BRAS DROIT BUSINESS ════
+
+Tu identifies les patterns, proposes des optimisations, pousses Shawn à avancer:
+• Si tu vois des prospects sans suivi → "Tu as 3 prospects en J+3 sans relance. Je les prépare?"
+• Si deal stagné → "Jean est en visite faite depuis 5 jours. Je rédige une relance?"
+• Après chaque résultat → propose amélioration: "On pourrait automatiser ça pour tous les J+7"
+
+════ CONTEXTE JURIDIQUE QUÉBEC ════
+
+TOUJOURS règles québécoises: Code civil QC, OACIQ, LAU, TPS+TVQ (pas TVH), Q-2 r.22 fosse septique, MRC + municipalité pour permis.
+
+════ MAILING MASSE — CAMPAGNES BREVO ════
+
+Projet: ~/Documents/github/mailing-masse/ | Lancer: node launch.js
+Menu interactif → brouillon Brevo → lien preview → confirmation "ENVOYER"
+RÈGLE: toujours tester à shawn@signaturesb.com avant envoi masse
+
+MASTER TEMPLATE:
+• Fichier local: ~/Dropbox/Liste de contact/email_templates/master_template_signature_sb.html
+• Dropbox API path: /Liste de contact/email_templates/master_template_signature_sb.html
+• Brevo template ID 43 = version production (ce que le bot utilise pour les emails prospects)
+• Design: fond #0a0a0a, rouge #aa0721, texte #f5f5f7, sections fond #111111 border #1e1e1e
+• Logos: Signature SB base64 ~20KB (header) + RE/MAX base64 ~17KB (footer) — NE JAMAIS MODIFIER
+• Placeholders: {{ params.KEY }} remplacés à l'envoi | {{ contact.FIRSTNAME }} = Brevo le remplace
+• Params clés: TITRE_EMAIL, HERO_TITRE, INTRO_TEXTE, TABLEAU_STATS_HTML, CONTENU_STRATEGIE, CTA_TITRE, CTA_URL, CTA_BOUTON, DESINSCRIPTION_URL
+• Helpers HTML injectés dans INTRO_TEXTE/CONTENU_STRATEGIE: statsGrid([{v,l}]), tableau(titre,[{l,v,h}]), etape(n,titre,desc), p(txt), note(txt)
+
+LISTES BREVO:
+• L3: anciens clients | L4: Prospects (~284 contacts) | L5: Acheteurs (~75) | L6: réseau perso | L7: Vendeurs (~10) | L8: Entrepreneurs (104 — terrains)
+
+5 CAMPAGNES:
+
+[1] VENDEURS — mensuelle
+• Listes: 3,4,5,6,7 (TOUS ~1029 contacts) | Exclu: L8
+• Stratégie: tout propriétaire peut vendre → maximiser listings
+• Sujets: rotation 6 sujets (indice = (année×12+mois) % 6, déterministe)
+• Contenu: statsGrid prix médians + délai 14j + évaluation gratuite, mise en valeur, suivi
+• CTA: tel:5149271340
+
+[2] ACHETEURS — mensuelle
+• Listes: [5] | Exclu: [8]
+• Contenu: taux BdC live (série V80691335 — affiché 5 ans), taux effectif = affiché-1.65%, versements 450k-600k @ 5%MdF 25 ans
+• CTA: CALENDLY_APPEL
+
+[3] PROSPECTS — mensuelle
+• Listes: [4] | Exclu: [5,8]
+• But: nurture leads Centris/Facebook/site qui n'ont pas agi
+• CTA: tel:5149271340
+
+[4] TERRAINS — aux 14 jours
+• Listes: [8] — Entrepreneurs seulement
+• Source terrains: API terrainspretsaconstruire.com → cache 6h → fallback Dropbox /Terrain en ligne/
+• HTML terrains: fond #111, rouge #aa0721, lien vers terrainspretsaconstruire.com/carte
+• Avant envoi: email automatique à Julie pour confirmer liste (si terrain vendu → mettre à jour)
+• Highlight: 0$ comptant ProFab, exonération TPS premier acheteur, GCR garantie résidentielle
+
+[5] RÉFÉRENCEMENT — mensuelle
+• Listes: [3,6,7] | Exclu: [4,5,8] (~105 contacts)
+• But: activer réseau existant → bonus référence 500$-1000$ (transaction conclue)
+• CTA: tel:5149271340
+
+STATS LIVE (stats_fetcher.js):
+• BdC Valet API: bankofcanada.ca/valet/observations/V80691335/json?recent=1
+• Prix médians APCIQ: marche_data.json — Lanaudière 515 000 $, Rive-Nord 570 000 $
+• Versement: formule M = P×[r(1+r)^n]/[(1+r)^n-1], 5% MdF, 25 ans
+
+DROPBOX — STRUCTURE CLÉS:
+• /Terrain en ligne/ — dossiers terrains {adresse}_NoCentris_{num}
+• /Liste de contact/email_templates/ — master_template_signature_sb.html
+• /Contacts/contacts.vcf — contacts iPhone (ou /Contacts/contacts.csv, /contacts.vcf)
+• Dropbox Refresh: DROPBOX_APP_KEY + DROPBOX_APP_SECRET + DROPBOX_REFRESH_TOKEN dans Render
+
+════ MÉMOIRE ════
+Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]`;
 
 let dropboxStructure = '';
 
 function getSystem() {
-  const dbBlock = dropboxStructure ? `\n\nDropbox de Shawn (racine):\n${dropboxStructure}` : '';
+  const dbBlock = dropboxStructure ? `\n\nDropbox Shawn (racine):\n${dropboxStructure}` : '';
   return SYSTEM_BASE + dbBlock + buildMemoryBlock();
 }
 
-// ─── Historique (max 40 messages, persistant) ─────────────────────────────────
+// ─── Historique (40 messages max, persistant) ─────────────────────────────────
 const MAX_HIST = 40;
 const rawChats = loadJSON(HIST_FILE, {});
 const chats    = new Map(Object.entries(rawChats));
 for (const [id, hist] of chats.entries()) {
   if (!Array.isArray(hist) || hist.length === 0) chats.delete(id);
 }
-
 let saveTimer = null;
 function scheduleHistSave() {
   if (saveTimer) clearTimeout(saveTimer);
@@ -213,7 +285,7 @@ function isDuplicate(msgId) {
   return false;
 }
 
-// ─── Extraction de mémos ──────────────────────────────────────────────────────
+// ─── Extraction mémos ─────────────────────────────────────────────────────────
 function extractMemos(text) {
   const memos = [];
   const cleaned = text.replace(/\[MEMO:\s*([^\]]+)\]/gi, (_, fact) => { memos.push(fact.trim()); return ''; }).trim();
@@ -234,7 +306,6 @@ function githubHeaders() {
   if (process.env.GITHUB_TOKEN) h['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
   return h;
 }
-
 async function listGitHubRepos() {
   const url = process.env.GITHUB_TOKEN
     ? `https://api.github.com/user/repos?per_page=50&sort=updated`
@@ -244,16 +315,15 @@ async function listGitHubRepos() {
   const data = await res.json();
   return data.map(r => `${r.private ? '🔒' : '🌐'} ${r.name}${r.description ? ' — ' + r.description : ''}`).join('\n');
 }
-
 async function listGitHubFiles(repo, filePath) {
   const p = (filePath || '').replace(/^\//, '');
-  const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`, { headers: githubHeaders() });
+  const url = `https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`;
+  const res = await fetch(url, { headers: githubHeaders() });
   if (!res.ok) return `Erreur GitHub: ${res.status} — repo "${repo}", path "${filePath}"`;
   const data = await res.json();
   if (Array.isArray(data)) return data.map(f => `${f.type === 'dir' ? '📁' : '📄'} ${f.name}`).join('\n');
   return JSON.stringify(data).substring(0, 2000);
 }
-
 async function readGitHubFile(repo, filePath) {
   const p = filePath.replace(/^\//, '');
   const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`, { headers: githubHeaders() });
@@ -265,7 +335,6 @@ async function readGitHubFile(repo, filePath) {
   }
   return 'Fichier non textuel ou trop volumineux';
 }
-
 async function writeGitHubFile(repo, filePath, content, commitMsg) {
   if (!process.env.GITHUB_TOKEN) return 'Erreur: GITHUB_TOKEN manquant';
   const p = filePath.replace(/^\//, '');
@@ -277,49 +346,56 @@ async function writeGitHubFile(repo, filePath, content, commitMsg) {
   const putRes = await fetch(url, {
     method: 'PUT',
     headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      message: commitMsg || `Kira: mise à jour ${p}`,
-      content: Buffer.from(content, 'utf8').toString('base64'),
-      ...(sha ? { sha } : {})
-    })
+    body: JSON.stringify({ message: commitMsg || `Kira: mise à jour ${p}`, content: Buffer.from(content, 'utf8').toString('base64'), ...(sha ? { sha } : {}) })
   });
-  if (!putRes.ok) {
-    const err = await putRes.json().catch(() => ({}));
-    return `Erreur GitHub écriture: ${putRes.status} — ${err.message || ''}`;
-  }
+  if (!putRes.ok) { const err = await putRes.json().catch(() => ({})); return `Erreur GitHub écriture: ${putRes.status} — ${err.message || ''}`; }
   return `✅ "${p}" ${sha ? 'modifié' : 'créé'} dans ${repo}.`;
 }
 
-// ─── Dropbox (avec refresh auto) ──────────────────────────────────────────────
+// ─── Dropbox (avec refresh auto) ─────────────────────────────────────────────
 let dropboxToken = process.env.DROPBOX_ACCESS_TOKEN || '';
-
 async function refreshDropboxToken() {
   const { DROPBOX_APP_KEY: key, DROPBOX_APP_SECRET: secret, DROPBOX_REFRESH_TOKEN: refresh } = process.env;
-  if (!key || !secret || !refresh) return false;
+  if (!key || !secret || !refresh) {
+    log('WARN', 'DROPBOX', `Refresh impossible — vars manquantes: ${!key?'APP_KEY ':''} ${!secret?'APP_SECRET ':''} ${!refresh?'REFRESH_TOKEN':''}`);
+    return false;
+  }
   try {
     const res = await fetch('https://api.dropbox.com/oauth2/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refresh, client_id: key, client_secret: secret })
     });
-    if (!res.ok) return false;
+    if (!res.ok) {
+      const err = await res.text().catch(() => res.status);
+      log('ERR', 'DROPBOX', `Refresh HTTP ${res.status}: ${String(err).substring(0, 100)}`);
+      return false;
+    }
     const data = await res.json();
+    if (!data.access_token) { log('ERR', 'DROPBOX', `Refresh: pas de access_token — ${JSON.stringify(data).substring(0,100)}`); return false; }
     dropboxToken = data.access_token;
-    log('OK', 'DROPBOX', 'Token rafraîchi');
+    log('OK', 'DROPBOX', 'Token rafraîchi ✓');
     return true;
-  } catch { return false; }
+  } catch (e) { log('ERR', 'DROPBOX', `Refresh exception: ${e.message}`); return false; }
 }
-
 async function dropboxAPI(apiUrl, body, isDownload = false) {
-  if (!dropboxToken) { const ok = await refreshDropboxToken(); if (!ok) return null; }
+  if (!dropboxToken) {
+    log('WARN', 'DROPBOX', 'Token absent — tentative refresh...');
+    const ok = await refreshDropboxToken();
+    if (!ok) { log('ERR', 'DROPBOX', 'Refresh échoué — Dropbox inaccessible'); return null; }
+  }
   const makeReq = (token) => isDownload
     ? fetch(apiUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify(body) } })
     : fetch(apiUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   let res = await makeReq(dropboxToken);
-  if (res.status === 401) { const ok = await refreshDropboxToken(); if (!ok) return null; res = await makeReq(dropboxToken); }
+  if (res.status === 401) {
+    log('WARN', 'DROPBOX', 'Token expiré — refresh...');
+    const ok = await refreshDropboxToken();
+    if (!ok) { log('ERR', 'DROPBOX', 'Re-refresh échoué'); return null; }
+    res = await makeReq(dropboxToken);
+  }
   return res;
 }
-
 async function listDropboxFolder(folderPath) {
   const p = folderPath === '' ? '' : ('/' + folderPath.replace(/^\//, ''));
   const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: p, recursive: false });
@@ -328,7 +404,6 @@ async function listDropboxFolder(folderPath) {
   if (!data.entries?.length) return 'Dossier vide';
   return data.entries.map(e => `${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
 }
-
 async function readDropboxFile(filePath) {
   const p = '/' + filePath.replace(/^\//, '');
   const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
@@ -336,7 +411,6 @@ async function readDropboxFile(filePath) {
   const text = await res.text();
   return text.length > 8000 ? text.substring(0, 8000) + '\n...[tronqué]' : text;
 }
-
 async function downloadDropboxFile(filePath) {
   const p = '/' + filePath.replace(/^\//, '');
   const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
@@ -345,7 +419,6 @@ async function downloadDropboxFile(filePath) {
   const filename = p.split('/').pop();
   return { buffer, filename };
 }
-
 async function loadDropboxStructure() {
   try {
     const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
@@ -357,9 +430,8 @@ async function loadDropboxStructure() {
   } catch (e) { log('WARN', 'DROPBOX', e.message); }
 }
 
-// ─── Mémoire GitHub Gist (persistance cross-restart) ─────────────────────────
+// ─── GitHub Gist (persistance mémoire cross-restart) ─────────────────────────
 let gistId = process.env.GIST_ID || null;
-
 async function initGistId() {
   if (gistId) { log('OK', 'GIST', `Configuré: ${gistId}`); return; }
   if (fs.existsSync(GIST_ID_FILE)) { gistId = fs.readFileSync(GIST_ID_FILE, 'utf8').trim(); return; }
@@ -368,17 +440,9 @@ async function initGistId() {
     const res = await fetch('https://api.github.com/gists', {
       method: 'POST',
       headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        description: 'Kira — mémoire persistante Shawn Barrette',
-        public: false,
-        files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } }
-      })
+      body: JSON.stringify({ description: 'Kira — mémoire persistante Shawn Barrette', public: false, files: { 'memory.json': { content: JSON.stringify(kiramem, null, 2) } } })
     });
-    if (!res.ok) {
-      if (res.status === 403 || res.status === 422) log('WARN', 'GIST', 'Token sans scope "gist" — ajoute le scope dans GitHub Settings > Tokens');
-      else log('WARN', 'GIST', `Create HTTP ${res.status}`);
-      return;
-    }
+    if (!res.ok) { log('WARN', 'GIST', `Create HTTP ${res.status}`); return; }
     const data = await res.json();
     gistId = data.id;
     try { fs.writeFileSync(GIST_ID_FILE, gistId, 'utf8'); } catch {}
@@ -386,7 +450,6 @@ async function initGistId() {
     if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🔑 *Gist créé!* Ajoute dans Render: \`GIST_ID=${gistId}\``, { parse_mode: 'Markdown' }).catch(() => {});
   } catch (e) { log('WARN', 'GIST', `Create: ${e.message}`); }
 }
-
 async function loadMemoryFromGist() {
   if (!gistId || !process.env.GITHUB_TOKEN) return;
   try {
@@ -404,7 +467,6 @@ async function loadMemoryFromGist() {
     }
   } catch (e) { log('WARN', 'GIST', `Load: ${e.message}`); }
 }
-
 async function saveMemoryToGist() {
   if (!gistId || !process.env.GITHUB_TOKEN) return;
   try {
@@ -418,35 +480,41 @@ async function saveMemoryToGist() {
 }
 
 // ─── Pipedrive ────────────────────────────────────────────────────────────────
-const PD_BASE  = 'https://api.pipedrive.com/v1';
+const PD_BASE   = 'https://api.pipedrive.com/v1';
 const PD_STAGES = { 49:'🆕 Nouveau lead', 50:'📞 Contacté', 51:'💬 En discussion', 52:'🗓 Visite prévue', 53:'🏡 Visite faite', 54:'📝 Offre déposée', 55:'✅ Gagné' };
 
 async function pdGet(endpoint) {
   if (!PD_KEY) return null;
   const sep = endpoint.includes('?') ? '&' : '?';
-  const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${PD_KEY}`, { signal: AbortSignal.timeout(8000) });
-  if (!res.ok) return null;
-  return res.json();
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${PD_KEY}`, { signal: controller.signal });
+    if (!res.ok) return null;
+    return res.json();
+  } finally { clearTimeout(t); }
 }
-
 async function pdPost(endpoint, body) {
   if (!PD_KEY) return null;
   const sep = endpoint.includes('?') ? '&' : '?';
-  const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${PD_KEY}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000)
-  });
-  if (!res.ok) return null;
-  return res.json();
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${PD_KEY}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal });
+    if (!res.ok) return null;
+    return res.json();
+  } finally { clearTimeout(t); }
 }
-
 async function pdPut(endpoint, body) {
   if (!PD_KEY) return null;
   const sep = endpoint.includes('?') ? '&' : '?';
-  const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${PD_KEY}`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000)
-  });
-  if (!res.ok) return null;
-  return res.json();
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${PD_KEY}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal });
+    if (!res.ok) return null;
+    return res.json();
+  } finally { clearTimeout(t); }
 }
 
 async function getPipeline() {
@@ -474,18 +542,15 @@ async function chercherProspect(terme) {
   const searchRes = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=5`);
   const deals = searchRes?.data?.items || [];
   if (!deals.length) return `Aucun deal trouvé pour "${terme}" dans Pipedrive.`;
-
   const deal = deals[0].item;
   const stageLabel = PD_STAGES[deal.stage_id] || `Étape ${deal.stage_id}`;
-  let info = `═══ PROSPECT: ${deal.title || terme} ═══\n`;
-  info += `Stade: ${stageLabel}\n`;
+  let info = `═══ PROSPECT: ${deal.title || terme} ═══\nDeal ID: ${deal.id}\nStade: ${stageLabel}\n`;
   if (deal.person_name) info += `Contact: ${deal.person_name}\n`;
-
-  // Notes Pipedrive
+  const created = deal.add_time ? new Date(deal.add_time).toLocaleDateString('fr-CA') : '?';
+  info += `Créé: ${created}\n`;
   const notes = await pdGet(`/notes?deal_id=${deal.id}&limit=5`);
   const notesList = (notes?.data || []).filter(n => n.content?.trim()).map(n => `• ${n.content.trim().substring(0, 300)}`);
   if (notesList.length) info += `\nNotes:\n${notesList.join('\n')}\n`;
-
   return info;
 }
 
@@ -540,51 +605,310 @@ async function statsBusiness() {
   return txt;
 }
 
-// ─── Contacts iPhone (Dropbox: /Contacts/contacts.vcf ou contacts.csv) ──────
+async function creerDeal({ prenom, nom, telephone, email, type, source, centris, note }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const fullName = [prenom, nom].filter(Boolean).join(' ');
+  const titre = fullName || prenom || 'Nouveau prospect';
+
+  // 1. Créer/mettre à jour la personne
+  let personId = null;
+  try {
+    const personBody = { name: fullName || prenom };
+    if (telephone) personBody.phone = [{ value: telephone.replace(/\D/g, ''), primary: true }];
+    if (email)     personBody.email = [{ value: email, primary: true }];
+    const personRes = await pdPost('/persons', personBody);
+    personId = personRes?.data?.id || null;
+  } catch {}
+
+  // 2. Créer le deal
+  const typeOpt = PD_TYPE_MAP[type] || PD_TYPE_MAP.maison_usagee;
+  const dealBody = {
+    title:           titre,
+    stage_id:        49,
+    pipeline_id:     7,
+    [PD_FIELD_TYPE]: typeOpt,
+    [PD_FIELD_SEQ]:  42, // séquence active = Oui
+  };
+  if (personId)         dealBody.person_id          = personId;
+  if (centris)          dealBody[PD_FIELD_CENTRIS]   = centris;
+
+  const dealRes = await pdPost('/deals', dealBody);
+  const deal = dealRes?.data;
+  if (!deal?.id) return `❌ Erreur création deal Pipedrive.`;
+
+  // 3. Ajouter note si fournie
+  if (note) await pdPost('/notes', { deal_id: deal.id, content: note });
+
+  const typeLabel = { terrain: 'Terrain', maison_usagee: 'Maison usagée', maison_neuve: 'Maison neuve', construction_neuve: 'Construction neuve', auto_construction: 'Auto-construction', plex: 'Plex' }[type] || 'Propriété';
+  return `✅ Deal créé: *${titre}*\nType: ${typeLabel} | ID: ${deal.id}\nSéquence J+1/J+3/J+7 activée.`;
+}
+
+async function planifierVisite({ prospect, date, adresse }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  const searchRes = await pdGet(`/deals/search?term=${encodeURIComponent(prospect)}&limit=3`);
+  const deals = searchRes?.data?.items || [];
+  if (!deals.length) return `Aucun deal trouvé pour "${prospect}". Crée d'abord le deal.`;
+  const deal = deals[0].item;
+
+  // Parser la date — utilise ISO si fournie, sinon now+1jour
+  let rdvISO = date;
+  if (!date.includes('T') && !date.includes('-')) {
+    // Date naturelle — approximation simple
+    rdvISO = new Date(Date.now() + 86400000).toISOString();
+  }
+  const dateStr = rdvISO.split('T')[0];
+  const timeStr = rdvISO.includes('T') ? rdvISO.split('T')[1]?.substring(0, 5) : '14:00';
+
+  await Promise.all([
+    pdPut(`/deals/${deal.id}`, { stage_id: 52 }),
+    pdPost('/activities', { deal_id: deal.id, subject: `Visite — ${deal.title}${adresse ? ' @ ' + adresse : ''}`, type: 'meeting', due_date: dateStr, due_time: timeStr, duration: '01:00', done: 0 })
+  ]);
+
+  // Sauvegarder dans visites.json pour rappel matin
+  const visites = loadJSON(VISITES_FILE, []);
+  visites.push({ dealId: deal.id, nom: deal.title, date: rdvISO, adresse: adresse || '' });
+  saveJSON(VISITES_FILE, visites);
+
+  return `✅ Visite planifiée: *${deal.title}*\n📅 ${dateStr} à ${timeStr}${adresse ? '\n📍 ' + adresse : ''}\nDeal → Visite prévue ✓`;
+}
+
+// ─── Brevo ────────────────────────────────────────────────────────────────────
+const BREVO_LISTES = { prospects: 4, acheteurs: 5, vendeurs: 7 };
+
+async function ajouterBrevo({ email, prenom, nom, telephone, liste }) {
+  if (!BREVO_KEY) return '❌ BREVO_API_KEY absent';
+  if (!email) return '❌ Email requis pour Brevo';
+  const listeId = BREVO_LISTES[liste] || BREVO_LISTES.prospects;
+  const attributes = { FIRSTNAME: prenom || '', LASTNAME: nom || '' };
+  if (telephone) attributes.SMS = telephone.replace(/\D/g, '');
+  try {
+    const res = await fetch('https://api.brevo.com/v3/contacts', {
+      method: 'POST',
+      headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, updateEnabled: true, attributes, listIds: [listeId] })
+    });
+    if (!res.ok) { const err = await res.text(); return `❌ Brevo: ${err.substring(0, 200)}`; }
+    const listeNom = { 4: 'Prospects', 5: 'Acheteurs', 7: 'Vendeurs' }[listeId] || 'liste';
+    return `✅ ${prenom || email} ajouté à Brevo — liste ${listeNom}.`;
+  } catch (e) { return `❌ Brevo: ${e.message}`; }
+}
+
+async function envoyerEmailBrevo({ to, toName, subject, textContent, htmlContent }) {
+  if (!BREVO_KEY) return false;
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sender: { name: 'Signature SB — Kira', email: SHAWN_EMAIL }, to: [{ email: to, name: toName || to }], subject, textContent: textContent || '', htmlContent: htmlContent || textContent || '' })
+  });
+  return res.ok;
+}
+
+// ─── Gmail ────────────────────────────────────────────────────────────────────
+let gmailToken = null;
+let gmailTokenExp = 0;
+let gmailRefreshInProgress = null;
+
+async function getGmailToken() {
+  const { GMAIL_CLIENT_ID: cid, GMAIL_CLIENT_SECRET: csec, GMAIL_REFRESH_TOKEN: ref } = process.env;
+  if (!cid || !csec || !ref) return null;
+  if (gmailToken && Date.now() < gmailTokenExp - 60000) return gmailToken;
+  if (gmailRefreshInProgress) return gmailRefreshInProgress;
+  gmailRefreshInProgress = (async () => {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 10000);
+    try {
+      const res = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST', signal: controller.signal,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ client_id: cid, client_secret: csec, refresh_token: ref, grant_type: 'refresh_token' })
+      });
+      const data = await res.json();
+      if (!data.access_token) throw new Error(`Gmail token: ${JSON.stringify(data)}`);
+      gmailToken    = data.access_token;
+      gmailTokenExp = Date.now() + (data.expires_in || 3600) * 1000;
+      return gmailToken;
+    } finally { clearTimeout(t); gmailRefreshInProgress = null; }
+  })();
+  return gmailRefreshInProgress;
+}
+
+async function gmailAPI(endpoint, options = {}) {
+  const token = await getGmailToken();
+  if (!token) throw new Error('Gmail non configuré (GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN manquants)');
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me${endpoint}`, {
+      ...options, signal: controller.signal,
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
+    });
+    if (!res.ok) { const err = await res.text(); throw new Error(`Gmail ${endpoint}: ${err.substring(0, 200)}`); }
+    return res.json();
+  } finally { clearTimeout(t); }
+}
+
+function gmailDecodeBase64(str) {
+  try { return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'); } catch { return ''; }
+}
+
+function gmailExtractBody(payload) {
+  if (!payload) return '';
+  if (payload.mimeType === 'text/plain' && payload.body?.data) return gmailDecodeBase64(payload.body.data);
+  if (payload.parts) {
+    for (const part of payload.parts) {
+      if (part.mimeType === 'text/plain' && part.body?.data) return gmailDecodeBase64(part.body.data);
+    }
+  }
+  return payload.snippet || '';
+}
+
+async function voirEmailsRecents(depuis = '1d') {
+  try {
+    const q = `-from:signaturesb.com -from:shawnbarrette@icloud.com -from:noreply@ -from:no-reply@ -from:brevo -from:pipedrive -from:calendly in:inbox newer_than:${depuis}`;
+    const list = await gmailAPI(`/messages?maxResults=10&q=${encodeURIComponent(q)}`);
+    if (!list.messages?.length) return `Aucun email prospect dans les dernières ${depuis}.`;
+    const emails = await Promise.all(list.messages.slice(0, 6).map(async m => {
+      try {
+        const d = await gmailAPI(`/messages/${m.id}?format=full`);
+        const headers = d.payload?.headers || [];
+        const get = n => headers.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
+        return `📧 *De:* ${get('From')}\n*Objet:* ${get('Subject')}\n*Date:* ${get('Date')}\n_${d.snippet?.substring(0, 150) || ''}_`;
+      } catch { return null; }
+    }));
+    return `📬 *Emails prospects récents (${depuis}):*\n\n` + emails.filter(Boolean).join('\n\n---\n\n');
+  } catch (e) {
+    if (e.message.includes('non configuré')) return '⚠️ Gmail non configuré dans Render. Ajoute: GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN.';
+    return `Erreur Gmail: ${e.message}`;
+  }
+}
+
+async function voirConversation(terme) {
+  try {
+    const t = terme.includes('@') ? terme : (terme.includes(' ') ? `"${terme}"` : terme);
+    const [recu, envoye] = await Promise.all([
+      gmailAPI(`/messages?maxResults=4&q=${encodeURIComponent(`from:${t} newer_than:30d`)}`).catch(() => ({ messages: [] })),
+      gmailAPI(`/messages?maxResults=4&q=${encodeURIComponent(`to:${t} newer_than:30d in:sent`)}`).catch(() => ({ messages: [] }))
+    ]);
+    const ids = [
+      ...(recu.messages  || []).map(m => ({ id: m.id, sens: '📥 Reçu' })),
+      ...(envoye.messages || []).map(m => ({ id: m.id, sens: '📤 Envoyé' }))
+    ];
+    if (!ids.length) return `Aucun échange Gmail avec "${terme}" dans les 30 derniers jours.`;
+    const emails = await Promise.all(ids.slice(0, 5).map(async ({ id, sens }) => {
+      try {
+        const d = await gmailAPI(`/messages/${id}?format=full`);
+        const headers = d.payload?.headers || [];
+        const get = n => headers.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
+        const corps = gmailExtractBody(d.payload).substring(0, 600).trim();
+        const dateMs = parseInt(d.internalDate || '0');
+        return { sens, de: get('From'), sujet: get('Subject'), date: get('Date'), corps, dateMs };
+      } catch { return null; }
+    }));
+    const sorted = emails.filter(Boolean).sort((a, b) => b.dateMs - a.dateMs);
+    let result = `📧 *Conversation avec "${terme}" (30 derniers jours):*\n\n`;
+    for (const e of sorted) {
+      result += `${e.sens} | *${e.sujet}*\n${e.date}\n${e.corps ? `_${e.corps}_` : ''}\n\n`;
+    }
+    return result.trim();
+  } catch (e) {
+    if (e.message.includes('non configuré')) return '⚠️ Gmail non configuré dans Render.';
+    return `Erreur Gmail: ${e.message}`;
+  }
+}
+
+async function envoyerEmailGmail({ to, toName, sujet, texte }) {
+  const token = await getGmailToken();
+  if (!token) throw new Error('Gmail non configuré');
+
+  // Wrap texte en HTML simple
+  const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;">
+${texte.replace(/\n/g, '<br>')}
+<br><br>--<br>
+<strong>Shawn Barrette · RE/MAX Prestige</strong><br>
+📞 514-927-1340 · <a href="https://signatureSB.com">signatureSB.com</a>
+</body></html>`;
+
+  const boundary = `sb_${Date.now()}`;
+  const toHeader = toName ? `${toName} <${to}>` : to;
+  const encodeSubject = s => `=?UTF-8?B?${Buffer.from(s, 'utf-8').toString('base64')}?=`;
+
+  const lines = [
+    `From: Shawn Barrette · RE/MAX Prestige <${SHAWN_EMAIL}>`,
+    `To: ${toHeader}`,
+    `Bcc: ${SHAWN_EMAIL}`,
+    `Reply-To: ${SHAWN_EMAIL}`,
+    `Subject: ${encodeSubject(sujet)}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    '',
+    texte,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html, 'utf-8').toString('base64'),
+    `--${boundary}--`
+  ];
+
+  const raw = Buffer.from(lines.join('\r\n'), 'utf-8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  await gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
+}
+
+// ─── Whisper (voix → texte) ───────────────────────────────────────────────────
+async function transcrire(audioBuffer) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error('OPENAI_API_KEY non configuré dans Render');
+  if (audioBuffer.length > 24 * 1024 * 1024) throw new Error('Message vocal trop long (max ~15 min)');
+  const formData = new FormData();
+  formData.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'voice.ogg');
+  formData.append('model', 'whisper-1');
+  formData.append('language', 'fr');
+  formData.append('prompt', 'Immobilier québécois: Centris, Pipedrive, terrain, plex, courtier, ProFab, Desjardins, fosse septique, Rawdon, Saint-Julienne, Lanaudière, RE/MAX Prestige, offre d\'achat, TVQ.');
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 30000);
+  try {
+    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', signal: controller.signal, headers: { 'Authorization': `Bearer ${key}` }, body: formData });
+    if (!res.ok) { const err = await res.text(); throw new Error(`Whisper HTTP ${res.status}: ${err.substring(0, 150)}`); }
+    const data = await res.json();
+    return data.text?.trim() || null;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Transcription trop longue (timeout 30s)');
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
+// ─── Contacts iPhone (Dropbox /Contacts/contacts.vcf) ────────────────────────
 async function chercherContact(terme) {
-  // Essaie vCard d'abord, puis CSV
   const paths = ['/Contacts/contacts.vcf', '/Contacts/contacts.csv', '/contacts.vcf', '/contacts.csv'];
-  let raw = null;
-  let format = null;
+  let raw = null, format = null;
   for (const p of paths) {
     const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p }, true);
     if (res && res.ok) { raw = await res.text(); format = p.endsWith('.vcf') ? 'vcf' : 'csv'; break; }
   }
-  if (!raw) return '📵 Fichier contacts introuvable dans Dropbox.\nExporte tes contacts iPhone vers `/Contacts/contacts.vcf` via un Raccourci iOS.';
-
+  if (!raw) return '📵 Fichier contacts introuvable dans Dropbox.\nExporte tes contacts iPhone → `/Contacts/contacts.vcf` via un Raccourci iOS.';
   const q = terme.toLowerCase().replace(/\s+/g, ' ').trim();
   const results = [];
-
   if (format === 'vcf') {
-    // Découper en vcards individuelles
     const cards = raw.split(/BEGIN:VCARD/i).slice(1);
     for (const card of cards) {
-      const get = (field) => {
-        const m = card.match(new RegExp(`^${field}[^:]*:(.+)$`, 'mi'));
-        return m ? m[1].replace(/\r/g, '').trim() : '';
-      };
+      const get = (field) => { const m = card.match(new RegExp(`^${field}[^:]*:(.+)$`, 'mi')); return m ? m[1].replace(/\r/g, '').trim() : ''; };
       const name  = get('FN') || get('N').replace(/;/g, ' ').trim();
       const org   = get('ORG');
       const email = card.match(/^EMAIL[^:]*:(.+)$/mi)?.[1]?.replace(/\r/g, '').trim() || '';
       const phones = [...card.matchAll(/^TEL[^:]*:(.+)$/gmi)].map(m => m[1].replace(/\r/g, '').trim());
       const blob = [name, org, email, ...phones].join(' ').toLowerCase();
-      if (blob.includes(q) || q.split(' ').every(w => blob.includes(w))) {
-        results.push({ name, org, email, phones });
-        if (results.length >= 5) break;
-      }
+      if (blob.includes(q) || q.split(' ').every(w => blob.includes(w))) { results.push({ name, org, email, phones }); if (results.length >= 5) break; }
     }
   } else {
-    // CSV simple: Prénom,Nom,Téléphone,Email,Entreprise (ou variantes)
     const lines = raw.split('\n').filter(l => l.trim());
-    const header = lines[0].toLowerCase();
     for (const line of lines.slice(1)) {
-      if (line.toLowerCase().includes(q) || q.split(' ').every(w => line.toLowerCase().includes(w))) {
-        results.push({ raw: line.replace(/,/g, ' · ') });
-        if (results.length >= 5) break;
-      }
+      if (q.split(' ').every(w => line.toLowerCase().includes(w))) { results.push({ raw: line.replace(/,/g, ' · ') }); if (results.length >= 5) break; }
     }
   }
-
   if (!results.length) return `Aucun contact iPhone trouvé pour "${terme}".`;
   return results.map(c => {
     if (c.raw) return `📱 ${c.raw}`;
@@ -598,42 +922,36 @@ async function chercherContact(terme) {
 
 // ─── Recherche web ────────────────────────────────────────────────────────────
 async function rechercherWeb(requete) {
-  // Option 1: Perplexity
   if (process.env.PERPLEXITY_API_KEY) {
     try {
       const res = await fetch('https://api.perplexity.ai/chat/completions', {
-        method: 'POST', signal: AbortSignal.timeout(15000),
+        method: 'POST',
         headers: { 'Authorization': `Bearer ${process.env.PERPLEXITY_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: 'sonar', max_tokens: 500, messages: [
-          { role: 'system', content: 'Assistant de recherche pour courtier immobilier québécois. Réponds en français, priorise sources canadiennes (Centris, APCIQ, Desjardins, Banque du Canada). Chiffres précis, dates, sources.' },
+          { role: 'system', content: 'Assistant recherche courtier immobilier québécois. Réponds en français, sources canadiennes (Centris, APCIQ, Desjardins, BdC). Chiffres précis.' },
           { role: 'user', content: requete }
         ]})
       });
       if (res.ok) { const d = await res.json(); const t = d.choices?.[0]?.message?.content?.trim(); if (t) return `🔍 *${requete}*\n\n${t}`; }
     } catch {}
   }
-  // Option 2: Brave Search
   if (process.env.BRAVE_SEARCH_API_KEY) {
     try {
       const res = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(requete)}&count=5&country=ca&search_lang=fr`, {
-        signal: AbortSignal.timeout(10000), headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_SEARCH_API_KEY }
+        headers: { 'Accept': 'application/json', 'X-Subscription-Token': process.env.BRAVE_SEARCH_API_KEY }
       });
-      if (res.ok) { const d = await res.json(); const results = (d.web?.results || []).slice(0, 4); if (results.length) return `🔍 *${requete}*\n\n${results.map((r,i) => `${i+1}. **${r.title}**\n${r.description || ''}`).join('\n\n')}`; }
+      if (res.ok) { const d = await res.json(); const results = (d.web?.results || []).slice(0, 4); if (results.length) return `🔍 *${requete}*\n\n${results.map((r, i) => `${i+1}. **${r.title}**\n${r.description || ''}`).join('\n\n')}`; }
     } catch {}
   }
-  // Option 3: Claude + DuckDuckGo snippets
   try {
     let contexte = '';
-    const ddg = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(requete)}&format=json&no_html=1`, { signal: AbortSignal.timeout(6000), headers: { 'User-Agent': 'SignatureSB/1.0' } });
-    if (ddg.ok) {
-      const d = await ddg.json();
-      contexte = [d.AbstractText, ...(d.RelatedTopics || []).slice(0,3).map(t => t.Text || '')].filter(Boolean).join('\n');
-    }
+    const ddg = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(requete)}&format=json&no_html=1`, { headers: { 'User-Agent': 'SignatureSB/1.0' } });
+    if (ddg.ok) { const d = await ddg.json(); contexte = [d.AbstractText, ...(d.RelatedTopics || []).slice(0,3).map(t => t.Text || '')].filter(Boolean).join('\n'); }
     const prompt = contexte
-      ? `Synthétise pour un courtier immobilier QC: "${requete}"\nSources: ${contexte}\nRéponds en français, chiffres précis, règles QC.`
-      : `Réponds à cette question pour un courtier QC: "${requete}"\nRéponds en français, règles QC (OACIQ, Code civil, TPS+TVQ), chiffres concrets.`;
+      ? `Synthétise pour courtier immobilier QC: "${requete}"\nSources: ${contexte}\nRéponds en français, chiffres précis, règles QC.`
+      : `Réponds pour courtier QC: "${requete}"\nFrançais, règles QC (OACIQ, Code civil, TPS+TVQ), chiffres concrets.`;
     const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', signal: AbortSignal.timeout(20000),
+      method: 'POST',
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 500, messages: [{ role: 'user', content: prompt }] })
     });
@@ -645,45 +963,66 @@ async function rechercherWeb(requete) {
 // ─── Outils Claude ────────────────────────────────────────────────────────────
 const TOOLS = [
   // ── Pipedrive ──
-  { name: 'voir_pipeline', description: 'Voir tous les deals actifs dans Pipedrive par étape. Utiliser pour "mon pipeline", "mes deals", "mes hot leads", etc.', input_schema: { type: 'object', properties: {} } },
-  { name: 'chercher_prospect', description: 'Chercher un prospect dans Pipedrive par nom, email ou téléphone. Retourne ses infos et notes.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, email ou téléphone' } }, required: ['terme'] } },
-  { name: 'marquer_perdu', description: 'Marquer un deal comme perdu dans Pipedrive. Ex: "ça marche pas avec Jean", "cause perdue Tremblay".', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom/email/tel du prospect' } }, required: ['terme'] } },
-  { name: 'ajouter_note', description: 'Ajouter une note sur un prospect dans Pipedrive. Ex: "note sur Jean: préfère terrains boisés, rappeler en mai".', input_schema: { type: 'object', properties: { terme: { type: 'string' }, note: { type: 'string' } }, required: ['terme', 'note'] } },
-  { name: 'stats_business', description: 'Tableau de bord complet: pipeline par étape, performance du mois, taux de conversion. Pour "tableau de bord", "mes stats", "dashboard".', input_schema: { type: 'object', properties: {} } },
+  { name: 'voir_pipeline',      description: 'Voir tous les deals actifs dans Pipedrive par étape. Pour "mon pipeline", "mes deals", "mes hot leads".', input_schema: { type: 'object', properties: {} } },
+  { name: 'chercher_prospect',  description: 'Chercher un prospect dans Pipedrive. Retourne infos, stade, historique, notes. Utiliser AVANT de rédiger tout message.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, email ou téléphone' } }, required: ['terme'] } },
+  { name: 'marquer_perdu',      description: 'Marquer un deal comme perdu. Ex: "ça marche pas avec Jean", "cause perdue Tremblay".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
+  { name: 'ajouter_note',       description: 'Ajouter une note sur un prospect dans Pipedrive.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, note: { type: 'string' } }, required: ['terme', 'note'] } },
+  { name: 'stats_business',     description: 'Tableau de bord: pipeline par étape, performance du mois, taux de conversion.', input_schema: { type: 'object', properties: {} } },
+  { name: 'créer_deal',         description: 'Créer un nouveau prospect/deal dans Pipedrive. Utiliser quand Shawn dit "nouveau prospect: [info]" ou reçoit un lead.', input_schema: { type: 'object', properties: { prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, email: { type: 'string' }, type: { type: 'string', description: 'terrain, maison_usagee, maison_neuve, construction_neuve, auto_construction, plex' }, source: { type: 'string', description: 'centris, facebook, site_web, reference, appel' }, centris: { type: 'string', description: 'Numéro Centris si disponible' }, note: { type: 'string', description: 'Note initiale: besoin, secteur, budget, délai' } }, required: ['prenom'] } },
+  { name: 'planifier_visite',   description: 'Planifier une visite de propriété. Met à jour le deal → Visite prévue + crée activité Pipedrive + sauvegarde pour rappel matin.', input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Nom du prospect' }, date: { type: 'string', description: 'Date ISO (2024-05-10T14:00) ou approximation' }, adresse: { type: 'string', description: 'Adresse de la propriété (optionnel)' } }, required: ['prospect', 'date'] } },
+  // ── Gmail ──
+  { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
+  { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
+  { name: 'envoyer_email',       description: 'Préparer un brouillon email pour approbation de Shawn. Affiche le brouillon complet et attend confirmation ("envoie") avant envoi réel. NE PAS appeler confirmer_envoi sans avoir obtenu "envoie" de Shawn dans la conversation.', input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Adresse email du destinataire' }, toName: { type: 'string', description: 'Nom du destinataire' }, sujet: { type: 'string', description: 'Objet de l\'email' }, texte: { type: 'string', description: 'Corps de l\'email — texte brut, style Shawn, vouvoiement, max 3 paragraphes courts.' } }, required: ['to', 'sujet', 'texte'] } },
   // ── Recherche web ──
-  { name: 'rechercher_web', description: 'Rechercher des infos actuelles: taux hypothécaires, stats marché immobilier QC, prix construction, réglementations. Utiliser pour enrichir les emails avec données récentes.', input_schema: { type: 'object', properties: { requete: { type: 'string', description: 'Requête précise. Ex: "taux hypothécaire 5 ans fixe Desjardins 2025"' } }, required: ['requete'] } },
+  { name: 'rechercher_web',  description: 'Rechercher infos actuelles: taux hypothécaires, stats marché QC, prix construction, réglementations. Enrichit les emails avec données récentes.', input_schema: { type: 'object', properties: { requete: { type: 'string', description: 'Requête précise. Ex: "taux hypothécaire 5 ans fixe Desjardins avril 2025"' } }, required: ['requete'] } },
   // ── GitHub ──
-  { name: 'list_github_repos', description: 'Liste tous les repos GitHub de Shawn (signaturesb)', input_schema: { type: 'object', properties: {} } },
-  { name: 'list_github_files', description: 'Liste les fichiers dans un dossier d\'un repo GitHub de Shawn', input_schema: { type: 'object', properties: { repo: { type: 'string' }, path: { type: 'string', description: 'Sous-dossier (vide = racine)' } }, required: ['repo'] } },
-  { name: 'read_github_file', description: 'Lit le contenu d\'un fichier dans un repo GitHub de Shawn', input_schema: { type: 'object', properties: { repo: { type: 'string' }, path: { type: 'string', description: 'Chemin du fichier (ex: bot.js)' } }, required: ['repo', 'path'] } },
-  { name: 'write_github_file', description: 'Écrit ou modifie un fichier dans un repo GitHub de Shawn (commit direct)', input_schema: { type: 'object', properties: { repo: { type: 'string' }, path: { type: 'string' }, content: { type: 'string', description: 'Contenu complet du fichier' }, message: { type: 'string', description: 'Message de commit (optionnel)' } }, required: ['repo', 'path', 'content'] } },
+  { name: 'list_github_repos',  description: 'Liste les repos GitHub de Shawn (signaturesb)', input_schema: { type: 'object', properties: {} } },
+  { name: 'list_github_files',  description: 'Liste les fichiers dans un dossier d\'un repo GitHub', input_schema: { type: 'object', properties: { repo: { type: 'string' }, path: { type: 'string', description: 'Sous-dossier (vide = racine)' } }, required: ['repo'] } },
+  { name: 'read_github_file',   description: 'Lit le contenu d\'un fichier dans un repo GitHub', input_schema: { type: 'object', properties: { repo: { type: 'string' }, path: { type: 'string' } }, required: ['repo', 'path'] } },
+  { name: 'write_github_file',  description: 'Écrit ou modifie un fichier GitHub (commit direct)', input_schema: { type: 'object', properties: { repo: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' }, message: { type: 'string' } }, required: ['repo', 'path', 'content'] } },
   // ── Dropbox ──
-  { name: 'list_dropbox_folder', description: 'Liste les fichiers dans un dossier Dropbox de Shawn (documents propriétés, terrains, etc.)', input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Chemin Dropbox ("Terrain en ligne" ou "" pour racine)' } }, required: ['path'] } },
-  { name: 'read_dropbox_file', description: 'Lit un fichier texte depuis le Dropbox de Shawn', input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Chemin complet (ex: /Terrain en ligne/rawdon.txt)' } }, required: ['path'] } },
-  { name: 'send_dropbox_file', description: 'Télécharge un fichier (PDF, image) depuis Dropbox et l\'envoie directement à Shawn par Telegram', input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Chemin Dropbox (ex: /Terrain en ligne/fiche-rawdon.pdf)' }, caption: { type: 'string', description: 'Message à joindre (optionnel)' } }, required: ['path'] } },
-  // ── Contacts iPhone ──
-  { name: 'chercher_contact', description: 'Chercher un contact dans les contacts iPhone de Shawn (exportés dans Dropbox). Utiliser pour trouver le téléphone ou email d\'un prospect avant d\'envoyer un suivi. Complète Pipedrive avec les infos personnelles.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom, ou numéro de téléphone à chercher' } }, required: ['terme'] } },
+  { name: 'list_dropbox_folder', description: 'Liste les fichiers dans un dossier Dropbox (documents propriétés, terrains)', input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Chemin ("Terrain en ligne" ou "" pour racine)' } }, required: ['path'] } },
+  { name: 'read_dropbox_file',   description: 'Lit un fichier texte depuis Dropbox', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
+  { name: 'send_dropbox_file',   description: 'Télécharge un PDF/image depuis Dropbox et l\'envoie à Shawn par Telegram', input_schema: { type: 'object', properties: { path: { type: 'string' }, caption: { type: 'string' } }, required: ['path'] } },
+  // ── Contacts ──
+  { name: 'chercher_contact',  description: 'Chercher dans les contacts iPhone de Shawn (Dropbox /Contacts/contacts.vcf). Trouver tel cell et email perso avant tout suivi. Complète Pipedrive.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou numéro de téléphone' } }, required: ['terme'] } },
+  // ── Brevo ──
+  { name: 'ajouter_brevo',  description: 'Ajouter/mettre à jour un contact dans Brevo. Utiliser quand deal perdu → nurture mensuel, ou nouveau contact à ajouter.', input_schema: { type: 'object', properties: { email: { type: 'string' }, prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, liste: { type: 'string', description: 'prospects, acheteurs, vendeurs (défaut: prospects)' } }, required: ['email'] } },
   // ── Fichiers bot ──
-  { name: 'read_bot_file', description: 'Lit un fichier de configuration du bot dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string', description: 'Nom du fichier (ex: campaigns_library.js)' } }, required: ['filename'] } },
-  { name: 'write_bot_file', description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string', description: 'Contenu complet du fichier' } }, required: ['filename', 'content'] } }
+  { name: 'read_bot_file',   description: 'Lit un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' } }, required: ['filename'] } },
+  { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
+  // ── Diagnostics ──
+  { name: 'tester_dropbox',  description: 'Tester la connexion Dropbox et diagnostiquer les problèmes de tokens. Utiliser quand Dropbox semble brisé.', input_schema: { type: 'object', properties: {} } },
+  { name: 'voir_template_dropbox', description: 'Lire les informations du master template email depuis Dropbox (/Liste de contact/email_templates/master_template_signature_sb.html). Pour vérifier les placeholders disponibles.', input_schema: { type: 'object', properties: {} } }
 ];
 
 async function executeTool(name, input, chatId) {
   try {
     switch (name) {
-      case 'voir_pipeline':       return await getPipeline();
-      case 'chercher_prospect':   return await chercherProspect(input.terme);
-      case 'marquer_perdu':       return await marquerPerdu(input.terme);
-      case 'ajouter_note':        return await ajouterNote(input.terme, input.note);
-      case 'stats_business':      return await statsBusiness();
-      case 'rechercher_web':      return await rechercherWeb(input.requete);
-      case 'list_github_repos':   return await listGitHubRepos();
-      case 'list_github_files':   return await listGitHubFiles(input.repo, input.path || '');
-      case 'read_github_file':    return await readGitHubFile(input.repo, input.path);
-      case 'write_github_file':   return await writeGitHubFile(input.repo, input.path, input.content, input.message);
+      case 'voir_pipeline':        return await getPipeline();
+      case 'chercher_prospect':    return await chercherProspect(input.terme);
+      case 'marquer_perdu':        return await marquerPerdu(input.terme);
+      case 'ajouter_note':         return await ajouterNote(input.terme, input.note);
+      case 'stats_business':       return await statsBusiness();
+      case 'créer_deal':           return await creerDeal(input);
+      case 'planifier_visite':     return await planifierVisite(input);
+      case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
+      case 'voir_conversation':    return await voirConversation(input.terme);
+      case 'envoyer_email': {
+        // Stocker le brouillon — ne PAS envoyer encore
+        pendingEmails.set(chatId, { to: input.to, toName: input.toName, sujet: input.sujet, texte: input.texte });
+        return `📧 *BROUILLON EMAIL — EN ATTENTE D'APPROBATION*\n\n*À:* ${input.toName ? input.toName + ' <' + input.to + '>' : input.to}\n*Objet:* ${input.sujet}\n\n---\n${input.texte}\n---\n\n💬 Dis *"envoie"* pour confirmer, ou modifie ce que tu veux.`;
+      }
+      case 'rechercher_web':       return await rechercherWeb(input.requete);
+      case 'list_github_repos':    return await listGitHubRepos();
+      case 'list_github_files':    return await listGitHubFiles(input.repo, input.path || '');
+      case 'read_github_file':     return await readGitHubFile(input.repo, input.path);
+      case 'write_github_file':    return await writeGitHubFile(input.repo, input.path, input.content, input.message);
       case 'chercher_contact':     return await chercherContact(input.terme);
-      case 'list_dropbox_folder': return await listDropboxFolder(input.path);
-      case 'read_dropbox_file':   return await readDropboxFile(input.path);
+      case 'ajouter_brevo':        return await ajouterBrevo(input);
+      case 'list_dropbox_folder':  return await listDropboxFolder(input.path);
+      case 'read_dropbox_file':    return await readDropboxFile(input.path);
       case 'send_dropbox_file': {
         const file = await downloadDropboxFile(input.path);
         if (!file) return `Erreur: impossible de télécharger ${input.path}`;
@@ -701,7 +1040,44 @@ async function executeTool(name, input, chatId) {
         const dir = path.join(DATA_DIR, 'botfiles');
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, path.basename(input.filename)), input.content, 'utf8');
-        return `✅ "${input.filename}" sauvegardé (${input.content.length} chars).`;
+        return `✅ "${input.filename}" sauvegardé.`;
+      }
+      case 'tester_dropbox': {
+        const vars = {
+          ACCESS_TOKEN: process.env.DROPBOX_ACCESS_TOKEN ? `✅ présent (${process.env.DROPBOX_ACCESS_TOKEN.substring(0,8)}...)` : '❌ absent',
+          REFRESH_TOKEN: process.env.DROPBOX_REFRESH_TOKEN ? '✅ présent' : '❌ absent',
+          APP_KEY:       process.env.DROPBOX_APP_KEY ? '✅ présent' : '❌ absent',
+          APP_SECRET:    process.env.DROPBOX_APP_SECRET ? '✅ présent' : '❌ absent',
+        };
+        const tokenStatus = dropboxToken ? `✅ token actif (${dropboxToken.substring(0,8)}...)` : '❌ token absent en mémoire';
+        let diagMsg = `🔍 *Diagnostic Dropbox*\n\nToken en mémoire: ${tokenStatus}\n\nEnv vars Render:\n`;
+        for (const [k, v] of Object.entries(vars)) diagMsg += `• DROPBOX_${k}: ${v}\n`;
+        // Tenter un refresh
+        const ok = await refreshDropboxToken();
+        diagMsg += `\nRefresh token: ${ok ? '✅ Succès' : '❌ Échec'}\n`;
+        if (ok) {
+          // Tester un vrai appel
+          const testRes = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
+          if (testRes?.ok) {
+            const data = await testRes.json();
+            diagMsg += `Connexion API: ✅ OK — ${data.entries?.length || 0} éléments à la racine`;
+          } else {
+            diagMsg += `Connexion API: ❌ HTTP ${testRes?.status || 'timeout'}`;
+          }
+        } else {
+          diagMsg += `\n⚠️ Vérifier dans Render: DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN`;
+        }
+        return diagMsg;
+      }
+      case 'voir_template_dropbox': {
+        const tplPath = '/Liste de contact/email_templates/master_template_signature_sb.html';
+        const res = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: tplPath }, true);
+        if (!res || !res.ok) return `❌ Template introuvable: ${tplPath}\nVérifier Dropbox avec tester_dropbox.`;
+        const html = await res.text();
+        const placeholders = [...html.matchAll(/\{\{\s*params\.(\w+)\s*\}\}/g)].map(m => m[1]);
+        const unique = [...new Set(placeholders)];
+        const size = Math.round(html.length / 1024);
+        return `✅ *Master Template trouvé*\n\nTaille: ${size} KB\nPlaceholders {{ params.X }}: ${unique.length}\n\n${unique.map(p => `• ${p}`).join('\n')}\n\nLogos base64: ${html.includes('data:image/png;base64') ? '✅ présents' : '⚠️ absents'}`;
       }
       default: return `Outil inconnu: ${name}`;
     }
@@ -713,22 +1089,17 @@ async function executeTool(name, input, chatId) {
 // ─── Appel Claude (boucle agentique + prompt caching) ────────────────────────
 async function callClaude(chatId, userMsg, retries = 3) {
   addMsg(chatId, 'user', userMsg);
-
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const messages = getHistory(chatId).map(m => ({ role: m.role, content: m.content }));
       let finalReply = null;
       let allMemos   = [];
-
-      // Boucle agentique (max 8 rounds)
       for (let round = 0; round < 8; round++) {
         const res = await claude.messages.create({
           model: currentModel, max_tokens: 4096,
-          // Prompt caching — économise ~90% des tokens système (cache 5 min)
           system: [{ type: 'text', text: getSystem(), cache_control: { type: 'ephemeral' } }],
           tools: TOOLS, messages,
         });
-
         if (res.stop_reason === 'tool_use') {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
@@ -740,27 +1111,19 @@ async function callClaude(chatId, userMsg, retries = 3) {
           messages.push({ role: 'user', content: results });
           continue;
         }
-
         const text = res.content.find(b => b.type === 'text')?.text || '_(vide)_';
         const { cleaned, memos } = extractMemos(text);
         finalReply = cleaned;
         allMemos   = memos;
         break;
       }
-
-      if (!finalReply) {
-        log('WARN', 'CLAUDE', `8 rounds atteints sans réponse finale (chatId: ${chatId})`);
-        finalReply = '_(délai dépassé — réessaie)_';
-      }
+      if (!finalReply) finalReply = '_(délai dépassé — réessaie)_';
       addMsg(chatId, 'assistant', finalReply);
       return { reply: finalReply, memos: allMemos };
-
     } catch (err) {
       const retryable = err.status === 429 || err.status === 529 || err.status >= 500;
       if (retryable && attempt < retries) {
-        const wait = attempt * 3000;
-        log('WARN', 'CLAUDE', `HTTP ${err.status} — retry ${attempt}/${retries} dans ${wait/1000}s`);
-        await new Promise(r => setTimeout(r, wait));
+        await new Promise(r => setTimeout(r, attempt * 3000));
       } else {
         const h = getHistory(chatId);
         if (h[h.length - 1]?.role === 'user') h.pop();
@@ -770,7 +1133,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
   }
 }
 
-// ─── Envoyer (découpe proprement sur les sauts de ligne) ──────────────────────
+// ─── Envoyer (découpe proprement sur sauts de ligne) ──────────────────────────
 async function send(chatId, text) {
   const MAX = 4000;
   const str = String(text || '');
@@ -791,19 +1154,43 @@ async function send(chatId, text) {
   }
 }
 
-// ─── Guard: seul Shawn peut utiliser le bot ───────────────────────────────────
+// ─── Guard ────────────────────────────────────────────────────────────────────
 function isAllowed(msg) {
   if (!msg.from) return false;
   return !ALLOWED_ID || msg.from.id === ALLOWED_ID;
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
+// ─── Confirmation envoi email ─────────────────────────────────────────────────
+const CONFIRM_REGEX = /^(envoie[!.]?|parfait[,.]? envoie|go[!.]?|oui[,.]? envoie|envoie[-\s]le[!.]?|c'est bon[,.]? envoie|send[!.]?)$/i;
+
+async function handleEmailConfirmation(chatId, text) {
+  if (!CONFIRM_REGEX.test(text.trim())) return false;
+  const pending = pendingEmails.get(chatId);
+  if (!pending) return false;
+  pendingEmails.delete(chatId);
+  try {
+    const gmailOk = await getGmailToken();
+    if (gmailOk) {
+      await envoyerEmailGmail(pending);
+      await send(chatId, `✅ Email envoyé à *${pending.toName || pending.to}*\nObjet: ${pending.sujet}`);
+    } else {
+      // Fallback: Brevo
+      await envoyerEmailBrevo({ to: pending.to, toName: pending.toName, subject: pending.sujet, textContent: pending.texte });
+      await send(chatId, `✅ Email envoyé via Brevo à *${pending.toName || pending.to}*`);
+    }
+  } catch (e) {
+    await send(chatId, `❌ Erreur envoi: ${e.message}`);
+  }
+  return true;
+}
+
+// ─── Handlers Telegram ────────────────────────────────────────────────────────
 function registerHandlers() {
 
   bot.onText(/\/start/, msg => {
     if (!isAllowed(msg)) return;
     bot.sendMessage(msg.chat.id,
-      `👋 Salut Shawn\\! Je suis ton assistante IA 24/7\\.\n\nAccès: *GitHub* · *Dropbox* · *Pipedrive* · *Recherche web*\n\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Ma mémoire persistante\n/oublier — Effacer ma mémoire\n/pipeline — Voir le pipeline Pipedrive\n/stats — Tableau de bord\n/sonnet — Mode puissant\n/haiku — Mode rapide \\(défaut\\)`,
+      `👋 Salut Shawn\\! Je suis ton assistante IA 24/7\\.\n\n*Accès:* GitHub · Dropbox · Pipedrive · Gmail · Contacts iPhone · Mailing\\-masse · Recherche web\n\n*Commandes:*\n/pipeline — Pipeline Pipedrive\n/stats — Tableau de bord\n/emails — Emails récents\n/reset — Nouvelle conversation\n/status — État du bot\n/memoire — Mémoire persistante\n/oublier — Effacer mémoire\n/opus — Opus 4\\.7 \\(défaut\\)\n/sonnet — Sonnet 4\\.6\n/haiku — Haiku 4\\.5`,
       { parse_mode: 'MarkdownV2' }
     );
   });
@@ -811,6 +1198,7 @@ function registerHandlers() {
   bot.onText(/\/reset/, msg => {
     if (!isAllowed(msg)) return;
     chats.delete(msg.chat.id);
+    pendingEmails.delete(msg.chat.id);
     scheduleHistSave();
     bot.sendMessage(msg.chat.id, '🔄 Nouvelle conversation. Je t\'écoute!');
   });
@@ -819,12 +1207,11 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     const h = getHistory(msg.chat.id);
     const uptime = Math.floor(process.uptime() / 60);
-    const ghStatus = process.env.GITHUB_TOKEN ? '✅' : '⚠️';
-    const dbStatus = dropboxToken ? '✅' : '❌';
-    const pdStatus = PD_KEY ? '✅' : '❌';
-    const memStatus = gistId ? `✅ Gist \`${gistId.substring(0, 8)}...\`` : '⚠️ /tmp';
+    const gmailOk = !!(process.env.GMAIL_CLIENT_ID);
+    const whisperOk = !!(process.env.OPENAI_API_KEY);
+    const dbxRefreshOk = !!(process.env.DROPBOX_REFRESH_TOKEN && process.env.DROPBOX_APP_KEY && process.env.DROPBOX_APP_SECRET);
     bot.sendMessage(msg.chat.id,
-      `✅ *Kira opérationnelle*\nModèle: \`${currentModel}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\nGitHub: ${ghStatus} | Dropbox: ${dbStatus} | Pipedrive: ${pdStatus}\nMémoire: ${memStatus} | Données: \`${DATA_DIR}\`\nUptime: ${uptime} min`,
+      `✅ *Kira opérationnelle*\nModèle: \`${currentModel}\`\nMessages: ${h.length} | Mémos: ${kiramem.facts.length}\n\nGitHub: ${process.env.GITHUB_TOKEN ? '✅' : '⚠️'} | Brevo: ${BREVO_KEY ? '✅' : '❌'}\nPipedrive: ${PD_KEY ? '✅' : '❌'} | Gmail: ${gmailOk ? '✅' : '⚠️'}\nDropbox: ${dropboxToken ? '✅ actif' : '❌ token absent'} ${dbxRefreshOk ? '(refresh ✅)' : '⚠️ refresh vars manquantes'}\nWhisper: ${whisperOk ? '✅' : '⚠️'} | Mémoire: ${gistId ? `✅ Gist` : '⚠️ /tmp'}\nUptime: ${uptime} min | Tools: ${TOOLS.length}`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -845,11 +1232,19 @@ function registerHandlers() {
     await send(msg.chat.id, result);
   });
 
+  bot.onText(/\/emails/, async msg => {
+    if (!isAllowed(msg)) return;
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    const result = await voirEmailsRecents('1d');
+    clearInterval(typing);
+    await send(msg.chat.id, result);
+  });
+
   bot.onText(/\/memoire/, msg => {
     if (!isAllowed(msg)) return;
     if (!kiramem.facts.length) return bot.sendMessage(msg.chat.id, '🧠 Aucun fait mémorisé pour l\'instant.');
-    const list = kiramem.facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
-    bot.sendMessage(msg.chat.id, `🧠 *Ma mémoire persistante:*\n\n${list}`, { parse_mode: 'Markdown' });
+    const list = kiramem.facts.map((f, i) => `${i+1}. ${f}`).join('\n');
+    bot.sendMessage(msg.chat.id, `🧠 *Mémoire persistante:*\n\n${list}`, { parse_mode: 'Markdown' });
   });
 
   bot.onText(/\/oublier/, msg => {
@@ -861,19 +1256,25 @@ function registerHandlers() {
     bot.sendMessage(msg.chat.id, '🗑️ Mémoire effacée (local + Gist).');
   });
 
+  bot.onText(/\/opus/, msg => {
+    if (!isAllowed(msg)) return;
+    currentModel = 'claude-opus-4-7';
+    bot.sendMessage(msg.chat.id, '🚀 Mode Opus 4.7 activé — le plus puissant (défaut).');
+  });
+
   bot.onText(/\/sonnet/, msg => {
     if (!isAllowed(msg)) return;
     currentModel = 'claude-sonnet-4-6';
-    bot.sendMessage(msg.chat.id, '🧠 Mode Sonnet activé — plus puissant, légèrement plus lent.');
+    bot.sendMessage(msg.chat.id, '🧠 Mode Sonnet activé — rapide et fort.');
   });
 
   bot.onText(/\/haiku/, msg => {
     if (!isAllowed(msg)) return;
     currentModel = 'claude-haiku-4-5';
-    bot.sendMessage(msg.chat.id, '⚡ Mode Haiku activé — rapide et efficace.');
+    bot.sendMessage(msg.chat.id, '⚡ Mode Haiku activé — ultra-rapide et léger.');
   });
 
-  // ─── Messages texte ─────────────────────────────────────────────────────────
+  // ─── Messages texte ──────────────────────────────────────────────────────────
   bot.on('message', async (msg) => {
     if (!isAllowed(msg)) return;
     const chatId = msg.chat.id;
@@ -883,9 +1284,11 @@ function registerHandlers() {
 
     log('IN', 'MSG', text.substring(0, 80));
 
+    // Vérifier si c'est une confirmation d'envoi d'email
+    if (await handleEmailConfirmation(chatId, text)) return;
+
     const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
     bot.sendChatAction(chatId, 'typing').catch(() => {});
-
     try {
       const { reply, memos } = await callClaude(chatId, text);
       clearInterval(typing);
@@ -905,13 +1308,156 @@ function registerHandlers() {
     }
   });
 
-  // ─── Reconnexion auto polling ────────────────────────────────────────────────
+  // ─── Messages vocaux (Whisper) ────────────────────────────────────────────────
+  bot.on('voice', async (msg) => {
+    if (!isAllowed(msg)) return;
+    const chatId = msg.chat.id;
+    if (isDuplicate(msg.message_id)) return;
+
+    if (!process.env.OPENAI_API_KEY) {
+      await bot.sendMessage(chatId, '⚠️ Whisper non configuré. Ajoute `OPENAI_API_KEY` dans Render.');
+      return;
+    }
+
+    log('IN', 'VOICE', `${msg.voice.duration}s`);
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+    try {
+      const fileInfo = await bot.getFile(msg.voice.file_id);
+      const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+      const res      = await fetch(fileUrl);
+      const buffer   = Buffer.from(await res.arrayBuffer());
+      const texte    = await transcrire(buffer);
+
+      if (!texte) { await bot.sendMessage(chatId, '❌ Impossible de transcrire ce message vocal.'); return; }
+
+      log('OK', 'VOICE', `Transcrit: "${texte.substring(0, 60)}"`);
+      await bot.sendMessage(chatId, `🎤 _${texte}_`, { parse_mode: 'Markdown' });
+
+      const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
+      try {
+        const { reply, memos } = await callClaude(chatId, texte);
+        clearInterval(typing);
+        await send(chatId, reply);
+        if (memos.length) await bot.sendMessage(chatId, `📝 *Mémorisé:* ${memos.join(' | ')}`, { parse_mode: 'Markdown' });
+      } catch (err) {
+        clearInterval(typing);
+        await bot.sendMessage(chatId, '❌ Erreur temporaire. Réessaie.');
+      }
+    } catch (err) {
+      log('ERR', 'VOICE', err.message);
+      await bot.sendMessage(chatId, `❌ Erreur vocal: ${err.message}`);
+    }
+  });
+
+  // ─── Reconnexion auto polling ─────────────────────────────────────────────────
   let pollingErrors = 0;
   bot.on('polling_error', err => {
     log('ERR', 'POLL', `#${++pollingErrors}: ${err.message}`);
     if (pollingErrors >= 10) { log('WARN', 'POLL', 'Restart forcé...'); process.exit(1); }
   });
   bot.on('message', () => { pollingErrors = 0; });
+}
+
+// ─── Tâches quotidiennes (sans node-cron) ─────────────────────────────────────
+const lastCron = { digest: null, suivi: null };
+
+async function runDigestJulie() {
+  if (!PD_KEY || !BREVO_KEY) return;
+  try {
+    const [nouveaux, enDiscussion, visitesAujourdhui] = await Promise.all([
+      pdGet('/deals?stage_id=49&status=open&limit=30'),
+      pdGet('/deals?stage_id=51&status=open&limit=30'),
+      pdGet('/deals?stage_id=52&status=open&limit=30')
+    ]);
+    const today = new Date().toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
+    let body = `Bonjour Julie,\n\nVoici le résumé pipeline du ${today}.\n\n`;
+    if (nouveaux?.data?.length) { body += `NOUVEAUX LEADS (${nouveaux.data.length}):\n`; nouveaux.data.forEach(d => body += `• ${d.title}\n`); body += '\n'; }
+    if (enDiscussion?.data?.length) { body += `EN DISCUSSION (${enDiscussion.data.length}):\n`; enDiscussion.data.forEach(d => body += `• ${d.title}\n`); body += '\n'; }
+    if (visitesAujourdhui?.data?.length) { body += `VISITES PRÉVUES (${visitesAujourdhui.data.length}):\n`; visitesAujourdhui.data.forEach(d => body += `• ${d.title}\n`); body += '\n'; }
+    if (!nouveaux?.data?.length && !enDiscussion?.data?.length && !visitesAujourdhui?.data?.length) return; // Rien à envoyer
+    body += 'Bonne journée!\nKira — Signature SB';
+    const ok = await envoyerEmailBrevo({ to: JULIE_EMAIL, toName: 'Julie', subject: `📋 Pipeline — ${today}`, textContent: body });
+    if (ok) log('OK', 'CRON', 'Digest Julie envoyé');
+  } catch (e) { log('ERR', 'CRON', `Digest: ${e.message}`); }
+}
+
+async function runSuiviQuotidien() {
+  if (!PD_KEY || !ALLOWED_ID) return;
+  try {
+    const data = await pdGet('/deals?pipeline_id=7&status=open&limit=100');
+    const deals = data?.data || [];
+    const now = Date.now();
+    const relances = [];
+    for (const deal of deals) {
+      if (deal.stage_id > 51) continue;
+      const j1 = deal[PD_FIELD_SUIVI_J1];
+      const j3 = deal[PD_FIELD_SUIVI_J3];
+      const j7 = deal[PD_FIELD_SUIVI_J7];
+      const created = new Date(deal.add_time).getTime();
+      const joursDep = (now - created) / 86400000;
+      if (!j1 && joursDep >= 1)          relances.push({ deal, type: 'J+1 (premier contact)', emoji: '🟢' });
+      else if (j1 && !j3 && joursDep >= 3) relances.push({ deal, type: 'J+3 (validation intérêt)', emoji: '🟡' });
+      else if (j1 && j3 && !j7 && joursDep >= 7) relances.push({ deal, type: 'J+7 (DERNIER — décision)', emoji: '🔴' });
+    }
+    if (!relances.length) return;
+    let msg = `📋 *Suivi du jour — ${relances.length} prospect${relances.length > 1 ? 's' : ''} à relancer:*\n\n`;
+    for (const { deal, type, emoji } of relances) {
+      const stage = PD_STAGES[deal.stage_id] || '';
+      msg += `${emoji} *${deal.title}* — ${type}\n  ${stage}\n`;
+    }
+    msg += '\n_Dis "relance [nom]" pour que je rédige le message._';
+    await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' });
+  } catch (e) { log('ERR', 'CRON', `Suivi: ${e.message}`); }
+}
+
+function startDailyTasks() {
+  setInterval(() => {
+    const now = new Date();
+    // Heure locale Montréal (EST = UTC-5 / EDT = UTC-4)
+    const heure = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
+    const h = parseInt(heure);
+    const todayStr = now.toDateString();
+    if (h === 8 && lastCron.digest !== todayStr) { lastCron.digest = todayStr; runDigestJulie(); }
+    if (h === 9 && lastCron.suivi !== todayStr)  { lastCron.suivi  = todayStr; runSuiviQuotidien(); }
+  }, 60 * 1000); // Check chaque minute
+  log('OK', 'CRON', 'Tâches quotidiennes activées (digest 8h → Julie, suivi 9h → Telegram)');
+}
+
+// ─── Webhooks Make.com ────────────────────────────────────────────────────────
+async function handleWebhook(route, data) {
+  if (!ALLOWED_ID) return;
+  try {
+    if (route === '/webhook/centris') {
+      const nom     = data.nom || data.name || 'Inconnu';
+      const tel     = data.telephone || data.tel || data.phone || '';
+      const email   = data.email || '';
+      const listing = data.url_listing || data.url || data.centris_url || '';
+      const type    = data.type || 'propriété';
+      await bot.sendMessage(ALLOWED_ID,
+        `🏡 *Nouveau lead Centris!*\n\n👤 ${nom}${tel ? '\n📞 ' + tel : ''}${email ? '\n✉️ ' + email : ''}${listing ? '\n🔗 ' + listing : ''}\nType: ${type}\n\nDis "crée deal pour ${nom}" pour l'ajouter à Pipedrive.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    if (route === '/webhook/sms') {
+      const from = data.from || data.numero || '';
+      const msg  = data.body || data.message || '';
+      const nom  = data.nom || '';
+      await bot.sendMessage(ALLOWED_ID,
+        `📱 *SMS entrant*\n\nDe: ${nom || from}\n"${msg}"\n\nDis "cherche ${nom || from} dans Pipedrive" pour voir le prospect.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    if (route === '/webhook/reply') {
+      const de    = data.from || data.email || '';
+      const sujet = data.subject || '';
+      const corps = data.body || data.text || '';
+      await bot.sendMessage(ALLOWED_ID,
+        `📧 *Réponse prospect!*\n\nDe: ${de}\nObjet: ${sujet}\n\n_"${corps.substring(0, 300)}${corps.length > 300 ? '...' : ''}"_\n\nDis "rédige réponse à ${de}" pour répondre.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  } catch (e) { log('ERR', 'WEBHOOK', e.message); }
 }
 
 // ─── Arrêt propre ─────────────────────────────────────────────────────────────
@@ -923,22 +1469,57 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-// ─── Health check Render ──────────────────────────────────────────────────────
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end(`Kira OK — ${new Date().toISOString()}`);
-}).listen(PORT);
+// ─── HTTP server (health + webhooks) ─────────────────────────────────────────
+const server = http.createServer((req, res) => {
+  const url = (req.url || '/').split('?')[0];
 
-// ─── Démarrage séquentiel — tout initialisé avant le 1er message ─────────────
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(`Kira OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length}`);
+    return;
+  }
+
+  if (req.method === 'POST' && ['/webhook/centris', '/webhook/sms', '/webhook/reply'].includes(url)) {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 10000) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        res.writeHead(200); res.end('ok');
+        await handleWebhook(url, data);
+      } catch {
+        res.writeHead(400); res.end('bad request');
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404); res.end('not found');
+});
+
+// ─── Démarrage séquentiel ─────────────────────────────────────────────────────
 async function main() {
+  // Refresh Dropbox proactif — évite les erreurs 401 au démarrage
+  if (process.env.DROPBOX_REFRESH_TOKEN) {
+    const ok = await refreshDropboxToken();
+    if (!ok) log('WARN', 'BOOT', 'Dropbox refresh échoué au démarrage — vérifier DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN dans Render');
+  }
+
   await loadDropboxStructure();
   await initGistId();
   await loadMemoryFromGist();
 
+  // Refresh Dropbox token toutes les 3h (tokens Dropbox expirent ~4h)
+  setInterval(async () => {
+    if (process.env.DROPBOX_REFRESH_TOKEN) await refreshDropboxToken().catch(() => {});
+  }, 3 * 60 * 60 * 1000);
+
   registerHandlers();
+  startDailyTasks();
   bot.startPolling({ interval: 1000, autoStart: true });
 
-  log('OK', 'BOOT', `Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos: ${kiramem.facts.length} — tools: ${TOOLS.length}`);
+  server.listen(PORT);
+  log('OK', 'BOOT', `Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 }
 
 main().catch(err => {
