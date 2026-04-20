@@ -979,15 +979,28 @@ async function creerDeal({ prenom, nom, telephone, email, type, source, centris,
   const fullName = [prenom, nom].filter(Boolean).join(' ');
   const titre = fullName || prenom || 'Nouveau prospect';
 
-  // 1. Créer/mettre à jour la personne
+  // 1. Chercher personne existante d'abord (évite les doublons)
   let personId = null;
+  let personNote = '';
   try {
-    const personBody = { name: fullName || prenom };
-    if (telephone) personBody.phone = [{ value: telephone.replace(/\D/g, ''), primary: true }];
-    if (email)     personBody.email = [{ value: email, primary: true }];
-    const personRes = await pdPost('/persons', personBody);
-    personId = personRes?.data?.id || null;
-  } catch {}
+    const searchTerm = email || telephone?.replace(/\D/g,'') || fullName;
+    if (searchTerm) {
+      const existing = await pdGet(`/persons/search?term=${encodeURIComponent(searchTerm)}&limit=1`);
+      personId = existing?.data?.items?.[0]?.item?.id || null;
+    }
+    if (!personId) {
+      // Créer si inexistant
+      const personBody = { name: fullName || prenom };
+      if (telephone) personBody.phone = [{ value: telephone.replace(/\D/g, ''), primary: true }];
+      if (email)     personBody.email = [{ value: email, primary: true }];
+      const personRes = await pdPost('/persons', personBody);
+      personId = personRes?.data?.id || null;
+      if (!personId) personNote = '\n⚠️ Contact non créé — ajoute email/tel manuellement dans Pipedrive.';
+    }
+  } catch (e) {
+    log('WARN', 'PD', `Person creation: ${e.message}`);
+    personNote = '\n⚠️ Contact non lié — ajoute manuellement.';
+  }
 
   // 2. Créer le deal
   const typeOpt = PD_TYPE_MAP[type] || PD_TYPE_MAP.maison_usagee;
@@ -996,20 +1009,26 @@ async function creerDeal({ prenom, nom, telephone, email, type, source, centris,
     stage_id:        49,
     pipeline_id:     AGENT.pipeline_id,
     [PD_FIELD_TYPE]: typeOpt,
-    [PD_FIELD_SEQ]:  42, // séquence active = Oui
+    [PD_FIELD_SEQ]:  42,
   };
-  if (personId)         dealBody.person_id          = personId;
-  if (centris)          dealBody[PD_FIELD_CENTRIS]   = centris;
+  if (personId) dealBody.person_id       = personId;
+  if (centris)  dealBody[PD_FIELD_CENTRIS] = centris;
 
   const dealRes = await pdPost('/deals', dealBody);
   const deal = dealRes?.data;
-  if (!deal?.id) return `❌ Erreur création deal Pipedrive.`;
+  if (!deal?.id) return `❌ Erreur création deal Pipedrive — vérifie PIPEDRIVE_API_KEY dans Render.`;
 
-  // 3. Ajouter note si fournie
-  if (note) await pdPost('/notes', { deal_id: deal.id, content: note });
+  // 3. Note initiale
+  const noteContent = [
+    note,
+    telephone ? `Tel: ${telephone}` : '',
+    email     ? `Email: ${email}` : '',
+    source    ? `Source: ${source}` : '',
+  ].filter(Boolean).join('\n');
+  if (noteContent) await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => {});
 
-  const typeLabel = { terrain: 'Terrain', maison_usagee: 'Maison usagée', maison_neuve: 'Maison neuve', construction_neuve: 'Construction neuve', auto_construction: 'Auto-construction', plex: 'Plex' }[type] || 'Propriété';
-  return `✅ Deal créé: *${titre}*\nType: ${typeLabel} | ID: ${deal.id}`;
+  const typeLabel = { terrain:'Terrain', maison_usagee:'Maison usagée', maison_neuve:'Maison neuve', construction_neuve:'Construction neuve', auto_construction:'Auto-construction', plex:'Plex' }[type] || 'Propriété';
+  return `✅ Deal créé: *${titre}*\nType: ${typeLabel} | ID: ${deal.id}${centris ? ' | Centris #' + centris : ''}${personNote}`;
 }
 
 async function planifierVisite({ prospect, date, adresse }) {
@@ -1169,28 +1188,33 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
 
   // 6. Télécharger depuis Dropbox
   const dlr = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: cible.path_lower }, true);
-  if (!dlr?.ok) return `❌ Téléchargement échoué: ${cible.name}`;
+  if (!dlr?.ok) return `❌ Téléchargement Dropbox échoué pour: ${cible.name}\nVérifier connexion Dropbox avec "teste dropbox".`;
   const buffer = Buffer.from(await dlr.arrayBuffer());
-  if (buffer.length === 0) return `❌ Fichier vide: ${cible.name}`;
+  if (buffer.length === 0) return `❌ Fichier vide dans Dropbox: ${cible.name}`;
+  if (buffer.length > 24 * 1024 * 1024) {
+    return `❌ Fichier trop gros: ${Math.round(buffer.length / 1024 / 1024)}MB (max 24MB pour Gmail).\nEnvoie manuellement depuis Dropbox.`;
+  }
 
   // 7. Envoyer par Gmail avec pièce jointe
   const token = await getGmailToken();
-  if (!token) return `❌ Gmail non configuré.\nFichier dispo: ${cible.name} dans ${folder.name}`;
+  if (!token) return `❌ Gmail non configuré dans Render.\nFichier disponible: ${cible.name} dans ${folder.adresse || folder.name}`;
 
   const boundary = `sb${Date.now()}`;
   const enc      = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const sujet    = `Documents — ${folder.adresse || folder.name} | ${AGENT.compagnie}`;
-  const corps    = `Bonjour,\n\nVeuillez trouver ci-joint la documentation concernant la propriété.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.prenom} Barrette\n${AGENT.telephone}`;
+  const corps    = `Bonjour,\n\nVeuillez trouver ci-joint la documentation concernant la propriété.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
   const lines    = [
     `From: ${AGENT.nom} <${AGENT.email}>`,
     `To: ${toEmail}`,
     `Bcc: ${AGENT.email}`,
+    `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
     `Content-Type: multipart/mixed; boundary="${boundary}"`,
     '',
     `--${boundary}`,
     'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: quoted-printable',
     '',
     corps,
     '',
@@ -1203,15 +1227,28 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
     `--${boundary}--`,
   ];
   const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-  const sr2 = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ raw })
-  });
-  if (!sr2.ok) return `❌ Gmail erreur: ${(await sr2.text()).substring(0, 200)}`;
 
-  await pdPost('/notes', { deal_id: deal.id, content: `Document envoyé: ${cible.name} → ${toEmail}` }).catch(() => {});
-  return `✅ *${cible.name}* envoyé à *${toEmail}*\nProspect: ${deal.title}\n📝 Note ajoutée dans Pipedrive.`;
+  const sendController = new AbortController();
+  const sendTimeout    = setTimeout(() => sendController.abort(), 20000);
+  let sendRes;
+  try {
+    sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST', signal: sendController.signal,
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw })
+    });
+  } finally { clearTimeout(sendTimeout); }
+
+  if (!sendRes.ok) {
+    const err = await sendRes.text().catch(() => sendRes.status);
+    return `❌ Gmail erreur ${sendRes.status}: ${String(err).substring(0, 200)}`;
+  }
+
+  // 8. Note Pipedrive (honnête si ça fail)
+  const noteRes = await pdPost('/notes', { deal_id: deal.id, content: `Document envoyé: ${cible.name} → ${toEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })})` }).catch(() => null);
+  const noteLabel = noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée';
+
+  return `✅ *${cible.name}* envoyé à *${toEmail}*\nProspect: ${deal.title}\n${noteLabel}`;
 }
 
 // ─── Brevo ────────────────────────────────────────────────────────────────────
@@ -1254,7 +1291,10 @@ async function getGmailToken() {
   const { GMAIL_CLIENT_ID: cid, GMAIL_CLIENT_SECRET: csec, GMAIL_REFRESH_TOKEN: ref } = process.env;
   if (!cid || !csec || !ref) return null;
   if (gmailToken && Date.now() < gmailTokenExp - 60000) return gmailToken;
-  if (gmailRefreshInProgress) return gmailRefreshInProgress;
+  // Attendre si refresh déjà en cours — retourner null si ça échoue (pas throw)
+  if (gmailRefreshInProgress) {
+    try { return await gmailRefreshInProgress; } catch { return null; }
+  }
   gmailRefreshInProgress = (async () => {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 10000);
@@ -1265,19 +1305,18 @@ async function getGmailToken() {
         body: new URLSearchParams({ client_id: cid, client_secret: csec, refresh_token: ref, grant_type: 'refresh_token' })
       });
       const data = await res.json();
-      if (!data.access_token) throw new Error(`Gmail token: ${JSON.stringify(data)}`);
+      if (!data.access_token) throw new Error(`Pas de access_token: ${JSON.stringify(data).substring(0,100)}`);
       gmailToken    = data.access_token;
       gmailTokenExp = Date.now() + (data.expires_in || 3600) * 1000;
+      log('OK', 'GMAIL', 'Token rafraîchi ✓');
       return gmailToken;
     } catch (e) {
-      gmailToken    = null; // reset pour forcer retry propre au prochain appel
-      gmailTokenExp = 0;
-      throw e;
+      log('ERR', 'GMAIL', `Refresh fail: ${e.message}`);
+      gmailToken = null; gmailTokenExp = 0;
+      return null; // retourner null plutôt que throw — évite crash cascade
     } finally { clearTimeout(t); gmailRefreshInProgress = null; }
   })();
-  // Attraper les rejets non gérés de la Promise pour éviter leak
-  gmailRefreshInProgress.catch(() => {});
-  return gmailRefreshInProgress;
+  try { return await gmailRefreshInProgress; } catch { return null; }
 }
 
 async function gmailAPI(endpoint, options = {}) {
@@ -1366,31 +1405,39 @@ async function voirConversation(terme) {
 
 async function envoyerEmailGmail({ to, toName, sujet, texte }) {
   const token = await getGmailToken();
-  if (!token) throw new Error('Gmail non configuré');
+  if (!token) throw new Error('Gmail non configuré — vérifier GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN dans Render');
 
-  // Wrap texte en HTML simple
-  const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;">
-${texte.replace(/\n/g, '<br>')}
-<br><br>--<br>
-<strong>Shawn Barrette · RE/MAX Prestige</strong><br>
-📞 514-927-1340 · <a href="https://signatureSB.com">signatureSB.com</a>
+  // HTML branded dynamique (utilise AGENT_CONFIG)
+  const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;margin:0 auto;padding:20px;">
+<div style="border-top:3px solid ${AGENT.couleur};padding-top:16px;">
+${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` : '<br>').join('')}
+</div>
+<div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;color:#666;font-size:12px;">
+<strong>${AGENT.nom}</strong> · ${AGENT.compagnie}<br>
+📞 ${AGENT.telephone} · <a href="https://${AGENT.site}" style="color:${AGENT.couleur};">${AGENT.site}</a>
+</div>
 </body></html>`;
 
-  const boundary = `sb_${Date.now()}`;
-  const toHeader = toName ? `${toName} <${to}>` : to;
-  const encodeSubject = s => `=?UTF-8?B?${Buffer.from(s, 'utf-8').toString('base64')}?=`;
+  const boundary  = `sb_${Date.now()}`;
+  const toHeader  = toName ? `${toName} <${to}>` : to;
+  const encSubj   = s => {
+    // Encoder chaque mot si nécessaire (robuste pour sujets longs)
+    const b64 = Buffer.from(s, 'utf-8').toString('base64');
+    return `=?UTF-8?B?${b64}?=`;
+  };
 
-  const lines = [
-    `From: Shawn Barrette · RE/MAX Prestige <${SHAWN_EMAIL}>`,
+  const msgLines = [
+    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${toHeader}`,
-    `Bcc: ${SHAWN_EMAIL}`,
-    `Reply-To: ${SHAWN_EMAIL}`,
-    `Subject: ${encodeSubject(sujet)}`,
+    `Bcc: ${AGENT.email}`,
+    `Reply-To: ${AGENT.email}`,
+    `Subject: ${encSubj(sujet)}`,
     'MIME-Version: 1.0',
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
     '',
     `--${boundary}`,
     'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
     '',
     texte,
     '',
@@ -1399,10 +1446,11 @@ ${texte.replace(/\n/g, '<br>')}
     'Content-Transfer-Encoding: base64',
     '',
     Buffer.from(html, 'utf-8').toString('base64'),
-    `--${boundary}--`
+    `--${boundary}--`,
   ];
 
-  const raw = Buffer.from(lines.join('\r\n'), 'utf-8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const raw = Buffer.from(msgLines.join('\r\n'), 'utf-8')
+    .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   await gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
 }
 
@@ -1915,27 +1963,43 @@ const CONFIRM_REGEX = /^(envoie[!.]?|envoie[- ]le[!.]?|parfait[!.]?|go[!.]?|oui[
 async function handleEmailConfirmation(chatId, text) {
   if (!CONFIRM_REGEX.test(text.trim())) return false;
   const pending = pendingEmails.get(chatId);
-  if (!pending) {
-    // Pas de brouillon en attente — ne pas intercepter ce message
-    return false;
-  }
-  // Ne PAS supprimer avant envoi réussi
+  if (!pending) return false;
+
+  let sent = false;
+  let method = '';
+
+  // 1. Essayer Gmail (priorité)
   try {
-    const gmailOk = await getGmailToken();
-    if (gmailOk) {
+    const token = await getGmailToken(); // retourne string ou null — jamais throw ici
+    if (token) {
       await envoyerEmailGmail(pending);
-      pendingEmails.delete(chatId); // supprimer seulement après succès
-      await send(chatId, `✅ Email envoyé à *${pending.toName || pending.to}*\nObjet: ${pending.sujet}`);
-    } else {
-      const ok = await envoyerEmailBrevo({ to: pending.to, toName: pending.toName, subject: pending.sujet, textContent: pending.texte });
-      if (!ok) throw new Error('Brevo a retourné une erreur — email non envoyé');
-      pendingEmails.delete(chatId);
-      await send(chatId, `✅ Email envoyé via Brevo à *${pending.toName || pending.to}*`);
+      sent = true;
+      method = 'Gmail';
     }
   } catch (e) {
-    // Brouillon conservé en cas d'erreur — Shawn peut réessayer
-    await send(chatId, `❌ Erreur envoi: ${e.message}\n_Le brouillon est conservé — dis "envoie" pour réessayer._`);
+    log('WARN', 'EMAIL', `Gmail fail: ${e.message} — tentative Brevo`);
   }
+
+  // 2. Fallback Brevo si Gmail a échoué ou non configuré
+  if (!sent) {
+    try {
+      if (!BREVO_KEY) throw new Error('BREVO_API_KEY manquant dans Render');
+      const ok = await envoyerEmailBrevo({ to: pending.to, toName: pending.toName, subject: pending.sujet, textContent: pending.texte });
+      if (!ok) throw new Error('Brevo HTTP error');
+      sent = true;
+      method = 'Brevo';
+    } catch (e) {
+      log('ERR', 'EMAIL', `Brevo fail: ${e.message}`);
+    }
+  }
+
+  if (!sent) {
+    await send(chatId, `❌ Email non envoyé — Gmail et Brevo en échec.\n_Brouillon conservé — dis "envoie" pour réessayer ou vérifie /status._`);
+    return true;
+  }
+
+  pendingEmails.delete(chatId); // supprimer SEULEMENT après succès confirmé
+  await send(chatId, `✅ *Email envoyé* (${method})\nÀ: ${pending.toName || pending.to}\nObjet: ${pending.sujet}`);
   return true;
 }
 
@@ -2256,9 +2320,9 @@ async function runDigestJulie() {
   if (!PD_KEY || !BREVO_KEY) return;
   try {
     const [nouveaux, enDiscussion, visitesAujourdhui] = await Promise.all([
-      pdGet('/deals?stage_id=49&status=open&limit=30'),
-      pdGet('/deals?stage_id=51&status=open&limit=30'),
-      pdGet('/deals?stage_id=52&status=open&limit=30')
+      pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&stage_id=49&status=open&limit=30`),
+      pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&stage_id=51&status=open&limit=30`),
+      pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&stage_id=52&status=open&limit=30`),
     ]);
     const today = new Date().toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
     let body = `Bonjour Julie,\n\nVoici le résumé pipeline du ${today}.\n\n`;
@@ -2275,7 +2339,7 @@ async function runDigestJulie() {
 async function runSuiviQuotidien() {
   if (!PD_KEY || !ALLOWED_ID) return;
   try {
-    const data = await pdGet('/deals?pipeline_id=7&status=open&limit=100');
+    const data = await pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=100`);
     const deals = data?.data || [];
     const now = Date.now();
     const relances = [];
