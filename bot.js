@@ -388,6 +388,29 @@ Idéal pour: stratégie de prix complexe, analyse marché multi-facteurs, négoc
 ════ MÉMOIRE ════
 Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]
 
+════ COMPARABLES VENDUS — CENTRIS ════
+
+Tu peux scraper Centris.ca pour les propriétés vendues et envoyer des rapports.
+
+SOUS-ENTENDUS → ACTIONS:
+• "comparables terrains Sainte-Julienne" → chercher_comparables(type=terrain, ville=Sainte-Julienne, jours=14)
+• "envoie-moi les terrains vendus depuis 2 semaines à Rawdon" → envoyer_rapport_comparables(type=terrain, ville=Rawdon, jours=14)
+• "maisons vendues Rawdon 30 jours" → chercher_comparables(type=maison, ville=Rawdon, jours=30)
+• "envoie rapport comparables à [email]" → envoyer_rapport_comparables(..., email=[email])
+• "stats vendus Lanaudière" → chercher_comparables plusieurs villes
+
+RAPPORT EMAIL:
+• Template Signature SB (logos, couleurs #aa0721, fond #0a0a0a)
+• Tableau: adresse · prix vendu · superficie · $/pi² · date vendu
+• Stats: nb ventes · prix moyen · fourchette · superficie moyenne
+• Envoyé via Gmail ou Brevo
+
+VILLES SUPPORTÉES: Rawdon, Sainte-Julienne, Chertsey, Saint-Didace, Sainte-Marcelline, Saint-Jean-de-Matha, Saint-Calixte, Joliette, Repentigny, Montréal, Laval, et plus
+
+TYPES SUPPORTÉS: terrain, maison, plex, duplex, triplex, condo, bungalow
+
+LIMITES: Centris peut limiter l'accès public aux vendus — si données insuffisantes, informer Shawn et suggérer d'augmenter la période ou changer de ville.
+
 ════ CAPACITÉS OPUS 4.7 ════
 Tu es claude-opus-4-7. Utilise tes capacités au maximum:
 • Vision native: analyse photos et PDFs directement — pas besoin d'outil intermédiaire
@@ -1691,6 +1714,411 @@ async function rechercherWeb(requete) {
   return `Aucun résultat trouvé pour: "${requete}"`;
 }
 
+// ─── COMPARABLES VENDUS — Scraping Centris ───────────────────────────────────
+
+// Cache scraping (30min TTL, max 100 entrées)
+const SCRAPE_CACHE = new Map();
+async function fetchHTML(url) {
+  const cached = SCRAPE_CACHE.get(url);
+  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return cached;
+  if (SCRAPE_CACHE.size >= 100) SCRAPE_CACHE.delete(SCRAPE_CACHE.keys().next().value);
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 20000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'fr-CA,fr;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      }
+    });
+    if (!res.ok) return { html: '', status: res.status };
+    const html = await res.text();
+    const entry = { html, ts: Date.now(), url };
+    SCRAPE_CACHE.set(url, entry);
+    setTimeout(() => SCRAPE_CACHE.delete(url), 30 * 60 * 1000);
+    return entry;
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Timeout scraping (20s)');
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
+// Normalisation des villes → slugs Centris
+const VILLES_CENTRIS = {
+  'rawdon':'rawdon', 'raw':'rawdon',
+  'sainte-julienne':'sainte-julienne','saint-julienne':'sainte-julienne','julienne':'sainte-julienne',
+  'chertsey':'chertsey',
+  'saint-didace':'saint-didace','didace':'saint-didace',
+  'sainte-marcelline':'sainte-marcelline-de-kildare','sainte-marcelline-de-kildare':'sainte-marcelline-de-kildare','marcelline':'sainte-marcelline-de-kildare',
+  'saint-jean-de-matha':'saint-jean-de-matha','matha':'saint-jean-de-matha',
+  'saint-calixte':'saint-calixte','calixte':'saint-calixte',
+  'saint-lin':'saint-lin-laurentides','laurentides':'saint-lin-laurentides',
+  'joliette':'joliette',
+  'repentigny':'repentigny',
+  'terrebonne':'terrebonne',
+  'mascouche':'mascouche',
+  'lachenaie':'terrebonne',
+  'berthierville':'berthierville',
+  'montreal':'montreal','mtl':'montreal',
+  'laval':'laval',
+  'longueuil':'longueuil',
+  'saint-jerome':'saint-jerome','saint-jérôme':'saint-jerome',
+  'mirabel':'mirabel',
+  'blainville':'blainville',
+  'boisbriand':'boisbriand',
+  'lanaudiere':'lanaudiere','lanaudière':'lanaudiere',
+};
+
+// Types → slugs Centris + genre (vendu/vendue)
+const TYPES_CENTRIS = {
+  'terrain':           { slug:'terrain',              genre:'vendu'  },
+  'lot':               { slug:'terrain',              genre:'vendu'  },
+  'land':              { slug:'terrain',              genre:'vendu'  },
+  'maison':            { slug:'maison',               genre:'vendue' },
+  'maison_usagee':     { slug:'maison',               genre:'vendue' },
+  'unifamiliale':      { slug:'maison',               genre:'vendue' },
+  'bungalow':          { slug:'bungalow',             genre:'vendu'  },
+  'plex':              { slug:'immeuble-a-revenus',   genre:'vendu'  },
+  'duplex':            { slug:'duplex',               genre:'vendu'  },
+  'triplex':           { slug:'triplex',              genre:'vendu'  },
+  'multiplex':         { slug:'immeuble-a-revenus',   genre:'vendu'  },
+  'condo':             { slug:'appartement-condo',    genre:'vendu'  },
+  'commercial':        { slug:'commercial-industriel',genre:'vendu'  },
+};
+
+function slugVille(ville) {
+  const k = ville.toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g,'-');
+  return VILLES_CENTRIS[k] || VILLES_CENTRIS[ville.toLowerCase().trim()] || ville.toLowerCase().replace(/\s+/g,'-');
+}
+function slugType(type) {
+  return TYPES_CENTRIS[type?.toLowerCase()] || TYPES_CENTRIS['terrain'];
+}
+
+// Extraire les comparables depuis HTML Centris
+function parseCentrisComparables(html, ville, jours) {
+  const listings = [];
+  const cutoff = new Date(Date.now() - jours * 86400000);
+  const seen = new Set();
+
+  // Stratégie 1 — JSON-LD schema.org
+  for (const m of html.matchAll(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const d = JSON.parse(m[1]);
+      const items = Array.isArray(d) ? d.flat() : [d];
+      for (const item of items) {
+        if (!item['@type']) continue;
+        const id = item.identifier || item['@id'] || '';
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const prixRaw = item.offers?.price || item.price;
+        const prix = prixRaw ? parseInt(String(prixRaw).replace(/[^\d]/g,'')) : null;
+        const adresse = item.name || item.address?.streetAddress || '';
+        const superficie = item.floorSize?.value || null;
+        const dateStr = item.dateModified || item.dateCreated || '';
+        if (dateStr) { try { if (new Date(dateStr) < cutoff) continue; } catch {} }
+        if (prix || adresse) listings.push({ mls:id, adresse, ville: item.address?.addressLocality || ville, prix, superficie: superficie ? parseInt(superficie) : null, dateVente: dateStr ? new Date(dateStr).toLocaleDateString('fr-CA') : '', source:'json-ld' });
+      }
+    } catch {}
+  }
+
+  // Stratégie 2 — HTML cards avec data-id
+  if (listings.length < 3) {
+    for (const m of html.matchAll(/data-(?:id|mlsnumber|listing-id|listingid)="(\d{6,9})"/gi)) {
+      const mls = m[1];
+      if (seen.has(mls)) continue;
+      seen.add(mls);
+      // Extraire le contexte autour (500 chars)
+      const start = Math.max(0, m.index - 50);
+      const ctx = html.substring(start, start + 800);
+      const priceM = ctx.match(/(\d{2,3}[\s\u00a0,]\d{3})\s*\$/);
+      const prix = priceM ? parseInt(priceM[1].replace(/[^\d]/g,'')) : null;
+      const adresseM = ctx.match(/(?:address|adresse)[^>]*>\s*<[^>]+>\s*([^<]{5,60})/i);
+      listings.push({ mls, adresse: adresseM?.[1]?.trim() || '', ville, prix, superficie: null, dateVente: '', source:'data-id' });
+    }
+  }
+
+  // Stratégie 3 — prix + contexte
+  if (listings.length < 2) {
+    const priceBlocks = [...html.matchAll(/(\d{2,3}[\s\u00a0,]\d{3})\s*\$[^"]*?(?:rue|avenue|ch\.|chemin|rang|route|place|boul|blvd)[^\n<]{5,50}/gi)];
+    for (const m of priceBlocks.slice(0, 15)) {
+      const prix = parseInt(m[1].replace(/[^\d]/g,''));
+      const adresseM = m[0].match(/(?:rue|avenue|ch\.|chemin|rang|route|place|boul|blvd)\s+[^\n<,"]{5,50}/i);
+      if (prix > 10000 && !seen.has(String(prix))) {
+        seen.add(String(prix));
+        listings.push({ mls:'', adresse: adresseM?.[0]?.trim() || '', ville, prix, superficie: null, dateVente: '', source:'prix' });
+      }
+    }
+  }
+
+  return listings.slice(0, 25);
+}
+
+// Détails d'un listing (superficie, date vente exacte)
+async function fetchListingDetails(mls) {
+  if (!mls || mls.length < 6) return {};
+  try {
+    const { html } = await fetchHTML(`https://www.centris.ca/fr/listing/${mls}`);
+    if (!html) return {};
+    const sup   = html.match(/(\d[\d\s,]*)\s*(?:pi²|pi2|sq\.?\s*ft|pieds?\s*carr[eé]s?)/i)?.[1];
+    const date  = html.match(/(?:vendu?e?|sold)\s*(?:le\s*)?:?\s*(\d{1,2}\s+\w+\s+\d{4})/i)?.[1];
+    const prix  = html.match(/(?:prix\s*(?:de\s*vente)?|sold\s*for)\s*:?\s*([\d\s,]+)\s*\$/i)?.[1];
+    return {
+      superficie: sup ? parseInt(sup.replace(/[^\d]/g,'')) : null,
+      dateVente:  date || null,
+      prixExact:  prix ? parseInt(prix.replace(/[^\d]/g,'')) : null,
+    };
+  } catch { return {}; }
+}
+
+async function chercherComparablesVendus({ type = 'terrain', ville, jours = 14, enrichir = true }) {
+  if (!ville) return '❌ Indique une ville: ex. "Sainte-Julienne", "Rawdon"';
+
+  const typeInfo  = slugType(type);
+  const villeSlug = slugVille(ville);
+  const typeLabel = type === 'terrain' ? 'terrains' : type === 'maison' || type === 'maison_usagee' ? 'maisons' : type;
+
+  // Essayer les deux formes (vendu/vendue) et vue liste
+  const urls = [
+    `https://www.centris.ca/fr/${typeInfo.slug}~${typeInfo.genre}~${villeSlug}?view=Vg==&uc=1`,
+    `https://www.centris.ca/fr/${typeInfo.slug}~${typeInfo.genre}~${villeSlug}`,
+    `https://www.centris.ca/fr/${typeInfo.slug}~vendu~${villeSlug}?view=Vg==`,
+    `https://www.centris.ca/fr/${typeInfo.slug}~vendue~${villeSlug}?view=Vg==`,
+  ];
+
+  let listings = [];
+  let htmlFetched = '';
+  for (const url of urls) {
+    try {
+      const { html } = await fetchHTML(url);
+      if (!html || html.length < 1000) continue;
+      htmlFetched = html;
+      listings = parseCentrisComparables(html, ville, jours);
+      if (listings.length > 0) { log('OK', 'COMP', `${listings.length} comparables via ${url}`); break; }
+    } catch (e) { log('WARN', 'COMP', `${url}: ${e.message}`); }
+  }
+
+  if (!listings.length) {
+    return `Aucun comparable trouvé pour *${typeLabel}* vendus à *${ville}* (${jours}j).\n\nPossibles raisons:\n• Aucune vente récente dans ce secteur\n• Ville non reconnue — essaie avec un nom différent\n• Centris limite l'accès aux vendus publics\n\nDis "essaie [ville voisine]" ou "augmente à 30 jours".`;
+  }
+
+  // Enrichir les 8 premiers avec les détails (superficie, date exacte)
+  if (enrichir && listings.some(l => l.mls)) {
+    const toEnrich = listings.filter(l => l.mls).slice(0, 8);
+    const details  = await Promise.all(toEnrich.map(async (l, i) => {
+      await new Promise(r => setTimeout(r, i * 400)); // rate limit gentil
+      return fetchListingDetails(l.mls);
+    }));
+    toEnrich.forEach((l, i) => {
+      if (details[i].superficie) l.superficie = details[i].superficie;
+      if (details[i].dateVente)  l.dateVente  = details[i].dateVente;
+      if (details[i].prixExact)  l.prix       = details[i].prixExact;
+    });
+  }
+
+  return listings;
+}
+
+// Générer le HTML du rapport (style template SB)
+function genererRapportHTML(listings, { type, ville, jours }) {
+  const typeLabel  = type === 'terrain' ? 'Terrains' : type === 'maison' || type === 'maison_usagee' ? 'Maisons' : type;
+  const fmt        = n => n ? `${Number(n).toLocaleString('fr-CA')} $` : '—';
+  const fmtSup     = n => n ? `${Number(n).toLocaleString('fr-CA')} pi²` : '—';
+  const fmtPiePi   = (p,s) => (p && s && s > 100) ? `${(p/s).toFixed(2)} $/pi²` : '—';
+
+  // Stats globales
+  const avecPrix   = listings.filter(l => l.prix > 1000);
+  const prixMoyen  = avecPrix.length ? Math.round(avecPrix.reduce((s,l) => s+l.prix, 0) / avecPrix.length) : 0;
+  const prixMin    = avecPrix.length ? Math.min(...avecPrix.map(l => l.prix)) : 0;
+  const prixMax    = avecPrix.length ? Math.max(...avecPrix.map(l => l.prix)) : 0;
+  const avecSup    = listings.filter(l => l.superficie > 100);
+  const supMoy     = avecSup.length ? Math.round(avecSup.reduce((s,l) => s+l.superficie, 0) / avecSup.length) : 0;
+
+  const statsBloc = `
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:12px 0;">
+<tr>
+  <td width="25%" style="padding:4px;">
+    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+      <div style="color:#aa0721;font-size:24px;font-weight:900;">${listings.length}</div>
+      <div style="color:#666;font-size:11px;line-height:1.4;">${typeLabel} vendus<br>${jours} derniers jours</div>
+    </div>
+  </td>
+  <td width="25%" style="padding:4px;">
+    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+      <div style="color:#aa0721;font-size:18px;font-weight:800;">${fmt(prixMoyen)}</div>
+      <div style="color:#666;font-size:11px;line-height:1.4;">Prix moyen</div>
+    </div>
+  </td>
+  <td width="25%" style="padding:4px;">
+    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+      <div style="color:#aa0721;font-size:15px;font-weight:800;">${fmt(prixMin)}<br><span style="font-size:11px;color:#666;">min</span></div>
+      <div style="color:#aa0721;font-size:15px;font-weight:800;margin-top:4px;">${fmt(prixMax)}<br><span style="font-size:11px;color:#666;">max</span></div>
+    </div>
+  </td>
+  ${supMoy ? `<td width="25%" style="padding:4px;">
+    <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:14px 12px;">
+      <div style="color:#aa0721;font-size:18px;font-weight:800;">${fmtSup(supMoy)}</div>
+      <div style="color:#666;font-size:11px;line-height:1.4;">Superficie moy.</div>
+    </div>
+  </td>` : '<td width="25%"></td>'}
+</tr>
+</table>`;
+
+  const lignes = listings.map(l => `
+<tr style="border-bottom:1px solid #1a1a1a;">
+  <td style="padding:10px 12px;color:#f5f5f7;font-size:13px;vertical-align:top;">
+    ${l.adresse || 'Adresse N/D'}
+    ${l.mls ? `<div style="color:#444;font-size:11px;margin-top:2px;">#${l.mls}</div>` : ''}
+  </td>
+  <td style="padding:10px 12px;color:#aa0721;font-size:14px;font-weight:800;white-space:nowrap;">${fmt(l.prix)}</td>
+  <td style="padding:10px 12px;color:#888;font-size:12px;white-space:nowrap;">${fmtSup(l.superficie)}</td>
+  <td style="padding:10px 12px;color:#888;font-size:12px;white-space:nowrap;">${fmtPiePi(l.prix, l.superficie)}</td>
+  <td style="padding:10px 12px;color:#555;font-size:11px;white-space:nowrap;">${l.dateVente || '—'}</td>
+</tr>`).join('');
+
+  const tableau = `
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;overflow:hidden;margin-top:16px;">
+  <div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:12px 16px 10px;border-bottom:1px solid #1a1a1a;">
+    ${typeLabel} vendus · ${ville} · ${jours} derniers jours · Source: Centris.ca
+  </div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+    <thead>
+      <tr style="background:#0d0d0d;">
+        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">ADRESSE</th>
+        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">PRIX VENDU</th>
+        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">SUPERFICIE</th>
+        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">$/PI²</th>
+        <th align="left" style="padding:8px 12px;color:#555;font-size:10px;letter-spacing:1px;">DATE</th>
+      </tr>
+    </thead>
+    <tbody>${lignes}</tbody>
+  </table>
+</div>`;
+
+  return statsBloc + tableau;
+}
+
+async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, email }) {
+  const dest = email || AGENT.email;
+  const typeLabel = type === 'terrain' ? 'Terrains' : type === 'maison' || type === 'maison_usagee' ? 'Maisons' : type;
+
+  // 1. Chercher les comparables
+  const result = await chercherComparablesVendus({ type, ville, jours, enrichir: true });
+  if (typeof result === 'string') return result; // message d'erreur
+  const listings = result;
+
+  // 2. Générer le HTML du rapport
+  const rapportHTML = genererRapportHTML(listings, { type, ville, jours });
+
+  // 3. Lire le master template depuis Dropbox
+  const tplPath = `${AGENT.dbx_templates}/master_template_signature_sb.html`;
+  let template  = '';
+  const tplRes  = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: tplPath.startsWith('/') ? tplPath : '/' + tplPath }, true);
+  if (tplRes?.ok) {
+    template = await tplRes.text();
+  } else {
+    // Fallback: template HTML minimal brandé
+    template = null;
+  }
+
+  const now       = new Date();
+  const dateMois  = now.toLocaleDateString('fr-CA', { month: 'long', year: 'numeric' });
+  const sujet     = `${typeLabel} vendus — ${ville} — ${jours} derniers jours | ${dateMois}`;
+
+  let htmlFinal;
+  if (template && template.length > 5000) {
+    // Remplir les placeholders du master template
+    const fillTemplate = (tpl, params) => {
+      let h = tpl;
+      for (const [k, v] of Object.entries(params)) h = h.split(`{{ params.${k} }}`).join(v ?? '');
+      return h;
+    };
+    htmlFinal = fillTemplate(template, {
+      TITRE_EMAIL:         `${typeLabel} vendus — ${ville}`,
+      LABEL_SECTION:       `Comparables · ${ville} · Lanaudière`,
+      DATE_MOIS:           dateMois,
+      TERRITOIRES:         ville,
+      SOUS_TITRE_ANALYSE:  `Marché ${typeLabel.toLowerCase()} · ${dateMois}`,
+      HERO_TITRE:          `${typeLabel} vendus<br>à ${ville} — ${jours} derniers jours.`,
+      INTRO_TEXTE:         `<p style="margin:0 0 16px;color:#cccccc;font-size:14px;">Voici les ${listings.length} ${typeLabel.toLowerCase()} vendus à ${ville} au cours des ${jours} derniers jours. Données extraites de Centris.ca.</p>`,
+      TITRE_SECTION_1:     `Résultats · ${ville} · ${dateMois}`,
+      MARCHE_LABEL:        `${typeLabel} vendus`,
+      PRIX_MEDIAN:         listings.filter(l=>l.prix).length ? `${Math.round(listings.filter(l=>l.prix).reduce((s,l)=>s+l.prix,0)/listings.filter(l=>l.prix).length).toLocaleString('fr-CA')} $` : 'N/D',
+      VARIATION_PRIX:      `${listings.length} ventes · ${jours}j · Source: Centris.ca`,
+      SOURCE_STAT:         `Centris.ca · ${dateMois}`,
+      LABEL_TABLEAU:       `Liste complète`,
+      TABLEAU_STATS_HTML:  rapportHTML,
+      TITRE_SECTION_2:     `À retenir`,
+      CITATION:            `Ces comparables représentent le marché actuel à ${ville}. Pour une analyse personnalisée de votre propriété, contactez-moi.`,
+      CONTENU_STRATEGIE:   '',
+      CTA_TITRE:           `Besoin d'une évaluation?`,
+      CTA_SOUS_TITRE:      `Gratuite, sans engagement. 20 minutes pour faire le point.`,
+      CTA_URL:             `tel:${AGENT.telephone.replace(/[^\d]/g,'')}`,
+      CTA_BOUTON:          `Appeler ${AGENT.prenom} — ${AGENT.telephone}`,
+      CTA_NOTE:            `${AGENT.nom} · ${AGENT.compagnie}`,
+      REFERENCE_URL:       `tel:${AGENT.telephone.replace(/[^\d]/g,'')}`,
+      SOURCES:             `Centris.ca · ${dateMois}`,
+      DESINSCRIPTION_URL:  '',
+    });
+  } else {
+    // Fallback HTML direct (sans template Dropbox)
+    htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px;">
+<table width="600" style="max-width:600px;background:#0a0a0a;color:#f5f5f7;">
+<tr><td style="background:#aa0721;height:4px;font-size:1px;">&nbsp;</td></tr>
+<tr><td style="padding:28px 32px 20px;">
+  <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">${AGENT.nom} · ${AGENT.compagnie}</div>
+  <h1 style="color:#f5f5f7;font-size:26px;margin:16px 0 8px;">${typeLabel} vendus<br>à ${ville} — ${jours} derniers jours</h1>
+  <p style="color:#888;font-size:13px;margin:0 0 24px;">Source: Centris.ca · ${dateMois}</p>
+  ${rapportHTML}
+  <div style="margin-top:24px;padding-top:16px;border-top:1px solid #1e1e1e;color:#555;font-size:12px;">
+    ${AGENT.nom} · ${AGENT.telephone} · ${AGENT.site}
+  </div>
+</td></tr>
+</table>
+</td></tr></table>
+</body></html>`;
+  }
+
+  // 4. Envoyer par Gmail (avec branding complet)
+  const token = await getGmailToken();
+  if (!token) return `❌ Gmail non configuré.\n\nRapport prêt (${listings.length} comparables):\n${listings.slice(0,5).map(l=>`• ${l.adresse || 'N/D'} — ${l.prix ? l.prix.toLocaleString('fr-CA')+' $' : '?'}`).join('\n')}`;
+
+  const boundary = `sb${Date.now()}`;
+  const enc      = s => `=?UTF-8?B?${Buffer.from(s,'utf-8').toString('base64')}?=`;
+  const msgLines = [
+    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `To: ${dest}`,
+    `Reply-To: ${AGENT.email}`,
+    `Subject: ${enc(sujet)}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    '',
+    `${typeLabel} vendus — ${ville} — ${jours} derniers jours\n\n${listings.map((l,i)=>`${i+1}. ${l.adresse||'N/D'} — ${l.prix?l.prix.toLocaleString('fr-CA')+' $':'N/D'}${l.superficie?' — '+l.superficie.toLocaleString('fr-CA')+' pi²':''}`).join('\n')}\n\n${AGENT.nom} · ${AGENT.telephone}`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(htmlFinal, 'utf-8').toString('base64'),
+    `--${boundary}--`,
+  ];
+  const raw = Buffer.from(msgLines.join('\r\n'), 'utf-8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  await gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
+
+  const statsLine = listings.filter(l=>l.prix).length
+    ? `Prix moyen: ${Math.round(listings.filter(l=>l.prix).reduce((s,l)=>s+l.prix,0)/listings.filter(l=>l.prix).length).toLocaleString('fr-CA')} $`
+    : '';
+  return `✅ *Rapport envoyé* à ${dest}\n\n📊 ${listings.length} ${typeLabel.toLowerCase()} vendus — ${ville} — ${jours}j\n${statsLine ? statsLine + '\n' : ''}📧 Template Signature SB · Centris.ca`;
+}
+
 // ─── Outils Claude ────────────────────────────────────────────────────────────
 const TOOLS = [
   // ── Pipedrive ──
@@ -1714,6 +2142,9 @@ const TOOLS = [
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
   { name: 'envoyer_email',       description: 'Préparer un brouillon email pour approbation de Shawn. Affiche le brouillon complet — il N\'EST PAS envoyé tant que Shawn ne confirme pas avec "envoie", "go", "ok", "parfait", "d\'accord", etc.', input_schema: { type: 'object', properties: { to: { type: 'string', description: 'Adresse email du destinataire' }, toName: { type: 'string', description: 'Nom du destinataire' }, sujet: { type: 'string', description: 'Objet de l\'email' }, texte: { type: 'string', description: 'Corps de l\'email — texte brut, style Shawn, vouvoiement, max 3 paragraphes courts.' } }, required: ['to', 'sujet', 'texte'] } },
+  // ── Comparables vendus ──
+  { name: 'chercher_comparables',         description: 'Scraper Centris.ca pour trouver les propriétés vendues (comparables) par type, ville et période. Pour "comparables terrains Sainte-Julienne 14 jours", "maisons vendues Rawdon". Retourne liste avec prix, superficie, $/pi², date.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex, condo, bungalow (défaut: terrain)' }, ville: { type: 'string', description: 'Nom de la ville: Rawdon, Sainte-Julienne, Chertsey, etc.' }, jours: { type: 'number', description: 'Nombre de jours en arrière (défaut: 14)' } }, required: ['ville'] } },
+  { name: 'envoyer_rapport_comparables',  description: 'Chercher comparables Centris ET envoyer par email avec le template Signature SB (logos, couleurs). Pour "envoie-moi les terrains vendus à Sainte-Julienne par email". Template officiel avec branding complet.', input_schema: { type: 'object', properties: { type: { type: 'string', description: 'terrain, maison, plex (défaut: terrain)' }, ville: { type: 'string', description: 'Ville' }, jours: { type: 'number', description: 'Nombre de jours (défaut: 14)' }, email: { type: 'string', description: 'Email destination (défaut: shawn@signaturesb.com)' } }, required: ['ville'] } },
   // ── Recherche web ──
   { name: 'rechercher_web',  description: 'Rechercher infos actuelles: taux hypothécaires, stats marché QC, prix construction, réglementations. Enrichit les emails avec données récentes.', input_schema: { type: 'object', properties: { requete: { type: 'string', description: 'Requête précise. Ex: "taux hypothécaire 5 ans fixe Desjardins avril 2025"' } }, required: ['requete'] } },
   // ── GitHub ──
@@ -1778,6 +2209,27 @@ async function executeTool(name, input, chatId) {
       case 'repondre_vite':           return await repondreVite(chatId, input.terme, input.message);
       case 'modifier_deal':           return await modifierDeal(input.terme, input);
       case 'creer_activite':          return await creerActivite(input);
+      case 'chercher_comparables': {
+        const res = await chercherComparablesVendus({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14 });
+        if (typeof res === 'string') return res;
+        const listings = res;
+        const fmt = n => n ? `${Number(n).toLocaleString('fr-CA')} $` : '—';
+        const fmtS = n => n ? `${Number(n).toLocaleString('fr-CA')} pi²` : '—';
+        const fmtPp = (p,s) => (p&&s&&s>100) ? `${(p/s).toFixed(2)} $/pi²` : '—';
+        const avecPrix = listings.filter(l=>l.prix>1000);
+        const prixMoy = avecPrix.length ? Math.round(avecPrix.reduce((s,l)=>s+l.prix,0)/avecPrix.length) : 0;
+        let txt = `📊 *${listings.length} ${input.type||'terrain'}(s) vendus — ${input.ville} — ${input.jours||14}j*\n`;
+        if (prixMoy) txt += `Prix moyen: *${fmt(prixMoy)}*\n`;
+        txt += '\n';
+        listings.slice(0,12).forEach((l,i) => {
+          txt += `${i+1}. ${l.adresse||'Adresse N/D'}${l.mls?' (#'+l.mls+')':''}\n`;
+          txt += `   ${fmt(l.prix)} · ${fmtS(l.superficie)} · ${fmtPp(l.prix,l.superficie)}${l.dateVente?' · '+l.dateVente:''}\n`;
+        });
+        if (listings.length > 12) txt += `\n_+ ${listings.length-12} autres — dis "envoie rapport" pour tout recevoir par email._`;
+        else txt += `\n_Dis "envoie rapport ${input.ville}" pour recevoir ça par email avec le template Signature SB._`;
+        return txt;
+      }
+      case 'envoyer_rapport_comparables': return await envoyerRapportComparables({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14, email: input.email });
       case 'chercher_listing_dropbox': return await chercherListingDropbox(input.terme);
       case 'envoyer_docs_prospect':    return await envoyerDocsProspect(input.terme, input.email, input.fichier);
       case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
