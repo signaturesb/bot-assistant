@@ -3398,6 +3398,15 @@ function registerHandlers() {
     );
   });
 
+  bot.onText(/\/cleanemail/, async msg => {
+    if (!isAllowed(msg)) return;
+    await bot.sendMessage(msg.chat.id, '🧹 Nettoyage emails GitHub/CI/Dependabot (30 derniers jours)...');
+    const res = await autoTrashGitHubNoise({ maxAge: '30d' });
+    await bot.sendMessage(msg.chat.id, res.error
+      ? `❌ ${res.error}`
+      : `✅ ${res.trashed} emails mis à la corbeille.\n\nAuto-clean: boot + tous les jours à 6h.`);
+  });
+
   bot.onText(/\/forcelead\s+([a-zA-Z0-9_-]+)/, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const msgId = match[1];
@@ -3738,7 +3747,7 @@ function registerHandlers() {
 }
 
 // ─── Tâches quotidiennes (sans node-cron) ─────────────────────────────────────
-const lastCron = { digest: null, suivi: null, visites: null, sync: null };
+const lastCron = { digest: null, suivi: null, visites: null, sync: null, trashCI: null };
 
 async function runDigestJulie() {
   if (!PD_KEY || !BREVO_KEY) return;
@@ -3876,6 +3885,7 @@ function startDailyTasks() {
     const heure    = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
     const h        = parseInt(heure);
     const todayStr = now.toDateString();
+    if (h === 6  && lastCron.trashCI !== todayStr)  { lastCron.trashCI = todayStr; autoTrashGitHubNoise(); }
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
@@ -4382,6 +4392,50 @@ const pollerStats = {
   totalsFound: 0, totalsJunk: 0, totalsNoSource: 0, totalsLowInfo: 0, totalsDealCreated: 0, totalsErrors: 0,
 };
 
+// ── autoTrashGitHubNoise — supprime auto les emails notifications GitHub/Dependabot/CI
+// Shawn ne veut plus être notifié par courriel — le bot nettoie tout seul.
+// Run: 30s après boot + cron quotidien 6h (+ manuel via /cleanemail)
+async function autoTrashGitHubNoise(opts = {}) {
+  try {
+    const token = await getGmailToken();
+    if (!token) return { trashed: 0, skipped: 'no_gmail' };
+
+    const maxAge = opts.maxAge || '30d';
+    // Tous les emails GitHub/Dependabot/CI (notifs, PR, run failed, workflow)
+    const query = [
+      '(',
+      'from:notifications@github.com',
+      'OR from:noreply@github.com',
+      'OR cc:ci_activity@noreply.github.com',
+      'OR cc:push@noreply.github.com',
+      'OR cc:state_change@noreply.github.com',
+      'OR cc:comment@noreply.github.com',
+      ')',
+      `newer_than:${maxAge}`,
+      '-in:trash',
+    ].join(' ');
+
+    const list = await gmailAPI(`/messages?maxResults=100&q=${encodeURIComponent(query)}`);
+    if (!list?.messages?.length) return { trashed: 0 };
+
+    let trashed = 0;
+    for (const m of list.messages) {
+      try {
+        await gmailAPI(`/messages/${m.id}/trash`, { method: 'POST' });
+        trashed++;
+        await new Promise(r => setTimeout(r, 200)); // éviter rate limit
+      } catch (e) {
+        log('WARN', 'CLEANUP', `trash ${m.id}: ${e.message.substring(0, 80)}`);
+      }
+    }
+    log('OK', 'CLEANUP', `Auto-trashed ${trashed} emails GitHub/CI`);
+    return { trashed };
+  } catch (e) {
+    log('WARN', 'CLEANUP', `autoTrashGitHubNoise: ${e.message}`);
+    return { trashed: 0, error: e.message };
+  }
+}
+
 // ── runGmailLeadPoller — BULLETPROOF (2026-04-22)
 // Principe: AUCUN lead client ne doit passer inaperçu.
 // - Scan SANS is:unread (dédup via processed[] state)
@@ -4594,11 +4648,13 @@ async function main() {
 
   // ── Gmail Lead Poller — surveille les leads entrants ──────────────────────
   if (process.env.GMAIL_CLIENT_ID) {
-    // Boot: scan les 6 dernières heures en arrière
+    // Boot: scan 24h en arrière (bulletproof)
     setTimeout(() => runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`)), 8000);
     // Polling toutes les 5 minutes
     setInterval(() => runGmailLeadPoller().catch(() => {}), 5 * 60 * 1000);
-    log('OK', 'BOOT', 'Gmail Lead Poller activé (toutes les 5min)');
+    // Boot: nettoyer emails GitHub/CI 30s après démarrage (Shawn veut zéro spam)
+    setTimeout(() => autoTrashGitHubNoise().catch(() => {}), 30000);
+    log('OK', 'BOOT', 'Gmail Lead Poller + auto-trash CI noise activés');
   } else {
     log('WARN', 'BOOT', 'Gmail Lead Poller désactivé — GMAIL_CLIENT_ID manquant');
   }
