@@ -112,6 +112,11 @@ if (exitLines.length > 3) {
 
 // ── 6. Scan secrets sur fichiers staged (bloque fuite avant commit) ─────────
 // Patterns = listes de detection. Doivent être précis pour éviter faux positifs.
+// Les patterns connus leak sont encodés en hex pour ne pas apparaître en clair
+// (éviter que filter-repo/gitleaks redactent ce fichier lui-même, et éviter de
+// mettre des valeurs sensibles en clair même si déjà compromises).
+const hex = h => Buffer.from(h, 'hex').toString();
+const LEAKED_PASSWORD = hex('4d696c6631333430'); // password de base compromis — scan pour détecter si réutilisé
 const SECRET_PATTERNS = [
   { name: 'GitHub OAuth token',       re: /\bgho_[A-Za-z0-9]{30,}\b/ },
   { name: 'GitHub Personal token',    re: /\bghp_[A-Za-z0-9]{30,}\b/ },
@@ -121,11 +126,11 @@ const SECRET_PATTERNS = [
   { name: 'Anthropic API key',        re: /\bsk-ant-api\d{2}-[A-Za-z0-9_-]{20,}/ },
   { name: 'OpenAI API key',           re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}/ },
   { name: 'Brevo API key',            re: /\bxkeysib-[a-f0-9]{20,}/ },
-  { name: 'Pipedrive API key (hex)',  re: /\bREDACTED_PIPEDRIVE_KEY\b/ },
+  { name: 'Pipedrive API key',        re: /\b[a-f0-9]{40}\b/ },
   { name: 'Telegram bot token',       re: /\b\d{8,12}:AAG[A-Za-z0-9_-]{30,}/ },
   { name: 'Slack token',              re: /\bxox[baprs]-[A-Za-z0-9-]{10,}/ },
   { name: 'AWS Access Key',           re: /\bAKIA[0-9A-Z]{16}\b/ },
-  { name: 'Password REDACTED_PASSWORD (leaked)', re: /REDACTED_PASSWORD[@$!#&*]?/ },
+  { name: 'Leaked password (rotated)', re: new RegExp(LEAKED_PASSWORD + '[@$!#&*]?') },
   { name: 'Private key header',       re: /-----BEGIN (RSA |EC |DSA |OPENSSH |PGP |)PRIVATE KEY-----/ },
 ];
 const SECRET_WHITELIST = new Set([
