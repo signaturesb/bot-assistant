@@ -3,8 +3,16 @@ name: CodeQL
 on:
   push:
     branches: [main]
+    paths:
+      - '**/*.js'
+      - 'package.json'
+      - 'package-lock.json'
   pull_request:
     branches: [main]
+    paths:
+      - '**/*.js'
+      - 'package.json'
+      - 'package-lock.json'
   schedule:
     - cron: '0 6 * * 1'  # Lundi 6h UTC — scan hebdo
 
@@ -16,6 +24,8 @@ permissions:
 jobs:
   analyze:
     name: Analyze JavaScript
+    # Skip on private repos (CodeQL requires GitHub Advanced Security, payant sur privés)
+    if: github.event.repository.visibility == 'public' || github.repository == 'signaturesb/kira-bot'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

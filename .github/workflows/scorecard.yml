@@ -12,6 +12,8 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
+    # Scorecard fonctionne uniquement sur repos publics
+    if: github.event.repository.visibility == 'public' || github.repository == 'signaturesb/kira-bot'
     runs-on: ubuntu-latest
     permissions:
       security-events: write

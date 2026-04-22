@@ -3,6 +3,11 @@ name: Smoke test post-deploy
 on:
   push:
     branches: [main]
+    paths:
+      - '**/*.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'render.yaml'
   workflow_dispatch:
 
 permissions:
