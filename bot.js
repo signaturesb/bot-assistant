@@ -4010,16 +4010,14 @@ async function main() {
   log('INFO', 'BOOT', 'Step 7: startDailyTasks');
   try { startDailyTasks(); } catch (e) { log('ERR', 'BOOT', `startDailyTasks FATAL: ${e.message}`); throw e; }
 
-  log('INFO', 'BOOT', 'Step 8: startPolling Telegram (async, pas de throw)');
-  // Démarrer polling de manière non-bloquante, ne throw jamais
-  try {
-    bot.startPolling({ interval: 3000, autoStart: true, params: { timeout: 10 } });
-    // Attraper les erreurs du startPolling
-    bot.on('polling_error', () => {}); // handler dummy pour éviter unhandled
-  } catch (e) {
-    log('ERR', 'BOOT', `startPolling (caught): ${e.message}`);
-    // Ne PAS throw — continuer sans polling, le server HTTP continue à tourner
-  }
+  log('INFO', 'BOOT', 'Step 8: startPolling Telegram — DÉLAI 10s pour laisser ancienne instance Render libérer le token');
+  // Délai pour éviter le conflict de token quand Render fait zero-downtime deploy
+  setTimeout(() => {
+    try {
+      bot.startPolling({ interval: 3000, autoStart: true, params: { timeout: 10 } });
+      log('OK', 'BOOT', 'Polling Telegram démarré (après délai 10s)');
+    } catch (e) { log('ERR', 'BOOT', `startPolling (non-fatal): ${e.message}`); }
+  }, 10000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
