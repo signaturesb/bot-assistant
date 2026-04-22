@@ -13,9 +13,17 @@ Mais notre fichier est `bot.js` (package.json main: bot.js)
 - AUCUN log de bot.js (pas de CRASH_REPORT, pas de BOOT_REPORT)
 - Même un bot.js minimal de 35 lignes crashait
 
-**Fix (commit 6a2fccb):**
+**Fix (commit 6a2fccb + 39e6561) — LIVE ✅:**
 - `PATCH /v1/services/{id}` → `startCommand: node bot.js`
 - bot.js restauré (4048 lignes, 39 outils, webhook Telegram)
+- Deploy `dep-xxx | live | 39e6561` — confirmation health 200 + BOOT_REPORT écrit
+
+**Production live confirmé 2026-04-22 00:12:**
+- tools: 39
+- model: claude-opus-4-7
+- subsystems ✅: pipedrive, brevo, gmail, dropbox, github, gist
+- ⏳: centris (lazy login au 1er call)
+- ❌: whisper (OPENAI_API_KEY absent — optionnel)
 
 **RÈGLE À RETENIR:**
 Toujours vérifier la config Render `startCommand` si deploy fail sans logs.
