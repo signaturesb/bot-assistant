@@ -3076,38 +3076,57 @@ async function rappelVisitesMatin() {
 }
 
 async function syncStatusGitHub() {
-  if (!process.env.GITHUB_TOKEN || !PD_KEY) return;
+  if (!process.env.GITHUB_TOKEN) return;
+  const now = new Date();
+  const ts  = now.toLocaleDateString('fr-CA', { weekday:'long', year:'numeric', month:'long', day:'numeric', timeZone:'America/Toronto' })
+            + ' à ' + now.toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' });
   try {
-    const [actifs, gagnes, perdus] = await Promise.all([
-      pdGet('/deals?pipeline_id=7&status=open&limit=50'),
-      pdGet('/deals?status=won&limit=20'),
-      pdGet('/deals?status=lost&limit=20'),
-    ]);
-    const now    = new Date();
-    const visites = loadJSON(VISITES_FILE, []);
-    const prochaines = visites.filter(v => new Date(v.date).getTime() > Date.now()).length;
+    let pipelineLines = [], gagnesMois = 0, perdusMois = 0;
+    if (PD_KEY) {
+      const [actifs, gagnes, perdus] = await Promise.all([
+        pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=50`).catch(()=>null),
+        pdGet('/deals?status=won&limit=50').catch(()=>null),
+        pdGet('/deals?status=lost&limit=50').catch(()=>null),
+      ]);
+      pipelineLines = (actifs?.data||[]).map(d=>`- **${d.title}** — ${PD_STAGES[d.stage_id]||d.stage_id}${d[PD_FIELD_CENTRIS]?' | Centris #'+d[PD_FIELD_CENTRIS]:''}`);
+      const m = now.getMonth();
+      gagnesMois = (gagnes?.data||[]).filter(d=>new Date(d.won_time||0).getMonth()===m).length;
+      perdusMois = (perdus?.data||[]).filter(d=>new Date(d.lost_time||0).getMonth()===m).length;
+    }
+    const visites     = loadJSON(VISITES_FILE, []);
+    const prochaines  = visites.filter(v => new Date(v.date).getTime() > Date.now());
 
     const content = [
       `# Bot Signature SB — Rapport automatique`,
-      `_Généré le ${now.toLocaleDateString('fr-CA', { weekday:'long', year:'numeric', month:'long', day:'numeric', timeZone:'America/Toronto' })} à ${now.toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' })}_`,
-      '',
-      `## Pipeline actif — ${actifs?.data?.length || 0} deals`,
-      ...(actifs?.data || []).map(d => `- **${d.title}** — ${PD_STAGES[d.stage_id] || d.stage_id}`),
-      '',
-      `## Ce mois-ci`,
-      `- Gagnés: ${(gagnes?.data || []).filter(d => new Date(d.won_time||0).getMonth() === now.getMonth()).length}`,
-      `- Perdus: ${(perdus?.data || []).filter(d => new Date(d.lost_time||0).getMonth() === now.getMonth()).length}`,
-      `- Visites prévues: ${prochaines}`,
-      '',
+      `_${ts}_`,
+      ``,
+      `## Système bot`,
+      `- Modèle: \`${currentModel}\` | Thinking: ${thinkingMode?'ON':'OFF'} | Outils: ${TOOLS.length}`,
+      `- Uptime: ${Math.floor(process.uptime()/60)}min | Mémos: ${kiramem.facts.length}`,
+      `- Centris agent: ${centrisSession.authenticated?`✅ (${process.env.CENTRIS_USER})`:'⏳'}`,
+      `- Gmail Poller: ${gmailPollerState.totalLeads||0} leads traités`,
+      `- Dropbox: ${dropboxTerrains.length} terrains en cache`,
+      ``,
+      `## Pipeline Pipedrive — ${pipelineLines.length} deals actifs`,
+      ...pipelineLines,
+      ``,
+      `## Ce mois`,
+      `- ✅ Gagnés: ${gagnesMois} | ❌ Perdus: ${perdusMois}`,
+      `- 📅 Visites à venir: ${prochaines.length}`,
+      ...prochaines.map(v=>`  - ${v.nom} — ${new Date(v.date).toLocaleDateString('fr-CA',{timeZone:'America/Toronto'})}`),
+      ``,
       `## Mémoire bot (${kiramem.facts.length} faits)`,
-      ...kiramem.facts.map(f => `- ${f}`),
-      '',
-      `## Modèle actif: \`${currentModel}\` | Thinking: ${thinkingMode ? 'ON' : 'OFF'}`,
-      `## Mémos: ${kiramem.facts.length} | Uptime: ${Math.floor(process.uptime() / 60)} min`,
+      ...kiramem.facts.map(f=>`- ${f}`),
+      ``,
+      `## Lien Claude Code ↔ Bot`,
+      `- Code: \`/Users/signaturesb/Documents/github/Claude, code Telegram/bot.js\``,
+      `- CLAUDE.md: \`read_github_file(repo='kira-bot', path='CLAUDE.md')\``,
+      `- État système: \`read_github_file(repo='kira-bot', path='ÉTAT_SYSTÈME.md')\``,
+      `- Ce fichier: \`read_github_file(repo='kira-bot', path='BOT_STATUS.md')\``,
     ].join('\n');
 
-    await writeGitHubFile('bot-assistant', 'BOT_STATUS.md', content, `Auto: rapport ${now.toISOString().split('T')[0]}`);
-    log('OK', 'SYNC', 'BOT_STATUS.md → GitHub');
+    await writeGitHubFile('kira-bot', 'BOT_STATUS.md', content, `Sync: ${now.toISOString().split('T')[0]}`);
+    log('OK', 'SYNC', `BOT_STATUS.md → kira-bot (${pipelineLines.length} deals, ${kiramem.facts.length} mémos)`);
   } catch (e) { log('WARN', 'SYNC', `GitHub sync: ${e.message}`); }
 }
 
