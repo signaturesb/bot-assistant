@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.0",
-    "dotenv": "^16.0.0",
+    "dotenv": "^17.4.2",
     "node-telegram-bot-api": "^0.66.0"
   },
   "overrides": {
