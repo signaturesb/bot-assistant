@@ -25,12 +25,22 @@ function isJunkLeadEmail(subject, from, body) {
   const s = (subject || '').toLowerCase();
   const f = (from || '').toLowerCase();
   const b = (body || '').toLowerCase();
-  // Notifications Centris / saved search alerts (vérifier sujet ET corps)
-  if (f.includes('no-reply@centris') || f.includes('noreply@centris') || f.includes('notifications@centris')) {
-    if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|découvrez-les|inscriptions?\s+(correspondantes|matching)/i.test(s + ' ' + b)) return true;
+  const sb = s + ' ' + b;
+  // Notifications Centris / saved search alerts (tous les domaines Centris)
+  const isCentrisAuto = f.includes('no-reply@centris') || f.includes('noreply@centris')
+    || f.includes('notifications@centris') || f.includes('@mlsmatrix') || f.includes('centris@');
+  if (isCentrisAuto) {
+    if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|d[eé]couvrez-les|inscriptions?\s+(correspondantes|matching|nouvelles)|une\s+ou\s+plusieurs\s+nouvelles\s+propri[eé]t[eé]s|voir\s+les\s+inscriptions/i.test(sb)) return true;
   }
-  // Newsletters / promotions
-  if (/(newsletter|infolettre|promotion|offre\s+sp[eé]ciale|super\s+promo|last\s+call|ending\s+soon|spring\s+sale)/i.test(s)) return true;
+  // Pattern sujet saved-search typique: "[Nom, Prénom] Maison X et moins" ou "[Client] Critères"
+  if (/^\[[^\]]+\]\s+(maison|terrain|plex|condo|chalet)\b/i.test(s)) return true;
+  // Newsletters / promotions / marketing
+  if (/(newsletter|infolettre|promotion|offre\s+sp[eé]ciale|super\s+promo|last\s+call|ending\s+soon|spring\s+sale|votre\s+campagne)/i.test(s)) return true;
+  // Brevo / marketing tool notifications
+  if (f.includes('brevo') || f.includes('brevosend')) return true;
+  // Confirmations/annulations de visite entre courtiers (pas des leads, notifications internes)
+  if (/(confirmation|annulation|modification)\s+de\s+visite\s+-/i.test(s)) return true;
+  if (/demande\s+de\s+visite\s+-/i.test(s) && f.includes('remax')) return true;
   // Alertes système internes
   if (/watchdog|system\s+alert|hmac/i.test(s)) return true;
   return false;

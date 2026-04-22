@@ -81,6 +81,27 @@ const samples = [
     junk: true,
   },
   {
+    name: 'MLS Matrix saved search alert (JUNK)',
+    subject: `[Charrette, Stéphane] Maison 430 et moins`,
+    from: 'Shawn Barrette <centris@mlsmatrix.com>',
+    body: `Bonjour Stéphane, Une ou plusieurs nouvelles propriétés répondent à vos critères. Découvrez-les! Voir Les Inscriptions Shawn Barrette.`,
+    junk: true,
+  },
+  {
+    name: 'RE/MAX confirmation visite entre courtiers (JUNK)',
+    subject: `Confirmation de visite - Philois Raphaël, VENDIREC`,
+    from: 'noreply@remax.ca',
+    body: `Visite confirmée pour le 2026-04-25 à 10h00.`,
+    junk: true,
+  },
+  {
+    name: 'Brevo notification campagne (JUNK)',
+    subject: `[Brevo] Votre campagne a été envoyée`,
+    from: 'contact@t.brevo.com',
+    body: `Votre campagne a été envoyée avec succès.`,
+    junk: true,
+  },
+  {
     name: 'Realtor.ca lead — format anglais',
     subject: `Property inquiry — 456 Main St`,
     from: 'info@realtor.ca',
