@@ -475,6 +475,56 @@ function addMsg(id, role, content) {
   scheduleHistSave();
 }
 
+// ─── Validation messages pour API Claude (prévient erreurs 400) ──────────────
+// Garantit: premier msg = user, alternance user/assistant correcte, dernier = user
+function validateMessagesForAPI(messages) {
+  if (!messages || !messages.length) return [];
+  const clean = [];
+  for (const m of messages) {
+    if (!m?.role || !m?.content) continue;
+    if (Array.isArray(m.content) && m.content.length === 0) continue;
+    if (typeof m.content === 'string' && !m.content.trim()) continue;
+    // Empêcher deux messages de même rôle consécutifs (fusionner ou skipper)
+    if (clean.length && clean[clean.length - 1].role === m.role) {
+      // Même rôle consécutif — garder seulement le plus récent
+      clean[clean.length - 1] = m;
+    } else {
+      clean.push(m);
+    }
+  }
+  // Supprimer les assistant en tête (le premier doit être user)
+  while (clean.length && clean[0].role !== 'user') clean.shift();
+  // Supprimer les assistant en queue (le dernier doit être user pour éviter prefilling)
+  while (clean.length && clean[clean.length - 1].role !== 'user') clean.pop();
+  return clean;
+}
+
+// Rate limiter pour éviter 429 — max N requêtes par fenêtre
+const rateLimiter = { recent: [], max: 15, windowMs: 60000 };
+function checkRateLimit() {
+  const now = Date.now();
+  rateLimiter.recent = rateLimiter.recent.filter(t => now - t < rateLimiter.windowMs);
+  if (rateLimiter.recent.length >= rateLimiter.max) return false;
+  rateLimiter.recent.push(now);
+  return true;
+}
+
+// Transforme les erreurs API en messages lisibles pour l'utilisateur
+function formatAPIError(err) {
+  const status = err?.status || err?.response?.status;
+  const msg    = err?.message || String(err);
+  if (status === 400) {
+    if (msg.includes('prefill') || msg.includes('prepend')) return '⚠️ Conversation corrompue — tape /reset puis réessaie.';
+    if (msg.includes('max_tokens')) return '⚠️ Requête trop longue — simplifie ou /reset.';
+    return '⚠️ Requête invalide — /reset pour repartir à neuf.';
+  }
+  if (status === 401) return '🔑 Clé API Claude invalide ou expirée.';
+  if (status === 403) return '🚫 Accès refusé.';
+  if (status === 429) return '⏳ Trop de requêtes — patiente 30 secondes.';
+  if (status === 529 || status >= 500) return '⚠️ Claude temporairement indisponible — réessaie dans une minute.';
+  return `⚠️ ${msg.substring(0, 120)}`;
+}
+
 // ─── Déduplication (FIFO, pas de fuite mémoire) ──────────────────────────────
 const processed = new Map(); // msgId → timestamp
 function isDuplicate(msgId) {
@@ -2452,18 +2502,31 @@ async function executeToolSafe(name, input, chatId) {
 
 // ─── Appel Claude (boucle agentique, prompt caching, Opus 4.7) ───────────────
 async function callClaude(chatId, userMsg, retries = 3) {
-  const msgIndex = getHistory(chatId).length; // index avant ajout — pour rollback précis
+  // Rate limiter — éviter 429 en cascade
+  if (!checkRateLimit()) {
+    const err = new Error('Rate limit local atteint — 15 req/min'); err.status = 429;
+    throw err;
+  }
+
+  const msgIndex = getHistory(chatId).length;
   addMsg(chatId, 'user', userMsg);
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      // Snapshot des globals mutables au début de l'appel (évite races)
       const localModel   = currentModel;
       const localThinking = thinkingMode;
-      const messages = getHistory(chatId).map(m => ({ role: m.role, content: m.content }));
+      // Validation: garantit premier=user, alternance, dernier=user
+      let messages = validateMessagesForAPI(
+        getHistory(chatId).map(m => ({ role: m.role, content: m.content }))
+      );
+      if (!messages.length) {
+        log('WARN', 'CLAUDE', 'Messages vides après validation — reset historique');
+        chats.delete(chatId);
+        addMsg(chatId, 'user', userMsg);
+        messages = [{ role: 'user', content: userMsg }];
+      }
       let finalReply = null;
       let allMemos   = [];
       for (let round = 0; round < 12; round++) {
-        // SYSTEM_BASE toujours caché (statique) — dynamic part non cachée (change souvent)
         const systemBlocks = [{ type: 'text', text: SYSTEM_BASE, cache_control: { type: 'ephemeral' } }];
         const dyn = getSystemDynamic();
         if (dyn) systemBlocks.push({ type: 'text', text: dyn });
@@ -2497,18 +2560,37 @@ async function callClaude(chatId, userMsg, retries = 3) {
       return { reply: finalReply, memos: allMemos };
     } catch (err) {
       log('ERR', 'CLAUDE', `attempt ${attempt}: HTTP ${err.status || '?'} — ${err.message?.substring(0, 120)}`);
-      // Thinking rejeté par API → désactiver localement, retry sans toucher au global
-      if (err.status === 400 && thinkingMode && attempt < retries) {
-        log('WARN', 'CLAUDE', 'Thinking mode incompatible — retry sans thinking (global inchangé)');
-        await new Promise(r => setTimeout(r, 1000));
-        continue; // Retry: localThinking sera re-snapshotté à thinkingMode (toujours true)
-        // Note: si l'erreur persiste, Shawn devra faire /penser pour désactiver manuellement
+
+      // 400 = erreur structurelle (NON retryable) → nettoyer et abandonner
+      if (err.status === 400) {
+        const msg = err.message || '';
+        // Cas spécifique: thinking incompatible → désactiver et retry 1 fois
+        if (thinkingMode && msg.toLowerCase().includes('thinking') && attempt < retries) {
+          log('WARN', 'CLAUDE', 'Thinking incompatible — retry sans thinking');
+          thinkingMode = false;
+          await new Promise(r => setTimeout(r, 500));
+          continue;
+        }
+        // Cas "prefilling" / "prepend" / conversation corrompue → reset
+        if (msg.toLowerCase().match(/prefill|prepend|assistant.*pre|first.*user|role/)) {
+          log('WARN', 'CLAUDE', 'Historique corrompu — reset automatique');
+          chats.delete(chatId);
+          scheduleHistSave();
+        }
+        // Rollback et abandonner (pas de retry 400)
+        const h = getHistory(chatId);
+        if (h.length > msgIndex && h[msgIndex]?.role === 'user') h.splice(msgIndex, 1);
+        scheduleHistSave();
+        throw err;
       }
+
       const retryable = err.status === 429 || err.status === 529 || err.status >= 500;
       if (retryable && attempt < retries) {
-        await new Promise(r => setTimeout(r, attempt * 3000));
+        // Backoff exponentiel pour 429 (plus long)
+        const delay = err.status === 429 ? attempt * 8000 : attempt * 3000;
+        log('INFO', 'CLAUDE', `Retry ${attempt}/${retries} dans ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
       } else {
-        // Rollback précis: supprimer seulement le message qu'on a ajouté
         const h = getHistory(chatId);
         if (h.length > msgIndex && h[msgIndex]?.role === 'user') h.splice(msgIndex, 1);
         scheduleHistSave();
@@ -2520,18 +2602,31 @@ async function callClaude(chatId, userMsg, retries = 3) {
 
 // ─── Appel Claude direct (vision/multimodal — sans historique alourdi) ────────
 async function callClaudeVision(chatId, content, contextLabel) {
+  // Rate limiter
+  if (!checkRateLimit()) {
+    const err = new Error('Rate limit local atteint'); err.status = 429;
+    throw err;
+  }
+
   const h = getHistory(chatId);
-  // Ajouter le contenu multimodal temporairement
   h.push({ role: 'user', content });
   if (h.length > MAX_HIST) h.splice(0, h.length - MAX_HIST);
 
   try {
-    const messages = h.map(m => ({ role: m.role, content: m.content }));
-    const localModel    = currentModel; // snapshot — évite race avec /opus pendant l'appel
+    // Validation des messages avant l'envoi
+    let messages = validateMessagesForAPI(h.map(m => ({ role: m.role, content: m.content })));
+    if (!messages.length) {
+      // Fallback: envoyer juste l'image/doc sans historique
+      messages = [{ role: 'user', content }];
+    }
+    const localModel    = currentModel;
     const localThinking = thinkingMode;
+    const systemBlocks  = [{ type: 'text', text: SYSTEM_BASE, cache_control: { type: 'ephemeral' } }];
+    const dyn = getSystemDynamic();
+    if (dyn) systemBlocks.push({ type: 'text', text: dyn });
     const params = {
       model: localModel, max_tokens: 16384,
-      system: [{ type: 'text', text: getSystem(), cache_control: { type: 'ephemeral' } }],
+      system: systemBlocks,
       tools: TOOLS_WITH_CACHE, messages,
     };
     if (localThinking) params.thinking = { type: 'enabled', budget_tokens: 10000 };
@@ -2567,8 +2662,15 @@ async function callClaudeVision(chatId, content, contextLabel) {
 
     return { reply: finalReply, memos: allMemos };
   } catch (err) {
-    // Rollback — retirer l'entrée ajoutée
+    // Rollback — retirer l'entrée image/PDF ajoutée
     if (h[h.length - 1]?.role === 'user') h.pop();
+    // Si 400 lié à historique → reset complet
+    if (err.status === 400 && (err.message || '').toLowerCase().match(/prefill|prepend|assistant.*pre|first.*user|role/)) {
+      log('WARN', 'VISION', 'Historique corrompu — reset');
+      chats.delete(chatId);
+      scheduleHistSave();
+    }
+    scheduleHistSave();
     throw err;
   }
 }
@@ -2841,13 +2943,8 @@ function registerHandlers() {
       }
     } catch (err) {
       clearInterval(typing);
-      log('ERR', 'MSG', `${err.status || ''} ${err.message}`);
-      if (err.status === 400) {
-        chats.delete(chatId); scheduleHistSave();
-        await bot.sendMessage(chatId, '⚠️ Conversation réinitialisée. Réessaie!');
-      } else {
-        await bot.sendMessage(chatId, '❌ Erreur temporaire. Réessaie dans quelques secondes.');
-      }
+      log('ERR', 'MSG', `${err.status || '?'}: ${err.message?.substring(0,150)}`);
+      await bot.sendMessage(chatId, formatAPIError(err));
     }
   });
 
@@ -2885,11 +2982,12 @@ function registerHandlers() {
         if (memos.length) await bot.sendMessage(chatId, `📝 *Mémorisé:* ${memos.join(' | ')}`, { parse_mode: 'Markdown' });
       } catch (err) {
         clearInterval(typing);
-        await bot.sendMessage(chatId, '❌ Erreur temporaire. Réessaie.');
+        log('ERR', 'VOICE-MSG', `${err.status||'?'}: ${err.message?.substring(0,120)}`);
+        await bot.sendMessage(chatId, formatAPIError(err));
       }
     } catch (err) {
       log('ERR', 'VOICE', err.message);
-      await bot.sendMessage(chatId, `❌ Erreur vocal: ${err.message}`);
+      await bot.sendMessage(chatId, `❌ Erreur vocal: ${err.message.substring(0, 120)}`);
     }
   });
 
@@ -2940,8 +3038,8 @@ function registerHandlers() {
 
     } catch (err) {
       clearInterval(typing);
-      log('ERR', 'PHOTO', err.message);
-      await bot.sendMessage(chatId, `❌ Erreur analyse photo: ${err.message.substring(0, 200)}`);
+      log('ERR', 'PHOTO', `${err.status||'?'}: ${err.message?.substring(0,150)}`);
+      await bot.sendMessage(chatId, `❌ Analyse photo: ${formatAPIError(err)}`);
     }
   });
 
@@ -2993,8 +3091,8 @@ function registerHandlers() {
 
     } catch (err) {
       clearInterval(typing);
-      log('ERR', 'PDF', err.message);
-      await bot.sendMessage(chatId, `❌ Erreur analyse PDF: ${err.message.substring(0, 200)}`);
+      log('ERR', 'PDF', `${err.status||'?'}: ${err.message?.substring(0,150)}`);
+      await bot.sendMessage(chatId, `❌ Analyse PDF: ${formatAPIError(err)}`);
     }
   });
 
