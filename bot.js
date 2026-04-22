@@ -4128,8 +4128,33 @@ function detectLeadSource(from, subject) {
   return null;
 }
 
+// Filtre junk — rejette newsletters, alertes saved-search, notifications
+function isJunkLeadEmail(subject, from, body) {
+  const s = (subject || '').toLowerCase();
+  const f = (from || '').toLowerCase();
+  // Notifications Centris (pas de demande réelle)
+  if (f.includes('no-reply@centris') || f.includes('noreply@centris')) {
+    if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|découvrez-les|inscriptions?\s+(correspondantes|matching)/i.test(s)) return true;
+  }
+  // Newsletter RE/MAX / Centris
+  if (/(newsletter|infolettre|promotion|offre\s+sp[eé]ciale|super\s+promo|last\s+call|ending\s+soon)/i.test(s)) return true;
+  // Alertes systeme
+  if (/watchdog|system\s+alert|hmac/i.test(s)) return true;
+  return false;
+}
+
 function parseLeadEmail(body, subject, from) {
-  const clean = body.replace(/\r/g, '').replace(/&nbsp;/g, ' ').replace(/<[^>]+>/g, ' ').replace(/\s{2,}/g, ' ');
+  // Strip <style>, <script>, et HTML — nettoyer avant extraction
+  let clean = (body || '')
+    .replace(/\r/g, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
+    .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s{2,}/g, ' ');
   const full  = `${subject} ${clean}`;
 
   const extract = (...patterns) => {
@@ -4140,26 +4165,40 @@ function parseLeadEmail(body, subject, from) {
     return '';
   };
 
-  // Nom
+  // Nom — labelled d'abord (Centris format: "Nom Shawn Barrette")
   const nom = extract(
+    /Nom\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+){1,3})\s+(?:Courriel|Email|Téléphone|Tel)/,
     /(?:nom(?:\s+complet)?|name|client|acheteur|vendeur|prénom\s+et\s+nom)\s*:?\s*([A-ZÀ-Ü][^\n\r:;|<>]{2,50})/i,
     /(?:bonjour|salut),?\s+([A-ZÀ-Ü][a-zà-ü]+ [A-ZÀ-Ü][a-zà-ü]+)/i,
   );
 
-  // Téléphone — tous les formats québécois
-  const telMatch = full.match(/\b((?:\+1[-.\s]?)?(?:\d{3}[-.\s]?\d{3}[-.\s]?\d{4}|\(\d{3}\)\s*\d{3}[-.\s]\d{4}|\d{10}))\b/);
-  const telephone = telMatch?.[1]?.replace(/[^\d+]/g, '').replace(/^1/, '') || '';
+  // Téléphone — préférer après mot-clé "Téléphone/Tel" (évite tokens CSS)
+  let telephone = '';
+  const telLabelMatch = full.match(/(?:t[eé]l[eé]phone|tel\.?|phone)\s*:?\s*((?:\+1[-.\s]?)?(?:\(\s*\d{3}\s*\)\s*\d{3}[-.\s]?\d{4}|\d{3}[-.\s]?\d{3}[-.\s]?\d{4}))/i);
+  if (telLabelMatch) telephone = telLabelMatch[1].replace(/[^\d+]/g, '').replace(/^1/, '');
+  else {
+    // Fallback: chercher format typique québécois (3-3-4 avec séparateur obligatoire)
+    const telFallback = full.match(/\b((?:\+1[-.\s]?)?\d{3}[-.\s]\d{3}[-.\s]\d{4})\b/);
+    if (telFallback) telephone = telFallback[1].replace(/[^\d+]/g, '').replace(/^1/, '');
+  }
 
-  // Email (ignorer les emails connus de Shawn)
-  const emailRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
-  const allEmails = [...full.matchAll(emailRe)].map(m => m[1].toLowerCase())
-    .filter(e => !e.includes('signaturesb') && !e.includes('remax') && !e.includes('centris') && !e.includes('noreply'));
-  const email = allEmails[0] || '';
+  // Email — préférer après "Courriel/Email" label, sinon chercher + filtrer
+  let email = '';
+  const emailLabelMatch = full.match(/(?:courriel|email|e-mail|courriel\s*\(email\))\s*:?\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i);
+  if (emailLabelMatch) email = emailLabelMatch[1].toLowerCase();
+  else {
+    const emailRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
+    const allEmails = [...full.matchAll(emailRe)].map(m => m[1].toLowerCase())
+      .filter(e => !e.includes('signaturesb') && !e.includes('remax') && !e.includes('centris') && !e.includes('noreply') && !e.includes('nepasrepondre'));
+    email = allEmails[0] || '';
+  }
 
-  // Numéro Centris
+  // Numéro Centris — pattern "(# 12345678)" très courant dans Centris
   const centris = extract(
-    /(?:centris|mls|inscription|listing)\s*[#no\.]*\s*:?\s*(\d{7,9})/i,
-    /\b(\d{8})\b/, // 8 chiffres = probablement Centris
+    /\(#\s*(\d{7,9})\)/,                                        // "(# 28939185)" — format officiel
+    /#\s*(\d{7,9})\b/,                                          // "#28939185" ou "# 28939185" n'importe où
+    /(?:centris|mls|inscription|listing)[^\d]{0,60}(\d{7,9})\b/i, // "Centris.ca ... 28939185"
+    /\b(\d{8})\b/,                                              // 8 chiffres isolés (fallback)
   );
 
   // Adresse
@@ -4323,7 +4362,13 @@ async function runGmailLeadPoller() {
           const body    = gmailExtractBody(full.payload);
 
           // Ignorer les emails de Shawn lui-même
-          if (from.includes(AGENT.email) || from.includes('shawnbarrette@icloud')) {
+          if (from.toLowerCase().includes(AGENT.email.toLowerCase())) {
+            gmailPollerState.processed.push(id); continue;
+          }
+
+          // FILTRE JUNK — rejette newsletters, alertes saved-search, notifications
+          if (isJunkLeadEmail(subject, from, body)) {
+            log('INFO', 'POLLER', `Junk skip: ${subject.substring(0, 60)} (${from.substring(0, 40)})`);
             gmailPollerState.processed.push(id); continue;
           }
 
@@ -4331,8 +4376,11 @@ async function runGmailLeadPoller() {
           if (!source) { gmailPollerState.processed.push(id); continue; }
 
           const lead = parseLeadEmail(body, subject, from);
-          // Ignorer si vraiment aucune info exploitable
-          if (!lead.nom && !lead.email && !lead.telephone && !lead.centris) {
+
+          // VALIDATION lead viable — minimum 2 infos ou (Centris# + 1 info)
+          const infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+          if (infoCount < 2 && !lead.centris) {
+            log('INFO', 'POLLER', `Lead non viable (${infoCount} info): "${subject.substring(0, 50)}" — ignoré`);
             gmailPollerState.processed.push(id); continue;
           }
 
