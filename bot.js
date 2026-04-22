@@ -4079,6 +4079,14 @@ async function handleWebhook(route, data) {
       const listing = data.url_listing || data.url || data.centris_url || '';
       const typeRaw = (data.type || listing).toLowerCase();
 
+      // DÉDUP CROSS-SOURCE: si ce lead a déjà été notifié récemment (Gmail Poller
+      // OU autre webhook), skip. Évite doublons quand Centris envoie webhook +
+      // Gmail reçoit l'email pour le même lead.
+      if (leadAlreadyNotifiedRecently(email, tel)) {
+        log('INFO', 'WEBHOOK', `Centris dédup: ${nom} (${email||tel}) déjà notifié — skip`);
+        return;
+      }
+
       // Détecter le type depuis l'URL ou les données
       let type = 'terrain';
       if (/maison|house|résidentiel|residential/.test(typeRaw))    type = 'maison_usagee';
