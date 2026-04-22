@@ -1,6 +1,29 @@
-# SESSION LIVE — 2026-04-21 23:26
+# SESSION LIVE — 2026-04-22 00:15
 
-## 🚨 BUG CRITIQUE TROUVÉ
+## 🎯 RÉSOLU: startCommand Render pointait vers `index.js` inexistant!
+
+**Cause racine de TOUS les deploy fails depuis c209c9e:**
+Service Render (via UI) configuré avec `startCommand: node index.js`
+Mais notre fichier est `bot.js` (package.json main: bot.js)
+→ Node exit 1 immédiat, AUCUN code bot.js jamais exécuté.
+
+**Symptômes qui auraient dû m'alerter plus tôt:**
+- Exit code 1 toujours en ~10s (Node peut pas trouver index.js)
+- Build succeed, deploy fail (npm install OK, rien à exécuter)
+- AUCUN log de bot.js (pas de CRASH_REPORT, pas de BOOT_REPORT)
+- Même un bot.js minimal de 35 lignes crashait
+
+**Fix (commit 6a2fccb):**
+- `PATCH /v1/services/{id}` → `startCommand: node bot.js`
+- bot.js restauré (4048 lignes, 39 outils, webhook Telegram)
+
+**RÈGLE À RETENIR:**
+Toujours vérifier la config Render `startCommand` si deploy fail sans logs.
+Commande: `curl GET /v1/services/{id}` → vérifier `serviceDetails.envSpecificDetails.startCommand`
+
+---
+
+## 🚨 ANCIENNE SECTION — BUG CRITIQUE (conservée pour historique)
 
 **Render deploy failed 5× de suite** — cause identifiée via run local:
 
