@@ -3238,13 +3238,26 @@ function registerHandlers() {
     }
   });
 
-  // ─── Reconnexion auto polling ─────────────────────────────────────────────────
+  // ─── Gestion polling errors (RÉSILIENT — pas de process.exit) ──────────────
+  // JAMAIS process.exit sur polling errors — Render tue le deploy et crash loop
+  // Les 404 arrivent pendant les redéploiements (2 instances partagent le token)
+  // Solution: laisser node-telegram-bot-api retry automatiquement, juste logger
   let pollingErrors = 0;
+  let lastPollError = 0;
   bot.on('polling_error', err => {
-    log('ERR', 'POLL', `#${++pollingErrors}: ${err.message}`);
-    if (pollingErrors >= 10) { log('WARN', 'POLL', 'Restart forcé...'); process.exit(1); }
+    const now = Date.now();
+    pollingErrors++;
+    // Log seulement toutes les 10s pour ne pas spammer
+    if (now - lastPollError > 10000) {
+      log('ERR', 'POLL', `#${pollingErrors}: ${err.message.substring(0, 100)}`);
+      lastPollError = now;
+    }
+    // Si 50+ erreurs consécutives ET token invalide, log critique mais pas exit
+    if (pollingErrors === 50) {
+      log('ERR', 'POLL', `50 erreurs consécutives — token peut-être invalide. Render redémarrera si health check échoue.`);
+    }
   });
-  bot.on('message', () => { pollingErrors = 0; });
+  bot.on('message', () => { pollingErrors = 0; lastPollError = 0; });
 }
 
 // ─── Tâches quotidiennes (sans node-cron) ─────────────────────────────────────
