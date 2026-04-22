@@ -3569,6 +3569,76 @@ function registerHandlers() {
     );
   });
 
+  bot.onText(/\/baseline|\/cutoff|\/leadsreset/, async msg => {
+    if (!isAllowed(msg)) return;
+    await bot.sendMessage(msg.chat.id, '⏱ Baseline: tous les leads actuels → marqués comme déjà vus (pas de notifs) — seuls les nouveaux après MAINTENANT seront notifiés.');
+    try {
+      const token = await getGmailToken();
+      if (!token) return bot.sendMessage(msg.chat.id, '❌ Gmail non configuré');
+      const shawnEmail = AGENT.email.toLowerCase();
+      const queries = [
+        `newer_than:7d from:centris NOT from:${shawnEmail}`,
+        `newer_than:7d from:remax NOT from:${shawnEmail}`,
+        `newer_than:7d from:realtor NOT from:${shawnEmail}`,
+        `newer_than:7d from:duproprio NOT from:${shawnEmail}`,
+        `newer_than:7d subject:(demande OR "intéress" OR inquiry) NOT from:${shawnEmail}`,
+      ];
+      let marked = 0;
+      const seen = new Set();
+      for (const q of queries) {
+        const list = await gmailAPI(`/messages?maxResults=50&q=${encodeURIComponent(q)}`).catch(() => null);
+        if (!list?.messages?.length) continue;
+        for (const m of list.messages) {
+          if (seen.has(m.id) || gmailPollerState.processed.includes(m.id)) continue;
+          seen.add(m.id);
+          gmailPollerState.processed.push(m.id);
+          marked++;
+          // Extraire aussi email/tel/centris du message pour peupler recentLeadsByKey
+          try {
+            const full = await gmailAPI(`/messages/${m.id}?format=full`).catch(() => null);
+            if (full) {
+              const hdrs = full.payload?.headers || [];
+              const get = n => hdrs.find(h => h.name.toLowerCase() === n)?.value || '';
+              const from    = get('from');
+              const subject = get('subject');
+              const body    = gmailExtractBody(full.payload);
+              if (!isJunkLeadEmail(subject, from, body)) {
+                const source = detectLeadSource(from, subject);
+                if (source) {
+                  const lead = parseLeadEmail(body, subject, from);
+                  // Mark dans dedup sans notifier
+                  leadAlreadyNotifiedRecently({
+                    email: lead.email,
+                    telephone: lead.telephone,
+                    centris: lead.centris,
+                    nom: lead.nom,
+                    source: source.source,
+                  });
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+      // Cutoff au moment présent — seuls emails futurs traités
+      gmailPollerState.lastRun = new Date().toISOString();
+      // FIFO max 500
+      if (gmailPollerState.processed.length > 500) {
+        gmailPollerState.processed = gmailPollerState.processed.slice(-500);
+      }
+      saveJSON(POLLER_FILE, gmailPollerState);
+      await bot.sendMessage(msg.chat.id,
+        `✅ Baseline fait.\n\n` +
+        `📧 ${marked} emails marqués comme déjà vus\n` +
+        `🔒 ${recentLeadsByKey.size} leads dans dédup\n` +
+        `⏱ Cutoff: ${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}\n\n` +
+        `À partir de maintenant, SEULS les nouveaux leads qui rentrent après cette minute seront notifiés sur Telegram.`
+      );
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+    }
+  });
+
   bot.onText(/\/cleanemail/, async msg => {
     if (!isAllowed(msg)) return;
     await bot.sendMessage(msg.chat.id, '🧹 Nettoyage emails GitHub/CI/Dependabot (30 derniers jours)...');
