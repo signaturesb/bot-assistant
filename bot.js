@@ -982,6 +982,51 @@ async function initGistId() {
     if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🔑 *Gist créé!* Ajoute dans Render: \`GIST_ID=${gistId}\``, { parse_mode: 'Markdown' }).catch(() => {});
   } catch (e) { log('WARN', 'GIST', `Create: ${e.message}`); }
 }
+// Persistance gmail_poller.json + leads_dedup.json via Gist (cross-redeploy)
+async function loadPollerStateFromGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: githubHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    const pollerStr = data.files?.['gmail_poller.json']?.content;
+    const dedupStr = data.files?.['leads_dedup.json']?.content;
+    if (pollerStr) {
+      const parsed = JSON.parse(pollerStr);
+      if (parsed.processed) gmailPollerState.processed = parsed.processed;
+      if (parsed.totalLeads) gmailPollerState.totalLeads = parsed.totalLeads;
+      if (parsed.lastRun) gmailPollerState.lastRun = parsed.lastRun;
+      saveJSON(POLLER_FILE, gmailPollerState); schedulePollerSave();
+      log('OK', 'GIST', `Poller state restauré: ${gmailPollerState.processed.length} processed, ${gmailPollerState.totalLeads} leads`);
+    }
+    if (dedupStr) {
+      const parsed = JSON.parse(dedupStr);
+      for (const [k, v] of Object.entries(parsed)) recentLeadsByKey.set(k, v);
+      saveLeadsDedup();
+      log('OK', 'GIST', `Dedup restauré: ${recentLeadsByKey.size} entries`);
+    }
+  } catch (e) { log('WARN', 'GIST', `Load poller: ${e.message}`); }
+}
+async function savePollerStateToGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    await fetch(`https://api.github.com/gists/${gistId}`, {
+      method: 'PATCH',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: {
+        'gmail_poller.json': { content: JSON.stringify(gmailPollerState, null, 2) },
+        'leads_dedup.json':  { content: JSON.stringify(Object.fromEntries(recentLeadsByKey), null, 2) },
+      }})
+    });
+  } catch (e) { log('WARN', 'GIST', `Save poller: ${e.message}`); }
+}
+// Debounce save to avoid hammering GitHub API
+let _savePollerTimer = null;
+function schedulePollerSave() {
+  clearTimeout(_savePollerTimer);
+  _savePollerTimer = setTimeout(() => savePollerStateToGist().catch(() => {}), 5000);
+}
+
 async function loadMemoryFromGist() {
   if (!gistId || !process.env.GITHUB_TOKEN) return;
   try {
@@ -3626,7 +3671,7 @@ function registerHandlers() {
       if (gmailPollerState.processed.length > 500) {
         gmailPollerState.processed = gmailPollerState.processed.slice(-500);
       }
-      saveJSON(POLLER_FILE, gmailPollerState);
+      saveJSON(POLLER_FILE, gmailPollerState); schedulePollerSave();
       await bot.sendMessage(msg.chat.id,
         `✅ Baseline fait.\n\n` +
         `📧 ${marked} emails marqués comme déjà vus\n` +
@@ -4538,7 +4583,7 @@ const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI 
 // centris# (normalisé), signature nom+source. TTL 7 jours.
 const LEADS_DEDUP_FILE = path.join(DATA_DIR, 'leads_dedup.json');
 const recentLeadsByKey = new Map(Object.entries(loadJSON(LEADS_DEDUP_FILE, {})));
-function saveLeadsDedup() { saveJSON(LEADS_DEDUP_FILE, Object.fromEntries(recentLeadsByKey)); }
+function saveLeadsDedup() { saveJSON(LEADS_DEDUP_FILE, Object.fromEntries(recentLeadsByKey)); if (typeof schedulePollerSave === 'function') schedulePollerSave(); }
 
 function normalizePhone(p) {
   return String(p || '').replace(/\D/g, '').slice(-10); // 10 derniers chiffres
@@ -4732,6 +4777,58 @@ const pollerStats = {
   totalsFound: 0, totalsJunk: 0, totalsNoSource: 0, totalsLowInfo: 0, totalsDealCreated: 0, totalsErrors: 0,
 };
 
+// ── baselineSilentAtBoot — marque tous les leads 7 derniers jours comme
+// déjà vus SANS notifier. Appelé au boot si processed[] vide.
+async function baselineSilentAtBoot() {
+  const token = await getGmailToken();
+  if (!token) return;
+  const shawnEmail = AGENT.email.toLowerCase();
+  const queries = [
+    `newer_than:7d from:centris NOT from:${shawnEmail}`,
+    `newer_than:7d from:remax NOT from:${shawnEmail}`,
+    `newer_than:7d from:realtor NOT from:${shawnEmail}`,
+    `newer_than:7d from:duproprio NOT from:${shawnEmail}`,
+    `newer_than:7d subject:(demande OR "intéress" OR inquiry) NOT from:${shawnEmail}`,
+  ];
+  let marked = 0;
+  const seen = new Set();
+  for (const q of queries) {
+    const list = await gmailAPI(`/messages?maxResults=50&q=${encodeURIComponent(q)}`).catch(() => null);
+    if (!list?.messages?.length) continue;
+    for (const m of list.messages) {
+      if (seen.has(m.id) || gmailPollerState.processed.includes(m.id)) continue;
+      seen.add(m.id);
+      gmailPollerState.processed.push(m.id);
+      marked++;
+      try {
+        const full = await gmailAPI(`/messages/${m.id}?format=full`).catch(() => null);
+        if (full) {
+          const hdrs = full.payload?.headers || [];
+          const get = n => hdrs.find(h => h.name.toLowerCase() === n)?.value || '';
+          const from    = get('from');
+          const subject = get('subject');
+          const body    = gmailExtractBody(full.payload);
+          if (!isJunkLeadEmail(subject, from, body)) {
+            const source = detectLeadSource(from, subject);
+            if (source) {
+              const lead = parseLeadEmail(body, subject, from);
+              leadAlreadyNotifiedRecently({
+                email: lead.email, telephone: lead.telephone, centris: lead.centris,
+                nom: lead.nom, source: source.source,
+              });
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+  gmailPollerState.lastRun = new Date().toISOString();
+  if (gmailPollerState.processed.length > 500) gmailPollerState.processed = gmailPollerState.processed.slice(-500);
+  saveJSON(POLLER_FILE, gmailPollerState);
+  schedulePollerSave(); // → Gist
+  log('OK', 'BOOT', `Baseline silencieux: ${marked} leads marqués, ${recentLeadsByKey.size} dédup entries`);
+}
+
 // ── autoTrashGitHubNoise — supprime auto les emails notifications GitHub/Dependabot/CI
 // Shawn ne veut plus être notifié par courriel — le bot nettoie tout seul.
 // Run: 30s après boot + cron quotidien 6h (+ manuel via /cleanemail)
@@ -4917,7 +5014,7 @@ async function runGmailLeadPoller(opts = {}) {
       gmailPollerState.processed = gmailPollerState.processed.slice(-500);
     }
     gmailPollerState.lastRun = new Date().toISOString();
-    saveJSON(POLLER_FILE, gmailPollerState);
+    saveJSON(POLLER_FILE, gmailPollerState); schedulePollerSave();
 
     // Update stats globales
     pollerStats.lastScan = scan;
@@ -5018,8 +5115,18 @@ async function main() {
 
   // ── Gmail Lead Poller — surveille les leads entrants ──────────────────────
   if (process.env.GMAIL_CLIENT_ID && POLLER_ENABLED) {
-    // Boot: scan 24h en arrière (bulletproof, dédup persistée sur disque)
-    setTimeout(() => runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`)), 8000);
+    // Boot: restaurer state depuis Gist (cross-redeploy persistence).
+    // Puis, si processed[] est vide (premier boot OU Gist vide) → baseline AUTO
+    // silencieux: marque tous les leads récents comme déjà vus SANS notifier.
+    // Évite le spam "re-notif de tout l'historique" à chaque redeploy.
+    setTimeout(async () => {
+      await loadPollerStateFromGist().catch(()=>{});
+      if (gmailPollerState.processed.length < 5) {
+        log('INFO', 'BOOT', 'State vide — baseline silencieux 7j au boot (zéro notif rétro)');
+        await baselineSilentAtBoot().catch(e => log('WARN', 'BOOT', `Baseline: ${e.message}`));
+      }
+      runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`));
+    }, 8000);
     // Polling toutes les 5 minutes
     setInterval(() => runGmailLeadPoller().catch(() => {}), 5 * 60 * 1000);
     // Boot: nettoyer emails GitHub/CI 30s après démarrage (Shawn veut zéro spam)
