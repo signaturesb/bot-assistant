@@ -3947,6 +3947,10 @@ async function runGmailLeadPoller() {
 
 // ─── Démarrage séquentiel ─────────────────────────────────────────────────────
 async function main() {
+  // ── CRITIQUE: Démarrer le server HTTP EN PREMIER pour passer health check Render ──
+  log('INFO', 'BOOT', `Step 0: server.listen(${PORT}) [CRITICAL]`);
+  try { server.listen(PORT); } catch (e) { log('ERR', 'BOOT', `listen FATAL: ${e.message}`); throw e; }
+
   log('INFO', 'BOOT', 'Step 1: refresh Dropbox token');
   if (process.env.DROPBOX_REFRESH_TOKEN) {
     try {
@@ -4003,9 +4007,6 @@ async function main() {
 
   log('INFO', 'BOOT', 'Step 8: startPolling Telegram');
   try { bot.startPolling({ interval: 3000, autoStart: true }); } catch (e) { log('ERR', 'BOOT', `startPolling FATAL: ${e.message}`); throw e; }
-
-  log('INFO', 'BOOT', `Step 9: server.listen(${PORT})`);
-  try { server.listen(PORT); } catch (e) { log('ERR', 'BOOT', `listen FATAL: ${e.message}`); throw e; }
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
