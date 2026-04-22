@@ -3229,6 +3229,10 @@ async function syncStatusGitHub() {
 }
 
 function startDailyTasks() {
+  // Rafraîchissement BOT_STATUS.md chaque heure (au lieu de 1×/jour)
+  // Garantit que Claude Code peut toujours reprendre avec l'état le plus récent
+  setInterval(() => syncStatusGitHub().catch(() => {}), 60 * 60 * 1000);
+
   setInterval(() => {
     const now = new Date();
     const heure    = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
@@ -3238,9 +3242,8 @@ function startDailyTasks() {
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
     // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
-    if (h === 18 && lastCron.sync    !== todayStr)  { lastCron.sync    = todayStr; syncStatusGitHub(); }
   }, 60 * 1000);
-  log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, suivi 9h→Telegram, sync GitHub 18h');
+  log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, sync BOT_STATUS chaque heure');
 }
 
 // ─── Webhooks intelligents ────────────────────────────────────────────────────
@@ -3712,6 +3715,9 @@ async function main() {
 
   server.listen(PORT);
   log('OK', 'BOOT', `Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
+
+  // Sync BOT_STATUS au boot (30s après démarrage) pour que Claude Code voie l'état dès le redéploiement
+  setTimeout(() => syncStatusGitHub().catch(() => {}), 30000);
 }
 
 main().catch(err => {
