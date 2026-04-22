@@ -1,9 +1,9 @@
 # ✅ Boot réussi
-_2026-04-22 19 h 23 min 05 s_
+_2026-04-22 19 h 35 min 05 s_
 
 - Modèle: claude-sonnet-4-6
 - Outils: 39
-- Uptime: 18s
+- Uptime: 17s
 - Centris: ⏳
 - Dropbox: ✅
 
@@ -14,7 +14,7 @@ INFO|BOOT|Step 1: refresh Dropbox token
 OK|BOOT|HTTP server listening on port 10000
 OK|DROPBOX|Token rafraîchi ✓
 INFO|BOOT|Step 2: load Dropbox structure
-OK|DROPBOX|Structure: 33 terrains, 4 sections chargées
+OK|DROPBOX|Structure: 34 terrains, 4 sections chargées
 INFO|BOOT|Step 3: init Gist
 OK|GIST|Configuré: a9a1a92fef67d6d3d7bddeaed5359f44
 INFO|BOOT|Step 4: load memory
