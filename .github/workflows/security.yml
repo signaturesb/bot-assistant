@@ -37,3 +37,16 @@ jobs:
       - run: npm ci
       - name: Syntax + validations
         run: node validate.js
+
+  audit:
+    name: npm audit — vulnérabilités dépendances
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci --ignore-scripts
+      - name: Audit high/critical
+        run: npm audit --audit-level=high
+        continue-on-error: false

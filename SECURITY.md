@@ -2,19 +2,25 @@
 
 Architecture de protection + playbook rotation. **Ce fichier remplace les credentials en clair** dans les anciens docs.
 
+**Historique git nettoyé:** toutes les occurrences de secrets compromis ont été retirées de l'historique des 2 repos via `git filter-repo` (commit `71decda+`). Les secrets restent néanmoins à révoquer sur les services car leur contenu est peut-être déjà archivé hors-site.
+
 ---
 
-## 🛡️ Défense en profondeur — 5 couches automatiques
+## 🛡️ Défense en profondeur — 9 couches automatiques
 
-| # | Couche | Fichier | Quand ça tourne | Ce que ça bloque |
+| # | Couche | Fichier | Quand ça tourne | Ce que ça protège |
 |---|---|---|---|---|
-| 1 | **Pre-commit local** | `.githooks/pre-commit` → `validate.js` | À chaque `git commit` | Secrets dans fichiers staged, syntaxe bot.js cassée, tool names invalides Opus 4.7 |
-| 2 | **Gitleaks CI** | `.github/workflows/security.yml` | Push + PR + lundi 9h | Fuites dans tout l'historique git |
-| 3 | **GitHub Push Protection** | `scripts/enable-github-security.js` | Côté serveur GitHub | Tout push contenant un pattern de secret connu |
-| 4 | **Dependabot** | activé via script | Continu | CVE dans `node_modules`, auto-PR des patches |
-| 5 | **Private Vuln Reporting** | activé via script | Continu | Canal sécurisé pour que des chercheurs signalent des failles |
+| 1 | **Pre-commit local** | `.githooks/pre-commit` → `validate.js` | À chaque `git commit` | Secrets staged, syntaxe bot.js, tool names Opus 4.7 |
+| 2 | **Gitleaks CI** | `.github/workflows/security.yml` | Push + PR + lundi 9h | Fuites dans tout l'historique |
+| 3 | **npm audit CI** | `.github/workflows/security.yml` | Push + PR | Vulnérabilités high/critical dans deps |
+| 4 | **GitHub Push Protection** | `scripts/enable-github-security.js` | Côté serveur GitHub | Push de secrets reconnus |
+| 5 | **CodeQL SAST** | `.github/workflows/codeql.yml` | Push + PR + lundi 6h | Failles sécurité dans le code JS (injection, XSS, etc.) |
+| 6 | **Dependency Review** | `.github/workflows/dependency-review.yml` | Chaque PR | Deps introduites par PR avec CVE ≥ moderate |
+| 7 | **OSSF Scorecard** | `.github/workflows/scorecard.yml` | Lundi 8h | Benchmark global best practices sécurité |
+| 8 | **Dependabot** | `.github/dependabot.yml` + script | Continu + lundi 9h | Auto-PR patchs CVE, groupé minor/patch |
+| 9 | **Private Vuln Reporting** | activé via script | Continu | Canal sécurisé pour signalements externes |
 
-**Zero config à maintenir** — tout tourne tout seul une fois activé.
+**Zero config à maintenir** — tout tourne tout seul.
 
 ---
 
@@ -101,22 +107,38 @@ Règles:
 # 1. Hooks Git activés localement
 git config core.hooksPath .githooks
 
-# 2. Installer dépendances (dotenv pour scripts)
+# 2. Installer dépendances
 npm install
 
 # 3. Créer .env depuis template
 cp .env.example .env
 # → remplir les valeurs
 
-# 4. Activer sécurité côté GitHub (nécessite GITHUB_TOKEN avec scope repo + admin:repo_hook)
-node scripts/enable-github-security.js
+# 4. Activer sécurité côté GitHub (nécessite GITHUB_TOKEN scope repo + admin:repo_hook)
+npm run enable-security
 
 # 5. Synchroniser Render
-node scripts/sync-env-render.js --dry-run   # vérifier le diff
-node scripts/sync-env-render.js             # push pour de vrai
+npm run sync-env:dry     # vérifier le diff
+npm run sync-env         # push pour de vrai
 ```
 
-Après ça: plus jamais de manipulation manuelle récurrente. Les 5 couches tournent seules.
+Après ça: plus jamais de manipulation manuelle récurrente. Les 9 couches tournent seules.
+
+---
+
+## 📜 npm scripts disponibles
+
+| Commande | Action |
+|---|---|
+| `npm start` | Démarre le bot (prod = Render) |
+| `npm run validate` | Syntax + 6 checks (secrets, tools, params Opus 4.7, etc.) |
+| `npm run diagnose` | Diagnostic système complet (Bot, Render, GitHub, etc.) |
+| `npm run fix` | Auto-réparation problèmes courants |
+| `npm run sync-env` | Push `.env` local → Render env vars (redéploie auto) |
+| `npm run sync-env:dry` | Preview du diff sans modifier |
+| `npm run enable-security` | One-shot: active les couches GitHub (2, 3, 4, 5, 6, 7, 8, 9) |
+| `npm run test-parser` | Valide que `parseLeadEmail()` extrait correctement (8 tests) |
+| `bash scripts/audit-history.sh` | Scan profond historique git (gitleaks via Docker) |
 
 ---
 

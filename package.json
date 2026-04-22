@@ -11,6 +11,7 @@
     "sync-env": "node scripts/sync-env-render.js",
     "sync-env:dry": "node scripts/sync-env-render.js --dry-run",
     "enable-security": "node scripts/enable-github-security.js",
+    "audit-history": "bash scripts/audit-history.sh",
     "test-parser": "node test_parser.js"
   },
   "dependencies": {
