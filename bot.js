@@ -855,26 +855,11 @@ async function loadSessionLiveContext() {
 }
 
 async function writeBotActivity() {
-  if (!process.env.GITHUB_TOKEN || botActivityLog.length === 0) return;
-  try {
-    const now = new Date();
-    const lines = botActivityLog.slice(-50).map(a => {
-      const d = new Date(a.ts).toLocaleString('fr-CA', { timeZone: 'America/Toronto' });
-      return `- [${d}] ${a.event}`;
-    });
-    const content = [
-      `# Bot — Journal d'activité`,
-      `_Mis à jour: ${now.toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}_`,
-      ``,
-      `## Actions récentes (${lines.length})`,
-      ...lines,
-      ``,
-      `## Pour Claude Code`,
-      `Voir ce que le bot a fait récemment: \`read_github_file(repo='kira-bot', path='BOT_ACTIVITY.md')\``,
-    ].join('\n');
-    await writeGitHubFile('kira-bot', 'BOT_ACTIVITY.md', content, `Activity: ${now.toISOString().split('T')[0]}`);
-    log('OK', 'SYNC', `BOT_ACTIVITY.md → GitHub (${lines.length} events)`);
-  } catch (e) { log('WARN', 'SYNC', `Write activity: ${e.message}`); }
+  // PRIVACY: BOT_ACTIVITY.md n'est PLUS publié sur GitHub.
+  // Les logs d'activité (contiennent noms clients, Centris#) restent in-memory
+  // + accessibles via Telegram. Jamais dans un repo public.
+  // Si besoin de consulter: `/activity` command ou logs Render.
+  return;
 }
 
 // ─── Dropbox (avec refresh auto) ─────────────────────────────────────────────
@@ -3903,52 +3888,52 @@ async function syncStatusGitHub() {
   const ts  = now.toLocaleDateString('fr-CA', { weekday:'long', year:'numeric', month:'long', day:'numeric', timeZone:'America/Toronto' })
             + ' à ' + now.toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' });
   try {
-    let pipelineLines = [], gagnesMois = 0, perdusMois = 0;
+    // PRIVACY: on ne publie PLUS les noms de clients ni les deals individuels.
+    // Juste des stats agrégées anonymes pour monitoring.
+    let totalActifs = 0, gagnesMois = 0, perdusMois = 0;
+    let stagesCounts = {};
     if (PD_KEY) {
       const [actifs, gagnes, perdus] = await Promise.all([
-        pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=50`).catch(()=>null),
-        pdGet('/deals?status=won&limit=50').catch(()=>null),
-        pdGet('/deals?status=lost&limit=50').catch(()=>null),
+        pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=100`).catch(()=>null),
+        pdGet('/deals?status=won&limit=100').catch(()=>null),
+        pdGet('/deals?status=lost&limit=100').catch(()=>null),
       ]);
-      pipelineLines = (actifs?.data||[]).map(d=>`- **${d.title}** — ${PD_STAGES[d.stage_id]||d.stage_id}${d[PD_FIELD_CENTRIS]?' | Centris #'+d[PD_FIELD_CENTRIS]:''}`);
+      totalActifs = (actifs?.data||[]).length;
+      for (const d of (actifs?.data||[])) {
+        const stage = PD_STAGES[d.stage_id] || `Étape ${d.stage_id}`;
+        stagesCounts[stage] = (stagesCounts[stage]||0) + 1;
+      }
       const m = now.getMonth();
       gagnesMois = (gagnes?.data||[]).filter(d=>new Date(d.won_time||0).getMonth()===m).length;
       perdusMois = (perdus?.data||[]).filter(d=>new Date(d.lost_time||0).getMonth()===m).length;
     }
-    const visites     = loadJSON(VISITES_FILE, []);
-    const prochaines  = visites.filter(v => new Date(v.date).getTime() > Date.now());
+    const visites    = loadJSON(VISITES_FILE, []);
+    const prochaines = visites.filter(v => new Date(v.date).getTime() > Date.now()).length;
 
     const content = [
-      `# Bot Signature SB — Rapport automatique`,
+      `# Bot Signature SB — Rapport système`,
       `_${ts}_`,
       ``,
-      `## Système bot`,
-      `- Modèle: \`${currentModel}\` | Thinking: ${thinkingMode?'ON':'OFF'} | Outils: ${TOOLS.length}`,
-      `- Uptime: ${Math.floor(process.uptime()/60)}min | Mémos: ${kiramem.facts.length}`,
-      `- Centris agent: ${centrisSession.authenticated?`✅ (${process.env.CENTRIS_USER})`:'⏳'}`,
-      `- Gmail Poller: ${gmailPollerState.totalLeads||0} leads traités`,
+      `## Système`,
+      `- Modèle: \`${currentModel}\` | Outils: ${TOOLS.length}`,
+      `- Uptime: ${Math.floor(process.uptime()/60)}min`,
+      `- Gmail Poller: ${gmailPollerState.totalLeads||0} leads traités (cumul)`,
       `- Dropbox: ${dropboxTerrains.length} terrains en cache`,
       ``,
-      `## Pipeline Pipedrive — ${pipelineLines.length} deals actifs`,
-      ...pipelineLines,
+      `## Pipeline (stats agrégées, sans identifier)`,
+      `- Deals actifs: ${totalActifs}`,
+      ...Object.entries(stagesCounts).map(([s,n]) => `  - ${s}: ${n}`),
       ``,
       `## Ce mois`,
       `- ✅ Gagnés: ${gagnesMois} | ❌ Perdus: ${perdusMois}`,
-      `- 📅 Visites à venir: ${prochaines.length}`,
-      ...prochaines.map(v=>`  - ${v.nom} — ${new Date(v.date).toLocaleDateString('fr-CA',{timeZone:'America/Toronto'})}`),
+      `- 📅 Visites à venir (count): ${prochaines}`,
       ``,
-      `## Mémoire bot (${kiramem.facts.length} faits)`,
-      ...kiramem.facts.map(f=>`- ${f}`),
-      ``,
-      `## Lien Claude Code ↔ Bot`,
-      `- Code: \`/Users/signaturesb/Documents/github/Claude, code Telegram/bot.js\``,
-      `- CLAUDE.md: \`read_github_file(repo='kira-bot', path='CLAUDE.md')\``,
-      `- État système: \`read_github_file(repo='kira-bot', path='ÉTAT_SYSTÈME.md')\``,
-      `- Ce fichier: \`read_github_file(repo='kira-bot', path='BOT_STATUS.md')\``,
+      `> Privacy: ce fichier est public. Aucun nom/email/téléphone client.`,
+      `> Pour les détails: Pipedrive directement ou \`/pipeline\` sur Telegram.`,
     ].join('\n');
 
     await writeGitHubFile('kira-bot', 'BOT_STATUS.md', content, `Sync: ${now.toISOString().split('T')[0]}`);
-    log('OK', 'SYNC', `BOT_STATUS.md → kira-bot (${pipelineLines.length} deals, ${kiramem.facts.length} mémos)`);
+    log('OK', 'SYNC', `BOT_STATUS.md → kira-bot (stats anonymes, ${totalActifs} deals)`);
   } catch (e) { log('WARN', 'SYNC', `GitHub sync: ${e.message}`); }
 }
 
