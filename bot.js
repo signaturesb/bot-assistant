@@ -5,6 +5,7 @@ const Anthropic   = require('@anthropic-ai/sdk');
 const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
+const leadParser  = require('./lead_parser');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
@@ -3836,7 +3837,41 @@ function startDailyTasks() {
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
     // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
   }, 60 * 1000);
-  log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, sync BOT_STATUS chaque heure');
+  // MONITORING PROACTIF — vérifie santé système toutes les 10 min, alerte Telegram si problème
+  let monitoringState = { pollerAlertSent: false, autoEnvoiStreak: 0, lastAutoEnvoiAlert: 0 };
+  setInterval(async () => {
+    if (!ALLOWED_ID) return;
+    const alerts = [];
+    // 1. Poller silence > 10 min
+    if (gmailPollerState.lastRun) {
+      const minsAgo = (Date.now() - new Date(gmailPollerState.lastRun).getTime()) / 60000;
+      if (minsAgo > 10) {
+        if (!monitoringState.pollerAlertSent) {
+          alerts.push(`🔴 *Gmail Poller silencieux depuis ${Math.round(minsAgo)}min* (devrait tourner aux 5min)`);
+          monitoringState.pollerAlertSent = true;
+        }
+      } else monitoringState.pollerAlertSent = false;
+    }
+    // 2. Streak échecs auto-envoi (≥3 fails consécutifs → alerte, max 1×/h)
+    const recent = (autoEnvoiState.log || []).slice(0, 5);
+    const recentFails = recent.slice(0, 3).filter(l => !l.success).length;
+    if (recentFails >= 3 && (Date.now() - monitoringState.lastAutoEnvoiAlert) > 3600000) {
+      alerts.push(`🔴 *Auto-envoi docs ÉCHOUÉ 3 fois consécutifs* — vérifier Gmail/Dropbox.\n${recent.slice(0,3).map(l => `  • ${l.email}: ${String(l.error).substring(0,60)}`).join('\n')}`);
+      monitoringState.lastAutoEnvoiAlert = Date.now();
+    }
+    // 3. Circuits ouverts prolongés
+    for (const [name, c] of Object.entries(circuits)) {
+      if (c.openUntil > Date.now() && c.fails >= 10) {
+        alerts.push(`🔴 *Circuit ${name} OUVERT* (${c.fails} fails) — API down prolongée`);
+      }
+    }
+    // Envoyer les alertes
+    for (const a of alerts) {
+      await bot.sendMessage(ALLOWED_ID, a, { parse_mode: 'Markdown' }).catch(() => {});
+    }
+  }, 10 * 60 * 1000);
+
+  log('OK', 'CRON', 'Tâches: visites 7h, digest 8h→Julie, sync BOT_STATUS chaque heure, monitoring 10min');
 }
 
 // ─── Webhooks intelligents ────────────────────────────────────────────────────
@@ -4040,6 +4075,83 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── Dashboard HTML — stats temps réel avec branding Signature SB ──────────
+  if (req.method === 'GET' && url === '/dashboard') {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized — add ?token=WEBHOOK_SECRET');
+      return;
+    }
+    const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
+    const pollerLast = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun) : null;
+    const minsAgo = pollerLast ? Math.floor((Date.now() - pollerLast.getTime()) / 60000) : null;
+    const autoStats = {
+      total: autoEnvoiState.totalAuto || 0,
+      fails: autoEnvoiState.totalFails || 0,
+      rate: ((autoEnvoiState.totalAuto||0) + (autoEnvoiState.totalFails||0)) > 0
+        ? Math.round(100 * (autoEnvoiState.totalAuto||0) / ((autoEnvoiState.totalAuto||0) + (autoEnvoiState.totalFails||0)))
+        : 0,
+    };
+    const recent = (autoEnvoiState.log || []).slice(0, 10);
+    const avgMs = recent.filter(l => l.success).reduce((s, l, _, a) => s + (l.deliveryMs||0)/(a.length||1), 0);
+    const pollerHealth = minsAgo === null ? '⚪ jamais' : minsAgo > 10 ? `🔴 ${minsAgo}min` : `🟢 ${minsAgo}min`;
+    const html = `<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dashboard — Signature SB Bot</title><style>
+body{margin:0;background:#0a0a0a;color:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif;padding:16px;}
+.container{max-width:900px;margin:0 auto}
+.header{border-bottom:3px solid #aa0721;padding:20px 0;margin-bottom:24px}
+.header h1{margin:0;font-size:22px;letter-spacing:2px;text-transform:uppercase}
+.header .sub{color:#888;font-size:12px;margin-top:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
+.card{background:#111;border:1px solid #1e1e1e;border-left:3px solid #aa0721;border-radius:4px;padding:16px 18px}
+.card .label{color:#888;font-size:10px;text-transform:uppercase;letter-spacing:2px;margin-bottom:8px}
+.card .value{font-family:Georgia,serif;font-size:32px;font-weight:700;line-height:1}
+.card .sub{color:#aaa;font-size:12px;margin-top:6px}
+.green{color:#34c759}
+.red{color:#ff3b30}
+.yellow{color:#ffcc00}
+h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;margin:24px 0 12px;border-bottom:1px solid #1e1e1e;padding-bottom:8px}
+.log{background:#0d0d0d;border:1px solid #1e1e1e;border-radius:4px;padding:14px;font-family:'SF Mono',Menlo,monospace;font-size:12px;line-height:1.7}
+.log .ok{color:#34c759}
+.log .fail{color:#ff3b30}
+.footer{margin-top:40px;padding-top:16px;border-top:1px solid #1e1e1e;color:#666;font-size:11px;text-align:center}
+</style></head><body><div class="container">
+<div class="header"><h1>Signature SB — Dashboard Bot</h1><div class="sub">Temps réel · ${new Date().toLocaleString('fr-CA',{timeZone:'America/Toronto'})}</div></div>
+<h2>🚀 Auto-envoi docs</h2>
+<div class="grid">
+  <div class="card"><div class="label">Total envoyés</div><div class="value green">${autoStats.total}</div><div class="sub">depuis démarrage</div></div>
+  <div class="card"><div class="label">Échecs</div><div class="value ${autoStats.fails > 0 ? 'red' : ''}">${autoStats.fails}</div><div class="sub">après 3 retries</div></div>
+  <div class="card"><div class="label">Taux succès</div><div class="value ${autoStats.rate >= 90 ? 'green' : autoStats.rate >= 70 ? 'yellow' : 'red'}">${autoStats.rate}%</div><div class="sub">global</div></div>
+  <div class="card"><div class="label">Temps moyen</div><div class="value">${Math.round(avgMs/1000)}s</div><div class="sub">lead → docs envoyés</div></div>
+</div>
+<h2>📧 Gmail Poller</h2>
+<div class="grid">
+  <div class="card"><div class="label">Leads traités</div><div class="value">${gmailPollerState.totalLeads || 0}</div><div class="sub">total depuis boot</div></div>
+  <div class="card"><div class="label">Dernier scan</div><div class="value" style="font-size:16px">${pollerHealth}</div><div class="sub">scan toutes les 5min</div></div>
+  <div class="card"><div class="label">IDs mémorisés</div><div class="value" style="font-size:24px">${(gmailPollerState.processed||[]).length}</div><div class="sub">anti-doublon</div></div>
+  <div class="card"><div class="label">Uptime bot</div><div class="value" style="font-size:18px">${Math.floor(uptimeS/3600)}h ${Math.floor((uptimeS%3600)/60)}m</div></div>
+</div>
+<h2>🏠 Pipeline</h2>
+<div class="grid">
+  <div class="card"><div class="label">Dropbox</div><div class="value" style="font-size:24px">${dropboxTerrains.length}</div><div class="sub">dossiers terrain en cache</div></div>
+  <div class="card"><div class="label">Modèle IA</div><div class="value" style="font-size:16px">${currentModel.replace('claude-','')}</div><div class="sub">thinking: ${thinkingMode}</div></div>
+  <div class="card"><div class="label">Tools actifs</div><div class="value">${TOOLS.length}</div><div class="sub">Pipedrive · Gmail · Dropbox</div></div>
+  <div class="card"><div class="label">Mémos Kira</div><div class="value">${kiramem.facts.length}</div></div>
+</div>
+<h2>📋 10 derniers auto-envois</h2>
+<div class="log">${recent.length === 0 ? '<span style="color:#666">Aucun auto-envoi encore</span>' : recent.map(l => {
+  const when = new Date(l.timestamp).toLocaleString('fr-CA',{timeZone:'America/Toronto',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  return l.success
+    ? `<span class="ok">✅</span> <span style="color:#888">${when}</span> · <strong>${l.email}</strong> · ${l.pdfsCount} PDFs · ${l.strategy}(${l.score}) · ${Math.round(l.deliveryMs/1000)}s`
+    : `<span class="fail">❌</span> <span style="color:#888">${when}</span> · ${l.email} · ${String(l.error).substring(0, 80)}`;
+}).join('<br>')}</div>
+<div class="footer">Signature SB · Bot Kira · auto-refresh manuel · <a href="/health" style="color:#aa0721">/health JSON</a></div>
+</div></body></html>`;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+    return;
+  }
+
   if (req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(`Assistant SignatureSB OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length}`);
@@ -4107,116 +4219,8 @@ const server = http.createServer((req, res) => {
 let gmailPollerState = loadJSON(POLLER_FILE, { processed: [], lastRun: null, totalLeads: 0 });
 
 // Sources d'emails → leads immobiliers
-const LEAD_EMAIL_PATTERNS = [
-  { re: /centris/i,               source: 'centris',   label: 'Centris.ca' },
-  { re: /remax/i,                 source: 'remax',     label: 'RE/MAX Québec' },
-  { re: /realtor|crea\.ca/i,      source: 'realtor',   label: 'Realtor.ca' },
-  { re: /duproprio/i,             source: 'duproprio', label: 'DuProprio' },
-  { re: /kijiji|facebook/i,       source: 'social',    label: 'Réseau social' },
-];
-
-// Sujets → signal que c'est un lead
-const LEAD_SUBJECT_RE = /demande|lead|prospect|contact|information|intéress|inquiry|visite|acheteur|request/i;
-
-function detectLeadSource(from, subject) {
-  const txt = `${from} ${subject}`.toLowerCase();
-  for (const s of LEAD_EMAIL_PATTERNS) {
-    if (s.re.test(txt)) return s;
-  }
-  // Email direct avec sujet lead-like
-  if (LEAD_SUBJECT_RE.test(subject)) return { source: 'direct', label: 'Demande directe' };
-  return null;
-}
-
-// Filtre junk — rejette newsletters, alertes saved-search, notifications
-function isJunkLeadEmail(subject, from, body) {
-  const s = (subject || '').toLowerCase();
-  const f = (from || '').toLowerCase();
-  // Notifications Centris (pas de demande réelle)
-  if (f.includes('no-reply@centris') || f.includes('noreply@centris')) {
-    if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|découvrez-les|inscriptions?\s+(correspondantes|matching)/i.test(s)) return true;
-  }
-  // Newsletter RE/MAX / Centris
-  if (/(newsletter|infolettre|promotion|offre\s+sp[eé]ciale|super\s+promo|last\s+call|ending\s+soon)/i.test(s)) return true;
-  // Alertes systeme
-  if (/watchdog|system\s+alert|hmac/i.test(s)) return true;
-  return false;
-}
-
-function parseLeadEmail(body, subject, from) {
-  // Strip <style>, <script>, et HTML — nettoyer avant extraction
-  let clean = (body || '')
-    .replace(/\r/g, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
-    .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s{2,}/g, ' ');
-  const full  = `${subject} ${clean}`;
-
-  const extract = (...patterns) => {
-    for (const p of patterns) {
-      const m = full.match(p);
-      if (m?.[1]?.trim()) return m[1].trim().substring(0, 100);
-    }
-    return '';
-  };
-
-  // Nom — labelled d'abord (Centris format: "Nom Shawn Barrette")
-  const nom = extract(
-    /Nom\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+){1,3})\s+(?:Courriel|Email|Téléphone|Tel)/,
-    /(?:nom(?:\s+complet)?|name|client|acheteur|vendeur|prénom\s+et\s+nom)\s*:?\s*([A-ZÀ-Ü][^\n\r:;|<>]{2,50})/i,
-    /(?:bonjour|salut),?\s+([A-ZÀ-Ü][a-zà-ü]+ [A-ZÀ-Ü][a-zà-ü]+)/i,
-  );
-
-  // Téléphone — préférer après mot-clé "Téléphone/Tel" (évite tokens CSS)
-  let telephone = '';
-  const telLabelMatch = full.match(/(?:t[eé]l[eé]phone|tel\.?|phone)\s*:?\s*((?:\+1[-.\s]?)?(?:\(\s*\d{3}\s*\)\s*\d{3}[-.\s]?\d{4}|\d{3}[-.\s]?\d{3}[-.\s]?\d{4}))/i);
-  if (telLabelMatch) telephone = telLabelMatch[1].replace(/[^\d+]/g, '').replace(/^1/, '');
-  else {
-    // Fallback: chercher format typique québécois (3-3-4 avec séparateur obligatoire)
-    const telFallback = full.match(/\b((?:\+1[-.\s]?)?\d{3}[-.\s]\d{3}[-.\s]\d{4})\b/);
-    if (telFallback) telephone = telFallback[1].replace(/[^\d+]/g, '').replace(/^1/, '');
-  }
-
-  // Email — préférer après "Courriel/Email" label, sinon chercher + filtrer
-  let email = '';
-  const emailLabelMatch = full.match(/(?:courriel|email|e-mail|courriel\s*\(email\))\s*:?\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i);
-  if (emailLabelMatch) email = emailLabelMatch[1].toLowerCase();
-  else {
-    const emailRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
-    const allEmails = [...full.matchAll(emailRe)].map(m => m[1].toLowerCase())
-      .filter(e => !e.includes('signaturesb') && !e.includes('remax') && !e.includes('centris') && !e.includes('noreply') && !e.includes('nepasrepondre'));
-    email = allEmails[0] || '';
-  }
-
-  // Numéro Centris — pattern "(# 12345678)" très courant dans Centris
-  const centris = extract(
-    /\(#\s*(\d{7,9})\)/,                                        // "(# 28939185)" — format officiel
-    /#\s*(\d{7,9})\b/,                                          // "#28939185" ou "# 28939185" n'importe où
-    /(?:centris|mls|inscription|listing)[^\d]{0,60}(\d{7,9})\b/i, // "Centris.ca ... 28939185"
-    /\b(\d{8})\b/,                                              // 8 chiffres isolés (fallback)
-  );
-
-  // Adresse
-  const adresse = extract(
-    /(?:adresse|propriét[eé]|property|address|bien)\s*:?\s*([^\n\r:;|<>]{10,80})/i,
-    /\b(\d+[,\s]+(?:rue|avenue|boul\.?|chemin|ch\.|rang|route|rte|place|pl\.|cour|court|dr\.?|blvd)[^\n\r:;|<>]{5,60})/i,
-  );
-
-  // Type de propriété
-  let type = 'terrain';
-  const typeText = full.toLowerCase();
-  if (/maison|unifamili|résidenti|bungalow|cottage|chalet/i.test(typeText))  type = 'maison_usagee';
-  else if (/plex|duplex|triplex|quadruplex|multilogement/i.test(typeText))   type = 'plex';
-  else if (/construction\s+neuve|neuve?|new\s+build/i.test(typeText))        type = 'construction_neuve';
-  else if (/terrain|lot\b|land/i.test(typeText))                             type = 'terrain';
-
-  return { nom, telephone, email, centris, adresse, type };
-}
+// Lead parsing — extrait dans lead_parser.js pour testabilité
+const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI } = leadParser;
 
 async function traiterNouveauLead(lead, msgId, from, subject, source) {
   const { nom, telephone, email, centris, adresse, type } = lead;
@@ -4375,12 +4379,21 @@ async function runGmailLeadPoller() {
           const source = detectLeadSource(from, subject);
           if (!source) { gmailPollerState.processed.push(id); continue; }
 
-          const lead = parseLeadEmail(body, subject, from);
+          let lead = parseLeadEmail(body, subject, from);
+          let infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
 
-          // VALIDATION lead viable — minimum 2 infos ou (Centris# + 1 info)
-          const infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+          // AI FALLBACK — si regex extrait <2 infos, appel Claude Haiku pour extraction structurée
+          if (infoCount < 2 && API_KEY) {
+            log('INFO', 'POLLER', `Regex <${infoCount} infos — tentative AI fallback`);
+            try {
+              lead = await parseLeadEmailWithAI(body, subject, from, lead, { apiKey: API_KEY, logger: log });
+              infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+            } catch (e) { log('WARN', 'POLLER', `AI fallback exception: ${e.message}`); }
+          }
+
+          // VALIDATION lead viable — minimum 2 infos ou Centris# seul suffit
           if (infoCount < 2 && !lead.centris) {
-            log('INFO', 'POLLER', `Lead non viable (${infoCount} info): "${subject.substring(0, 50)}" — ignoré`);
+            log('INFO', 'POLLER', `Lead non viable après fallback (${infoCount} info): "${subject.substring(0, 50)}" — ignoré`);
             gmailPollerState.processed.push(id); continue;
           }
 

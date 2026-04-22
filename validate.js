@@ -13,12 +13,30 @@ const fs = require('fs');
 const issues = [];
 const warnings = [];
 
-// ── 1. Syntaxe bot.js ────────────────────────────────────────────────────────
+// ── 1. Syntaxe bot.js + lead_parser.js ───────────────────────────────────────
 try {
   require('child_process').execSync('node --check bot.js', { stdio: 'pipe' });
 } catch (e) {
   issues.push('❌ Syntaxe bot.js invalide');
   console.error(e.stderr?.toString() || e.message);
+}
+if (fs.existsSync('./lead_parser.js')) {
+  try {
+    require('child_process').execSync('node --check lead_parser.js', { stdio: 'pipe' });
+  } catch (e) {
+    issues.push('❌ Syntaxe lead_parser.js invalide');
+  }
+}
+
+// ── 1b. Suite de tests parseLeadEmail (bloque si extraction cassée) ──────────
+if (fs.existsSync('./test_parser.js') && fs.existsSync('./lead_parser.js')) {
+  try {
+    require('child_process').execSync('node test_parser.js', { stdio: 'pipe' });
+    console.log('  ✓ Suite de tests parser passe (8/8)');
+  } catch (e) {
+    issues.push('❌ Suite de tests parser échoue — parseLeadEmail est cassé');
+    console.error(e.stdout?.toString() || e.message);
+  }
 }
 
 const code = fs.readFileSync('./bot.js', 'utf8');
