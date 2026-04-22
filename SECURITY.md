@@ -6,7 +6,7 @@ Architecture de protection + playbook rotation. **Ce fichier remplace les creden
 
 ---
 
-## 🛡️ Défense en profondeur — 9 couches automatiques
+## 🛡️ Défense en profondeur — 11 couches automatiques
 
 | # | Couche | Fichier | Quand ça tourne | Ce que ça protège |
 |---|---|---|---|---|
@@ -19,6 +19,8 @@ Architecture de protection + playbook rotation. **Ce fichier remplace les creden
 | 7 | **OSSF Scorecard** | `.github/workflows/scorecard.yml` | Lundi 8h | Benchmark global best practices sécurité |
 | 8 | **Dependabot** | `.github/dependabot.yml` + script | Continu + lundi 9h | Auto-PR patchs CVE, groupé minor/patch |
 | 9 | **Private Vuln Reporting** | activé via script | Continu | Canal sécurisé pour signalements externes |
+| 10 | **Branch protection main** | `scripts/enable-github-security.js` | Côté serveur GitHub | Force-push bloqué, linear history, delete bloqué |
+| 11 | **Smoke test post-deploy** | `.github/workflows/smoke-test.yml` | Après chaque push main | Ping `/health`, crée issue auto si deploy cassé |
 
 **Zero config à maintenir** — tout tourne tout seul.
 
@@ -136,9 +138,11 @@ Après ça: plus jamais de manipulation manuelle récurrente. Les 9 couches tour
 | `npm run fix` | Auto-réparation problèmes courants |
 | `npm run sync-env` | Push `.env` local → Render env vars (redéploie auto) |
 | `npm run sync-env:dry` | Preview du diff sans modifier |
-| `npm run enable-security` | One-shot: active les couches GitHub (2, 3, 4, 5, 6, 7, 8, 9) |
+| `npm run enable-security` | One-shot: active les couches GitHub server-side (4, 9, 10) |
+| `npm run security-status` | Dashboard des 11 couches — score % vert/jaune/rouge |
+| `npm run audit-history` | Scan profond historique git (gitleaks via Docker) |
+| `npm run preflight` | Validate + security-status combinés (à rouler avant push sensible) |
 | `npm run test-parser` | Valide que `parseLeadEmail()` extrait correctement (8 tests) |
-| `bash scripts/audit-history.sh` | Scan profond historique git (gitleaks via Docker) |
 
 ---
 

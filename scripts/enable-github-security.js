@@ -98,6 +98,30 @@ async function enableForRepo(repo) {
   } catch (e) {
     console.log(`  ⚠️ Private vuln reporting: ${e.message}`);
   }
+
+  // 5. Branch protection sur main — status checks + linear history + block force-push
+  try {
+    await gh('PUT', `/repos/${repo}/branches/main/protection`, {
+      required_status_checks: {
+        strict: true,
+        contexts: [],  // relâché: les contexts exacts dépendent des noms GitHub Actions
+      },
+      enforce_admins: false,  // Shawn admin peut bypass en urgence
+      required_pull_request_reviews: null,  // solo dev, pas de review requise
+      restrictions: null,
+      required_linear_history: true,
+      allow_force_pushes: false,
+      allow_deletions: false,
+      block_creations: false,
+      required_conversation_resolution: true,
+      lock_branch: false,
+      allow_fork_syncing: false,
+    });
+    console.log('  ✅ Branch protection main: linear history, pas de force-push, pas de delete');
+  } catch (e) {
+    console.log(`  ⚠️ Branch protection: ${e.message}`);
+    console.log(`     → Configure manuellement: https://github.com/${repo}/settings/branches`);
+  }
 }
 
 (async () => {
