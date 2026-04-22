@@ -94,7 +94,14 @@ avant que mon handler uncaughtException ait une chance de s'exécuter.
 **Historique tentatives:**
 - cd92e0f: server.listen en Step 0 → ÉCHEC
 - e012f23: server.on('error') + polling non-throw → ÉCHEC  
-- 2641720: délai 10s avant startPolling (conflit token Render zero-downtime) → EN ATTENTE
+- 2641720: délai 10s avant startPolling → ÉCHEC
+- 5271a98: PIVOT MAJEUR → webhook Telegram au lieu de polling → EN ATTENTE
+
+**5271a98 — Webhook mode:**
+- POST /webhook/telegram reçoit les updates
+- bot.setWebHook() configuré 5s après boot
+- Pas de polling = pas de conflit multi-instance
+- C'est la méthode officielle Telegram pour production
 
 **Si 2641720 échoue aussi:**
 1. **Switch webhook Telegram** au lieu de polling (plus fiable en prod)
