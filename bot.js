@@ -85,6 +85,60 @@ const GIST_ID_FILE    = path.join(DATA_DIR, 'gist_id.txt');
 const VISITES_FILE    = path.join(DATA_DIR, 'visites.json');
 const POLLER_FILE     = path.join(DATA_DIR, 'gmail_poller.json');
 
+// ─── Observabilité: Metrics + Circuit Breakers (fine pointe) ──────────────────
+const metrics = {
+  startedAt:  Date.now(),
+  messages:   { text:0, voice:0, photo:0, pdf:0 },
+  tools:      {}, // toolName → count
+  api:        { claude:0, pipedrive:0, gmail:0, dropbox:0, centris:0, brevo:0, github:0 },
+  errors:     { total:0, byStatus:{} },
+  leads:      0,
+  emailsSent: 0,
+};
+function mTick(cat, key) {
+  if (cat === 'tools') { metrics.tools[key] = (metrics.tools[key]||0)+1; return; }
+  if (metrics[cat] && typeof metrics[cat][key] === 'number') metrics[cat][key]++;
+  else if (metrics[cat]) metrics[cat][key] = 1;
+}
+
+// Circuit breaker: après N échecs, coupe le service X minutes (protège cascade failures)
+const circuits = {};
+function circuitConfig(service, threshold = 5, cooldownMs = 5 * 60 * 1000) {
+  if (!circuits[service]) circuits[service] = { fails:0, openUntil:0, threshold, cooldown:cooldownMs };
+  return circuits[service];
+}
+function circuitCheck(service) {
+  const c = circuitConfig(service);
+  if (Date.now() < c.openUntil) {
+    const remainS = Math.ceil((c.openUntil - Date.now()) / 1000);
+    const err = new Error(`${service} en coupure — réessai dans ${remainS}s`);
+    err.status = 503;
+    throw err;
+  }
+}
+function circuitSuccess(service) { const c = circuits[service]; if (c) c.fails = 0; }
+function circuitFail(service) {
+  const c = circuitConfig(service);
+  c.fails++;
+  if (c.fails >= c.threshold) {
+    c.openUntil = Date.now() + c.cooldown;
+    log('WARN', 'CIRCUIT', `${service} COUPÉ ${c.cooldown/1000}s (${c.fails} échecs)`);
+  }
+}
+// Wrapper générique pour protéger un appel avec circuit breaker
+async function withCircuit(service, fn) {
+  circuitCheck(service);
+  mTick('api', service);
+  try {
+    const r = await fn();
+    circuitSuccess(service);
+    return r;
+  } catch (e) {
+    if (e.status !== 400 && e.status !== 401 && e.status !== 404) circuitFail(service);
+    throw e;
+  }
+}
+
 function loadJSON(file, fallback) {
   try { if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { log('WARN', 'IO', `Impossible de lire ${file} — réinitialisation`); }
@@ -2565,11 +2619,12 @@ async function executeToolSafe(name, input, chatId) {
 
 // ─── Appel Claude (boucle agentique, prompt caching, Opus 4.7) ───────────────
 async function callClaude(chatId, userMsg, retries = 3) {
-  // Rate limiter — éviter 429 en cascade
   if (!checkRateLimit()) {
     const err = new Error('Rate limit local atteint — 15 req/min'); err.status = 429;
     throw err;
   }
+  circuitCheck('claude');
+  mTick('messages', 'text');
 
   const msgIndex = getHistory(chatId).length;
   addMsg(chatId, 'user', userMsg);
@@ -2599,12 +2654,15 @@ async function callClaude(chatId, userMsg, retries = 3) {
           tools: TOOLS_WITH_CACHE, messages,
         };
         if (localThinking) params.thinking = { type: 'enabled', budget_tokens: 10000 };
+        mTick('api', 'claude');
         const res = await claude.messages.create(params);
+        circuitSuccess('claude');
         if (res.stop_reason === 'tool_use') {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
           const results = await Promise.all(toolBlocks.map(async b => {
             log('INFO', 'TOOL', `${b.name}(${JSON.stringify(b.input).substring(0, 80)})`);
+            mTick('tools', b.name);
             const result = await executeToolSafe(b.name, b.input, chatId);
             return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
           }));
@@ -2623,6 +2681,10 @@ async function callClaude(chatId, userMsg, retries = 3) {
       return { reply: finalReply, memos: allMemos };
     } catch (err) {
       log('ERR', 'CLAUDE', `attempt ${attempt}: HTTP ${err.status || '?'} — ${err.message?.substring(0, 120)}`);
+      metrics.errors.total++;
+      metrics.errors.byStatus[err.status || 'unknown'] = (metrics.errors.byStatus[err.status || 'unknown'] || 0) + 1;
+      // Circuit breaker: seulement sur erreurs transient (500+/429), pas sur 400 (user error)
+      if (err.status === 429 || err.status === 529 || err.status >= 500) circuitFail('claude');
 
       // 400 = erreur structurelle (NON retryable) → nettoyer et abandonner
       if (err.status === 400) {
@@ -2819,6 +2881,7 @@ async function handleEmailConfirmation(chatId, text) {
 
   pendingEmails.delete(chatId); // supprimer SEULEMENT après succès confirmé
   logActivity(`Email envoyé (${method}) → ${pending.to} — "${pending.sujet.substring(0,60)}"`);
+  mTick('emailsSent', 0); metrics.emailsSent++;
   await send(chatId, `✅ *Email envoyé* (${method})\nÀ: ${pending.toName || pending.to}\nObjet: ${pending.sujet}`);
   return true;
 }
@@ -2858,6 +2921,18 @@ function registerHandlers() {
   });
 
   // ─── Commandes poller ────────────────────────────────────────────────────────
+  // ─── Metrics — observabilité depuis Telegram ──────────────────────────────────
+  bot.onText(/\/metrics/, async msg => {
+    if (!isAllowed(msg)) return;
+    const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
+    const uptime  = `${Math.floor(uptimeS/3600)}h ${Math.floor((uptimeS%3600)/60)}m`;
+    const topTools = Object.entries(metrics.tools).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`${k}: ${v}`).join(', ') || 'aucun';
+    const errorsByCode = Object.entries(metrics.errors.byStatus).map(([k,v])=>`${k}:${v}`).join(', ') || '0';
+    const openCircuits = Object.entries(circuits).filter(([,v])=>Date.now()<v.openUntil).map(([k])=>k).join(', ') || 'aucun';
+    const txt = `📊 *Métriques — ${uptime}*\n\n*Messages reçus:*\ntext: ${metrics.messages.text} · voice: ${metrics.messages.voice} · photo: ${metrics.messages.photo} · pdf: ${metrics.messages.pdf}\n\n*API calls:*\nClaude: ${metrics.api.claude} · Pipedrive: ${metrics.api.pipedrive}\nGmail: ${metrics.api.gmail} · Dropbox: ${metrics.api.dropbox}\nCentris: ${metrics.api.centris} · Brevo: ${metrics.api.brevo}\n\n*Top outils:*\n${topTools}\n\n*Erreurs:* ${metrics.errors.total} (${errorsByCode})\n*Leads:* ${metrics.leads} · *Emails envoyés:* ${metrics.emailsSent}\n*Circuit breakers ouverts:* ${openCircuits}\n\nEndpoint JSON complet: ${AGENT.site.startsWith('http')?AGENT.site:'https://signaturesb-bot-s272.onrender.com'}/health`;
+    bot.sendMessage(msg.chat.id, txt, { parse_mode: 'Markdown' });
+  });
+
   // ─── Test Centris agent ────────────────────────────────────────────────────────
   bot.onText(/\/centris/, async msg => {
     if (!isAllowed(msg)) return;
@@ -3024,6 +3099,7 @@ function registerHandlers() {
     }
 
     log('IN', 'VOICE', `${msg.voice.duration}s`);
+    mTick('messages', 'voice');
     bot.sendChatAction(chatId, 'typing').catch(() => {});
 
     try {
@@ -3065,6 +3141,7 @@ function registerHandlers() {
     const caption = msg.caption || 'Analyse cette photo en contexte immobilier québécois. Qu\'est-ce que tu vois? Qu\'est-ce que je dois savoir?';
 
     log('IN', 'PHOTO', `${photo.width}x${photo.height} — "${caption.substring(0, 60)}"`);
+    mTick('messages', 'photo');
     const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
     bot.sendChatAction(chatId, 'typing').catch(() => {});
 
@@ -3126,6 +3203,7 @@ function registerHandlers() {
     }
 
     log('IN', 'PDF', `${doc.file_name} — ${Math.round(doc.file_size / 1024)}KB`);
+    mTick('messages', 'pdf');
     const typing = setInterval(() => bot.sendChatAction(chatId, 'typing').catch(() => {}), 4500);
     bot.sendChatAction(chatId, 'typing').catch(() => {});
 
@@ -3475,14 +3553,74 @@ process.on('SIGTERM', async () => {
 const server = http.createServer((req, res) => {
   const url = (req.url || '/').split('?')[0];
 
+  // ── Health endpoint détaillé (JSON) — observabilité complète ──────────────
+  if (req.method === 'GET' && url === '/health') {
+    const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
+    const health = {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uptime_sec: uptimeS,
+      uptime_human: `${Math.floor(uptimeS/3600)}h ${Math.floor((uptimeS%3600)/60)}m`,
+      model: currentModel,
+      thinking: thinkingMode,
+      tools: TOOLS.length,
+      mémos: kiramem.facts.length,
+      subsystems: {
+        pipedrive:  !!PD_KEY,
+        brevo:      !!BREVO_KEY,
+        gmail:      !!(process.env.GMAIL_CLIENT_ID && gmailToken),
+        dropbox:    !!dropboxToken,
+        centris:    centrisSession.authenticated,
+        github:     !!process.env.GITHUB_TOKEN,
+        whisper:    !!process.env.OPENAI_API_KEY,
+        gist:       !!gistId,
+      },
+      metrics,
+      circuits: Object.fromEntries(
+        Object.entries(circuits).map(([k,v]) => [k, {
+          fails: v.fails,
+          open:  Date.now() < v.openUntil,
+          open_remaining_sec: Math.max(0, Math.ceil((v.openUntil - Date.now())/1000)),
+        }])
+      ),
+      session_live_kb: Math.round((sessionLiveContext?.length||0)/1024),
+      dropbox_terrains: dropboxTerrains.length,
+      gmail_poller: {
+        total_leads: gmailPollerState.totalLeads||0,
+        last_run: gmailPollerState.lastRun,
+      },
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(health, null, 2));
+    return;
+  }
+
   if (req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(`Kira OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length}`);
+    res.end(`Assistant SignatureSB OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length}`);
+    return;
+  }
+
+  // ── GitHub webhook — sync instant au lieu de polling 30min ────────────────
+  if (req.method === 'POST' && url === '/webhook/github') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 100000) req.destroy(); });
+    req.on('end', async () => {
+      res.writeHead(200); res.end('ok');
+      try {
+        const event = req.headers['x-github-event'] || '';
+        const data  = JSON.parse(body || '{}');
+        if (event === 'push' && data.ref === 'refs/heads/main') {
+          log('OK', 'WEBHOOK', `GitHub push → rechargement SESSION_LIVE.md (${data.commits?.length||0} commits)`);
+          await loadSessionLiveContext();
+          logActivity(`Sync GitHub: ${data.commits?.length||0} commits — SESSION_LIVE rechargé`);
+        }
+      } catch (e) { log('WARN', 'WEBHOOK', `GitHub: ${e.message}`); }
+    });
     return;
   }
 
   if (req.method === 'POST' && ['/webhook/centris', '/webhook/sms', '/webhook/reply'].includes(url)) {
-    // Sécurité: valider WEBHOOK_SECRET si configuré
     const wSecret = process.env.WEBHOOK_SECRET;
     if (wSecret) {
       const provided = req.headers['x-webhook-secret'] || req.headers['authorization']?.replace(/^Bearer\s+/i, '');
@@ -3494,6 +3632,7 @@ const server = http.createServer((req, res) => {
       try {
         const data = JSON.parse(body || '{}');
         res.writeHead(200); res.end('ok');
+        if (url === '/webhook/centris') mTick('leads');
         await handleWebhook(url, data);
       } catch {
         res.writeHead(400); res.end('bad request');
