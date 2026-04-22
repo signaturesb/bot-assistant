@@ -1530,55 +1530,183 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
     return `📁 *${folder.adresse || folder.name}*\nPDFs: ${pdfs.map(p => p.name).join(', ')}\n\n❓ Pas d'email pour *${deal.title}*.\nFournis: "email docs ${terme} à prenom@exemple.com"`;
   }
 
-  // 5. Choisir le fichier (spécifié ou premier par défaut)
-  const cible = fichier
-    ? pdfs.find(p => p.name.toLowerCase().includes(fichier.toLowerCase())) || pdfs[0]
-    : pdfs[0];
-
-  // 6. Télécharger depuis Dropbox
-  const dlr = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: cible.path_lower }, true);
-  if (!dlr?.ok) return `❌ Téléchargement Dropbox échoué pour: ${cible.name}\nVérifier connexion Dropbox avec "teste dropbox".`;
-  const buffer = Buffer.from(await dlr.arrayBuffer());
-  if (buffer.length === 0) return `❌ Fichier vide dans Dropbox: ${cible.name}`;
-  if (buffer.length > 24 * 1024 * 1024) {
-    return `❌ Fichier trop gros: ${Math.round(buffer.length / 1024 / 1024)}MB (max 24MB pour Gmail).\nEnvoie manuellement depuis Dropbox.`;
+  // 5. Filtrer les PDFs à envoyer (si `fichier` spécifié → juste celui-là, sinon TOUS)
+  const pdfsToSend = fichier
+    ? pdfs.filter(p => p.name.toLowerCase().includes(fichier.toLowerCase()))
+    : pdfs;
+  if (!pdfsToSend.length) {
+    return `❌ Aucun PDF matchant "${fichier}" dans ${folder.name}.\nDisponibles: ${pdfs.map(p=>p.name).join(', ')}`;
   }
 
-  // 7. Envoyer par Gmail avec pièce jointe
-  const token = await getGmailToken();
-  if (!token) return `❌ Gmail non configuré dans Render.\nFichier disponible: ${cible.name} dans ${folder.adresse || folder.name}`;
+  // 6. Télécharger TOUS les PDFs en parallèle
+  const downloads = await Promise.all(pdfsToSend.map(async p => {
+    const dl = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p.path_lower }, true);
+    if (!dl?.ok) return { name: p.name, error: `HTTP ${dl?.status || '?'}` };
+    const buf = Buffer.from(await dl.arrayBuffer());
+    if (buf.length === 0) return { name: p.name, error: 'fichier vide' };
+    return { name: p.name, buffer: buf, size: buf.length };
+  }));
 
-  const boundary = `sb${Date.now()}`;
-  const enc      = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
-  const sujet    = `Documents — ${folder.adresse || folder.name} | ${AGENT.compagnie}`;
-  const corps    = `Bonjour,\n\nVeuillez trouver ci-joint la documentation concernant la propriété.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
-  const lines    = [
-    `From: ${AGENT.nom} <${AGENT.email}>`,
+  const ok = downloads.filter(d => d.buffer);
+  const fails = downloads.filter(d => d.error);
+  if (!ok.length) return `❌ Tous téléchargements Dropbox échoués:\n${fails.map(f => `  ${f.name}: ${f.error}`).join('\n')}`;
+
+  const totalSize = ok.reduce((s, d) => s + d.size, 0);
+  if (totalSize > 24 * 1024 * 1024) {
+    // Taille totale dépasse — garder les plus petits jusqu'à la limite
+    ok.sort((a, b) => a.size - b.size);
+    let acc = 0; const keep = [];
+    for (const d of ok) { if (acc + d.size > 22 * 1024 * 1024) break; keep.push(d); acc += d.size; }
+    const skipped = ok.length - keep.length;
+    log('WARN', 'DOCS', `Total ${Math.round(totalSize/1024/1024)}MB > 24MB — ${skipped} PDF(s) omis, ${keep.length} envoyés`);
+    ok.length = 0; ok.push(...keep);
+  }
+
+  // 7. Lire le master template Dropbox (logos Signature SB + RE/MAX base64)
+  const token = await getGmailToken();
+  if (!token) return `❌ Gmail non configuré.\nDocs dispo: ${ok.map(d=>d.name).join(', ')} dans ${folder.adresse || folder.name}`;
+
+  const tplPath = `${AGENT.dbx_templates}/master_template_signature_sb.html`.replace(/\/+/g, '/');
+  let masterTpl = null;
+  try {
+    const tplRes = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: tplPath.startsWith('/')?tplPath:'/'+tplPath }, true);
+    if (tplRes?.ok) masterTpl = await tplRes.text();
+  } catch (e) { log('WARN', 'DOCS', `Template Dropbox: ${e.message}`); }
+
+  const propLabel = folder.adresse || folder.name;
+  const now       = new Date();
+  const dateMois  = now.toLocaleDateString('fr-CA', { month:'long', year:'numeric', timeZone:'America/Toronto' });
+  const sujet     = `Documents — ${propLabel} | ${AGENT.compagnie}`;
+
+  // Liste des pièces jointes en HTML
+  const pjListHTML = ok.map(d =>
+    `<tr><td style="padding:4px 0;color:#f5f5f7;font-size:13px;">📎 ${d.name} <span style="color:#666;font-size:11px;">(${Math.round(d.size/1024)} KB)</span></td></tr>`
+  ).join('');
+
+  // Contenu métier — injecté dans le master template à la place de TABLEAU_STATS_HTML
+  const contentHTML = `
+<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Veuillez trouver ci-joint la documentation concernant la propriété <strong style="color:#f5f5f7;">${propLabel}</strong>.</p>
+
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px 20px;margin:16px 0;">
+<div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">📎 Pièces jointes — ${ok.length} document${ok.length>1?'s':''}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${pjListHTML}</table>
+</div>
+
+<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions — je suis disponible au <strong style="color:#aa0721;">${AGENT.telephone}</strong>.</p>
+
+<div style="background:#0d0d0d;border:2px solid #aa0721;border-radius:8px;padding:18px 22px;margin:24px 0 12px;">
+<div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">💰 Programme de référencement</div>
+<div style="color:#f5f5f7;font-size:14px;font-weight:600;margin-bottom:6px;">Vous connaissez quelqu'un qui pense à acheter, vendre ou construire?</div>
+<div style="color:#cccccc;font-size:13px;line-height:1.6;">Envoyez-moi son nom et son numéro — si la transaction se conclut, vous recevez <strong style="color:#aa0721;">500 $ à 1 000 $</strong> en argent. Aucun engagement, aucune paperasse.</div>
+</div>`;
+
+  // Construire le HTML final
+  let htmlFinal;
+  if (masterTpl && masterTpl.length > 5000) {
+    // Utiliser le master template Dropbox (avec logos base64 Signature SB + RE/MAX)
+    const fill = (tpl, p) => { let h = tpl; for (const [k, v] of Object.entries(p)) h = h.split(`{{ params.${k} }}`).join(v ?? ''); return h; };
+    htmlFinal = fill(masterTpl, {
+      TITRE_EMAIL:        `Documents — ${propLabel}`,
+      LABEL_SECTION:      `Documentation propriété`,
+      DATE_MOIS:          dateMois,
+      TERRITOIRES:        propLabel,
+      SOUS_TITRE_ANALYSE: propLabel,
+      HERO_TITRE:         `Documents<br>pour ${propLabel}.`,
+      INTRO_TEXTE:        contentHTML,
+      TITRE_SECTION_1:    '',
+      MARCHE_LABEL:       '',
+      PRIX_MEDIAN:        '',
+      VARIATION_PRIX:     '',
+      SOURCE_STAT:        '',
+      LABEL_TABLEAU:      '',
+      TABLEAU_STATS_HTML: '',
+      TITRE_SECTION_2:    '',
+      CITATION:           `Je reste disponible pour toute question concernant ce dossier.`,
+      CONTENU_STRATEGIE:  '',
+      CTA_TITRE:          `Des questions?`,
+      CTA_SOUS_TITRE:     `Appelez-moi directement, je vous réponds rapidement.`,
+      CTA_URL:            `tel:${AGENT.telephone.replace(/\D/g,'')}`,
+      CTA_BOUTON:         `Appeler ${AGENT.prenom} — ${AGENT.telephone}`,
+      CTA_NOTE:           `${AGENT.nom} · ${AGENT.compagnie}`,
+      REFERENCE_URL:      `tel:${AGENT.telephone.replace(/\D/g,'')}`,
+      SOURCES:            `${AGENT.nom} · ${AGENT.compagnie} · ${dateMois}`,
+      DESINSCRIPTION_URL: '',
+    });
+    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos)`);
+  } else {
+    // Fallback HTML inline brandé si Dropbox template indisponible
+    htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:32px 16px;background:#0a0a0a;">
+<table width="600" style="max-width:600px;background:#0a0a0a;color:#f5f5f7;">
+<tr><td style="background:${AGENT.couleur};height:4px;font-size:1px;">&nbsp;</td></tr>
+<tr><td style="padding:28px 32px 20px;">
+<div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">${AGENT.compagnie}</div>
+<h2 style="color:#f5f5f7;font-size:22px;margin:10px 0 0;">${AGENT.nom}</h2>
+</td></tr>
+<tr><td style="padding:0 32px 20px;">${contentHTML}
+<p style="margin:24px 0 0;color:#f5f5f7;">Au plaisir,<br><strong>${AGENT.prenom}</strong></p>
+</td></tr>
+<tr><td style="padding:20px 32px;border-top:1px solid #1a1a1a;color:#666;font-size:12px;">
+<strong>${AGENT.nom}</strong> · ${AGENT.compagnie}<br>
+📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a> · <a href="https://${AGENT.site}" style="color:${AGENT.couleur};">${AGENT.site}</a>
+</td></tr>
+<tr><td style="background:${AGENT.couleur};height:4px;font-size:1px;">&nbsp;</td></tr>
+</table></td></tr></table></body></html>`;
+    log('WARN', 'DOCS', 'Master template Dropbox indisponible — fallback HTML inline');
+  }
+
+  // 8. Construire MIME multipart avec TOUS les PDFs
+  const outer = `sbOut${Date.now()}`;
+  const inner = `sbAlt${Date.now()}`;
+  const enc   = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+  const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.nom} · ${AGENT.compagnie}`;
+
+  const lines = [
+    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${toEmail}`,
     `Bcc: ${AGENT.email}`,
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
-    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    `Content-Type: multipart/mixed; boundary="${outer}"`,
     '',
-    `--${boundary}`,
+    `--${outer}`,
+    `Content-Type: multipart/alternative; boundary="${inner}"`,
+    '',
+    `--${inner}`,
     'Content-Type: text/plain; charset=UTF-8',
-    'Content-Transfer-Encoding: quoted-printable',
+    'Content-Transfer-Encoding: 8bit',
     '',
-    corps,
+    textBody,
     '',
-    `--${boundary}`,
-    'Content-Type: application/pdf',
-    `Content-Disposition: attachment; filename="${enc(cible.name)}"`,
+    `--${inner}`,
+    'Content-Type: text/html; charset=UTF-8',
     'Content-Transfer-Encoding: base64',
     '',
-    buffer.toString('base64'),
-    `--${boundary}--`,
+    Buffer.from(htmlFinal, 'utf-8').toString('base64'),
+    `--${inner}--`,
+    '',
   ];
+
+  // Ajouter chaque PDF comme pièce jointe
+  for (const doc of ok) {
+    lines.push(
+      `--${outer}`,
+      'Content-Type: application/pdf',
+      `Content-Disposition: attachment; filename="${enc(doc.name)}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      doc.buffer.toString('base64'),
+      ''
+    );
+  }
+  lines.push(`--${outer}--`);
+
   const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
   const sendController = new AbortController();
-  const sendTimeout    = setTimeout(() => sendController.abort(), 20000);
+  const sendTimeout    = setTimeout(() => sendController.abort(), 30000);
   let sendRes;
   try {
     sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
@@ -1589,15 +1717,17 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
   } finally { clearTimeout(sendTimeout); }
 
   if (!sendRes.ok) {
-    const err = await sendRes.text().catch(() => sendRes.status);
-    return `❌ Gmail erreur ${sendRes.status}: ${String(err).substring(0, 200)}`;
+    const errMsg = await sendRes.text().catch(() => String(sendRes.status));
+    return `❌ Gmail erreur ${sendRes.status}: ${errMsg.substring(0, 200)}`;
   }
 
-  // 8. Note Pipedrive (honnête si ça fail)
-  const noteRes = await pdPost('/notes', { deal_id: deal.id, content: `Document envoyé: ${cible.name} → ${toEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })})` }).catch(() => null);
+  // 9. Note Pipedrive (liste des docs envoyés)
+  const noteContent = `Documents envoyés à ${toEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}):\n${ok.map(d => `• ${d.name}`).join('\n')}`;
+  const noteRes = await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => null);
   const noteLabel = noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée';
 
-  return `✅ *${cible.name}* envoyé à *${toEmail}*\nProspect: ${deal.title}\n${noteLabel}`;
+  const skippedMsg = fails.length > 0 ? `\n⚠️ ${fails.length} PDF(s) échec téléchargement: ${fails.map(f=>f.name).join(', ')}` : '';
+  return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${toEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${skippedMsg}`;
 }
 
 // ─── Brevo ────────────────────────────────────────────────────────────────────
