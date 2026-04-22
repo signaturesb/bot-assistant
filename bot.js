@@ -1583,7 +1583,9 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
     `<tr><td style="padding:4px 0;color:#f5f5f7;font-size:13px;">📎 ${d.name} <span style="color:#666;font-size:11px;">(${Math.round(d.size/1024)} KB)</span></td></tr>`
   ).join('');
 
-  // Contenu métier — injecté dans le master template à la place de TABLEAU_STATS_HTML
+  // Contenu métier — injecté dans le master template à la place d'INTRO_TEXTE
+  // NOTE: le master template Dropbox a DÉJÀ un bloc "Programme référence" à la fin,
+  // donc on ne le duplique PAS ici.
   const contentHTML = `
 <p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Veuillez trouver ci-joint la documentation concernant la propriété <strong style="color:#f5f5f7;">${propLabel}</strong>.</p>
 
@@ -1592,13 +1594,7 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">${pjListHTML}</table>
 </div>
 
-<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions — je suis disponible au <strong style="color:#aa0721;">${AGENT.telephone}</strong>.</p>
-
-<div style="background:#0d0d0d;border:2px solid #aa0721;border-radius:8px;padding:18px 22px;margin:24px 0 12px;">
-<div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">💰 Programme de référencement</div>
-<div style="color:#f5f5f7;font-size:14px;font-weight:600;margin-bottom:6px;">Vous connaissez quelqu'un qui pense à acheter, vendre ou construire?</div>
-<div style="color:#cccccc;font-size:13px;line-height:1.6;">Envoyez-moi son nom et son numéro — si la transaction se conclut, vous recevez <strong style="color:#aa0721;">500 $ à 1 000 $</strong> en argent. Aucun engagement, aucune paperasse.</div>
-</div>`;
+<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions — je suis disponible au <strong style="color:#aa0721;">${AGENT.telephone}</strong>.</p>`;
 
   // Construire le HTML final
   let htmlFinal;
@@ -1636,10 +1632,15 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
     // Retirer les sections inutiles pour un email de docs (garder header, hero, intro, CTA, footer avec logos)
     // Supprime: SECTION 01, HERO STAT, TABLEAU, SECTION 02, CITATION
     htmlFinal = htmlFinal.replace(
-      /<!-- ══ SÉPARATEUR ══ -->[\s\S]*?<!-- ══ SÉPARATEUR ══ -->\s*<!-- ══ CTA PRINCIPAL ══ -->/,
+      /<!-- ══ SÉPARATEUR ══ -->[\s\S]*?<!-- ══ CTA PRINCIPAL ══ -->/,
       '<!-- ══ CTA PRINCIPAL ══ -->'
     );
-    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées`);
+    // Remplacer le label "Données Centris Matrix" à côté du logo par la spécialité de Shawn
+    htmlFinal = htmlFinal.replace(
+      /Données Centris Matrix/g,
+      'Spécialiste vente maison usagée, construction neuve et développement immobilier'
+    );
+    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées + label logo personnalisé`);
   } else {
     // Fallback HTML inline brandé si Dropbox template indisponible
     htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
