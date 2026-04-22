@@ -4353,8 +4353,34 @@ let gmailPollerState = loadJSON(POLLER_FILE, { processed: [], lastRun: null, tot
 // Lead parsing — extrait dans lead_parser.js pour testabilité
 const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI } = leadParser;
 
+// Dédoublonnage 24h par email/tel — empêche spam Telegram pour même lead
+const recentLeadsByKey = new Map(); // key(email|tel) → timestamp
+function leadAlreadyNotifiedRecently(email, telephone) {
+  const now = Date.now();
+  const TTL = 24 * 60 * 60 * 1000; // 24h
+  // Purge expired
+  for (const [k, t] of recentLeadsByKey) {
+    if (now - t > TTL) recentLeadsByKey.delete(k);
+  }
+  const keys = [];
+  if (email) keys.push('e:' + email.toLowerCase().trim());
+  if (telephone) keys.push('t:' + String(telephone).replace(/\D/g, '').slice(-10));
+  for (const k of keys) {
+    if (recentLeadsByKey.has(k)) return true;
+  }
+  for (const k of keys) recentLeadsByKey.set(k, now);
+  return false;
+}
+
 async function traiterNouveauLead(lead, msgId, from, subject, source) {
   const { nom, telephone, email, centris, adresse, type } = lead;
+
+  // DÉDUP 24h — si même email ou tel déjà notifié dans les 24h, SKIP
+  if (leadAlreadyNotifiedRecently(email, telephone)) {
+    log('INFO', 'POLLER', `Dédup 24h: lead ${nom || email || telephone} déjà notifié — skip`);
+    return;
+  }
+
   log('OK', 'POLLER', `Lead ${source.label}: ${nom || email || telephone} | Centris: ${centris || '?'}`);
 
   // 1. Créer deal Pipedrive
@@ -4520,6 +4546,19 @@ async function autoTrashGitHubNoise(opts = {}) {
 // - Logging structuré par étape
 async function runGmailLeadPoller(opts = {}) {
   const t0 = Date.now();
+
+  // CIRCUIT BREAKER CRÉDIT: si Anthropic a retourné credit/auth error dans les
+  // dernières 30min, SKIP le poller. Évite le spam de leads + save argent
+  // pendant que Shawn règle son crédit. Auto-resume dès que crédit OK.
+  if (metrics.lastApiError && !opts.force) {
+    const age = Date.now() - new Date(metrics.lastApiError.at).getTime();
+    const msg = metrics.lastApiError.message || '';
+    if (age < 30 * 60 * 1000 && /credit|billing|insufficient|authentication|invalid.*key/i.test(msg)) {
+      log('INFO', 'POLLER', `Skip — Anthropic down (${Math.round(age/60000)}min ago): ${msg.substring(0, 80)}`);
+      return;
+    }
+  }
+
   pollerStats.runs++;
   const scan = { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, errors: 0 };
   const problems = []; // emails qui matchent mais n'ont pas abouti — pour alerte P0
@@ -4655,7 +4694,11 @@ async function runGmailLeadPoller(opts = {}) {
     pollerStats.lastError = null;
 
     // ALERTE P0 Telegram: leads potentiels manqués
-    if (problems.length && ALLOWED_ID) {
+    // Skip si Anthropic est down (crédit/auth) — ce n'est pas une vraie anomalie parser
+    const anthropicDown = metrics.lastApiError &&
+      Date.now() - new Date(metrics.lastApiError.at).getTime() < 30 * 60 * 1000 &&
+      /credit|billing|authentication|invalid.*key/i.test(metrics.lastApiError.message || '');
+    if (problems.length && ALLOWED_ID && !anthropicDown) {
       const lines = problems.slice(0, 5).map(p =>
         `• [${p.source}] ${p.subject.substring(0, 60)} — ${p.reason}`
       );
