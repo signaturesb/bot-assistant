@@ -439,11 +439,24 @@ const SYSTEM_BASE = buildSystemBase();
 
 let dropboxStructure = '';
 let dropboxTerrains  = []; // cache des dossiers terrain — pour lookup rapide
+let sessionLiveContext = ''; // SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot)
 
-// Partie dynamique (Dropbox + mémoire) — change fréquemment, jamais cachée
+// Log d'activité du bot — écrit dans BOT_ACTIVITY.md toutes les 10 min
+const botActivityLog = [];
+function logActivity(event) {
+  botActivityLog.push({ ts: Date.now(), event: event.substring(0, 200) });
+  if (botActivityLog.length > 100) botActivityLog.shift();
+}
+
+// Partie dynamique (Dropbox + mémoire + session live) — change fréquemment, jamais cachée
 function getSystemDynamic() {
   const parts = [];
   if (dropboxStructure) parts.push(`━━ DROPBOX — Structure actuelle:\n${dropboxStructure}`);
+  if (sessionLiveContext) {
+    // Tronquer à 3000 chars pour rester raisonnable en tokens
+    const trunc = sessionLiveContext.length > 3000 ? sessionLiveContext.substring(0, 3000) + '\n...[tronqué]' : sessionLiveContext;
+    parts.push(`━━ SESSION CLAUDE CODE ↔ BOT (sync temps réel):\n${trunc}`);
+  }
   const mem = buildMemoryBlock().trim();
   if (mem) parts.push(mem);
   return parts.join('\n\n');
@@ -609,6 +622,45 @@ async function writeGitHubFile(repo, filePath, content, commitMsg) {
   });
   if (!putRes.ok) { const err = await putRes.json().catch(() => ({})); return `Erreur GitHub écriture: ${putRes.status} — ${err.message || ''}`; }
   return `✅ "${p}" ${sha ? 'modifié' : 'créé'} dans ${repo}.`;
+}
+
+// ─── Sync Claude Code ↔ Bot (bidirectionnelle via GitHub) ────────────────────
+async function loadSessionLiveContext() {
+  if (!process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/kira-bot/contents/SESSION_LIVE.md`, {
+      headers: githubHeaders()
+    });
+    if (!res.ok) { log('WARN', 'SYNC', `SESSION_LIVE.md HTTP ${res.status}`); return; }
+    const data = await res.json();
+    if (data.content) {
+      sessionLiveContext = Buffer.from(data.content, 'base64').toString('utf8');
+      log('OK', 'SYNC', `SESSION_LIVE.md chargé (${Math.round(sessionLiveContext.length / 1024)}KB)`);
+    }
+  } catch (e) { log('WARN', 'SYNC', `Load session: ${e.message}`); }
+}
+
+async function writeBotActivity() {
+  if (!process.env.GITHUB_TOKEN || botActivityLog.length === 0) return;
+  try {
+    const now = new Date();
+    const lines = botActivityLog.slice(-50).map(a => {
+      const d = new Date(a.ts).toLocaleString('fr-CA', { timeZone: 'America/Toronto' });
+      return `- [${d}] ${a.event}`;
+    });
+    const content = [
+      `# Bot — Journal d'activité`,
+      `_Mis à jour: ${now.toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}_`,
+      ``,
+      `## Actions récentes (${lines.length})`,
+      ...lines,
+      ``,
+      `## Pour Claude Code`,
+      `Voir ce que le bot a fait récemment: \`read_github_file(repo='kira-bot', path='BOT_ACTIVITY.md')\``,
+    ].join('\n');
+    await writeGitHubFile('kira-bot', 'BOT_ACTIVITY.md', content, `Activity: ${now.toISOString().split('T')[0]}`);
+    log('OK', 'SYNC', `BOT_ACTIVITY.md → GitHub (${lines.length} events)`);
+  } catch (e) { log('WARN', 'SYNC', `Write activity: ${e.message}`); }
 }
 
 // ─── Dropbox (avec refresh auto) ─────────────────────────────────────────────
@@ -868,6 +920,7 @@ async function marquerPerdu(terme) {
   if (!deals.length) return `Aucun deal trouvé pour "${terme}".`;
   const deal = deals[0].item;
   await pdPut(`/deals/${deal.id}`, { status: 'lost' });
+  logActivity(`Deal marqué perdu: ${deal.title || terme}`);
   return `✅ "${deal.title || terme}" marqué perdu dans Pipedrive.`;
 }
 
@@ -1165,6 +1218,7 @@ async function creerDeal({ prenom, nom, telephone, email, type, source, centris,
   if (noteContent) await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => {});
 
   const typeLabel = { terrain:'Terrain', maison_usagee:'Maison usagée', maison_neuve:'Maison neuve', construction_neuve:'Construction neuve', auto_construction:'Auto-construction', plex:'Plex' }[type] || 'Propriété';
+  logActivity(`Deal créé: ${titre} (${typeLabel}${centris?', Centris #'+centris:''})`);
   return `✅ Deal créé: *${titre}*\nType: ${typeLabel} | ID: ${deal.id}${centris ? ' | Centris #' + centris : ''}${personNote}`;
 }
 
@@ -1194,6 +1248,7 @@ async function planifierVisite({ prospect, date, adresse }) {
   visites.push({ dealId: deal.id, nom: deal.title, date: rdvISO, adresse: adresse || '' });
   saveJSON(VISITES_FILE, visites);
 
+  logActivity(`Visite planifiée: ${deal.title} — ${dateStr} ${timeStr}${adresse?' @ '+adresse:''}`);
   return `✅ Visite planifiée: *${deal.title}*\n📅 ${dateStr} à ${timeStr}${adresse ? '\n📍 ' + adresse : ''}\nDeal → Visite prévue ✓`;
 }
 
@@ -2334,6 +2389,8 @@ const TOOLS = [
   // ── Listings Dropbox + envoi docs ──
   { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox (/Terrain en ligne/) par ville, adresse ou numéro Centris. Utilise le cache — résultat instantané. Liste PDFs + photos de chaque dossier trouvé.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
   { name: 'envoyer_docs_prospect',   description: 'Flow COMPLET: trouve dossier Dropbox par Centris (dans Pipedrive) → télécharge PDF → envoie par Gmail avec pièce jointe → note Pipedrive. Utiliser quand Shawn dit "envoie les docs à [nom]".', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive' }, email: { type: 'string', description: 'Email destination si différent de Pipedrive' }, fichier: { type: 'string', description: 'Nom partiel du PDF spécifique (optionnel — premier PDF par défaut)' } }, required: ['terme'] } },
+  // ── Sync Claude Code ↔ Bot ──
+  { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
   // ── Diagnostics ──
   { name: 'tester_dropbox',  description: 'Tester la connexion Dropbox et diagnostiquer les problèmes de tokens. Utiliser quand Dropbox semble brisé.', input_schema: { type: 'object', properties: {} } },
   { name: 'voir_template_dropbox', description: 'Lire les informations du master template email depuis Dropbox. Pour vérifier les placeholders disponibles.', input_schema: { type: 'object', properties: {} }, cache_control: { type: 'ephemeral' } }
@@ -2447,6 +2504,12 @@ async function executeTool(name, input, chatId) {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, path.basename(input.filename)), input.content, 'utf8');
         return `✅ "${input.filename}" sauvegardé.`;
+      }
+      case 'refresh_contexte_session': {
+        await loadSessionLiveContext();
+        return sessionLiveContext
+          ? `✅ *Session rechargée* — ${Math.round(sessionLiveContext.length/1024)}KB\n\n*Contexte actuel:*\n${sessionLiveContext.substring(0, 400)}...`
+          : '⚠️ SESSION_LIVE.md vide ou inaccessible.';
       }
       case 'tester_dropbox': {
         const vars = {
@@ -2755,6 +2818,7 @@ async function handleEmailConfirmation(chatId, text) {
   }
 
   pendingEmails.delete(chatId); // supprimer SEULEMENT après succès confirmé
+  logActivity(`Email envoyé (${method}) → ${pending.to} — "${pending.sujet.substring(0,60)}"`);
   await send(chatId, `✅ *Email envoyé* (${method})\nÀ: ${pending.toName || pending.to}\nObjet: ${pending.sujet}`);
   return true;
 }
@@ -3233,6 +3297,12 @@ function startDailyTasks() {
   // Garantit que Claude Code peut toujours reprendre avec l'état le plus récent
   setInterval(() => syncStatusGitHub().catch(() => {}), 60 * 60 * 1000);
 
+  // Sync bidirectionnelle Claude Code ↔ bot
+  // - Lire SESSION_LIVE.md depuis GitHub (ce que Claude Code a écrit) toutes les 30 min
+  // - Écrire BOT_ACTIVITY.md vers GitHub (ce que le bot a fait) toutes les 10 min
+  setInterval(() => loadSessionLiveContext().catch(() => {}), 30 * 60 * 1000);
+  setInterval(() => writeBotActivity().catch(() => {}), 10 * 60 * 1000);
+
   setInterval(() => {
     const now = new Date();
     const heure    = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
@@ -3680,6 +3750,7 @@ async function main() {
   await loadDropboxStructure();
   await initGistId();
   await loadMemoryFromGist();
+  await loadSessionLiveContext(); // Sync Claude Code ↔ bot au boot
 
   // Refresh token Dropbox toutes les 3h (tokens expirent ~4h)
   setInterval(async () => {
