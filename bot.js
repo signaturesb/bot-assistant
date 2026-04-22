@@ -3893,16 +3893,25 @@ async function runGmailLeadPoller() {
 
 // ─── Démarrage séquentiel ─────────────────────────────────────────────────────
 async function main() {
-  // Refresh Dropbox proactif — évite les erreurs 401 au démarrage
+  log('INFO', 'BOOT', 'Step 1: refresh Dropbox token');
   if (process.env.DROPBOX_REFRESH_TOKEN) {
-    const ok = await refreshDropboxToken();
-    if (!ok) log('WARN', 'BOOT', 'Dropbox refresh échoué au démarrage — vérifier DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN dans Render');
+    try {
+      const ok = await refreshDropboxToken();
+      if (!ok) log('WARN', 'BOOT', 'Dropbox refresh échoué au démarrage');
+    } catch (e) { log('WARN', 'BOOT', `Dropbox refresh exception: ${e.message}`); }
   }
 
-  await loadDropboxStructure();
-  await initGistId();
-  await loadMemoryFromGist();
-  await loadSessionLiveContext(); // Sync Claude Code ↔ bot au boot
+  log('INFO', 'BOOT', 'Step 2: load Dropbox structure');
+  try { await loadDropboxStructure(); } catch (e) { log('WARN', 'BOOT', `Dropbox struct: ${e.message}`); }
+
+  log('INFO', 'BOOT', 'Step 3: init Gist');
+  try { await initGistId(); } catch (e) { log('WARN', 'BOOT', `Gist init: ${e.message}`); }
+
+  log('INFO', 'BOOT', 'Step 4: load memory');
+  try { await loadMemoryFromGist(); } catch (e) { log('WARN', 'BOOT', `Memory: ${e.message}`); }
+
+  log('INFO', 'BOOT', 'Step 5: load session live context');
+  try { await loadSessionLiveContext(); } catch (e) { log('WARN', 'BOOT', `Session live: ${e.message}`); }
 
   // Refresh token Dropbox toutes les 3h (tokens expirent ~4h)
   setInterval(async () => {
@@ -3932,18 +3941,26 @@ async function main() {
       .catch(() => {});
   }
 
-  registerHandlers();
-  startDailyTasks();
-  bot.startPolling({ interval: 3000, autoStart: true });
+  log('INFO', 'BOOT', 'Step 6: registerHandlers');
+  try { registerHandlers(); } catch (e) { log('ERR', 'BOOT', `registerHandlers FATAL: ${e.message}\n${e.stack}`); throw e; }
 
-  server.listen(PORT);
-  log('OK', 'BOOT', `Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
+  log('INFO', 'BOOT', 'Step 7: startDailyTasks');
+  try { startDailyTasks(); } catch (e) { log('ERR', 'BOOT', `startDailyTasks FATAL: ${e.message}`); throw e; }
 
-  // Sync BOT_STATUS au boot (30s après démarrage) pour que Claude Code voie l'état dès le redéploiement
+  log('INFO', 'BOOT', 'Step 8: startPolling Telegram');
+  try { bot.startPolling({ interval: 3000, autoStart: true }); } catch (e) { log('ERR', 'BOOT', `startPolling FATAL: ${e.message}`); throw e; }
+
+  log('INFO', 'BOOT', `Step 9: server.listen(${PORT})`);
+  try { server.listen(PORT); } catch (e) { log('ERR', 'BOOT', `listen FATAL: ${e.message}`); throw e; }
+
+  log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
+
   setTimeout(() => syncStatusGitHub().catch(() => {}), 30000);
 }
 
 main().catch(err => {
-  log('ERR', 'BOOT', `Erreur démarrage: ${err.message}`);
-  process.exit(1);
+  log('ERR', 'BOOT', `❌ ERREUR DÉMARRAGE: ${err.message}\n${err.stack?.substring(0, 500) || ''}`);
+  // Ne PAS exit(1) — laisser Render faire le health check
+  // Si health fail, Render restart. Si on exit, on crash loop.
+  setTimeout(() => process.exit(1), 5000); // Délai pour que les logs soient envoyés
 });
