@@ -1367,20 +1367,53 @@ async function creerDeal({ prenom, nom, telephone, email, type, source, centris,
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   const fullName = [prenom, nom].filter(Boolean).join(' ');
   const titre = fullName || prenom || 'Nouveau prospect';
+  const phoneNorm = telephone ? telephone.replace(/\D/g, '') : '';
 
-  // 1. Chercher personne existante d'abord (évite les doublons)
+  // 1. Chercher personne existante — priorité email > tel > nom (évite doublons)
   let personId = null;
   let personNote = '';
+  let personAction = 'created';
   try {
-    const searchTerm = email || telephone?.replace(/\D/g,'') || fullName;
-    if (searchTerm) {
-      const existing = await pdGet(`/persons/search?term=${encodeURIComponent(searchTerm)}&limit=1`);
-      personId = existing?.data?.items?.[0]?.item?.id || null;
+    let existingPerson = null;
+    // Priorité 1: email exact (le plus fiable)
+    if (email) {
+      const r = await pdGet(`/persons/search?term=${encodeURIComponent(email)}&fields=email&limit=1`);
+      existingPerson = r?.data?.items?.[0]?.item;
     }
-    if (!personId) {
-      // Créer si inexistant
+    // Priorité 2: tel si pas trouvé par email
+    if (!existingPerson && phoneNorm) {
+      const r = await pdGet(`/persons/search?term=${encodeURIComponent(phoneNorm)}&fields=phone&limit=1`);
+      existingPerson = r?.data?.items?.[0]?.item;
+    }
+    // Priorité 3: nom (fallback, risque homonymes — à confirmer côté Shawn)
+    if (!existingPerson && fullName) {
+      const r = await pdGet(`/persons/search?term=${encodeURIComponent(fullName)}&fields=name&limit=1`);
+      existingPerson = r?.data?.items?.[0]?.item;
+    }
+
+    if (existingPerson) {
+      personId = existingPerson.id;
+      personAction = 'found';
+      // UPDATE si email ou tel manquants sur la personne existante
+      const fullPerson = await pdGet(`/persons/${personId}`).then(r => r?.data).catch(() => null);
+      const existingEmails = (fullPerson?.email || []).map(e => e.value).filter(Boolean);
+      const existingPhones = (fullPerson?.phone || []).map(p => p.value).filter(Boolean);
+      const updates = {};
+      if (email && !existingEmails.includes(email)) {
+        updates.email = [...existingEmails.map(v => ({ value: v })), { value: email, primary: existingEmails.length === 0 }];
+      }
+      if (phoneNorm && !existingPhones.some(p => p.replace(/\D/g,'') === phoneNorm)) {
+        updates.phone = [...existingPhones.map(v => ({ value: v })), { value: phoneNorm, primary: existingPhones.length === 0 }];
+      }
+      if (Object.keys(updates).length) {
+        await pdPut(`/persons/${personId}`, updates).catch(() => {});
+        personAction = 'updated';
+        log('OK', 'PD', `Personne #${personId} updated: ${Object.keys(updates).join('+')}`);
+      }
+    } else {
+      // Créer la personne
       const personBody = { name: fullName || prenom };
-      if (telephone) personBody.phone = [{ value: telephone.replace(/\D/g, ''), primary: true }];
+      if (phoneNorm) personBody.phone = [{ value: phoneNorm, primary: true }];
       if (email)     personBody.email = [{ value: email, primary: true }];
       const personRes = await pdPost('/persons', personBody);
       personId = personRes?.data?.id || null;
@@ -4079,11 +4112,12 @@ async function handleWebhook(route, data) {
       const listing = data.url_listing || data.url || data.centris_url || '';
       const typeRaw = (data.type || listing).toLowerCase();
 
-      // DÉDUP CROSS-SOURCE: si ce lead a déjà été notifié récemment (Gmail Poller
-      // OU autre webhook), skip. Évite doublons quand Centris envoie webhook +
-      // Gmail reçoit l'email pour le même lead.
-      if (leadAlreadyNotifiedRecently(email, tel)) {
-        log('INFO', 'WEBHOOK', `Centris dédup: ${nom} (${email||tel}) déjà notifié — skip`);
+      // DÉDUP CROSS-SOURCE multi-clé: si ce lead a déjà été notifié (par email,
+      // tel, centris# OU nom+source), skip. Évite doublons quand Centris webhook
+      // + Gmail email pour le même prospect.
+      const centrisForDedup = listing.match(/\/(\d{7,9})\b/)?.[1] || data.centris || '';
+      if (leadAlreadyNotifiedRecently({ email, telephone: tel, centris: centrisForDedup, nom, source: 'centris' })) {
+        log('INFO', 'WEBHOOK', `Centris dédup: ${nom} (${email||tel||centrisForDedup}) déjà notifié — skip`);
         return;
       }
 
@@ -4429,23 +4463,48 @@ let gmailPollerState = loadJSON(POLLER_FILE, { processed: [], lastRun: null, tot
 // Lead parsing — extrait dans lead_parser.js pour testabilité
 const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI } = leadParser;
 
-// Dédoublonnage 24h par email/tel — persisté sur disque pour survivre aux redeploys
+// ── Dédoublonnage multi-clé, persisté disque (survit aux redeploys) ─────────
+// Indexe par: email (exact, lower-case), téléphone (10 derniers chiffres),
+// centris# (normalisé), signature nom+source. TTL 7 jours.
 const LEADS_DEDUP_FILE = path.join(DATA_DIR, 'leads_dedup.json');
 const recentLeadsByKey = new Map(Object.entries(loadJSON(LEADS_DEDUP_FILE, {})));
 function saveLeadsDedup() { saveJSON(LEADS_DEDUP_FILE, Object.fromEntries(recentLeadsByKey)); }
-function leadAlreadyNotifiedRecently(email, telephone) {
+
+function normalizePhone(p) {
+  return String(p || '').replace(/\D/g, '').slice(-10); // 10 derniers chiffres
+}
+function normalizeName(n) {
+  return String(n || '').toLowerCase().trim().replace(/\s+/g, ' ').replace(/[^a-zà-ü\s]/gi, '');
+}
+function buildLeadKeys({ email, telephone, centris, nom, source }) {
+  const keys = [];
+  if (email)             keys.push('e:' + email.toLowerCase().trim());
+  const p = normalizePhone(telephone);
+  if (p && p.length >= 10) keys.push('t:' + p);
+  if (centris)           keys.push('c:' + String(centris).replace(/\D/g, ''));
+  const n = normalizeName(nom);
+  if (n && source)       keys.push('ns:' + n + ':' + source);
+  return keys;
+}
+
+function leadAlreadyNotifiedRecently(emailOrLead, telephone, centris, nom, source) {
+  // Support 2 signatures: (email, phone) legacy OU ({email, telephone, centris, nom, source}) nouveau
+  const lead = typeof emailOrLead === 'object' ? emailOrLead : { email: emailOrLead, telephone, centris, nom, source };
   const now = Date.now();
-  const TTL = 7 * 24 * 60 * 60 * 1000; // 7 jours (plus agressif qu'avant)
+  const TTL = 7 * 24 * 60 * 60 * 1000;
   // Purge expired
   for (const [k, t] of recentLeadsByKey) {
     if (now - t > TTL) recentLeadsByKey.delete(k);
   }
-  const keys = [];
-  if (email) keys.push('e:' + email.toLowerCase().trim());
-  if (telephone) keys.push('t:' + String(telephone).replace(/\D/g, '').slice(-10));
+  const keys = buildLeadKeys(lead);
+  if (keys.length === 0) return false; // aucune clé utile → ne bloque pas
   for (const k of keys) {
-    if (recentLeadsByKey.has(k)) return true;
+    if (recentLeadsByKey.has(k)) {
+      log('INFO', 'DEDUP', `Lead match: ${k} (vu ${Math.round((now-recentLeadsByKey.get(k))/60000)}min ago)`);
+      return true;
+    }
   }
+  // Marque toutes les clés pour bloquer futures occurrences même partielles
   for (const k of keys) recentLeadsByKey.set(k, now);
   saveLeadsDedup();
   return false;
@@ -4454,9 +4513,9 @@ function leadAlreadyNotifiedRecently(email, telephone) {
 async function traiterNouveauLead(lead, msgId, from, subject, source) {
   const { nom, telephone, email, centris, adresse, type } = lead;
 
-  // DÉDUP 24h — si même email ou tel déjà notifié dans les 24h, SKIP
-  if (leadAlreadyNotifiedRecently(email, telephone)) {
-    log('INFO', 'POLLER', `Dédup 24h: lead ${nom || email || telephone} déjà notifié — skip`);
+  // DÉDUP multi-clé 7j — email OU tel OU centris# OU (nom+source) = skip
+  if (leadAlreadyNotifiedRecently({ email, telephone, centris, nom, source: source.source })) {
+    log('INFO', 'POLLER', `Dédup 7j: lead ${nom || email || telephone || centris} déjà notifié — skip`);
     return;
   }
 
