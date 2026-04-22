@@ -3087,6 +3087,49 @@ async function executeToolSafe(name, input, chatId) {
   ]);
 }
 
+// ─── Cost tracking Anthropic ─────────────────────────────────────────────────
+// Prix par million tokens (2026 pricing Anthropic)
+const PRICING = {
+  'claude-opus-4-7':    { in: 15.00, out: 75.00, cache_read: 1.50,  cache_write: 18.75 },
+  'claude-sonnet-4-6':  { in:  3.00, out: 15.00, cache_read: 0.30,  cache_write:  3.75 },
+  'claude-haiku-4-5':   { in:  1.00, out:  5.00, cache_read: 0.10,  cache_write:  1.25 },
+};
+const COST_FILE = path.join(DATA_DIR, 'cost_tracker.json');
+let costTracker = loadJSON(COST_FILE, { daily: {}, monthly: {}, total: 0, byModel: {}, alertsSent: {} });
+function today() { return new Date().toISOString().slice(0, 10); }
+function thisMonth() { return new Date().toISOString().slice(0, 7); }
+function trackCost(model, usage) {
+  if (!usage) return;
+  const p = PRICING[model] || PRICING['claude-sonnet-4-6'];
+  const inp = (usage.input_tokens || 0) / 1e6 * p.in;
+  const out = (usage.output_tokens || 0) / 1e6 * p.out;
+  const cacheRead  = (usage.cache_read_input_tokens  || 0) / 1e6 * p.cache_read;
+  const cacheWrite = (usage.cache_creation_input_tokens || 0) / 1e6 * p.cache_write;
+  const cost = inp + out + cacheRead + cacheWrite;
+  const d = today(), m = thisMonth();
+  costTracker.daily[d]   = (costTracker.daily[d]   || 0) + cost;
+  costTracker.monthly[m] = (costTracker.monthly[m] || 0) + cost;
+  costTracker.total += cost;
+  costTracker.byModel[model] = (costTracker.byModel[model] || 0) + cost;
+  // Purge daily >30j, monthly >12m
+  const cutoffDay = new Date(Date.now() - 30*86400000).toISOString().slice(0,10);
+  Object.keys(costTracker.daily).forEach(k => { if (k < cutoffDay) delete costTracker.daily[k]; });
+  saveJSON(COST_FILE, costTracker);
+  // Alertes seuils (anti-runaway)
+  const todayCost = costTracker.daily[d];
+  const monthCost = costTracker.monthly[m];
+  if (todayCost > 10 && !costTracker.alertsSent[`d${d}-10`]) {
+    costTracker.alertsSent[`d${d}-10`] = true;
+    saveJSON(COST_FILE, costTracker);
+    if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `💰 *Coût Anthropic aujourd'hui: $${todayCost.toFixed(2)}*\nSeuil 10$/jour atteint. Mois: $${monthCost.toFixed(2)}.`, { parse_mode: 'Markdown' }).catch(()=>{});
+  }
+  if (monthCost > 100 && !costTracker.alertsSent[`m${m}-100`]) {
+    costTracker.alertsSent[`m${m}-100`] = true;
+    saveJSON(COST_FILE, costTracker);
+    if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `💰 *Anthropic mois: $${monthCost.toFixed(2)}*\nSeuil 100$/mois atteint. Vérifier usage dans /cout.`, { parse_mode: 'Markdown' }).catch(()=>{});
+  }
+}
+
 // ─── Routing auto modèle selon type de tâche ─────────────────────────────────
 // Sonnet 4.6 par défaut (5x moins cher), switch Opus 4.7 auto sur mots-clés
 // qui indiquent recherche/analyse/stratégie/négociation/optimisation.
@@ -3149,6 +3192,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
         mTick('api', 'claude');
         const res = await claude.messages.create(params);
         circuitSuccess('claude');
+        trackCost(localModel, res.usage);
         if (res.stop_reason === 'tool_use') {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
@@ -3463,6 +3507,32 @@ function registerHandlers() {
       `✅ ${s.dealCreated} deals créés\n` +
       `❌ ${s.errors} erreurs\n\n` +
       `Total depuis boot: ${gmailPollerState.totalLeads} leads`
+    );
+  });
+
+  bot.onText(/\/cout|\/cost/, msg => {
+    if (!isAllowed(msg)) return;
+    const d = today(), m = thisMonth();
+    const todayCost = costTracker.daily[d] || 0;
+    const monthCost = costTracker.monthly[m] || 0;
+    const totalCost = costTracker.total || 0;
+    const byModel = Object.entries(costTracker.byModel || {})
+      .sort((a,b) => b[1] - a[1])
+      .map(([k,v]) => `  ${k.replace('claude-','')}: $${v.toFixed(2)}`)
+      .join('\n') || '  —';
+    // Projection mensuelle basée sur jours écoulés
+    const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
+    const daysElapsed = new Date().getDate();
+    const projection = daysElapsed > 0 ? (monthCost / daysElapsed * daysInMonth) : 0;
+    bot.sendMessage(msg.chat.id,
+      `💰 *Coût Anthropic*\n\n` +
+      `📅 Aujourd'hui: *$${todayCost.toFixed(4)}*\n` +
+      `📆 Ce mois: *$${monthCost.toFixed(2)}*\n` +
+      `📊 Projection mois: ~$${projection.toFixed(2)}\n` +
+      `🏆 Total cumul: $${totalCost.toFixed(2)}\n\n` +
+      `*Par modèle:*\n${byModel}\n\n` +
+      `Seuils d'alerte: $10/jour · $100/mois`,
+      { parse_mode: 'Markdown' }
     );
   });
 
@@ -4191,6 +4261,12 @@ const server = http.createServer((req, res) => {
         total_leads: gmailPollerState.totalLeads||0,
         last_run: gmailPollerState.lastRun,
         stats: pollerStats,  // runs + lastScan breakdown + totals + lastError
+      },
+      cost: {
+        today_usd:       Number((costTracker.daily[today()] || 0).toFixed(4)),
+        this_month_usd:  Number((costTracker.monthly[thisMonth()] || 0).toFixed(2)),
+        total_usd:       Number(costTracker.total.toFixed(2)),
+        by_model:        Object.fromEntries(Object.entries(costTracker.byModel).map(([k,v])=>[k, Number(v.toFixed(2))])),
       },
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
