@@ -57,24 +57,78 @@ if (!process.env.GMAIL_CLIENT_ID)  { console.warn('⚠️  GMAIL_CLIENT_ID absen
 if (!process.env.OPENAI_API_KEY)   { console.warn('⚠️  OPENAI_API_KEY absent — Whisper désactivé'); }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
+const bootStartTs = Date.now();
+const bootLogsCapture = [];
 function log(niveau, cat, msg) {
   const ts  = new Date().toLocaleTimeString('fr-CA', { hour12: false });
   const ico = { INFO:'📋', OK:'✅', WARN:'⚠️ ', ERR:'❌', IN:'📥', OUT:'📤' }[niveau] || '•';
-  console.log(`[${ts}] ${ico} [${cat}] ${msg}`);
+  const line = `[${ts}] ${ico} [${cat}] ${msg}`;
+  console.log(line);
+  // Capturer les logs durant les 2 premières minutes pour diagnostic
+  if (Date.now() - bootStartTs < 120000) {
+    bootLogsCapture.push(`${niveau}|${cat}|${msg}`);
+    if (bootLogsCapture.length > 500) bootLogsCapture.shift();
+  }
 }
 
 // ─── Anti-crash global ────────────────────────────────────────────────────────
 process.stdout.on('error', e => { if (e.code !== 'EPIPE') console.error(e); });
 process.stderr.on('error', e => { if (e.code !== 'EPIPE') console.error(e); });
+// ─── Self-reporting: capture TOUTES erreurs → GitHub pour debug ─────────────
+async function reportCrashToGitHub(title, details) {
+  if (!process.env.GITHUB_TOKEN) return;
+  try {
+    const now = new Date();
+    const content = [
+      `# 🚨 ${title}`,
+      `_${now.toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}_`,
+      ``,
+      `## Erreur`,
+      '```',
+      String(details),
+      '```',
+      ``,
+      `## Logs du boot (capture complète)`,
+      '```',
+      (bootLogsCapture || []).slice(-150).join('\n'),
+      '```',
+      ``,
+      `## Environnement`,
+      `- Node: ${process.version}`,
+      `- Platform: ${process.platform}`,
+      `- Memory: ${JSON.stringify(process.memoryUsage())}`,
+      `- Env vars présents: ${Object.keys(process.env).filter(k => !k.startsWith('npm_')).length}`,
+      ``,
+      `**Claude Code peut lire ce fichier avec:**`,
+      `\`read_github_file(repo='kira-bot', path='CRASH_REPORT.md')\``,
+    ].join('\n');
+
+    // Essayer GitHub API directement (fetch)
+    const url = `https://api.github.com/repos/signaturesb/kira-bot/contents/CRASH_REPORT.md`;
+    const getRes = await fetch(url, { headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' } });
+    const sha = getRes.ok ? (await getRes.json()).sha : undefined;
+    await fetch(url, {
+      method: 'PUT',
+      headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: `Crash report ${now.toISOString()}`, content: Buffer.from(content).toString('base64'), ...(sha ? { sha } : {}) })
+    });
+    console.log('[CRASH REPORT] Écrit dans GitHub → kira-bot/CRASH_REPORT.md');
+  } catch (e) { console.error('[CRASH REPORT FAIL]', e.message); }
+}
+
 process.on('uncaughtException', err => {
   if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) return;
-  log('ERR', 'CRASH', `uncaughtException: ${err.message}`);
-  if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `⚠️ Erreur: ${err.message.substring(0, 200)}`).catch(() => {});
+  console.error('[CRASH uncaughtException]', err.message, err.stack);
+  reportCrashToGitHub('uncaughtException', `${err.message}\n${err.stack || ''}`).finally(() => {
+    // Ne pas exit immédiatement — laisser Render faire son health check
+  });
 });
 process.on('unhandledRejection', reason => {
   const msg = reason instanceof Error ? reason.message : String(reason);
+  const stk = reason instanceof Error ? reason.stack : '';
   if (msg.includes('EPIPE')) return;
-  log('ERR', 'CRASH', `unhandledRejection: ${msg}`);
+  console.error('[CRASH unhandledRejection]', msg, stk);
+  reportCrashToGitHub('unhandledRejection', `${msg}\n${stk}`).catch(()=>{});
 });
 
 // ─── Persistance ──────────────────────────────────────────────────────────────
@@ -3956,6 +4010,24 @@ async function main() {
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
   setTimeout(() => syncStatusGitHub().catch(() => {}), 30000);
+
+  // Rapport de boot réussi — Claude Code peut voir que le bot a bien démarré
+  setTimeout(async () => {
+    try {
+      if (process.env.GITHUB_TOKEN) {
+        const content = `# ✅ Boot réussi\n_${new Date().toLocaleString('fr-CA',{timeZone:'America/Toronto'})}_\n\n- Modèle: ${currentModel}\n- Outils: ${TOOLS.length}\n- Uptime: ${Math.floor(process.uptime())}s\n- Centris: ${centrisSession.authenticated?'✅':'⏳'}\n- Dropbox: ${dropboxToken?'✅':'❌'}\n\n## Logs boot (150 dernières lignes)\n\`\`\`\n${(bootLogsCapture||[]).slice(-150).join('\n')}\n\`\`\`\n`;
+        const url = `https://api.github.com/repos/signaturesb/kira-bot/contents/BOOT_REPORT.md`;
+        const getRes = await fetch(url, { headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' } });
+        const sha = getRes.ok ? (await getRes.json()).sha : undefined;
+        await fetch(url, {
+          method: 'PUT',
+          headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: `Boot OK ${new Date().toISOString()}`, content: Buffer.from(content).toString('base64'), ...(sha ? { sha } : {}) })
+        });
+        log('OK', 'BOOT', 'BOOT_REPORT.md écrit dans GitHub');
+      }
+    } catch (e) { log('WARN', 'BOOT', `Report: ${e.message}`); }
+  }, 15000);
 }
 
 main().catch(err => {
