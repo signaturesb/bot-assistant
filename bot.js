@@ -673,26 +673,63 @@ function checkRateLimit() {
 }
 
 // Transforme les erreurs API en messages lisibles pour l'utilisateur
+// + déclenche alerte proactive Telegram à Shawn pour les erreurs admin-actionables
+const apiErrorState = { lastCreditAlert: 0, lastAuthAlert: 0 };
+function notifyShawnOnce(key, text, cooldownMs = 30 * 60 * 1000) {
+  const now = Date.now();
+  if (now - (apiErrorState[key] || 0) < cooldownMs) return;
+  apiErrorState[key] = now;
+  if (!ALLOWED_ID || typeof bot?.sendMessage !== 'function') return;
+  bot.sendMessage(ALLOWED_ID, text, { parse_mode: 'Markdown', disable_web_page_preview: false }).catch(() => {
+    bot.sendMessage(ALLOWED_ID, text.replace(/[*_`]/g, '')).catch(() => {});
+  });
+}
 function formatAPIError(err) {
   const status = err?.status || err?.response?.status;
   const msg    = err?.message || String(err);
+  const lower  = msg.toLowerCase();
+
+  // Erreurs Anthropic critiques admin-actionables — alerte proactive Shawn
+  if (/credit\s*balance|billing|insufficient\s*credit|out\s*of\s*credit/i.test(msg)) {
+    notifyShawnOnce('lastCreditAlert',
+      `🚨 *Anthropic — crédit épuisé*\n\n` +
+      `Le bot ne peut plus appeler Claude. Action:\n` +
+      `→ https://console.anthropic.com/settings/billing\n\n` +
+      `Recharge le compte puis le bot reprend automatiquement (aucun redeploy requis).`
+    );
+    return '💳 Crédit Anthropic épuisé. Shawn notifié — recharge à console.anthropic.com/settings/billing.';
+  }
+  if (/invalid[\s_-]?api[\s_-]?key|authentication[\s_-]?error|invalid[\s_-]?authentication/i.test(msg) || status === 401) {
+    notifyShawnOnce('lastAuthAlert',
+      `🚨 *Anthropic — clé API invalide*\n\n` +
+      `ANTHROPIC_API_KEY rejetée (révoquée ou erronée). Action:\n` +
+      `1. Nouvelle clé: https://console.anthropic.com/settings/keys\n` +
+      `2. Mettre dans .env local\n` +
+      `3. \`npm run sync-env\` → Render redéploie auto`
+    );
+    return '🔑 Clé Claude invalide/révoquée. Shawn notifié.';
+  }
   if (status === 400) {
-    // Tool name invalide (accents, caractères spéciaux) — erreur admin
     const toolMatch = msg.match(/tools\.(\d+)\.custom\.name.*?pattern/);
     if (toolMatch) {
       const idx = parseInt(toolMatch[1]);
-      return `🚨 Config bot cassée — tool #${idx} a un nom invalide (regex [a-zA-Z0-9_-] violée). Admin: check logs.`;
+      return `🚨 Config bot cassée — tool #${idx} nom invalide (regex [a-zA-Z0-9_-] violée).`;
     }
     if (msg.includes('prefill') || msg.includes('prepend')) return '⚠️ Conversation corrompue — tape /reset puis réessaie.';
     if (msg.includes('max_tokens')) return '⚠️ Requête trop longue — simplifie ou /reset.';
-    if (msg.includes('temperature') || msg.includes('top_p') || msg.includes('top_k')) {
-      return '🚨 Config bot cassée — temperature/top_p/top_k rejetés par Opus 4.7. Admin: retirer ces params.';
+    if (lower.includes('temperature') || lower.includes('top_p') || lower.includes('top_k')) {
+      return '🚨 Config bot — temperature/top_p/top_k rejetés par Opus 4.7.';
     }
-    return `⚠️ Requête invalide — /reset pour repartir à neuf. (${msg.substring(0, 80)})`;
+    return `⚠️ Requête invalide — /reset pour repartir. (${msg.substring(0, 80)})`;
   }
-  if (status === 401) return '🔑 Clé API Claude invalide ou expirée.';
   if (status === 403) return '🚫 Accès refusé.';
-  if (status === 429) return '⏳ Trop de requêtes — patiente 30 secondes.';
+  if (status === 429) {
+    notifyShawnOnce('lastRateLimit',
+      `⏳ *Anthropic — rate limit fréquent*\nVérifier plan: https://console.anthropic.com/settings/limits`,
+      60 * 60 * 1000
+    );
+    return '⏳ Rate limit — patiente 30 sec.';
+  }
   if (status === 529 || status >= 500) return '⚠️ Claude temporairement indisponible — réessaie dans une minute.';
   return `⚠️ ${msg.substring(0, 120)}`;
 }
