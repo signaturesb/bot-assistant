@@ -3949,7 +3949,12 @@ async function runGmailLeadPoller() {
 async function main() {
   // ── CRITIQUE: Démarrer le server HTTP EN PREMIER pour passer health check Render ──
   log('INFO', 'BOOT', `Step 0: server.listen(${PORT}) [CRITICAL]`);
-  try { server.listen(PORT); } catch (e) { log('ERR', 'BOOT', `listen FATAL: ${e.message}`); throw e; }
+  server.on('error', err => {
+    log('ERR', 'BOOT', `server error: ${err.code || err.message}`);
+    // Si EADDRINUSE, retry après 2s (l'ancienne instance libère le port)
+    if (err.code === 'EADDRINUSE') setTimeout(() => server.listen(PORT).on('error', () => {}), 2000);
+  });
+  server.listen(PORT, () => log('OK', 'BOOT', `HTTP server listening on port ${PORT}`));
 
   log('INFO', 'BOOT', 'Step 1: refresh Dropbox token');
   if (process.env.DROPBOX_REFRESH_TOKEN) {
@@ -4005,8 +4010,16 @@ async function main() {
   log('INFO', 'BOOT', 'Step 7: startDailyTasks');
   try { startDailyTasks(); } catch (e) { log('ERR', 'BOOT', `startDailyTasks FATAL: ${e.message}`); throw e; }
 
-  log('INFO', 'BOOT', 'Step 8: startPolling Telegram');
-  try { bot.startPolling({ interval: 3000, autoStart: true }); } catch (e) { log('ERR', 'BOOT', `startPolling FATAL: ${e.message}`); throw e; }
+  log('INFO', 'BOOT', 'Step 8: startPolling Telegram (async, pas de throw)');
+  // Démarrer polling de manière non-bloquante, ne throw jamais
+  try {
+    bot.startPolling({ interval: 3000, autoStart: true, params: { timeout: 10 } });
+    // Attraper les erreurs du startPolling
+    bot.on('polling_error', () => {}); // handler dummy pour éviter unhandled
+  } catch (e) {
+    log('ERR', 'BOOT', `startPolling (caught): ${e.message}`);
+    // Ne PAS throw — continuer sans polling, le server HTTP continue à tourner
+  }
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
