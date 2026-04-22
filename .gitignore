@@ -1,3 +1,35 @@
 node_modules/
-.env
 *.log
+
+# Secrets — jamais committer
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.aws/
+.ssh/
+*.session
+credentials.json
+token.json
+secrets.json
+auth.json
+
+# Output local
+.DS_Store
+*.swp
+.vscode/
+.idea/
+coverage/
+dist/
+build/
+.nyc_output/
+
+# Backups accidentels
+*.bak
+*.backup
+*.orig

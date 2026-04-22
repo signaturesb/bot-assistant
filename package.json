@@ -4,7 +4,14 @@
   "description": "Kira — assistante IA de Shawn via Telegram",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "validate": "node validate.js",
+    "diagnose": "node diagnose.js",
+    "fix": "node fix.js",
+    "sync-env": "node scripts/sync-env-render.js",
+    "sync-env:dry": "node scripts/sync-env-render.js --dry-run",
+    "enable-security": "node scripts/enable-github-security.js",
+    "test-parser": "node test_parser.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.0",

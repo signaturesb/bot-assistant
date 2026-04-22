@@ -110,6 +110,59 @@ if (exitLines.length > 3) {
   warnings.push(`⚠️ ${exitLines.length} process.exit(1) trouvés — vérifier qu'aucun n'est appelé par un event handler transient`);
 }
 
+// ── 6. Scan secrets sur fichiers staged (bloque fuite avant commit) ─────────
+// Patterns = listes de detection. Doivent être précis pour éviter faux positifs.
+const SECRET_PATTERNS = [
+  { name: 'GitHub OAuth token',       re: /\bgho_[A-Za-z0-9]{30,}\b/ },
+  { name: 'GitHub Personal token',    re: /\bghp_[A-Za-z0-9]{30,}\b/ },
+  { name: 'GitHub App token',         re: /\bghs_[A-Za-z0-9]{30,}\b/ },
+  { name: 'GitHub Refresh token',     re: /\bghr_[A-Za-z0-9]{30,}\b/ },
+  { name: 'Render API key',           re: /\brnd_[A-Za-z0-9]{25,}\b/ },
+  { name: 'Anthropic API key',        re: /\bsk-ant-api\d{2}-[A-Za-z0-9_-]{20,}/ },
+  { name: 'OpenAI API key',           re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}/ },
+  { name: 'Brevo API key',            re: /\bxkeysib-[a-f0-9]{20,}/ },
+  { name: 'Pipedrive API key (hex)',  re: /\bREDACTED_PIPEDRIVE_KEY\b/ },
+  { name: 'Telegram bot token',       re: /\b\d{8,12}:AAG[A-Za-z0-9_-]{30,}/ },
+  { name: 'Slack token',              re: /\bxox[baprs]-[A-Za-z0-9-]{10,}/ },
+  { name: 'AWS Access Key',           re: /\bAKIA[0-9A-Z]{16}\b/ },
+  { name: 'Password REDACTED_PASSWORD (leaked)', re: /REDACTED_PASSWORD[@$!#&*]?/ },
+  { name: 'Private key header',       re: /-----BEGIN (RSA |EC |DSA |OPENSSH |PGP |)PRIVATE KEY-----/ },
+];
+const SECRET_WHITELIST = new Set([
+  '.env.example',
+  'SECURITY.md',
+  '.gitleaksignore',
+  'validate.js',            // ce fichier contient les patterns pour les détecter
+  '.github/workflows/security.yml',
+]);
+try {
+  const staged = require('child_process')
+    .execSync('git diff --cached --name-only --diff-filter=ACMRTUXB', { stdio: ['pipe','pipe','pipe'] })
+    .toString().trim().split('\n').filter(Boolean);
+  const filesToScan = staged.length ? staged : []; // en mode manual (hors pre-commit), ne scan pas tout
+  let secretsFound = 0;
+  for (const f of filesToScan) {
+    if (SECRET_WHITELIST.has(f)) continue;
+    if (!fs.existsSync(f)) continue;
+    let content;
+    try { content = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    for (const { name, re } of SECRET_PATTERNS) {
+      const m = content.match(re);
+      if (m) {
+        secretsFound++;
+        issues.push(`🔐 SECRET DÉTECTÉ: ${name} dans ${f}`);
+        issues.push(`    → Extrait: ${m[0].slice(0, 12)}…${m[0].slice(-4)}`);
+        issues.push(`    → Retire la valeur, utilise process.env.<NAME>, regénère la clé si exposée`);
+      }
+    }
+  }
+  if (filesToScan.length) {
+    console.log(`  ✓ Secret scan: ${filesToScan.length} fichiers staged, ${secretsFound} secrets${secretsFound?'':' — OK'}`);
+  }
+} catch (e) {
+  // pas dans un contexte git / pas de staging — on skip silencieusement
+}
+
 // ── Résultat ─────────────────────────────────────────────────────────────────
 console.log('');
 if (warnings.length) {

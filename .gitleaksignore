@@ -1,0 +1,5 @@
+# Gitleaks allowlist — patterns connus non-secrets (IDs de service, hash fixes)
+# Format: finding-fingerprint (gitleaks le génère) ou un path:rule:start_line
+
+# Service IDs (pas des secrets, juste des identifiants)
+# Ex: srv-d7fh9777f7vs73a15ddg (Render service ID — pas de risque sans API key associée)
