@@ -213,6 +213,13 @@ const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
 const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
+let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match }
+
+// RÈGLE ABSOLUE — aucun email/sms/action externe sans consent Shawn explicite
+// Désactive tous les auto-envois. Toute action "sortante" doit passer par
+// pendingEmails/pendingDocSends + Shawn dit "envoie" OU être un cron approuvé.
+const CONSENT_REQUIRED = true;
+const POLLER_ENABLED = process.env.POLLER_ENABLED !== 'false'; // kill switch via env
 
 // ─── Mode réflexion (Opus 4.7 thinking) ──────────────────────────────────────
 let thinkingMode = false; // toggle via /penser
@@ -4353,11 +4360,13 @@ let gmailPollerState = loadJSON(POLLER_FILE, { processed: [], lastRun: null, tot
 // Lead parsing — extrait dans lead_parser.js pour testabilité
 const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI } = leadParser;
 
-// Dédoublonnage 24h par email/tel — empêche spam Telegram pour même lead
-const recentLeadsByKey = new Map(); // key(email|tel) → timestamp
+// Dédoublonnage 24h par email/tel — persisté sur disque pour survivre aux redeploys
+const LEADS_DEDUP_FILE = path.join(DATA_DIR, 'leads_dedup.json');
+const recentLeadsByKey = new Map(Object.entries(loadJSON(LEADS_DEDUP_FILE, {})));
+function saveLeadsDedup() { saveJSON(LEADS_DEDUP_FILE, Object.fromEntries(recentLeadsByKey)); }
 function leadAlreadyNotifiedRecently(email, telephone) {
   const now = Date.now();
-  const TTL = 24 * 60 * 60 * 1000; // 24h
+  const TTL = 7 * 24 * 60 * 60 * 1000; // 7 jours (plus agressif qu'avant)
   // Purge expired
   for (const [k, t] of recentLeadsByKey) {
     if (now - t > TTL) recentLeadsByKey.delete(k);
@@ -4369,6 +4378,7 @@ function leadAlreadyNotifiedRecently(email, telephone) {
     if (recentLeadsByKey.has(k)) return true;
   }
   for (const k of keys) recentLeadsByKey.set(k, now);
+  saveLeadsDedup();
   return false;
 }
 
@@ -4425,24 +4435,17 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
     docsTxt = `📁 Candidats Dropbox: ${dbxMatch.candidates.map(c => `${c.folder.adresse || c.folder.name} (${c.score})`).join(', ')}`;
   }
 
-  // AUTO-ENVOI si toutes conditions: email + deal créé + match ≥90 + PDFs présents
+  // AUTO-ENVOI DÉSACTIVÉ (2026-04-22) — Shawn veut confirmer avant tout email
+  // Règle permanente: jamais d'email envoyé sans son OK explicite via Telegram.
+  // Ancien flow: auto-envoi si match ≥90 → désactivé.
+  // Nouveau flow: brouillon prêt + notification Telegram → Shawn dit "envoie".
   let dealFullObj = null;
   if (dealId) {
     try { dealFullObj = (await pdGet(`/deals/${dealId}`))?.data; } catch {}
   }
-  if (email && dealFullObj && dbxMatch?.folder && dbxMatch.score >= 90 && dbxMatch.pdfs.length > 0) {
-    try {
-      const autoRes = await envoyerDocsAuto({
-        email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch,
-      });
-      if (autoRes.sent) {
-        autoEnvoiMsg = `\n🚀 *Docs envoyés automatiquement* à ${email}\n   ${dbxMatch.pdfs.length} PDFs · score ${dbxMatch.score} · livré en ${Math.round(autoRes.deliveryMs / 1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
-      } else if (autoRes.skipped) {
-        autoEnvoiMsg = `\n⏭ Auto-envoi skip: ${autoRes.reason}`;
-      } else {
-        autoEnvoiMsg = `\n⚠️ *Auto-envoi ÉCHOUÉ après ${autoRes.attempts} tentatives*: ${String(autoRes.error).substring(0, 120)}\n   Envoie manuellement: "envoie les docs à ${email}"`;
-      }
-    } catch (e) { autoEnvoiMsg = `\n⚠️ Auto-envoi exception: ${e.message.substring(0, 100)}`; }
+  if (email && dbxMatch?.folder && dbxMatch.pdfs.length > 0) {
+    pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    autoEnvoiMsg = `\n📦 *Docs prêts à envoyer* (score ${dbxMatch.score}, ${dbxMatch.pdfs.length} PDFs)\n   Dis \`envoie les docs à ${email}\` pour livrer.`;
   } else if (email && dbxMatch?.folder && dbxMatch.score >= 70) {
     autoEnvoiMsg = `\n🤔 Match ambigü (score ${dbxMatch.score}) — dis *"envoie les docs à ${email}"* pour confirmer`;
   }
@@ -4766,14 +4769,16 @@ async function main() {
   }, 30 * 60 * 1000);
 
   // ── Gmail Lead Poller — surveille les leads entrants ──────────────────────
-  if (process.env.GMAIL_CLIENT_ID) {
-    // Boot: scan 24h en arrière (bulletproof)
+  if (process.env.GMAIL_CLIENT_ID && POLLER_ENABLED) {
+    // Boot: scan 24h en arrière (bulletproof, dédup persistée sur disque)
     setTimeout(() => runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`)), 8000);
     // Polling toutes les 5 minutes
     setInterval(() => runGmailLeadPoller().catch(() => {}), 5 * 60 * 1000);
     // Boot: nettoyer emails GitHub/CI 30s après démarrage (Shawn veut zéro spam)
     setTimeout(() => autoTrashGitHubNoise().catch(() => {}), 30000);
     log('OK', 'BOOT', 'Gmail Lead Poller + auto-trash CI noise activés');
+  } else if (!POLLER_ENABLED) {
+    log('WARN', 'BOOT', '🛑 Gmail Lead Poller DÉSACTIVÉ (POLLER_ENABLED=false) — /checkemail pour scan manuel');
   } else {
     log('WARN', 'BOOT', 'Gmail Lead Poller désactivé — GMAIL_CLIENT_ID manquant');
   }
