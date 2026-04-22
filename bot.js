@@ -3086,7 +3086,29 @@ async function executeToolSafe(name, input, chatId) {
   ]);
 }
 
-// ─── Appel Claude (boucle agentique, prompt caching, Opus 4.7) ───────────────
+// ─── Routing auto modèle selon type de tâche ─────────────────────────────────
+// Sonnet 4.6 par défaut (5x moins cher), switch Opus 4.7 auto sur mots-clés
+// qui indiquent recherche/analyse/stratégie/négociation/optimisation.
+// Shawn peut toujours forcer via /opus ou /sonnet ou /haiku.
+const OPUS_TRIGGERS = /\b(analys|optim|recherch|strat[eé]g|compar|[eé]val|n[eé]goci|estim|march[eé]\s+(?:immo|actuel)|rapport\s+(?:march[eé]|vente|pro)|plan\s+d['e]action|pr[eé]vis|penser|think|r[eé]fl[eé]ch|deep\s+dive|pourquoi|analys(?:e|er)\s+ce|regarde\s+(?:en\s+)?d[eé]tail|(?:quel|combien|calcul).*prix|prix\s+(?:du?\s*march|de\s+vente|[àa]\s+mettre|demand|conseil|juste)|conseil\s+prix)/i;
+const MODEL_DEFAULT = 'claude-sonnet-4-6';
+function pickModelForMessage(userMsg) {
+  // Shawn a explicitement forcé un modèle non-default (/opus ou /haiku) → respecter
+  if (currentModel !== MODEL_DEFAULT) return currentModel;
+  // Env var MODEL définie → respecter
+  if (process.env.MODEL) return currentModel;
+  // Thinking mode activé → toujours Opus (deep reasoning)
+  if (thinkingMode) return 'claude-opus-4-7';
+  // Mot-clé complexité/stratégie/analyse détecté → Opus pour CE message uniquement
+  if (OPUS_TRIGGERS.test(userMsg || '')) {
+    log('INFO', 'ROUTER', `Complexité détectée → Opus 4.7 pour cette requête`);
+    return 'claude-opus-4-7';
+  }
+  // Défaut: Sonnet (envoi docs, emails, deals, conversation — 5x moins cher)
+  return MODEL_DEFAULT;
+}
+
+// ─── Appel Claude (boucle agentique, prompt caching, routing auto modèle) ────
 async function callClaude(chatId, userMsg, retries = 3) {
   if (!checkRateLimit()) {
     const err = new Error('Rate limit local atteint — 15 req/min'); err.status = 429;
@@ -3099,7 +3121,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
   addMsg(chatId, 'user', userMsg);
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const localModel   = currentModel;
+      const localModel    = pickModelForMessage(userMsg);
       const localThinking = thinkingMode;
       // Validation: garantit premier=user, alternance, dernier=user
       let messages = validateMessagesForAPI(
@@ -3384,7 +3406,7 @@ function registerHandlers() {
     const dbxOk        = !!(dropboxToken && process.env.DROPBOX_REFRESH_TOKEN);
     const pollerLast   = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun).toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' }) : 'jamais';
     bot.sendMessage(msg.chat.id,
-      `✅ *Kira — ${currentModel.replace('claude-','')} — ${TOOLS.length} outils*\n${thinkingMode?'🧠 think':'⚡ rapide'} | Uptime: ${uptime}min | Mémos: ${kiramem.facts.length}\n\nPipedrive: ${PD_KEY?'✅':'❌'} | Brevo: ${BREVO_KEY?'✅':'❌'}\nGmail: ${gmailOk?'✅':'⚠️'} | Dropbox: ${dbxOk?'✅':'❌'}\nCentris: ${centrisOk?`✅ (${process.env.CENTRIS_USER})`:'⏳'}\nWhisper: ${whisperOk?'✅':'⚠️ OPENAI manquant'}\nPoller: ${gmailOk?`✅ ${pollerLast} (${gmailPollerState.totalLeads||0} leads)`:'❌'}\nGist: ${gistId?'✅':'⚠️'}\n\n/opus pour raisonnement profond · /haiku pour ultra-rapide`,
+      `✅ *Kira — ${TOOLS.length} outils*\n🎯 Routing auto · base: \`${currentModel.replace('claude-','')}\` · Opus sur analyse/stratégie\n${thinkingMode?'🧠 thinking ON':'⚡'} | Uptime: ${uptime}min | Mémos: ${kiramem.facts.length}\n\nPipedrive: ${PD_KEY?'✅':'❌'} | Brevo: ${BREVO_KEY?'✅':'❌'}\nGmail: ${gmailOk?'✅':'⚠️'} | Dropbox: ${dbxOk?'✅':'❌'}\nCentris: ${centrisOk?`✅ (${process.env.CENTRIS_USER})`:'⏳'}\nWhisper: ${whisperOk?'✅':'⚠️ OPENAI manquant'}\nPoller: ${gmailOk?`✅ ${pollerLast} (${gmailPollerState.totalLeads||0} leads)`:'❌'}\n\n/opus ou /haiku pour forcer · /penser pour thinking profond`,
       { parse_mode: 'Markdown' }
     );
   });
