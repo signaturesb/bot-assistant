@@ -694,12 +694,21 @@ function formatAPIError(err) {
   // Erreurs Anthropic critiques admin-actionables — alerte proactive Shawn
   if (/credit\s*balance|billing|insufficient\s*credit|out\s*of\s*credit/i.test(msg)) {
     notifyShawnOnce('lastCreditAlert',
-      `🚨 *Anthropic — crédit épuisé*\n\n` +
-      `Le bot ne peut plus appeler Claude. Action:\n` +
-      `→ https://console.anthropic.com/settings/billing\n\n` +
-      `Recharge le compte puis le bot reprend automatiquement (aucun redeploy requis).`
+      `🚨 *Anthropic — crédit épuisé ou mauvais workspace*\n\n` +
+      `Le bot ne peut pas appeler Claude. 2 causes possibles:\n\n` +
+      `*1. Crédit vraiment épuisé*\n` +
+      `→ https://console.anthropic.com/settings/billing\n` +
+      `Buy credits + active Auto-reload à 10$\n\n` +
+      `*2. Clé API dans un AUTRE workspace que le crédit* (fréquent)\n` +
+      `→ https://console.anthropic.com/settings/keys\n` +
+      `Vérifie le workspace de la clé active. Puis sur billing,\n` +
+      `vérifie que le crédit est sur LE MÊME workspace (sélecteur\n` +
+      `en haut de la page).\n\n` +
+      `*Fix rapide workspace:* crée une nouvelle clé dans le workspace\n` +
+      `qui a du crédit → mets-la dans .env → \`npm run sync-env\`.\n\n` +
+      `Le bot reprend dans la seconde après fix (aucun redeploy).`
     );
-    return '💳 Crédit Anthropic épuisé. Shawn notifié — recharge à console.anthropic.com/settings/billing.';
+    return '💳 Crédit Anthropic indisponible. Shawn notifié — vérifier workspace à console.anthropic.com/settings/billing.';
   }
   if (/invalid[\s_-]?api[\s_-]?key|authentication[\s_-]?error|invalid[\s_-]?authentication/i.test(msg) || status === 401) {
     notifyShawnOnce('lastAuthAlert',
@@ -3174,6 +3183,12 @@ async function callClaude(chatId, userMsg, retries = 3) {
       log('ERR', 'CLAUDE', `attempt ${attempt}: HTTP ${err.status || '?'} — ${err.message?.substring(0, 120)}`);
       metrics.errors.total++;
       metrics.errors.byStatus[err.status || 'unknown'] = (metrics.errors.byStatus[err.status || 'unknown'] || 0) + 1;
+      // Capturer dernier message d'erreur pour diagnostic (/health)
+      metrics.lastApiError = {
+        at: new Date().toISOString(),
+        status: err.status || null,
+        message: (err.message || String(err)).substring(0, 300),
+      };
       // Circuit breaker: seulement sur erreurs transient (500+/429), pas sur 400 (user error)
       if (err.status === 429 || err.status === 529 || err.status >= 500) circuitFail('claude');
 
