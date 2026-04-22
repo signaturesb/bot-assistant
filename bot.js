@@ -1640,7 +1640,26 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
       /Données Centris Matrix/g,
       'Spécialiste vente maison usagée, construction neuve et développement immobilier'
     );
-    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées + label logo personnalisé`);
+    // PUNCH référencement — 500$ à 1 000$ en HERO stat 56px rouge pour maximiser conversion
+    const refPunch = `
+          <div style="color:#aa0721; font-size:10px; font-weight:700; letter-spacing:3px; text-transform:uppercase; margin-bottom:14px;">💰 Programme référence</div>
+          <div style="font-family:Georgia,serif; font-size:20px; color:#f5f5f7; line-height:1.3; margin-bottom:18px;">
+            Vous connaissez quelqu'un<br/>qui veut acheter ou vendre ?
+          </div>
+          <div style="font-family:Georgia,serif; font-size:56px; font-weight:800; color:#aa0721; line-height:1; margin:14px 0 6px; letter-spacing:-1px;">500$ <span style="color:#666;font-size:34px;font-weight:400;">à</span> 1 000$</div>
+          <div style="color:#f5f5f7; font-size:13px; font-weight:700; letter-spacing:2px; text-transform:uppercase; margin-bottom:22px;">En argent · pour chaque référence conclue</div>
+          <div style="color:#cccccc; font-size:13px; line-height:1.7; margin-bottom:22px;">Pas de paperasse — juste un appel.<br/>Payé à la signature chez le notaire.</div>
+          <a href="tel:${AGENT.telephone.replace(/\D/g,'')}" style="display:inline-block; background-color:#aa0721; color:#ffffff; font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif; font-size:13px; font-weight:700; letter-spacing:2px; text-transform:uppercase; padding:15px 32px; border-radius:3px; text-decoration:none;">Référer quelqu'un</a>`;
+    htmlFinal = htmlFinal.replace(
+      /<!-- ══ PROGRAMME RÉFÉRENCE ══ -->[\s\S]*?<td style="background-color:#0d0d0d[^>]*>[\s\S]*?<\/td>/,
+      `<!-- ══ PROGRAMME RÉFÉRENCE ══ -->
+  <tr>
+    <td style="padding:0 28px 40px;" class="mobile-pad">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0"><tbody><tr>
+        <td style="background-color:#0d0d0d; border:1px solid #1e1e1e; border-top:4px solid #aa0721; border-radius:4px; padding:36px 28px; text-align:center;">${refPunch}
+        </td>`
+    );
+    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées + label logo personnalisé + punch référencement`);
   } else {
     // Fallback HTML inline brandé si Dropbox template indisponible
     htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
