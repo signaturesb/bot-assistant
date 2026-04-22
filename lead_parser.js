@@ -77,7 +77,8 @@ function parseLeadEmail(body, subject, from) {
   const UC = '[A-ZÀ-Ü][A-Za-zÀ-Üà-ü\\-\']+';
   const nom = extract(
     // Labellé explicite (Centris contact form, RE/MAX, Realtor)
-    new RegExp(`\\b(?:Nom(?:\\s+complet)?|Name|Client|Acheteur|Vendeur|Pr[eé]nom\\s+et\\s+nom)\\s*:?\\s+(${UC}(?:\\s+${UC}){1,3}?)${STOP}`),
+    // Inclut "Nom du contact" (RE/MAX Québec) + "Nom complet" + etc.
+    new RegExp(`\\b(?:Nom(?:\\s+(?:complet|du\\s+contact|et\\s+pr[eé]nom))?|Name|Client|Acheteur|Vendeur|Pr[eé]nom\\s+et\\s+nom|Contact)\\s*:?\\s+(${UC}(?:\\s+${UC}){1,3}?)${STOP}`),
     // "Nom Prénom Nom " sans deux points (format Centris condensé)
     new RegExp(`\\bNom\\s+(${UC}(?:\\s+${UC}){1,3}?)${STOP}`),
     // "Mon nom est X" / "je m'appelle X" — FR

@@ -3380,22 +3380,66 @@ function registerHandlers() {
 
   bot.onText(/\/checkemail/, async msg => {
     if (!isAllowed(msg)) return;
-    await bot.sendMessage(msg.chat.id, '🔍 Scan des emails leads en cours...');
-    // Forcer un scan étendu (48h)
-    const savedLastRun = gmailPollerState.lastRun;
-    gmailPollerState.lastRun = new Date(Date.now() - 48 * 3600000).toISOString();
-    await runGmailLeadPoller().catch(e => bot.sendMessage(msg.chat.id, `❌ Poller: ${e.message}`));
-    if (!savedLastRun || gmailPollerState.lastRun !== savedLastRun) {
-      await bot.sendMessage(msg.chat.id, `✅ Scan terminé — ${gmailPollerState.totalLeads || 0} lead(s) total traité(s).`);
-    }
+    await bot.sendMessage(msg.chat.id, '🔍 Scan 48h — leads éventuellement manqués...');
+    // Forcer scan 48h en passant un `forceSince` au lieu de manipuler le state
+    await runGmailLeadPoller({ forceSince: '48h' }).catch(e =>
+      bot.sendMessage(msg.chat.id, `❌ Poller: ${e.message}`)
+    );
+    const s = pollerStats.lastScan;
+    await bot.sendMessage(msg.chat.id,
+      `✅ Scan terminé\n\n` +
+      `📬 ${s.found} emails trouvés\n` +
+      `🗑 ${s.junk} junk filtered\n` +
+      `🔍 ${s.noSource} sans source\n` +
+      `⚠️ ${s.lowInfo} info insuffisante (P0 alert envoyée si >0)\n` +
+      `✅ ${s.dealCreated} deals créés\n` +
+      `❌ ${s.errors} erreurs\n\n` +
+      `Total depuis boot: ${gmailPollerState.totalLeads} leads`
+    );
   });
 
-  bot.onText(/\/poller/, msg => {
+  bot.onText(/\/forcelead\s+([a-zA-Z0-9_-]+)/, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const msgId = match[1];
+    await bot.sendMessage(msg.chat.id, `🎯 Force process email Gmail ${msgId}...`);
+    // Retirer l'ID de processed[] pour forcer retraitement
+    const idx = gmailPollerState.processed.indexOf(msgId);
+    if (idx >= 0) gmailPollerState.processed.splice(idx, 1);
+    await runGmailLeadPoller({ singleMsgId: msgId }).catch(e =>
+      bot.sendMessage(msg.chat.id, `❌ ${e.message}`)
+    );
+    const s = pollerStats.lastScan;
+    await bot.sendMessage(msg.chat.id,
+      s.dealCreated > 0 ? `✅ Lead traité!` :
+      s.lowInfo > 0 ? `⚠️ Info insuffisante même après AI fallback — voir P0 alert` :
+      s.junk > 0 ? `🗑 Filtré comme junk` :
+      s.noSource > 0 ? `🔍 Pas reconnu comme lead (source inconnue)` :
+      `❌ Aucun traitement — vérifie Gmail ID`
+    );
+  });
+
+  bot.onText(/\/poller|\/leadstats/, msg => {
     if (!isAllowed(msg)) return;
     const last    = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun).toLocaleTimeString('fr-CA', { timeZone: 'America/Toronto' }) : 'jamais';
     const gmailOk = !!(process.env.GMAIL_CLIENT_ID);
+    const s = pollerStats.lastScan;
+    const t = pollerStats;
     bot.sendMessage(msg.chat.id,
-      `📧 *Gmail Lead Poller*\nStatut: ${gmailOk ? '✅ Actif' : '❌ Gmail non configuré'}\nDernier scan: ${last}\nLeads traités: ${gmailPollerState.totalLeads || 0}\nIDs mémorisés: ${gmailPollerState.processed?.length || 0}\n\nSources surveillées:\n• Centris.ca\n• RE/MAX Québec\n• Realtor.ca · DuProprio\n• Demandes directes\n\nDis /checkemail pour scanner maintenant.`,
+      `📧 *Gmail Lead Poller*\n` +
+      `Statut: ${gmailOk ? '✅ Actif' : '❌ Gmail non configuré'}\n` +
+      `Dernier scan: ${last} (${pollerStats.lastDuration}ms)\n` +
+      `Runs: ${pollerStats.runs}\n\n` +
+      `*Dernier scan:*\n` +
+      `📬 Trouvés: ${s.found} · 🗑 Junk: ${s.junk}\n` +
+      `🔍 Pas source: ${s.noSource} · ⚠️ Low info: ${s.lowInfo}\n` +
+      `✅ Deals: ${s.dealCreated} · ❌ Erreurs: ${s.errors}\n\n` +
+      `*Cumulatif:*\n` +
+      `Total leads: ${gmailPollerState.totalLeads || 0}\n` +
+      `Total found: ${t.totalsFound} · Junk: ${t.totalsJunk}\n` +
+      `Deals créés: ${t.totalsDealCreated} · Low info: ${t.totalsLowInfo}\n` +
+      `IDs mémorisés: ${gmailPollerState.processed?.length || 0}\n` +
+      (pollerStats.lastError ? `\n⚠️ Dernière erreur: ${pollerStats.lastError.substring(0, 100)}` : '') +
+      `\n\nCommandes:\n/checkemail — scan 48h\n/forcelead <id> — force retraitement`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -4068,6 +4112,7 @@ const server = http.createServer((req, res) => {
       gmail_poller: {
         total_leads: gmailPollerState.totalLeads||0,
         last_run: gmailPollerState.lastRun,
+        stats: pollerStats,  // runs + lastScan breakdown + totals + lastError
       },
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4327,34 +4372,77 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   });
 }
 
-async function runGmailLeadPoller() {
+// Stats poller (pour /health + debug P0)
+const pollerStats = {
+  runs: 0,
+  lastRun: null,
+  lastDuration: 0,
+  lastError: null,
+  lastScan: { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, errors: 0 },
+  totalsFound: 0, totalsJunk: 0, totalsNoSource: 0, totalsLowInfo: 0, totalsDealCreated: 0, totalsErrors: 0,
+};
+
+// ── runGmailLeadPoller — BULLETPROOF (2026-04-22)
+// Principe: AUCUN lead client ne doit passer inaperçu.
+// - Scan SANS is:unread (dédup via processed[] state)
+// - 24h fenêtre au boot (pas 6h)
+// - Alert Telegram P0 si email match source mais deal non créé (bug detection)
+// - Logging structuré par étape
+async function runGmailLeadPoller(opts = {}) {
+  const t0 = Date.now();
+  pollerStats.runs++;
+  const scan = { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, errors: 0 };
+  const problems = []; // emails qui matchent mais n'ont pas abouti — pour alerte P0
   try {
     const token = await getGmailToken();
-    if (!token) return; // Gmail pas configuré ou token fail
+    if (!token) { pollerStats.lastError = 'gmail_token_unavailable'; return; }
 
-    // Construire les queries: chercher leads non lus des dernières 24h max
-    const since = gmailPollerState.lastRun
-      ? Math.max(1, Math.ceil((Date.now() - new Date(gmailPollerState.lastRun).getTime()) / 60000) + 1) + 'm'
-      : '6h'; // Au boot: regarder 6h en arrière
+    // Force scan 48h si demandé explicitement (/checkemail ou /forcelead)
+    const since = opts.forceSince
+      ? opts.forceSince
+      : (gmailPollerState.lastRun
+          ? Math.max(1, Math.ceil((Date.now() - new Date(gmailPollerState.lastRun).getTime()) / 60000) + 2) + 'm'
+          : '24h'); // Au boot: 24h (pas 6h — laisser de la marge pour emails manqués)
 
+    // Queries SANS is:unread — emails lus scannés aussi (dédup via processed[])
+    // Plusieurs queries ciblées + un catch-all pour robustesse
+    const shawnEmail = AGENT.email.toLowerCase();
     const queries = [
-      `is:unread newer_than:${since} (from:centris OR from:remax) NOT from:shawn@signaturesb.com`,
-      `is:unread newer_than:${since} subject:(demande OR lead OR prospect OR information OR visite) NOT from:shawn@signaturesb.com NOT from:noreply NOT from:no-reply`,
+      `newer_than:${since} from:centris NOT from:${shawnEmail}`,
+      `newer_than:${since} from:remax NOT from:${shawnEmail}`,
+      `newer_than:${since} from:realtor NOT from:${shawnEmail}`,
+      `newer_than:${since} from:duproprio NOT from:${shawnEmail}`,
+      // Catch-all: demande dans subject, pas d'une source auto
+      `newer_than:${since} subject:(demande OR "intéress" OR inquiry OR "prospect") NOT from:${shawnEmail} NOT from:noreply@signaturesb NOT from:notifications@github`,
     ];
 
     let newLeads = 0;
     const processedThisRun = new Set();
+    const singleId = opts.singleMsgId || null;
 
-    for (const q of queries) {
+    // Mode forcelead: traiter 1 msgId spécifique, bypass queries
+    const msgIds = singleId ? [{ id: singleId }] : null;
+
+    for (const q of (msgIds ? [null] : queries)) {
       let list;
-      try {
-        list = await gmailAPI(`/messages?maxResults=15&q=${encodeURIComponent(q)}`);
-      } catch (e) { log('WARN', 'POLLER', `Query fail: ${e.message}`); continue; }
+      if (msgIds) {
+        list = { messages: msgIds };
+      } else {
+        try {
+          list = await gmailAPI(`/messages?maxResults=25&q=${encodeURIComponent(q)}`);
+        } catch (e) {
+          scan.errors++;
+          log('WARN', 'POLLER', `Query fail [${q.substring(0,40)}]: ${e.message}`);
+          continue;
+        }
+      }
       if (!list?.messages?.length) continue;
+      scan.found += list.messages.length;
 
       for (const msgRef of list.messages) {
         const id = msgRef.id;
-        if (gmailPollerState.processed.includes(id) || processedThisRun.has(id)) continue;
+        // En mode forcelead, on bypass le dédup pour forcer le retraitement
+        if (!singleId && (gmailPollerState.processed.includes(id) || processedThisRun.has(id))) continue;
         processedThisRun.add(id);
 
         try {
@@ -4366,59 +4454,100 @@ async function runGmailLeadPoller() {
           const body    = gmailExtractBody(full.payload);
 
           // Ignorer les emails de Shawn lui-même
-          if (from.toLowerCase().includes(AGENT.email.toLowerCase())) {
+          if (from.toLowerCase().includes(shawnEmail)) {
             gmailPollerState.processed.push(id); continue;
           }
 
           // FILTRE JUNK — rejette newsletters, alertes saved-search, notifications
           if (isJunkLeadEmail(subject, from, body)) {
-            log('INFO', 'POLLER', `Junk skip: ${subject.substring(0, 60)} (${from.substring(0, 40)})`);
+            scan.junk++;
+            log('INFO', 'POLLER', `Junk: ${subject.substring(0, 60)} (${from.substring(0, 40)})`);
             gmailPollerState.processed.push(id); continue;
           }
 
           const source = detectLeadSource(from, subject);
-          if (!source) { gmailPollerState.processed.push(id); continue; }
+          if (!source) { scan.noSource++; gmailPollerState.processed.push(id); continue; }
 
           let lead = parseLeadEmail(body, subject, from);
           let infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
 
-          // AI FALLBACK — si regex extrait <2 infos, appel Claude Haiku pour extraction structurée
-          if (infoCount < 2 && API_KEY) {
-            log('INFO', 'POLLER', `Regex <${infoCount} infos — tentative AI fallback`);
+          // AI FALLBACK — si regex extrait <3 infos, appel Claude Haiku pour extraction structurée
+          // Seuil augmenté à <3 (était <2) pour être plus safe
+          if (infoCount < 3 && API_KEY) {
+            log('INFO', 'POLLER', `Regex ${infoCount} infos — AI fallback pour "${subject.substring(0,50)}"`);
             try {
               lead = await parseLeadEmailWithAI(body, subject, from, lead, { apiKey: API_KEY, logger: log });
               infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
-            } catch (e) { log('WARN', 'POLLER', `AI fallback exception: ${e.message}`); }
+            } catch (e) { log('WARN', 'POLLER', `AI fallback: ${e.message}`); }
           }
 
-          // VALIDATION lead viable — minimum 2 infos ou Centris# seul suffit
+          // VALIDATION lead viable — minimum 2 infos OU Centris# seul suffit
           if (infoCount < 2 && !lead.centris) {
-            log('INFO', 'POLLER', `Lead non viable après fallback (${infoCount} info): "${subject.substring(0, 50)}" — ignoré`);
+            scan.lowInfo++;
+            // ⚠ ALERTE P0: email match source (Centris/RE/MAX) mais extraction insuffisante = BUG probable
+            problems.push({ id, subject, from, source: source.label, reason: `${infoCount} info extraites après AI fallback` });
+            log('WARN', 'POLLER', `Lead non viable: "${subject.substring(0, 50)}" (${source.label}) — PROBLÈME P0`);
             gmailPollerState.processed.push(id); continue;
           }
 
           await traiterNouveauLead(lead, id, from, subject, source);
           gmailPollerState.processed.push(id);
           gmailPollerState.totalLeads = (gmailPollerState.totalLeads || 0) + 1;
+          scan.dealCreated++;
           newLeads++;
-          await new Promise(r => setTimeout(r, 1500)); // pause entre leads
+          await new Promise(r => setTimeout(r, 1500));
         } catch (e) {
+          scan.errors++;
+          problems.push({ id, subject: 'N/A', from: 'N/A', source: 'N/A', reason: `Exception: ${e.message.substring(0, 100)}` });
           log('WARN', 'POLLER', `msg ${id}: ${e.message}`);
-          gmailPollerState.processed.push(id); // marquer pour ne pas réessayer
+          gmailPollerState.processed.push(id);
         }
       }
     }
 
-    // Garder max 500 IDs processed (FIFO)
+    // FIFO max 500 IDs
     if (gmailPollerState.processed.length > 500) {
       gmailPollerState.processed = gmailPollerState.processed.slice(-500);
     }
     gmailPollerState.lastRun = new Date().toISOString();
     saveJSON(POLLER_FILE, gmailPollerState);
 
-    if (newLeads > 0) log('OK', 'POLLER', `${newLeads} lead(s) traité(s) | Total: ${gmailPollerState.totalLeads}`);
+    // Update stats globales
+    pollerStats.lastScan = scan;
+    pollerStats.totalsFound      += scan.found;
+    pollerStats.totalsJunk       += scan.junk;
+    pollerStats.totalsNoSource   += scan.noSource;
+    pollerStats.totalsLowInfo    += scan.lowInfo;
+    pollerStats.totalsDealCreated+= scan.dealCreated;
+    pollerStats.totalsErrors     += scan.errors;
+    pollerStats.lastRun = new Date().toISOString();
+    pollerStats.lastDuration = Date.now() - t0;
+    pollerStats.lastError = null;
+
+    // ALERTE P0 Telegram: leads potentiels manqués
+    if (problems.length && ALLOWED_ID) {
+      const lines = problems.slice(0, 5).map(p =>
+        `• [${p.source}] ${p.subject.substring(0, 60)} — ${p.reason}`
+      );
+      const alertMsg = [
+        `🚨 *P0 — ${problems.length} lead(s) potentiellement manqué(s)*`,
+        ``,
+        ...lines,
+        ``,
+        `Dis \`/forcelead ${problems[0].id}\` pour forcer le retraitement du premier.`,
+        `Ou vérifie Gmail directement.`,
+      ].join('\n');
+      bot.sendMessage(ALLOWED_ID, alertMsg, { parse_mode: 'Markdown' }).catch(() => {
+        bot.sendMessage(ALLOWED_ID, alertMsg.replace(/[*_`]/g, '')).catch(() => {});
+      });
+    }
+
+    if (newLeads > 0) {
+      log('OK', 'POLLER', `Scan: ${scan.found} found | ${scan.junk} junk | ${scan.dealCreated} deals | ${newLeads} nouveaux`);
+    }
   } catch (e) {
-    log('WARN', 'POLLER', `Erreur générale: ${e.message}`);
+    pollerStats.lastError = e.message;
+    log('ERR', 'POLLER', `Erreur fatale: ${e.message}`);
   }
 }
 
