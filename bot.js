@@ -264,7 +264,7 @@ COMPORTEMENT PROACTIF OBLIGATOIRE:
 SOUS-ENTENDUS DE SHAWN → ACTIONS:
 • "ça marche pas avec lui/elle" → marquer_perdu
 • "c'est quoi mes hot leads" → voir_pipeline focus 51-53
-• "nouveau prospect: [info]" → créer_deal auto
+• "nouveau prospect: [info]" → creer_deal auto
 • "relance [nom]" → voir_prospect_complet + voir_conversation + brouillon email
 • "c'est quoi le deal avec [nom]" → voir_prospect_complet
 • "bouge [nom] à [étape]" → changer_etape
@@ -300,7 +300,7 @@ Si Shawn mentionne un prénom/nom → chercher_prospect silencieusement avant de
 Si Shawn mentionne "visite faite" → changer_etape + ajouter_note + brouillon relance J+1
 Si Shawn mentionne "offre" ou "deal" → changer_etape + ajouter_note
 Si Shawn mentionne "pas intéressé" / "cause perdue" → marquer_perdu + ajouter_brevo
-Si Shawn mentionne "nouveau: [prénom] [tel/email]" → créer_deal immédiatement
+Si Shawn mentionne "nouveau: [prénom] [tel/email]" → creer_deal immédiatement
 
 QUICK ACTIONS (Shawn dicte, bot exécute):
 • "visite faite avec Marie" → changer_etape Marie→visite faite + note + brouillon relance
@@ -2457,7 +2457,7 @@ const TOOLS = [
   { name: 'marquer_perdu',      description: 'Marquer un deal comme perdu. Ex: "ça marche pas avec Jean", "cause perdue Tremblay".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
   { name: 'ajouter_note',       description: 'Ajouter une note sur un prospect dans Pipedrive.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, note: { type: 'string' } }, required: ['terme', 'note'] } },
   { name: 'stats_business',     description: 'Tableau de bord: pipeline par étape, performance du mois, taux de conversion.', input_schema: { type: 'object', properties: {} } },
-  { name: 'créer_deal',         description: 'Créer un nouveau prospect/deal dans Pipedrive. Utiliser quand Shawn dit "nouveau prospect: [info]" ou reçoit un lead.', input_schema: { type: 'object', properties: { prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, email: { type: 'string' }, type: { type: 'string', description: 'terrain, maison_usagee, maison_neuve, construction_neuve, auto_construction, plex' }, source: { type: 'string', description: 'centris, facebook, site_web, reference, appel' }, centris: { type: 'string', description: 'Numéro Centris si disponible' }, note: { type: 'string', description: 'Note initiale: besoin, secteur, budget, délai' } }, required: ['prenom'] } },
+  { name: 'creer_deal',         description: 'Créer un nouveau prospect/deal dans Pipedrive. Utiliser quand Shawn dit "nouveau prospect: [info]" ou reçoit un lead.', input_schema: { type: 'object', properties: { prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, email: { type: 'string' }, type: { type: 'string', description: 'terrain, maison_usagee, maison_neuve, construction_neuve, auto_construction, plex' }, source: { type: 'string', description: 'centris, facebook, site_web, reference, appel' }, centris: { type: 'string', description: 'Numéro Centris si disponible' }, note: { type: 'string', description: 'Note initiale: besoin, secteur, budget, délai' } }, required: ['prenom'] } },
   { name: 'planifier_visite',   description: 'Planifier une visite de propriété. Met à jour le deal → Visite prévue + crée activité Pipedrive + sauvegarde pour rappel matin.', input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Nom du prospect' }, date: { type: 'string', description: 'Date ISO (2024-05-10T14:00) ou approximation' }, adresse: { type: 'string', description: 'Adresse de la propriété (optionnel)' } }, required: ['prospect', 'date'] } },
   { name: 'voir_visites',      description: 'Voir les visites planifiées (aujourd\'hui + à venir). Pour "mes visites", "c\'est quoi aujourd\'hui".', input_schema: { type: 'object', properties: {} } },
   { name: 'changer_etape',          description: 'Changer l\'étape d\'un deal Pipedrive. Options: nouveau, contacté, discussion, visite prévue, visite faite, offre, gagné.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, etape: { type: 'string' } }, required: ['terme', 'etape'] } },
@@ -2515,7 +2515,7 @@ async function executeTool(name, input, chatId) {
       case 'marquer_perdu':        return await marquerPerdu(input.terme);
       case 'ajouter_note':         return await ajouterNote(input.terme, input.note);
       case 'stats_business':       return await statsBusiness();
-      case 'créer_deal':           return await creerDeal(input);
+      case 'creer_deal':           return await creerDeal(input);
       case 'planifier_visite':     return await planifierVisite(input);
       case 'voir_visites': {
         const visites = loadJSON(VISITES_FILE, []);
