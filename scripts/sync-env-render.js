@@ -117,7 +117,13 @@ const LOCAL_ONLY = new Set([
 
   const payload = localKeys.map(k => ({ key: k, value: local[k] }));
   await renderAPI('PUT', `/services/${SERVICE}/env-vars`, payload);
-  console.log(`✅ ${localKeys.length} env vars synchronisées. Render redéploie dans ~30s.`);
+  console.log(`✅ ${localKeys.length} env vars synchronisées.`);
+
+  // TRIGGER DEPLOY AUTO — Render ne redéploie PAS forcément après PUT env-vars
+  // via API. Sans ce trigger, le bot continue de tourner avec les ANCIENNES valeurs.
+  console.log('→ Triggering deploy manuel...');
+  const dep = await renderAPI('POST', `/services/${SERVICE}/deploys`, { clearCache: 'do_not_clear' });
+  console.log(`✅ Deploy ${dep?.id || ''} lancé — status: ${dep?.status || '?'} — live dans ~60-90s`);
 })().catch(e => {
   console.error(`❌ Erreur: ${e.message}`);
   process.exit(1);

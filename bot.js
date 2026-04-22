@@ -4488,6 +4488,43 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
 }
 
 // Stats poller (pour /health + debug P0)
+// ── Health check proactif Anthropic — ping Haiku léger toutes les 6h pour
+// détecter crédit bas / clé révoquée AVANT qu'un vrai appel échoue.
+// Si fail → alerte Telegram proactive avec action (déjà codée dans formatAPIError)
+async function anthropicHealthCheck() {
+  if (!API_KEY) return;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 5, messages: [{ role: 'user', content: 'ok' }] }),
+    });
+    clearTimeout(t);
+    if (!res.ok) {
+      const body = await res.text();
+      const err = { status: res.status, message: `${res.status} ${body.substring(0, 200)}` };
+      log('WARN', 'HEALTH', `Anthropic ping: ${err.message.substring(0, 120)}`);
+      // formatAPIError détecte credit/auth et alerte Telegram avec cooldown 30min
+      formatAPIError(err);
+      metrics.lastApiError = { at: new Date().toISOString(), status: res.status, message: err.message.substring(0, 300) };
+    } else {
+      log('OK', 'HEALTH', 'Anthropic OK (healthcheck Haiku)');
+      // Succès → effacer lastApiError si était credit/auth (problème résolu)
+      if (metrics.lastApiError && /credit|billing|authentication|invalid.*key/i.test(metrics.lastApiError.message || '')) {
+        log('OK', 'HEALTH', '🎉 Anthropic retour à la normale — clear lastApiError');
+        metrics.lastApiError = null;
+        if (ALLOWED_ID) {
+          bot.sendMessage(ALLOWED_ID, '✅ *Anthropic est de retour*\nLe bot a récupéré l\'accès Claude. Tout reprend normalement.', { parse_mode: 'Markdown' }).catch(() => {});
+        }
+      }
+    }
+  } catch (e) {
+    log('WARN', 'HEALTH', `Anthropic ping exception: ${e.message}`);
+  }
+}
+
 const pollerStats = {
   runs: 0,
   lastRun: null,
@@ -4767,6 +4804,19 @@ async function main() {
   setInterval(async () => {
     await loadDropboxStructure().catch(e => log('WARN', 'DROPBOX', `Refresh structure: ${e.message}`));
   }, 30 * 60 * 1000);
+
+  // ── Anthropic Health Check — ping Haiku pour détecter credit/auth problems
+  // avant qu'un vrai appel Claude échoue. Adaptive: 6h normal, 5min si down.
+  setTimeout(() => anthropicHealthCheck(), 30000); // 1er check 30s après boot
+  setInterval(() => {
+    const isDown = metrics.lastApiError &&
+      Date.now() - new Date(metrics.lastApiError.at).getTime() < 60 * 60 * 1000 &&
+      /credit|billing|authentication|invalid.*key/i.test(metrics.lastApiError.message || '');
+    // Si down → check toutes les 5min (détecte reprise rapide après recharge)
+    // Sinon → check toutes les 6h (pas de spam)
+    if (isDown) anthropicHealthCheck();
+  }, 5 * 60 * 1000); // tick 5min (fait le call seulement si down)
+  setInterval(() => anthropicHealthCheck(), 6 * 60 * 60 * 1000); // check propre 6h
 
   // ── Gmail Lead Poller — surveille les leads entrants ──────────────────────
   if (process.env.GMAIL_CLIENT_ID && POLLER_ENABLED) {
