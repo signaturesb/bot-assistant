@@ -1,4 +1,39 @@
-# SESSION LIVE — 2026-04-22 00:15
+# SESSION LIVE — 2026-04-22 13:20
+
+## 🔄 2026-04-22 PM — Roadmap du bot Telegram réconciliée avec l'état réel
+
+**Contexte:** Le bot Telegram a poussé sur `origin` (kira-bot) 3 docs utiles + une vieille version de `bot.js` (force push destructif basé sur `2b815d27`). Heureusement `bot-assistant/main` (= remote Render prod) était resté à jour à `c8b899d` — aucune interruption prod.
+
+**Action prise:**
+1. Récupéré les 3 docs utiles dans le working tree sans écraser le local:
+   - `INSTRUCTIONS_CLAUDE_CODE.md` — méta-instructions pour les sessions
+   - `ROADMAP_OPTIMISATION.md` — plan 6 phases
+   - `ANTI_DOUBLONS.md` — protocole Pipedrive/Gmail/Brevo
+2. Vérifié que Phase 1 complète de la roadmap était déjà implémentée (le bot Telegram n'avait pas cette info)
+3. Remis `origin` (kira-bot) d'aplomb avec la version complète du code — les commits auto `Activity/Sync/Boot` de la journée sont perdus (régénérés par runtime)
+
+**État Phase 1 roadmap vs code réel:**
+- 1.1 Polling crash → N/A (bot en **webhook** depuis `2afdc0f`, plus robuste)
+- 1.2 `/health` détaillé → ✅ ligne 4037 (subsystems + metrics + circuits + poller)
+- 1.3 CRASH_REPORT global → ✅ ligne 120-132 (uncaught + unhandled → GitHub)
+
+**État Phase 2-3 roadmap vs code réel:**
+- 2.1 Réveil matinal 7h → ✅ `rappelVisitesMatin()` ligne 3748
+- 2.2 Alerte leads chauds → ✅ Gmail Poller (scan 5min Centris/RE-MAX → deal + J+0)
+- 2.3 Détection deals refroidissants → ⚠️ À implémenter
+- 2.4 **Anti-doublons renforcé** → ⚠️ À implémenter — protocole dans `ANTI_DOUBLONS.md`, validation de Shawn avant changement `creer_deal`
+- 3.1 Token refresh auto → ✅ Dropbox 3h + Gmail null-safe + refresh on boot
+- 3.2 Retry/timeout → ⚠️ Partiel (à renforcer)
+- 3.3 Circuit breaker → ✅ `circuits{}` ligne 161 + ouvertures visibles `/health`
+
+**Prochaines étapes (validation Shawn requise):**
+- Phase 2.4 anti-doublons: refactor `creer_deal` avec `checkDuplicates()` (email → phone → fuzzy nom)
+- Phase 2.3 cron 6h scan Pipedrive deals stagnants
+- Phase 4.1 rapport hebdo dimanche 18h
+
+**Règle de sécurité git:** `bot-assistant/main` (Render) = vérité production. Ne jamais force-push dessus. `origin/main` (kira-bot) = dev, peut être resynché quand le bot diverge.
+
+---
 
 ## 🎯 RÉSOLU: startCommand Render pointait vers `index.js` inexistant!
 
