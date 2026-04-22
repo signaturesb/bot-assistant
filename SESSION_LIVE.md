@@ -91,10 +91,43 @@ avant que mon handler uncaughtException ait une chance de s'exécuter.
 3. Render SIGTERM inattendu pendant startup
 4. Limite mémoire 512MB du plan starter dépassée (pas probable)
 
-**Si ça fail encore après e012f23:**
-- Probable: c'est un problème spécifique node-telegram-bot-api sur Render
-- Solution: downgrade la librairie OU webhook au lieu de polling
-- OU: splitter en 2 services Render (un pour polling Telegram, un pour Centris/API)
+**Historique tentatives:**
+- cd92e0f: server.listen en Step 0 → ÉCHEC
+- e012f23: server.on('error') + polling non-throw → ÉCHEC  
+- 2641720: délai 10s avant startPolling (conflit token Render zero-downtime) → EN ATTENTE
+
+**Si 2641720 échoue aussi:**
+1. **Switch webhook Telegram** au lieu de polling (plus fiable en prod)
+   - `bot.setWebHook('https://signaturesb-bot-s272.onrender.com/webhook/telegram')`
+   - Ajouter handler POST /webhook/telegram
+   - Retirer `bot.startPolling()`
+2. **Downgrade node-telegram-bot-api** à version plus stable (0.61.0 peut-être)
+3. **Splitter en 2 services Render** (un polling, un HTTP/API)
+
+## 📋 Tout le travail mémorisé
+
+Commits de cette session:
+- bfdd042: mémoriser bug mystérieux Render
+- 2641720: délai 10s avant polling
+- e012f23: server error handler + polling non-throw
+- cd92e0f: server.listen Step 0
+- b084701: système auto-diagnostic GitHub
+- bd1ab88: logging verbose chaque étape
+- 2f164df: fix polling crash process.exit
+- c524195: metrics + circuits + /health + webhook GitHub
+- 776e3f3: sync bidirectionnelle Mac ↔ bot
+- a8348e5: mémoire 3-niveaux (SESSION_LIVE.md)
+- ec30aac: validation messages + rate limit + erreurs propres
+- 46751a0: J+1/J+3/J+7 sur glace
+- cf2b8bd: webhooks intelligents + mobile + historique_contact
+- 6dae7eb: Pipedrive complet (voir_prospect_complet, stagnants)
+- 3ff000c: AGENT_CONFIG SaaS + Dropbox profond
+- 22de937: 12 bugs critiques (processed Map, races, photo timeout)
+- ca8de20: Opus 4.7 vision + thinking + 16k tokens
+- 4bf2fa3: Opus 4.7 + Dropbox fix + mailing-masse
+
+Reprise session garantie: lire ce fichier + CLAUDE.md + ÉTAT_SYSTÈME.md.
+Mémoire Claude Code dans /Users/signaturesb/.claude/projects/.../memory/
 
 ## 🔑 Accès Centris courtier (Shawn confirme)
 
