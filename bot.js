@@ -3292,26 +3292,8 @@ function registerHandlers() {
     }
   });
 
-  // ─── Gestion polling errors (RÉSILIENT — pas de process.exit) ──────────────
-  // JAMAIS process.exit sur polling errors — Render tue le deploy et crash loop
-  // Les 404 arrivent pendant les redéploiements (2 instances partagent le token)
-  // Solution: laisser node-telegram-bot-api retry automatiquement, juste logger
-  let pollingErrors = 0;
-  let lastPollError = 0;
-  bot.on('polling_error', err => {
-    const now = Date.now();
-    pollingErrors++;
-    // Log seulement toutes les 10s pour ne pas spammer
-    if (now - lastPollError > 10000) {
-      log('ERR', 'POLL', `#${pollingErrors}: ${err.message.substring(0, 100)}`);
-      lastPollError = now;
-    }
-    // Si 50+ erreurs consécutives ET token invalide, log critique mais pas exit
-    if (pollingErrors === 50) {
-      log('ERR', 'POLL', `50 erreurs consécutives — token peut-être invalide. Render redémarrera si health check échoue.`);
-    }
-  });
-  bot.on('message', () => { pollingErrors = 0; lastPollError = 0; });
+  // Mode webhook — pas de polling errors à gérer (bot.processUpdate reçoit les messages)
+  bot.on('webhook_error', err => log('WARN', 'TG', `Webhook: ${err.message}`));
 }
 
 // ─── Tâches quotidiennes (sans node-cron) ─────────────────────────────────────
@@ -3669,6 +3651,20 @@ const server = http.createServer((req, res) => {
   }
 
   // ── GitHub webhook — sync instant au lieu de polling 30min ────────────────
+  // ── Webhook Telegram (remplace polling — plus fiable en production) ──────
+  if (req.method === 'POST' && url === '/webhook/telegram') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 100000) req.destroy(); });
+    req.on('end', () => {
+      res.writeHead(200); res.end('ok');
+      try {
+        const update = JSON.parse(body || '{}');
+        bot.processUpdate(update);
+      } catch (e) { log('WARN', 'TG', `processUpdate: ${e.message}`); }
+    });
+    return;
+  }
+
   if (req.method === 'POST' && url === '/webhook/github') {
     let body = '';
     req.on('data', chunk => { body += chunk; if (body.length > 100000) req.destroy(); });
@@ -4010,14 +4006,16 @@ async function main() {
   log('INFO', 'BOOT', 'Step 7: startDailyTasks');
   try { startDailyTasks(); } catch (e) { log('ERR', 'BOOT', `startDailyTasks FATAL: ${e.message}`); throw e; }
 
-  log('INFO', 'BOOT', 'Step 8: startPolling Telegram — DÉLAI 10s pour laisser ancienne instance Render libérer le token');
-  // Délai pour éviter le conflict de token quand Render fait zero-downtime deploy
-  setTimeout(() => {
+  log('INFO', 'BOOT', 'Step 8: configuration WEBHOOK Telegram (au lieu de polling — production-grade)');
+  // WEBHOOK mode au lieu de polling: Telegram push les updates sur notre endpoint HTTPS
+  // Plus robuste, pas de conflict d'instances, pas de polling errors
+  const webhookUrl = `https://signaturesb-bot-s272.onrender.com/webhook/telegram`;
+  setTimeout(async () => {
     try {
-      bot.startPolling({ interval: 3000, autoStart: true, params: { timeout: 10 } });
-      log('OK', 'BOOT', 'Polling Telegram démarré (après délai 10s)');
-    } catch (e) { log('ERR', 'BOOT', `startPolling (non-fatal): ${e.message}`); }
-  }, 10000);
+      await bot.setWebHook(webhookUrl);
+      log('OK', 'BOOT', `Webhook Telegram configuré: ${webhookUrl}`);
+    } catch (e) { log('ERR', 'BOOT', `setWebHook (non-fatal): ${e.message}`); }
+  }, 5000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
