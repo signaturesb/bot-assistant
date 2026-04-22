@@ -635,9 +635,18 @@ function formatAPIError(err) {
   const status = err?.status || err?.response?.status;
   const msg    = err?.message || String(err);
   if (status === 400) {
+    // Tool name invalide (accents, caractères spéciaux) — erreur admin
+    const toolMatch = msg.match(/tools\.(\d+)\.custom\.name.*?pattern/);
+    if (toolMatch) {
+      const idx = parseInt(toolMatch[1]);
+      return `🚨 Config bot cassée — tool #${idx} a un nom invalide (regex [a-zA-Z0-9_-] violée). Admin: check logs.`;
+    }
     if (msg.includes('prefill') || msg.includes('prepend')) return '⚠️ Conversation corrompue — tape /reset puis réessaie.';
     if (msg.includes('max_tokens')) return '⚠️ Requête trop longue — simplifie ou /reset.';
-    return '⚠️ Requête invalide — /reset pour repartir à neuf.';
+    if (msg.includes('temperature') || msg.includes('top_p') || msg.includes('top_k')) {
+      return '🚨 Config bot cassée — temperature/top_p/top_k rejetés par Opus 4.7. Admin: retirer ces params.';
+    }
+    return `⚠️ Requête invalide — /reset pour repartir à neuf. (${msg.substring(0, 80)})`;
   }
   if (status === 401) return '🔑 Clé API Claude invalide ou expirée.';
   if (status === 403) return '🚫 Accès refusé.';
@@ -4020,6 +4029,31 @@ async function main() {
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
   setTimeout(() => syncStatusGitHub().catch(() => {}), 30000);
+
+  // ── PRE-FLIGHT Claude API — détecte tool invalide dès le boot ─────────────
+  setTimeout(async () => {
+    try {
+      await claude.messages.create({
+        model: currentModel, max_tokens: 10,
+        tools: TOOLS_WITH_CACHE,
+        messages: [{ role: 'user', content: 'ping' }]
+      });
+      log('OK', 'PREFLIGHT', `✅ Claude API accepte les ${TOOLS.length} tools`);
+    } catch (e) {
+      const msg = e.message || '';
+      const badIdx = msg.match(/tools\.(\d+)\.custom\.name/);
+      if (badIdx) {
+        const badTool = TOOLS[parseInt(badIdx[1])]?.name || '?';
+        log('ERR', 'PREFLIGHT', `🚨 TOOL REJETÉ: "${badTool}" — regex [a-zA-Z0-9_-] violée`);
+        if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🚨 *BOT EN PANNE*\nTool "${badTool}" invalide pour ${currentModel}.\nFix immédiat requis — accent ou caractère spécial dans le nom.`, { parse_mode: 'Markdown' }).catch(()=>{});
+      } else if (e.status === 400) {
+        log('ERR', 'PREFLIGHT', `🚨 API 400: ${msg.substring(0, 200)}`);
+        if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🚨 *Claude API 400*\n${msg.substring(0, 200)}`, { parse_mode: 'Markdown' }).catch(()=>{});
+      } else {
+        log('WARN', 'PREFLIGHT', `API test: ${msg.substring(0, 150)}`);
+      }
+    }
+  }, 3000);
 
   // Rapport de boot réussi — Claude Code peut voir que le bot a bien démarré
   setTimeout(async () => {
