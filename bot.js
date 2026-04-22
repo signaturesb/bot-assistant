@@ -138,6 +138,7 @@ const MEM_FILE        = path.join(DATA_DIR, 'memory.json');
 const GIST_ID_FILE    = path.join(DATA_DIR, 'gist_id.txt');
 const VISITES_FILE    = path.join(DATA_DIR, 'visites.json');
 const POLLER_FILE     = path.join(DATA_DIR, 'gmail_poller.json');
+const AUTOENVOI_FILE  = path.join(DATA_DIR, 'autoenvoi_state.json');
 
 // ─── Observabilité: Metrics + Circuit Breakers (fine pointe) ──────────────────
 const metrics = {
@@ -1485,35 +1486,203 @@ async function chercherListingDropbox(terme) {
   return `🔍 *Listings "${terme}":*\n\n${details.join('\n\n')}`;
 }
 
-async function envoyerDocsProspect(terme, emailDest, fichier) {
+// ═══════════════════════════════════════════════════════════════════════════
+// MATCHING DROPBOX AVANCÉ — 4 stratégies en cascade avec score de confiance
+// ═══════════════════════════════════════════════════════════════════════════
+function _normalizeAddr(s) {
+  if (!s) return '';
+  return s.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .replace(/\b(rue|chemin|ch|avenue|av|boulevard|boul|route|rte|rang|rg|montee|place|pl)\b/g, '')
+    .replace(/\b(qc|quebec|canada)\b/g, '')
+    .replace(/\b[a-z]\d[a-z]\s?\d[a-z]\d\b/g, '') // code postal
+    .replace(/[,.;()]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function _addrTokens(s) {
+  const n = _normalizeAddr(s);
+  const numMatch = n.match(/\b(\d{1,6})\b/);
+  const numero = numMatch ? numMatch[1] : '';
+  const mots = n.split(/\s+/).filter(w => w && w.length > 2 && !/^\d+$/.test(w));
+  return { numero, mots: new Set(mots), raw: n };
+}
+
+async function matchDropboxAvance(centris, adresse) {
+  let dossiers = dropboxTerrains;
+  if (!dossiers.length) { await loadDropboxStructure(); dossiers = dropboxTerrains; }
+  if (!dossiers.length) return { folder: null, score: 0, strategy: 'no_folders', pdfs: [], candidates: [] };
+
+  // STRATÉGIE 1 — Match exact par # Centris (confidence 100)
+  if (centris) {
+    const hit = dossiers.find(d => d.centris && d.centris === String(centris).trim());
+    if (hit) {
+      const pdfs = await _listFolderPDFs(hit);
+      return { folder: hit, score: 100, strategy: 'centris_exact', pdfs, candidates: [{ folder: hit, score: 100 }] };
+    }
+  }
+
+  // STRATÉGIE 2 — Fuzzy adresse normalisée (score 0-95)
+  const scored = [];
+  if (adresse) {
+    const q = _addrTokens(adresse);
+    for (const d of dossiers) {
+      const t = _addrTokens(d.adresse || d.name);
+      let score = 0;
+      if (q.numero && t.numero && q.numero === t.numero) score += 50;
+      if (q.mots.size && t.mots.size) {
+        const inter = [...q.mots].filter(m => t.mots.has(m)).length;
+        const union = new Set([...q.mots, ...t.mots]).size;
+        score += Math.round(45 * (inter / Math.max(1, union))); // Jaccard
+      }
+      if (score > 0) scored.push({ folder: d, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+  }
+  const topCandidates = scored.slice(0, 3);
+  const best = scored[0];
+
+  // STRATÉGIE 3 — Filename scan pour Centris# (confidence 85)
+  if (centris && (!best || best.score < 70)) {
+    for (const d of dossiers.slice(0, 50)) { // limite pour ne pas scanner 500 dossiers
+      const pdfs = await _listFolderPDFs(d);
+      if (pdfs.some(p => p.name.includes(String(centris)))) {
+        return { folder: d, score: 85, strategy: 'filename_centris', pdfs, candidates: [{ folder: d, score: 85 }] };
+      }
+    }
+  }
+
+  // STRATÉGIE 4 — Substring fallback (confidence 50-70)
+  if ((!best || best.score < 50) && adresse) {
+    const q = adresse.toLowerCase().split(/[\s,]+/).filter(w => w.length > 3)[0];
+    if (q) {
+      const hit = dossiers.find(d => (d.name + ' ' + d.adresse).toLowerCase().includes(q));
+      if (hit) {
+        const pdfs = await _listFolderPDFs(hit);
+        return { folder: hit, score: 55, strategy: 'substring', pdfs, candidates: [{ folder: hit, score: 55 }] };
+      }
+    }
+  }
+
+  if (best && best.score >= 60) {
+    const pdfs = await _listFolderPDFs(best.folder);
+    return { folder: best.folder, score: best.score, strategy: 'fuzzy_addr', pdfs, candidates: topCandidates };
+  }
+
+  return { folder: null, score: best?.score || 0, strategy: 'no_match', pdfs: [], candidates: topCandidates };
+}
+
+async function _listFolderPDFs(folder) {
+  try {
+    const r = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: false });
+    if (!r?.ok) return [];
+    return ((await r.json()).entries || []).filter(x => x.name.toLowerCase().endsWith('.pdf'));
+  } catch { return []; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTO-ENVOI DOCS — garantie livraison avec retry + anti-doublon + tracking
+// ═══════════════════════════════════════════════════════════════════════════
+let autoEnvoiState = loadJSON(AUTOENVOI_FILE, { sent: {}, log: [], totalAuto: 0, totalFails: 0 });
+
+async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
+  const dedupKey = `${email}|${centris || match?.folder?.centris || ''}`;
+  const last = autoEnvoiState.sent[dedupKey];
+  if (last && (Date.now() - last) < 24 * 3600 * 1000) {
+    return { sent: false, skipped: true, reason: 'déjà envoyé <24h', match };
+  }
+
+  if (!match.folder || match.score < 90 || !match.pdfs?.length) {
+    return { sent: false, skipped: true, reason: `score ${match.score} < 90 ou 0 PDF`, match };
+  }
+
+  const maxRetries = 3;
+  const delays = [0, 30000, 120000]; // 0s, 30s, 2min
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (delays[attempt]) await new Promise(r => setTimeout(r, delays[attempt]));
+    try {
+      const t0 = Date.now();
+      const result = await envoyerDocsProspect(nom || email, email, null, {
+        dealHint: deal,
+        folderHint: match.folder,
+        centrisHint: centris,
+      });
+      const ms = Date.now() - t0;
+
+      if (typeof result === 'string' && result.startsWith('✅')) {
+        autoEnvoiState.sent[dedupKey] = Date.now();
+        autoEnvoiState.log.unshift({
+          timestamp: Date.now(), email, nom, centris,
+          folder: match.folder.name, score: match.score, strategy: match.strategy,
+          pdfsCount: match.pdfs.length, deliveryMs: ms, attempt: attempt + 1, success: true,
+        });
+        autoEnvoiState.log = autoEnvoiState.log.slice(0, 100); // garder 100 dernières
+        autoEnvoiState.totalAuto = (autoEnvoiState.totalAuto || 0) + 1;
+        saveJSON(AUTOENVOI_FILE, autoEnvoiState);
+        log('OK', 'AUTOENVOI', `${email} <- ${match.pdfs.length} PDFs (${match.strategy}, score ${match.score}, ${ms}ms, try ${attempt + 1})`);
+        return { sent: true, match, deliveryMs: ms, attempt: attempt + 1, resultStr: result };
+      }
+      lastError = result;
+      log('WARN', 'AUTOENVOI', `Tentative ${attempt + 1}/${maxRetries} échouée: ${String(result).substring(0, 100)}`);
+    } catch (e) {
+      lastError = e.message;
+      log('WARN', 'AUTOENVOI', `Tentative ${attempt + 1}/${maxRetries} exception: ${e.message}`);
+    }
+  }
+
+  autoEnvoiState.log.unshift({
+    timestamp: Date.now(), email, nom, centris,
+    folder: match.folder?.name, score: match.score,
+    error: String(lastError).substring(0, 200), success: false, attempts: maxRetries,
+  });
+  autoEnvoiState.log = autoEnvoiState.log.slice(0, 100);
+  autoEnvoiState.totalFails = (autoEnvoiState.totalFails || 0) + 1;
+  saveJSON(AUTOENVOI_FILE, autoEnvoiState);
+
+  // Alerte Telegram critique + note Pipedrive
+  if (dealId) {
+    await pdPost('/notes', { deal_id: dealId, content: `⚠️ Auto-envoi docs ÉCHOUÉ après 3 tentatives: ${String(lastError).substring(0, 200)}` }).catch(() => null);
+  }
+  return { sent: false, error: lastError, match, attempts: maxRetries };
+}
+
+async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
 
-  // 1. Chercher deal dans Pipedrive
-  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
-  const deals = sr?.data?.items || [];
-  if (!deals.length) return `Aucun deal "${terme}" — crée-le d'abord.`;
-  const deal = deals[0].item;
-  const centris = deal[PD_FIELD_CENTRIS] || '';
+  // 1. Chercher deal — ou utiliser hint si fourni (auto-envoi)
+  let deal;
+  if (opts.dealHint) {
+    deal = opts.dealHint;
+  } else {
+    const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+    const deals = sr?.data?.items || [];
+    if (!deals.length) return `Aucun deal "${terme}" — crée-le d'abord.`;
+    deal = deals[0].item;
+  }
+  const centris = deal[PD_FIELD_CENTRIS] || opts.centrisHint || '';
 
-  // 2. Email destination: fourni en param ou chercher dans Pipedrive
+  // 2. Email destination
   let toEmail = emailDest || '';
   if (!toEmail && deal.person_id) {
     const p = await pdGet(`/persons/${deal.person_id}`);
     toEmail = p?.data?.email?.find(e => e.primary)?.value || p?.data?.email?.[0]?.value || '';
   }
 
-  // 3. Trouver dossier Dropbox (Centris en priorité, puis nom)
-  let dossiers = dropboxTerrains;
-  if (!dossiers.length) { await loadDropboxStructure(); dossiers = dropboxTerrains; }
-
-  let folder = centris ? dossiers.find(d => d.centris === centris) : null;
+  // 3. Dossier Dropbox — folder hint (auto) ou recherche
+  let folder = opts.folderHint || null;
   if (!folder) {
-    const q = terme.toLowerCase().split(/\s+/)[0];
-    folder = dossiers.find(d => d.name.toLowerCase().includes(q) || d.adresse.toLowerCase().includes(q));
-  }
-  if (!folder) {
-    const avail = dossiers.slice(0, 5).map(d => d.adresse || d.name).join(', ');
-    return `❌ Aucun dossier Dropbox pour "${deal.title}"${centris ? ` (#${centris})` : ''}.\nDisponible: ${avail}`;
+    let dossiers = dropboxTerrains;
+    if (!dossiers.length) { await loadDropboxStructure(); dossiers = dropboxTerrains; }
+    folder = centris ? dossiers.find(d => d.centris === centris) : null;
+    if (!folder) {
+      const q = terme.toLowerCase().split(/\s+/)[0];
+      folder = dossiers.find(d => d.name.toLowerCase().includes(q) || d.adresse.toLowerCase().includes(q));
+    }
+    if (!folder) {
+      const avail = dossiers.slice(0, 5).map(d => d.adresse || d.name).join(', ');
+      return `❌ Aucun dossier Dropbox pour "${deal.title}"${centris ? ` (#${centris})` : ''}.\nDisponible: ${avail}`;
+    }
   }
 
   // 4. Lister les PDFs
@@ -3230,6 +3399,27 @@ function registerHandlers() {
     );
   });
 
+  bot.onText(/\/autoenvoi/, msg => {
+    if (!isAllowed(msg)) return;
+    const total   = autoEnvoiState.totalAuto || 0;
+    const fails   = autoEnvoiState.totalFails || 0;
+    const rate    = (total + fails) > 0 ? Math.round(100 * total / (total + fails)) : 0;
+    const recent  = (autoEnvoiState.log || []).slice(0, 5);
+    const avgMs   = recent.filter(l => l.success).reduce((s, l, _, a) => s + (l.deliveryMs || 0) / (a.length || 1), 0);
+    let txt = `🚀 *Auto-envoi docs*\n\n`;
+    txt += `Succès: ${total} · Échecs: ${fails} · Taux: ${rate}%\n`;
+    txt += `Temps moyen: ${Math.round(avgMs / 1000)}s\n\n`;
+    txt += `*5 derniers:*\n`;
+    if (!recent.length) txt += '_(aucun auto-envoi encore)_';
+    else txt += recent.map(l => {
+      const when = new Date(l.timestamp).toLocaleString('fr-CA', { timeZone:'America/Toronto', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+      return l.success
+        ? `✅ ${when} — ${l.email} · ${l.pdfsCount}PDFs · ${l.strategy}(${l.score}) · ${Math.round(l.deliveryMs/1000)}s`
+        : `❌ ${when} — ${l.email} · ${String(l.error).substring(0, 60)}`;
+    }).join('\n');
+    bot.sendMessage(msg.chat.id, txt, { parse_mode: 'Markdown' });
+  });
+
   bot.onText(/\/pipeline/, async msg => {
     if (!isAllowed(msg)) return;
     const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
@@ -4019,19 +4209,42 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
     } catch (e) { dealTxt = `⚠️ Deal: ${e.message.substring(0, 80)}`; }
   }
 
-  // 2. Chercher les docs Dropbox et préparer J+0
-  let docsTxt   = '';
+  // 2. Matching Dropbox AVANCÉ (4 stratégies) + auto-envoi si score ≥90
+  let docsTxt = '';
   let j0Brouillon = null;
+  let autoEnvoiMsg = '';
 
-  // Trouver le dossier listing
+  let dbxMatch = null;
   if (centris || adresse) {
-    const searchTerm = centris || (adresse?.split(',')[0]?.trim()) || '';
-    if (searchTerm) {
-      try {
-        const docsInfo = await chercherListingDropbox(searchTerm);
-        if (!docsInfo.includes('Aucun')) docsTxt = `📁 Docs trouvés: ${docsInfo.substring(0, 150)}`;
-      } catch {}
-    }
+    try { dbxMatch = await matchDropboxAvance(centris, adresse); } catch (e) { log('WARN', 'POLLER', `Match: ${e.message}`); }
+  }
+
+  if (dbxMatch?.folder) {
+    docsTxt = `📁 Match Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}* (${dbxMatch.strategy}, score ${dbxMatch.score}, ${dbxMatch.pdfs.length} PDF${dbxMatch.pdfs.length > 1 ? 's' : ''})`;
+  } else if (dbxMatch?.candidates?.length) {
+    docsTxt = `📁 Candidats Dropbox: ${dbxMatch.candidates.map(c => `${c.folder.adresse || c.folder.name} (${c.score})`).join(', ')}`;
+  }
+
+  // AUTO-ENVOI si toutes conditions: email + deal créé + match ≥90 + PDFs présents
+  let dealFullObj = null;
+  if (dealId) {
+    try { dealFullObj = (await pdGet(`/deals/${dealId}`))?.data; } catch {}
+  }
+  if (email && dealFullObj && dbxMatch?.folder && dbxMatch.score >= 90 && dbxMatch.pdfs.length > 0) {
+    try {
+      const autoRes = await envoyerDocsAuto({
+        email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch,
+      });
+      if (autoRes.sent) {
+        autoEnvoiMsg = `\n🚀 *Docs envoyés automatiquement* à ${email}\n   ${dbxMatch.pdfs.length} PDFs · score ${dbxMatch.score} · livré en ${Math.round(autoRes.deliveryMs / 1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
+      } else if (autoRes.skipped) {
+        autoEnvoiMsg = `\n⏭ Auto-envoi skip: ${autoRes.reason}`;
+      } else {
+        autoEnvoiMsg = `\n⚠️ *Auto-envoi ÉCHOUÉ après ${autoRes.attempts} tentatives*: ${String(autoRes.error).substring(0, 120)}\n   Envoie manuellement: "envoie les docs à ${email}"`;
+      }
+    } catch (e) { autoEnvoiMsg = `\n⚠️ Auto-envoi exception: ${e.message.substring(0, 100)}`; }
+  } else if (email && dbxMatch?.folder && dbxMatch.score >= 70) {
+    autoEnvoiMsg = `\n🤔 Match ambigü (score ${dbxMatch.score}) — dis *"envoie les docs à ${email}"* pour confirmer`;
   }
 
   // Préparer brouillon J+0
@@ -4058,6 +4271,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   if (centris)   msg += `🏡 Centris #${centris}\n`;
   msg += `\n${dealTxt || '⚠️ Pipedrive non configuré'}\n`;
   if (docsTxt) msg += `\n${docsTxt}\n`;
+  if (autoEnvoiMsg) msg += autoEnvoiMsg;
   if (j0Brouillon) {
     msg += `\n📧 *Brouillon J+0 prêt* — dis *"envoie"* pour l'envoyer à ${email}`;
   } else if (!email) {
