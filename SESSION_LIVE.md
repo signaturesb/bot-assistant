@@ -29,6 +29,24 @@ Mais notre fichier est `bot.js` (package.json main: bot.js)
 Toujours vérifier la config Render `startCommand` si deploy fail sans logs.
 Commande: `curl GET /v1/services/{id}` → vérifier `serviceDetails.envSpecificDetails.startCommand`
 
+## 🎯 RÉSOLU #2: Tool 'créer_deal' avec accent (Opus 4.7 rejette)
+
+**Symptôme (2026-04-22 00:20):** Tous les messages Telegram → bot répond "Requête invalide"
+Metrics: 12 messages → 12 erreurs 400 (byStatus.400: 12)
+
+**Cause exacte:** Opus 4.7 valide les noms de tools avec regex:
+`^[a-zA-Z0-9_-]{1,128}$`
+
+Le "é" dans `créer_deal` fait rejeter TOUT le payload (pas juste le tool).
+L'erreur API: `tools.5.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'`
+
+**Fix (commit d50e129):** renommé `créer_deal` → `creer_deal` (4 occurrences).
+
+**RÈGLE PERMANENTE pour Opus 4.7:**
+- ❌ AUCUN accent dans les noms de tools
+- ❌ Pas de temperature/top_p/top_k non-default
+- ✅ Le reste = compatible Claude API standard
+
 ---
 
 ## 🚨 ANCIENNE SECTION — BUG CRITIQUE (conservée pour historique)
