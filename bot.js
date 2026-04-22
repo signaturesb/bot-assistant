@@ -1632,7 +1632,14 @@ async function envoyerDocsProspect(terme, emailDest, fichier) {
       SOURCES:            `${AGENT.nom} · ${AGENT.compagnie} · ${dateMois}`,
       DESINSCRIPTION_URL: '',
     });
-    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos)`);
+
+    // Retirer les sections inutiles pour un email de docs (garder header, hero, intro, CTA, footer avec logos)
+    // Supprime: SECTION 01, HERO STAT, TABLEAU, SECTION 02, CITATION
+    htmlFinal = htmlFinal.replace(
+      /<!-- ══ SÉPARATEUR ══ -->[\s\S]*?<!-- ══ SÉPARATEUR ══ -->\s*<!-- ══ CTA PRINCIPAL ══ -->/,
+      '<!-- ══ CTA PRINCIPAL ══ -->'
+    );
+    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées`);
   } else {
     // Fallback HTML inline brandé si Dropbox template indisponible
     htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
