@@ -17,7 +17,9 @@ const PD_KEY      = process.env.PIPEDRIVE_API_KEY || '';
 const BREVO_KEY   = process.env.BREVO_API_KEY || '';
 const SHAWN_EMAIL = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
 const JULIE_EMAIL = process.env.JULIE_EMAIL || 'julie@signaturesb.com';
-let   currentModel = process.env.MODEL || 'claude-opus-4-7';
+// Default Sonnet 4.6 — 5x moins cher qu'Opus pour 95% de la qualité sur ce use case.
+// Shawn peut switch à la volée via /opus (deep reasoning) ou /haiku (rapide, ultra-économique).
+let   currentModel = process.env.MODEL || 'claude-sonnet-4-6';
 
 // ─── AGENT_CONFIG — Foundation SaaS multi-courtier ───────────────────────────
 // Toutes les valeurs courtier-spécifiques ici. Pour un autre courtier: changer les env vars.
@@ -569,10 +571,10 @@ RAPPORT EMAIL:
 VILLES: Rawdon, Sainte-Julienne, Chertsey, Saint-Didace, Sainte-Marcelline, Saint-Jean-de-Matha, Saint-Calixte, Joliette, Repentigny, Montréal, Laval...
 TYPES: terrain, maison, plex, duplex, triplex, condo, bungalow
 
-════ CAPACITÉS OPUS 4.7 ════
-Tu es claude-opus-4-7. Utilise tes capacités au maximum:
+════ CAPACITÉS ════
+Tu es Kira, assistante de Shawn. Utilise toutes tes capacités:
 • Vision native: analyse photos et PDFs directement — pas besoin d'outil intermédiaire
-• Raisonnement profond: /penser active 10k tokens de réflexion — pour stratégie, prix, négociation
+• Raisonnement: /penser pour réflexion profonde (stratégie, prix, négociation)
 • Contexte long: tu retiens toute la conversation — référence les échanges précédents
 • Outils parallèles: quand plusieurs outils peuvent tourner en même temps, ils tournent en même temps
 • Décision directe: déduis l'action la plus probable et exécute — demande confirmation seulement pour actions irréversibles (envoi email, marquer perdu)
@@ -3382,7 +3384,7 @@ function registerHandlers() {
     const dbxOk        = !!(dropboxToken && process.env.DROPBOX_REFRESH_TOKEN);
     const pollerLast   = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun).toLocaleTimeString('fr-CA', { hour:'2-digit', minute:'2-digit', timeZone:'America/Toronto' }) : 'jamais';
     bot.sendMessage(msg.chat.id,
-      `✅ *Kira — Opus 4.7 — ${TOOLS.length} outils*\nModèle: \`${currentModel}\` ${thinkingMode?'🧠 think':'⚡'}\nUptime: ${uptime}min | Mémos: ${kiramem.facts.length}\n\nPipedrive: ${PD_KEY?'✅':'❌'} | Brevo: ${BREVO_KEY?'✅':'❌'}\nGmail: ${gmailOk?'✅':'⚠️'} | Dropbox: ${dbxOk?'✅':'❌'}\nCentris agent: ${centrisOk?`✅ (${process.env.CENTRIS_USER})`:'⏳ à connecter'}\nWhisper: ${whisperOk?'✅':'⚠️ OPENAI_API_KEY manquant'}\nPoller: ${gmailOk?`✅ dernier: ${pollerLast} (${gmailPollerState.totalLeads||0} leads)`:'❌'}\nGist: ${gistId?'✅':'⚠️ /tmp'}`,
+      `✅ *Kira — ${currentModel.replace('claude-','')} — ${TOOLS.length} outils*\n${thinkingMode?'🧠 think':'⚡ rapide'} | Uptime: ${uptime}min | Mémos: ${kiramem.facts.length}\n\nPipedrive: ${PD_KEY?'✅':'❌'} | Brevo: ${BREVO_KEY?'✅':'❌'}\nGmail: ${gmailOk?'✅':'⚠️'} | Dropbox: ${dbxOk?'✅':'❌'}\nCentris: ${centrisOk?`✅ (${process.env.CENTRIS_USER})`:'⏳'}\nWhisper: ${whisperOk?'✅':'⚠️ OPENAI manquant'}\nPoller: ${gmailOk?`✅ ${pollerLast} (${gmailPollerState.totalLeads||0} leads)`:'❌'}\nGist: ${gistId?'✅':'⚠️'}\n\n/opus pour raisonnement profond · /haiku pour ultra-rapide`,
       { parse_mode: 'Markdown' }
     );
   });
