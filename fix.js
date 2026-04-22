@@ -8,11 +8,16 @@ const https = require('https');
 const fs = require('fs');
 const { execSync } = require('child_process');
 
+require('dotenv').config();
 const creds = {
-  RENDER_API: 'REDACTED_RENDER_API_KEY',
-  RENDER_SERVICE: 'srv-d7fh9777f7vs73a15ddg',
-  BOT_URL: 'https://signaturesb-bot-s272.onrender.com',
+  RENDER_API:     process.env.RENDER_API_KEY || '',
+  RENDER_SERVICE: process.env.RENDER_SERVICE_ID || 'srv-d7fh9777f7vs73a15ddg',
+  BOT_URL:        process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com',
 };
+if (!creds.RENDER_API) {
+  console.error('❌ RENDER_API_KEY manquant dans .env');
+  process.exit(1);
+}
 
 async function fetch(url, opts = {}) {
   return new Promise((res, rej) => {
@@ -91,8 +96,8 @@ const fixes = {
 
   async 'test-centris'() {
     console.log('🔐 Test login Centris agent...');
-    const user = '110509', pass = 'REDACTED_PASSWORD';
-    // Faire un test de login basique
+    const user = process.env.CENTRIS_USER, pass = process.env.CENTRIS_PASS;
+    if (!user || !pass) return console.error('❌ CENTRIS_USER/CENTRIS_PASS manquants dans .env');
     console.log(`User: ${user} | Tester via Telegram: /centris`);
   },
 

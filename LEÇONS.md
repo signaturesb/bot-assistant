@@ -132,20 +132,18 @@ Si fail → alerte Telegram instantanée avec le tool fautif.
 
 ---
 
-## 🔑 Credentials critiques (dans Render)
+## 🔑 Credentials critiques (dans Render — **jamais en clair dans le repo**)
 
-- `TELEGRAM_BOT_TOKEN` — 8661968303:AAGIe9nDJ...
-- `TELEGRAM_ALLOWED_USER_ID` — 5261213272
-- `ANTHROPIC_API_KEY` — sk-ant-api03-HN8hEdIO...
-- `PIPEDRIVE_API_KEY` — REDACTED_PIPEDRIVE_KEY
-- `BREVO_API_KEY` — xkeysib-0dbb68bc...
+- `TELEGRAM_BOT_TOKEN` · `TELEGRAM_ALLOWED_USER_ID`
+- `ANTHROPIC_API_KEY` · `PIPEDRIVE_API_KEY` · `BREVO_API_KEY`
 - `GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN` — OAuth Gmail
 - `DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN/ACCESS_TOKEN` — OAuth Dropbox
-- `GITHUB_TOKEN` — REDACTED_GITHUB_TOKEN... (pour sync BOT_STATUS, webhook)
-- `CENTRIS_USER=110509` + `CENTRIS_PASS=REDACTED_PASSWORD` — agent Centris
-- `SIRF_USER=57K0426` + `SIRF_PASS=REDACTED_PASSWORD` — Registre foncier
-- `GIST_ID=a9a1a92fef67d6d3d7bddeaed5359f44` — mémoire persistante
+- `GITHUB_TOKEN` — sync BOT_STATUS, webhook
+- `CENTRIS_USER` + `CENTRIS_PASS` — agent Centris
+- `SIRF_USER` + `SIRF_PASS` — Registre foncier
+- `GIST_ID` — mémoire persistante
 - `WEBHOOK_SECRET` — pour webhooks Make.com
+- `RENDER_API_KEY` + `RENDER_SERVICE_ID` — pour diagnose.js / fix.js
 
 **Manquants optionnels:**
 - `OPENAI_API_KEY` — pour Whisper (transcription vocaux). Non critique.

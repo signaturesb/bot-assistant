@@ -226,9 +226,9 @@ Shawn a deux façons d'accéder aux données pro:
 1. **Prospect Mobile** (iPhone app) — agent version, full data comparables + actifs
 2. **Centris.ca Zone Courtier** (web) — même login agent, accès desktop
 
-Credentials partagés pour les deux:
-- User: `110509`
-- Pass: `REDACTED_PASSWORD`
+Credentials partagés pour les deux (valeurs en env vars Render):
+- `CENTRIS_USER`
+- `CENTRIS_PASS`
 
 Pour le bot, **Centris.ca Zone Courtier** est la cible (scrapable).
 Prospect Mobile = app iOS privée, pas accessible programmatiquement facilement.

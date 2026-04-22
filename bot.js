@@ -2611,7 +2611,7 @@ async function centrisGetDetails(mls) {
 // Fonction principale — chercher comparables (vendus OU actifs)
 async function chercherComparablesVendus({ type = 'terrain', ville, jours = 14, statut = 'vendu' }) {
   if (!process.env.CENTRIS_USER) {
-    return `❌ CENTRIS_USER/CENTRIS_PASS non configurés dans Render.\nAjouter:\n• CENTRIS_USER=110509\n• CENTRIS_PASS=REDACTED_PASSWORD`;
+    return `❌ CENTRIS_USER/CENTRIS_PASS non configurés dans Render.\nAjouter les env vars CENTRIS_USER et CENTRIS_PASS (valeurs chez Shawn).`;
   }
   if (!ville) return '❌ Précise la ville: ex. "Sainte-Julienne", "Rawdon"';
 

@@ -24,7 +24,7 @@ Architecte + développeur principal du bot Telegram. Tutoiement. Français. Touj
 | Fichier | `/Users/signaturesb/Documents/github/Claude, code Telegram/bot.js` |
 | Render | srv-d7fh9777f7vs73a15ddg |
 | URL | signaturesb-bot-s272.onrender.com |
-| Render API Key | `REDACTED_RENDER_API_KEY` |
+| Render API Key | `$RENDER_API_KEY` (env var — jamais en clair ici) |
 | Repo GitHub | signaturesb/bot-assistant |
 | Modèle | claude-opus-4-7 (défaut) |
 | Outils | 40 actifs |
@@ -153,7 +153,7 @@ PIPEDRIVE_API_KEY   BREVO_API_KEY
 GMAIL_CLIENT_ID     GMAIL_CLIENT_SECRET    GMAIL_REFRESH_TOKEN
 DROPBOX_ACCESS_TOKEN DROPBOX_REFRESH_TOKEN DROPBOX_APP_KEY DROPBOX_APP_SECRET
 SHAWN_EMAIL  JULIE_EMAIL  GIST_ID  GITHUB_TOKEN  WEBHOOK_SECRET
-SIRF_USER=57K0426  SIRF_PASS=REDACTED_PASSWORD
+SIRF_USER  SIRF_PASS  (valeurs en env vars — jamais en clair ici)
 ```
 
 **RÈGLE CRITIQUE :** `PUT /services/{id}/env-vars` remplace TOUTES — toujours envoyer la liste complète.

@@ -14,14 +14,19 @@ const warn = (msg) => console.log(`${YEL}⚠️ ${RESET} ${msg}`);
 const info = (msg) => console.log(`${BLUE}ℹ️ ${RESET} ${msg}`);
 const section = (title) => console.log(`\n${BLUE}━━━ ${title} ━━━${RESET}`);
 
-// Credentials (read from .env.shared if possible)
+// Credentials (from env vars — jamais hardcodés)
+require('dotenv').config();
 const creds = {
-  RENDER_API: 'REDACTED_RENDER_API_KEY',
-  RENDER_SERVICE: 'srv-d7fh9777f7vs73a15ddg',
-  GITHUB_TOKEN: 'REDACTED_GITHUB_TOKEN',
-  BOT_URL: 'https://signaturesb-bot-s272.onrender.com',
-  REPO: 'signaturesb/kira-bot',
+  RENDER_API:     process.env.RENDER_API_KEY || '',
+  RENDER_SERVICE: process.env.RENDER_SERVICE_ID || 'srv-d7fh9777f7vs73a15ddg',
+  GITHUB_TOKEN:   process.env.GITHUB_TOKEN || '',
+  BOT_URL:        process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com',
+  REPO:           process.env.GITHUB_REPO || 'signaturesb/kira-bot',
 };
+if (!creds.RENDER_API || !creds.GITHUB_TOKEN) {
+  console.error('❌ Secrets manquants. Ajoute RENDER_API_KEY et GITHUB_TOKEN dans .env (voir .env.example)');
+  process.exit(1);
+}
 
 async function fetch(url, opts = {}) {
   return new Promise((res, rej) => {
