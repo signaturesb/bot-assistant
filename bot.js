@@ -2700,7 +2700,25 @@ ${convInfo}
         <td style="background-color:#0d0d0d; border:1px solid #1e1e1e; border-top:4px solid #aa0721; border-radius:4px; padding:36px 28px; text-align:center;">${refPunch}
         </td>`
     );
-    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées + label logo personnalisé + punch référencement`);
+    // CLEANUP placeholders Brevo non-remplacés quand envoi Gmail (pas Brevo)
+    // Le template contient {{ contact.FIRSTNAME }} qui resterait littéral sans ça.
+    // Règle pro: "Bonjour," tout court, jamais "Bonjour [Prénom]" ni contact.FIRSTNAME.
+    htmlFinal = htmlFinal
+      // "Bonjour {{ contact.X }}" → "Bonjour,"
+      .replace(/Bonjour\s+\{\{\s*contact\.[A-Z_]+\s*\}\}[\s,]*/gi, 'Bonjour,')
+      // "Bonjour {{ params.X }}" → "Bonjour," (si un placeholder params reste vide)
+      .replace(/Bonjour\s+\{\{\s*params\.[A-Z_]+\s*\}\}[\s,]*/gi, 'Bonjour,')
+      // "Cher/Chère/Dear {{ contact.X }}" → "Bonjour,"
+      .replace(/(?:Cher|Chère|Dear)\s+\{\{\s*contact\.[A-Z_]+\s*\}\}[\s,]*/gi, 'Bonjour,')
+      // Nettoyer tout autre {{ contact.X }} restant (silencieusement)
+      .replace(/\{\{\s*contact\.[A-Z_]+\s*\}\}/gi, '')
+      // Nettoyer les placeholders params non-remplis qui resteraient
+      .replace(/\{\{\s*params\.[A-Z_]+\s*\}\}/gi, '')
+      // Normaliser: "Bonjour  ," / "Bonjour ," → "Bonjour,"
+      .replace(/Bonjour\s*,\s*/g, 'Bonjour, ')
+      // Nettoyer virgules orphelines (ex: "à ,") et espaces doublés dans le texte
+      .replace(/\s+,/g, ',').replace(/,\s*,/g, ',');
+    log('OK', 'DOCS', `Master template Dropbox utilisé (${Math.round(masterTpl.length/1024)}KB avec logos) — sections vides retirées + label logo personnalisé + punch référencement + placeholders client strippés`);
   } else {
     // Fallback HTML inline brandé si Dropbox template indisponible
     htmlFinal = `<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
