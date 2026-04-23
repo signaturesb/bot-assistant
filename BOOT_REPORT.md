@@ -1,5 +1,5 @@
 # ✅ Boot réussi
-_2026-04-22 22 h 33 min 40 s_
+_2026-04-22 23 h 00 min 11 s_
 
 - Modèle: claude-sonnet-4-6
 - Outils: 39
@@ -32,7 +32,7 @@ WARN|CENTRIS|Pré-login échoué — retry automatique à la première requête
 OK|PREFLIGHT|✅ Claude API accepte les 39 tools
 OK|WEBHOOK|Sync OK (boot) — secret=set
 INFO|AUDIT|webhook/synced {"reason":"boot","hasSecret":true}
-OK|GIST|Poller state restauré: 56 processed, 21 leads
-OK|GIST|Dedup restauré: 28 entries
+OK|GIST|Poller state restauré: 57 processed, 22 leads
+OK|GIST|Dedup restauré: 29 entries
 OK|GMAIL|Token rafraîchi ✓
 ```
