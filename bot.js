@@ -6110,6 +6110,14 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   // DÉDUP multi-clé 7j — email OU tel OU centris# OU (nom+source) = skip
   if (leadAlreadyNotifiedRecently({ email, telephone, centris, nom, source: source.source })) {
     log('INFO', 'POLLER', `Dédup 7j: lead ${nom || email || telephone || centris} déjà notifié — skip`);
+    // Audit: tracer le dédup pour /lead-audit (sinon silencieux)
+    auditLogEvent('lead', 'dedup_skipped', {
+      msgId, at: new Date().toISOString(),
+      source: source?.label, subject: subject?.substring(0, 100),
+      extracted: { nom, telephone, email, centris, adresse, type },
+      reason: 'déjà notifié dans les 7 derniers jours (multi-clé)',
+      decision: 'dedup_skipped',
+    });
     return;
   }
 
@@ -6723,12 +6731,21 @@ async function main() {
     if (process.env.DROPBOX_REFRESH_TOKEN) await refreshDropboxToken().catch(() => {});
   }, 3 * 60 * 60 * 1000);
 
-  // Refresh structure Dropbox toutes les 30min — terrain cache toujours à jour
+  // Refresh structure Dropbox toutes les 15min (était 30min) — index plus frais
   setInterval(async () => {
     await loadDropboxStructure().catch(e => log('WARN', 'DROPBOX', `Refresh structure: ${e.message}`));
-    // Rebuild index complet en parallèle (scan récursif + indexation)
     buildDropboxIndex().catch(e => log('WARN', 'DROPBOX', `Rebuild index: ${e.message}`));
-  }, 30 * 60 * 1000);
+  }, 15 * 60 * 1000);
+
+  // Preemptive Gmail token refresh toutes les 45min (token expire à 60min)
+  // Évite les 401 au moment d'envoyer un doc au client
+  setInterval(async () => {
+    try {
+      if (typeof getGmailToken === 'function') {
+        await getGmailToken().catch(() => {});
+      }
+    } catch {}
+  }, 45 * 60 * 1000);
 
   // ── Anthropic Health Check — ping Haiku pour détecter credit/auth problems
   // avant qu'un vrai appel Claude échoue. Adaptive: 6h normal, 5min si down.
