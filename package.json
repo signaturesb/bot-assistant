@@ -20,7 +20,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.0",
     "dotenv": "^16.0.0",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "pdf-lib": "^1.17.1"
   },
   "overrides": {
     "form-data": "^4.0.4",

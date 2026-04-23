@@ -1748,6 +1748,63 @@ async function _listFolderPDFs(folder) {
   } catch { return []; }
 }
 
+// ─── Conversion images → PDF (pdf-lib, pure JS) ───────────────────────────────
+// PDFs passthrough · JPG/PNG combinés en un seul "Photos_[terrain].pdf" ·
+// autres formats (HEIC, DWG, Word, Excel, webp, gif, rtf, txt) signalés skipped
+async function convertDocsToPDF(docs, folderLabel) {
+  const { PDFDocument } = require('pdf-lib');
+  const out = { docs: [], skipped: [], imagesMerged: 0 };
+  const images = [];
+  for (const d of docs) {
+    const ext = _docExt(d.name);
+    if (ext === '.pdf') { out.docs.push(d); continue; }
+    if (ext === '.jpg' || ext === '.jpeg' || ext === '.png') { images.push(d); continue; }
+    out.skipped.push({ name: d.name, reason: `format ${ext || '?'} non convertible` });
+  }
+  if (images.length === 0) return out;
+
+  try {
+    const pdf = await PDFDocument.create();
+    pdf.setTitle(`Photos — ${folderLabel}`);
+    pdf.setCreator(`${AGENT.nom} · ${AGENT.compagnie}`);
+    pdf.setProducer('pdf-lib');
+    pdf.setCreationDate(new Date());
+
+    for (const img of images) {
+      try {
+        const ext = _docExt(img.name);
+        const embed = (ext === '.png')
+          ? await pdf.embedPng(img.buffer)
+          : await pdf.embedJpg(img.buffer);
+        const MAX_W = 612, MAX_H = 792; // letter portrait en points PDF
+        const s = Math.min(MAX_W / embed.width, MAX_H / embed.height, 1);
+        const w = embed.width * s, h = embed.height * s;
+        const page = pdf.addPage([w, h]);
+        page.drawImage(embed, { x: 0, y: 0, width: w, height: h });
+        out.imagesMerged++;
+      } catch (e) {
+        out.skipped.push({ name: img.name, reason: `embed échoué: ${e.message.substring(0, 60)}` });
+      }
+    }
+
+    if (out.imagesMerged > 0) {
+      const bytes = await pdf.save();
+      const safe = String(folderLabel).replace(/[^\w\- ]/g, '').trim().substring(0, 50) || 'Terrain';
+      out.docs.push({
+        name: `Photos_${safe.replace(/\s+/g, '_')}.pdf`,
+        buffer: Buffer.from(bytes),
+        size: bytes.length,
+      });
+    }
+  } catch (e) {
+    log('WARN', 'PDF', `Conversion images → PDF échouée: ${e.message}`);
+    // Fallback: garder les images en format natif
+    for (const img of images) out.docs.push(img);
+    out.imagesMerged = 0;
+  }
+  return out;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // AUTO-ENVOI DOCS — garantie livraison avec retry + anti-doublon + tracking
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1932,9 +1989,23 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     return { name: p.name, buffer: buf, size: buf.length };
   }));
 
-  const ok = downloads.filter(d => d.buffer);
+  const rawOk = downloads.filter(d => d.buffer);
   const fails = downloads.filter(d => d.error);
-  if (!ok.length) return `❌ Tous téléchargements Dropbox échoués:\n${fails.map(f => `  ${f.name}: ${f.error}`).join('\n')}`;
+  if (!rawOk.length) return `❌ Tous téléchargements Dropbox échoués:\n${fails.map(f => `  ${f.name}: ${f.error}`).join('\n')}`;
+
+  // 6. CONVERSION → PDF (images combinées, autres formats skipped)
+  const convResult = await convertDocsToPDF(rawOk, folder.adresse || folder.name);
+  const ok = convResult.docs;
+  const convertedSkipped = convResult.skipped; // [{name, reason}]
+  if (convResult.imagesMerged > 0) {
+    log('OK', 'PDF', `${convResult.imagesMerged} image(s) → 1 PDF combiné (${folder.adresse || folder.name})`);
+  }
+  if (convertedSkipped.length > 0) {
+    log('WARN', 'PDF', `${convertedSkipped.length} fichier(s) non convertibles skipped: ${convertedSkipped.map(s => s.name).join(', ')}`);
+  }
+  if (!ok.length) {
+    return `❌ Après conversion, aucun PDF à envoyer.\nSkipped: ${convertedSkipped.map(s=>`${s.name} (${s.reason})`).join(', ')}`;
+  }
 
   const totalSize = ok.reduce((s, d) => s + d.size, 0);
   if (totalSize > 24 * 1024 * 1024) {
@@ -1976,12 +2047,25 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     `<tr><td style="padding:4px 0;color:#f5f5f7;font-size:13px;">📎 ${d.name} <span style="color:#666;font-size:11px;">(${Math.round(d.size/1024)} KB)</span></td></tr>`
   ).join('');
 
+  // Infos conversion (preview seulement)
+  const convInfo = previewMode ? (() => {
+    const bits = [];
+    if (convResult?.imagesMerged > 0) bits.push(`<div style="color:#7cb782;font-size:12px;margin-top:8px;">✅ ${convResult.imagesMerged} photo(s) combinée(s) en 1 PDF</div>`);
+    if (convertedSkipped?.length > 0) {
+      const list = convertedSkipped.slice(0, 8).map(s => `<div style="color:#e0a700;font-size:12px;margin-left:8px;">• ${s.name} <span style="color:#666">— ${s.reason}</span></div>`).join('');
+      const more = convertedSkipped.length > 8 ? `<div style="color:#666;font-size:11px;margin-left:8px;">…et ${convertedSkipped.length - 8} autres</div>` : '';
+      bits.push(`<div style="color:#e0a700;font-size:12px;margin-top:10px;font-weight:700;">⚠️ ${convertedSkipped.length} fichier(s) NON envoyé(s) (format non convertible):</div>${list}${more}`);
+    }
+    return bits.join('');
+  })() : '';
+
   // Bandeau preview (injecté seulement en mode preview)
   const previewBanner = previewMode ? `
 <div style="background:#1a0a0a;border:2px solid #aa0721;border-radius:8px;padding:18px 20px;margin:0 0 20px;">
 <div style="color:#aa0721;font-size:11px;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;">🔍 Preview — pas encore envoyé</div>
 <div style="color:#f5f5f7;font-size:14px;line-height:1.6;margin-bottom:8px;">Voici <strong>exactement</strong> ce qui sera envoyé à <strong style="color:#aa0721;">${clientName || ''} &lt;${clientEmail}&gt;</strong>.</div>
 <div style="color:#cccccc;font-size:13px;line-height:1.6;">✅ Sur Telegram, réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#aa0721;">envoie les docs à ${clientEmail}</code> pour livrer au client.<br>❌ Réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#666;">annule ${clientEmail}</code> pour ignorer.</div>
+${convInfo}
 </div>` : '';
 
   // Contenu métier — injecté dans le master template à la place d'INTRO_TEXTE
@@ -2151,15 +2235,17 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
 
   // 9. Note Pipedrive — skip en mode preview (c'est juste un preview, pas une vraie livraison)
   const skippedMsg = fails.length > 0 ? `\n⚠️ ${fails.length} doc(s) échec téléchargement: ${fails.map(f=>f.name).join(', ')}` : '';
+  const convMsg = convResult?.imagesMerged > 0 ? `\n✅ ${convResult.imagesMerged} photo(s) combinée(s) en 1 PDF` : '';
+  const convSkipMsg = convertedSkipped?.length > 0 ? `\n⚠️ ${convertedSkipped.length} fichier(s) non convertible(s) skipped: ${convertedSkipped.map(s=>s.name).join(', ')}` : '';
   if (previewMode) {
     log('OK', 'DOCS', `PREVIEW envoyé à ${realToEmail} (${ok.length} docs, pour client ${clientEmail})`);
-    return `✅ *PREVIEW envoyé* à *${realToEmail}*\n   Aperçu de ce qui sera envoyé à *${clientEmail}*\n   ${ok.length} pièce${ok.length>1?'s':''} jointe${ok.length>1?'s':''}: ${ok.map(d=>d.name).join(', ')}${skippedMsg}`;
+    return `✅ *PREVIEW envoyé* à *${realToEmail}*\n   Aperçu de ce qui sera envoyé à *${clientEmail}*\n   ${ok.length} pièce${ok.length>1?'s':''} jointe${ok.length>1?'s':''}: ${ok.map(d=>d.name).join(', ')}${convMsg}${convSkipMsg}${skippedMsg}`;
   }
-  const noteContent = `Documents envoyés à ${realToEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}):\n${ok.map(d => `• ${d.name}`).join('\n')}`;
+  const noteContent = `Documents envoyés à ${realToEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}):\n${ok.map(d => `• ${d.name}`).join('\n')}${convResult?.imagesMerged > 0 ? `\n(${convResult.imagesMerged} photos combinées en 1 PDF)` : ''}${convertedSkipped?.length > 0 ? `\nFichiers non convertibles skipped: ${convertedSkipped.map(s=>s.name).join(', ')}` : ''}`;
   const noteRes = await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => null);
   const noteLabel = noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée';
 
-  return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${realToEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${skippedMsg}`;
+  return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${realToEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${convMsg}${convSkipMsg}${skippedMsg}`;
 }
 
 // ─── Brevo ────────────────────────────────────────────────────────────────────
