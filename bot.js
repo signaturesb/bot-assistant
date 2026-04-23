@@ -1008,7 +1008,19 @@ async function _dropboxListAll(rootPath) {
   return all;
 }
 
+// Mutex: empêche 2 builds concurrents (boot + cron qui se chevauchent)
+let _dbxIndexBuildInFlight = null;
 async function buildDropboxIndex() {
+  if (_dbxIndexBuildInFlight) {
+    log('INFO', 'DBX_IDX', 'Build déjà en cours — attente du build existant');
+    return _dbxIndexBuildInFlight;
+  }
+  _dbxIndexBuildInFlight = _buildDropboxIndexInner();
+  try { return await _dbxIndexBuildInFlight; }
+  finally { _dbxIndexBuildInFlight = null; }
+}
+
+async function _buildDropboxIndexInner() {
   const t0 = Date.now();
 
   // Sources de listings Shawn (confirmées par screenshot 2026-04-22):
@@ -1116,46 +1128,58 @@ async function buildDropboxIndex() {
       }
     });
 
-    dropboxIndex = {
+    // Build le nouvel objet AU COMPLET puis swap atomique — si build crash,
+    // on garde l'ancien index en mémoire (pas de "index vide" temporaire).
+    const newIndex = {
       builtAt: Date.now(),
       totalFolders: folders.length,
       totalFiles: folders.reduce((s, f) => s + f.files.length, 0),
       folders, byCentris, byStreet,
     };
-    saveJSON(DROPBOX_INDEX_FILE, dropboxIndex);
+
+    // Protection: si le nouveau build a 0 dossiers mais l'ancien en avait >0,
+    // ne pas remplacer (probable bug passager Dropbox API, pas un vrai vide).
+    if (newIndex.totalFolders === 0 && (dropboxIndex.totalFolders || 0) > 0) {
+      log('WARN', 'DBX_IDX', `Nouveau build 0 dossiers — garde l'ancien (${dropboxIndex.totalFolders} dossiers)`);
+      return dropboxIndex;
+    }
+
+    // Swap atomique
+    dropboxIndex = newIndex;
+    try { saveJSON(DROPBOX_INDEX_FILE, dropboxIndex); } catch (e) { log('WARN', 'DBX_IDX', `Save disk: ${e.message}`); }
 
     // Mettre à jour aussi dropboxTerrains (legacy — pour compat matchDropboxAvance)
     dropboxTerrains = folders.map(f => ({
       name: f.name, path: f.path, centris: f.centris, adresse: f.adresse,
     }));
 
-    log('OK', 'DBX_IDX', `Index: ${folders.length} dossiers, ${dropboxIndex.totalFiles} fichiers · ${Math.round((Date.now()-t0)/1000)}s · ${Object.keys(byCentris).length} Centris# · ${Object.keys(byStreet).length} tokens rue`);
+    log('OK', 'DBX_IDX', `Index: ${folders.length} dossiers, ${newIndex.totalFiles} fichiers · ${Math.round((Date.now()-t0)/1000)}s · ${Object.keys(byCentris).length} Centris# · ${Object.keys(byStreet).length} tokens rue`);
     return dropboxIndex;
   } catch (e) {
-    log('WARN', 'DBX_IDX', `build failed: ${e.message}`);
+    log('WARN', 'DBX_IDX', `build failed: ${e.message} — index existant préservé`);
     return dropboxIndex;
   }
 }
 
 // Fast lookup — utilise l'index construit pour matcher un lead
 // Retourne le MEILLEUR match avec score confidence, ou null si rien
+// DEFENSIVE: check folders[idx] existence avant deref (race contre rebuild)
 function fastDropboxMatch({ centris, adresse, rue }) {
-  if (!dropboxIndex.folders?.length) return null;
+  const folders = dropboxIndex.folders;
+  if (!folders?.length) return null;
 
   // Strategy 1: Centris# exact (score 100)
   if (centris) {
     const idx = dropboxIndex.byCentris[String(centris).trim()];
-    if (idx !== undefined) {
-      const f = dropboxIndex.folders[idx];
-      return { folder: f, score: 100, strategy: 'centris_index' };
+    if (idx !== undefined && folders[idx]) {
+      return { folder: folders[idx], score: 100, strategy: 'centris_index' };
     }
   }
 
   // Strategy 2: Scan filenames pour Centris# (dossier n'a pas # mais fichier oui)
   if (centris) {
-    for (let i = 0; i < dropboxIndex.folders.length; i++) {
-      const f = dropboxIndex.folders[i];
-      if (f.files.some(x => x.name.includes(String(centris)))) {
+    for (const f of folders) {
+      if (f.files?.some(x => x.name.includes(String(centris)))) {
         return { folder: f, score: 88, strategy: 'filename_centris_index' };
       }
     }
@@ -1165,7 +1189,7 @@ function fastDropboxMatch({ centris, adresse, rue }) {
   const q = _addrTokens(adresse || '');
   if (q.numero || q.mots.size) {
     let best = null;
-    for (const f of dropboxIndex.folders) {
+    for (const f of folders) {
       const t = _addrTokens(f.adresse || f.name);
       let score = 0;
       if (q.numero && t.numero && q.numero === t.numero) score += 50;
@@ -1183,15 +1207,18 @@ function fastDropboxMatch({ centris, adresse, rue }) {
   const streetQuery = (rue || adresse || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
   const streetTokens = streetQuery.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(t => t.length >= 3 && !/^\d+$/.test(t));
   if (streetTokens.length) {
-    const votes = new Map(); // folderIdx → count
+    const votes = new Map();
     for (const tok of streetTokens) {
       const hits = dropboxIndex.byStreet[tok] || [];
       for (const i of hits) votes.set(i, (votes.get(i) || 0) + 1);
     }
     if (votes.size) {
-      const best = [...votes.entries()].sort((a, b) => b[1] - a[1])[0];
-      const score = Math.min(75, 40 + best[1] * 15);
-      return { folder: dropboxIndex.folders[best[0]], score, strategy: 'street_index' };
+      const [bestIdx, bestCount] = [...votes.entries()].sort((a, b) => b[1] - a[1])[0];
+      const folder = folders[bestIdx];
+      if (folder) {
+        const score = Math.min(75, 40 + bestCount * 15);
+        return { folder, score, strategy: 'street_index' };
+      }
     }
   }
 
@@ -4466,6 +4493,77 @@ function registerHandlers() {
       s.noSource > 0 ? `🔍 Pas reconnu comme lead (source inconnue)` :
       `❌ Aucun traitement — vérifie Gmail ID`
     );
+  });
+
+  // /diag — vue santé système complète en un seul coup d'œil (fine pointe)
+  bot.onText(/\/diag/i, async msg => {
+    if (!isAllowed(msg)) return;
+    try {
+      const now = Date.now();
+      const uptime = Math.floor(process.uptime());
+      const mem = process.memoryUsage();
+      const memMB = (n) => Math.round(n / 1024 / 1024);
+      const pollerAgeMin = gmailPollerState?.lastRun ? Math.round((now - new Date(gmailPollerState.lastRun).getTime()) / 60000) : -1;
+      const idxAgeMin = dropboxIndex?.builtAt ? Math.round((now - dropboxIndex.builtAt) / 60000) : -1;
+      const autoEnvoiRecent = (autoEnvoiState?.log || []).slice(0, 10);
+      const autoEnvoiOk = autoEnvoiRecent.filter(l => l.success).length;
+      const autoEnvoiFail = autoEnvoiRecent.filter(l => !l.success).length;
+      const circuitsOpen = Object.entries(circuits || {}).filter(([,c]) => c.openUntil > now).map(([n]) => n);
+      const healthScore = typeof computeHealthScore === 'function' ? computeHealthScore() : null;
+
+      // Status emoji par subsystem
+      const st = (ok) => ok ? '✅' : '❌';
+      const warn = (b) => b ? '⚠️' : '✅';
+
+      const lines = [
+        `🩺 *DIAGNOSTIC SYSTÈME*`,
+        ``,
+        `*Runtime:*`,
+        `  ⏱ Uptime: ${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m`,
+        `  💾 RAM: ${memMB(mem.rss)}MB (heap ${memMB(mem.heapUsed)}/${memMB(mem.heapTotal)}MB)`,
+        `  🧠 Modèle: \`${currentModel || 'claude-sonnet-4-6'}\``,
+        ``,
+        `*Subsystems:*`,
+        `  ${st(!!PD_KEY)} Pipedrive`,
+        `  ${st(!!BREVO_KEY)} Brevo`,
+        `  ${st(!!process.env.GMAIL_CLIENT_ID)} Gmail API`,
+        `  ${st(!!process.env.DROPBOX_REFRESH_TOKEN)} Dropbox`,
+        `  ${st(!!process.env.GITHUB_TOKEN)} GitHub`,
+        `  ${st(!!process.env.OPENAI_API_KEY)} Whisper (OPTIONAL)`,
+        ``,
+        `*Dropbox Index:*`,
+        `  ${warn(idxAgeMin > 60 || idxAgeMin < 0)} Âge: ${idxAgeMin >= 0 ? idxAgeMin + 'min' : 'jamais'}`,
+        `  📁 ${dropboxIndex?.totalFolders || 0} dossiers · 📄 ${dropboxIndex?.totalFiles || 0} fichiers`,
+        `  🔢 ${Object.keys(dropboxIndex?.byCentris || {}).length} Centris# · 🛣 ${Object.keys(dropboxIndex?.byStreet || {}).length} rues`,
+        ``,
+        `*Gmail Poller:*`,
+        `  ${warn(pollerAgeMin > 10 || pollerAgeMin < 0)} Dernière run: ${pollerAgeMin >= 0 ? pollerAgeMin + 'min ago' : 'jamais'}`,
+        `  📧 Total leads traités: ${gmailPollerState?.totalLeads || 0}`,
+        ``,
+        `*Auto-envoi (10 derniers):*`,
+        `  ✅ Succès: ${autoEnvoiOk} · ❌ Échecs: ${autoEnvoiFail}`,
+        `  📊 Total all-time: ${autoEnvoiState?.totalAuto || 0} envoyés, ${autoEnvoiState?.totalFails || 0} échecs`,
+        ``,
+        `*Circuits:*`,
+        circuitsOpen.length ? `  🔴 Ouverts: ${circuitsOpen.join(', ')}` : `  ✅ Tous fermés`,
+        ``,
+        `*Rate limits:*`,
+        `  📥 Messages: ${metrics?.messages?.text || 0} text, ${metrics?.messages?.photo || 0} photo, ${metrics?.messages?.voice || 0} voice`,
+        `  🔌 API calls: Claude=${metrics?.api?.claude || 0} Gmail=${metrics?.api?.gmail || 0} Dropbox=${metrics?.api?.dropbox || 0}`,
+        `  ❌ Errors: ${metrics?.errors?.total || 0}`,
+        ``,
+        `*Pending:*`,
+        `  📦 Doc sends: ${pendingDocSends?.size || 0}`,
+        `  📧 Email drafts: ${pendingEmails?.size || 0}`,
+        healthScore ? `\n*Health Score:* ${healthScore.score}/100 (${healthScore.status})` : '',
+      ].filter(Boolean).join('\n');
+
+      await bot.sendMessage(msg.chat.id, lines, { parse_mode: 'Markdown' }).catch(() => {
+        bot.sendMessage(msg.chat.id, lines.replace(/[*_`]/g, ''));
+      });
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ Diag crashed: ${e.message}`);
+    }
   });
 
   // /dropbox-reindex — force rebuild de l'index Dropbox complet (toutes inscriptions)
