@@ -970,12 +970,25 @@ async function loadDropboxStructure() {
       const entries = data.entries || [];
 
       // Mettre à jour le cache terrain
+      // Parser flexible: Centris# peut être au début, au milieu ou à la fin du nom
+      // Formats supportés:
+      //   "12582379_456_rue_Principale_Rawdon"        ← # au début (recommandé)
+      //   "456_rue_Principale_Rawdon_12582379"        ← # à la fin
+      //   "Terrain_NoCentris_12582379_456_Principale" ← ancien format
+      //   "456_rue_Principale_Rawdon"                 ← sans #
       if (sec.label === 'Terrain en ligne') {
-        dropboxTerrains = entries.filter(e => e['.tag'] === 'folder').map(e => ({
-          name: e.name, path: e.path_lower,
-          centris: (e.name.match(/_NoCentris_(\d+)/) || [])[1] || '',
-          adresse: e.name.replace(/_NoCentris_\d+.*$/, '').replace(/_/g, ' ').trim(),
-        }));
+        dropboxTerrains = entries.filter(e => e['.tag'] === 'folder').map(e => {
+          const m = e.name.match(/(?:_NoCentris_|(?:^|_))(\d{7,9})(?=_|$)/);
+          const centris = m ? m[1] : '';
+          const adresse = e.name
+            .replace(/_NoCentris_\d+/g, '')
+            .replace(/(?:^|_)\d{7,9}(?=_|$)/g, '')
+            .replace(/^_+|_+$/g, '')
+            .replace(/_/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          return { name: e.name, path: e.path_lower, centris, adresse };
+        });
       }
 
       const lines = entries.map(e => `  ${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
