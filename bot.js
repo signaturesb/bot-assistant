@@ -4610,6 +4610,23 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ── Admin endpoints — protégés par WEBHOOK_SECRET (accès assistant) ──────
+  if (req.method === 'GET' && url === '/admin/chat-history') {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const history = getHistory(ALLOWED_ID).slice(-30).map(m => ({
+      role: m.role,
+      // Truncate pour éviter payloads énormes
+      content: typeof m.content === 'string' ? m.content.substring(0, 2000) : JSON.stringify(m.content).substring(0, 2000),
+      ts: m.ts,
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ history, total: getHistory(ALLOWED_ID).length, audit: auditLog.slice(-20) }, null, 2));
+    return;
+  }
+
   // ── Webhook Telegram — PROTÉGÉ par X-Telegram-Bot-Api-Secret-Token ───────
   // Sans ce header, n'importe qui peut injecter des commandes dans le bot.
   // Le secret est configuré côté Telegram via setWebhook(secret_token).
