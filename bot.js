@@ -26,6 +26,7 @@ let   currentModel = process.env.MODEL || 'claude-sonnet-4-6';
 const AGENT = {
   nom:          process.env.AGENT_NOM       || 'Shawn Barrette',
   prenom:       process.env.AGENT_PRENOM    || 'Shawn',
+  titre:        process.env.AGENT_TITRE     || 'Courtier immobilier',
   telephone:    process.env.AGENT_TEL       || '514-927-1340',
   email:        SHAWN_EMAIL,
   site:         process.env.AGENT_SITE      || 'signatureSB.com',
@@ -2124,9 +2125,9 @@ ${convInfo}
       CTA_SOUS_TITRE:     `Appelez-moi directement, je vous réponds rapidement.`,
       CTA_URL:            `tel:${AGENT.telephone.replace(/\D/g,'')}`,
       CTA_BOUTON:         `Appeler ${AGENT.prenom} — ${AGENT.telephone}`,
-      CTA_NOTE:           `${AGENT.nom} · ${AGENT.compagnie}`,
+      CTA_NOTE:           `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie}`,
       REFERENCE_URL:      `tel:${AGENT.telephone.replace(/\D/g,'')}`,
-      SOURCES:            `${AGENT.nom} · ${AGENT.compagnie} · ${dateMois}`,
+      SOURCES:            `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie} · ${dateMois}`,
       DESINSCRIPTION_URL: '',
     });
 
@@ -2170,13 +2171,20 @@ ${convInfo}
 <tr><td style="background:${AGENT.couleur};height:4px;font-size:1px;">&nbsp;</td></tr>
 <tr><td style="padding:28px 32px 20px;">
 <div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">${AGENT.compagnie}</div>
-<h2 style="color:#f5f5f7;font-size:22px;margin:10px 0 0;">${AGENT.nom}</h2>
+<h2 style="color:#f5f5f7;font-size:22px;margin:10px 0 4px;">${AGENT.nom}</h2>
+<div style="color:#999;font-size:13px;font-style:italic;">${AGENT.titre}</div>
 </td></tr>
 <tr><td style="padding:0 32px 20px;">${contentHTML}
-<p style="margin:24px 0 0;color:#f5f5f7;">Au plaisir,<br><strong>${AGENT.prenom}</strong></p>
+<div style="margin:28px 0 0;padding-top:20px;border-top:1px solid #1a1a1a;color:#f5f5f7;font-size:14px;line-height:1.7;">
+Au plaisir,<br>
+<strong style="color:#f5f5f7;">${AGENT.nom}</strong><br>
+<span style="color:#cccccc;">${AGENT.titre} | ${AGENT.compagnie}</span><br>
+<span style="color:#cccccc;">📞 <a href="tel:${AGENT.telephone.replace(/\D/g,'')}" style="color:${AGENT.couleur};text-decoration:none;">${AGENT.telephone}</a></span><br>
+<a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};text-decoration:none;">${AGENT.email}</a>
+</div>
 </td></tr>
 <tr><td style="padding:20px 32px;border-top:1px solid #1a1a1a;color:#666;font-size:12px;">
-<strong>${AGENT.nom}</strong> · ${AGENT.compagnie}<br>
+<strong>${AGENT.nom}</strong> · ${AGENT.titre} · ${AGENT.compagnie}<br>
 📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a> · <a href="https://${AGENT.site}" style="color:${AGENT.couleur};">${AGENT.site}</a>
 </td></tr>
 <tr><td style="background:${AGENT.couleur};height:4px;font-size:1px;">&nbsp;</td></tr>
@@ -2188,7 +2196,7 @@ ${convInfo}
   const outer = `sbOut${Date.now()}`;
   const inner = `sbAlt${Date.now()}`;
   const enc   = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
-  const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.nom} · ${AGENT.compagnie}`;
+  const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
@@ -4600,6 +4608,16 @@ async function syncStatusGitHub() {
 }
 
 function startDailyTasks() {
+  // KEEP-ALIVE — self-ping /health toutes les 10 min pour empêcher Render de
+  // mettre le service en veille (spin-down après inactivité sur certains plans).
+  // Fire-and-forget, zéro impact si déjà actif.
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://signaturesb-bot-s272.onrender.com';
+  setInterval(() => {
+    fetch(`${SELF_URL}/`, { method: 'GET', signal: AbortSignal.timeout(8000) })
+      .then(r => r.ok ? null : log('WARN', 'KEEPALIVE', `self-ping ${r.status}`))
+      .catch(e => log('WARN', 'KEEPALIVE', `self-ping: ${e.message.substring(0, 60)}`));
+  }, 10 * 60 * 1000);
+
   // Rafraîchissement BOT_STATUS.md chaque heure (au lieu de 1×/jour)
   // Garantit que Claude Code peut toujours reprendre avec l'état le plus récent
   setInterval(() => syncStatusGitHub().catch(() => {}), 60 * 60 * 1000);
@@ -4710,7 +4728,7 @@ async function handleWebhook(route, data) {
 
       // Brouillon J+0 automatique
       const typeLabel = { terrain:'terrain', maison_usagee:'propriété', plex:'plex', construction_neuve:'construction neuve' }[type] || 'propriété';
-      const j0texte = `Bonjour,\n\nMerci de votre intérêt pour ce ${typeLabel}${centrisNum ? ` (Centris #${centrisNum})` : ''}.\n\nJe communique avec vous pour vous donner plus d'informations et répondre à vos questions. Quand seriez-vous disponible pour qu'on se parle?\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+      const j0texte = `Bonjour,\n\nMerci de votre intérêt pour ce ${typeLabel}${centrisNum ? ` (Centris #${centrisNum})` : ''}.\n\nJe communique avec vous pour vous donner plus d'informations et répondre à vos questions. Quand seriez-vous disponible pour qu'on se parle?\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
       if (email) {
         pendingEmails.set(ALLOWED_ID, { to: email, toName: nom, sujet: `${typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1)} — ${AGENT.compagnie}`, texte: j0texte });
@@ -4745,7 +4763,7 @@ async function handleWebhook(route, data) {
             const stage = PD_STAGES[deal.stage_id] || deal.stage_id;
             dealContext = `📊 *Pipedrive:* ${deal.title} — ${stage}\n\n`;
             // Brouillon réponse rapide
-            const reponse = `Bonjour,\n\nMerci pour votre message. Je vous reviens rapidement.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+            const reponse = `Bonjour,\n\nMerci pour votre message. Je vous reviens rapidement.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
             if (deal.person_id) {
               const person = await pdGet(`/persons/${deal.person_id}`);
               const emailP = person?.data?.email?.[0]?.value;
@@ -4798,7 +4816,7 @@ async function handleWebhook(route, data) {
             dealContext += `📝 Note ajoutée dans Pipedrive\n\n`;
 
             // Brouillon réponse
-            const reponse = `Bonjour,\n\nMerci pour votre réponse. Je vous reviens dès que possible.\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+            const reponse = `Bonjour,\n\nMerci pour votre réponse. Je vous reviens dès que possible.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
             pendingEmails.set(ALLOWED_ID, { to: de, toName: nom, sujet: `RE: ${sujet}`, texte: reponse });
             dealContext += `📧 Brouillon réponse prêt — dis *"envoie"* ou précise ce que tu veux répondre.`;
           } else {
@@ -5228,7 +5246,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   // Préparer brouillon J+0
   const prospectNom   = nom || (email?.split('@')[0]) || 'Madame/Monsieur';
   const typeLabel     = { terrain:'terrain', maison_usagee:'propriété', plex:'plex', construction_neuve:'construction neuve' }[type] || 'propriété';
-  const j0Texte = `Bonjour,\n\nMerci de votre intérêt${centris ? ` pour la propriété Centris #${centris}` : adresse ? ` pour la propriété au ${adresse}` : ''}.\n\nJ'aimerais vous contacter pour vous donner plus d'informations et répondre à vos questions. Quand seriez-vous disponible pour qu'on se parle?\n\nAu plaisir,\n${AGENT.prenom}\n${AGENT.telephone}`;
+  const j0Texte = `Bonjour,\n\nMerci de votre intérêt${centris ? ` pour la propriété Centris #${centris}` : adresse ? ` pour la propriété au ${adresse}` : ''}.\n\nJ'aimerais vous contacter pour vous donner plus d'informations et répondre à vos questions. Quand seriez-vous disponible pour qu'on se parle?\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
   // Si email dispo → stocker brouillon (Shawn dit "envoie")
   if (email) {
