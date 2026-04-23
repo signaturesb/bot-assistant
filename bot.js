@@ -1011,29 +1011,18 @@ async function _dropboxListAll(rootPath) {
 async function buildDropboxIndex() {
   const t0 = Date.now();
 
-  // AUTO-DISCOVERY: scan TOUS les dossiers top-level de Dropbox sauf exclusions
-  // Permet au bot de connaître 100% du Dropbox (terrains, inscriptions, maisons, etc.)
-  // Override explicite possible via DROPBOX_LISTING_PATHS="/a,/b" si Shawn veut limiter
+  // Sources de listings Shawn (confirmées par screenshot 2026-04-22):
+  //   /Inscription         → inscriptions actives (courtage), convention [Adresse]_NoCentris_[#]
+  //   /Terrain en ligne    → terrains actifs, même convention
+  // Override possible via DROPBOX_LISTING_PATHS="/a,/b,/c"
+  // NE PAS scanner /Dossier Dan Giroux (autre courtier) ni /Dossier de l'équipe (partagé).
   let configuredPaths;
   if (process.env.DROPBOX_LISTING_PATHS) {
     configuredPaths = process.env.DROPBOX_LISTING_PATHS.split(',').map(p => p.trim()).filter(Boolean);
   } else {
-    // Discover: list / → filter folders → exclude known non-listings
-    const excludeRe = /^(email[_\s]?templates?|contacts?|assets?|archives?|apps?|private|backup|templates?|_|\.)/i;
-    try {
-      const rootRes = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
-      if (rootRes?.ok) {
-        const rootData = await rootRes.json();
-        configuredPaths = (rootData.entries || [])
-          .filter(e => e['.tag'] === 'folder' && !excludeRe.test(e.name))
-          .map(e => e.path_display);
-        log('INFO', 'DBX_IDX', `Auto-discovery: ${configuredPaths.length} dossiers top-level à indexer`);
-      }
-    } catch (e) { log('WARN', 'DBX_IDX', `Auto-discovery échouée: ${e.message}`); }
-    if (!configuredPaths || !configuredPaths.length) {
-      configuredPaths = [AGENT.dbx_terrains]; // fallback safety
-    }
+    configuredPaths = ['/Inscription', AGENT.dbx_terrains];
   }
+  log('INFO', 'DBX_IDX', `Paths à indexer: ${configuredPaths.join(' | ')}`);
   const folderMap = new Map(); // path_lower → folder record
 
   try {
