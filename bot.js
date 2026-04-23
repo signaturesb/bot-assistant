@@ -652,15 +652,17 @@ function getSystem() {
   return dyn ? SYSTEM_BASE + '\n\n' + dyn : SYSTEM_BASE;
 }
 
-// ─── Historique longue durée — 200 msgs window + Gist backup + auto-summary ──
-// Shawn veut que le bot se rappelle de tout. Trois couches:
-// 1. Window live: MAX_HIST=200 messages (prompt caching → cost contenu)
-// 2. Auto-summary: quand on dépasse SUMMARY_AT=250, les 100 plus vieux
-//    sont résumés par Haiku et compactés en 1 message [CONTEXTE_ANTÉRIEUR]
+// ─── Mémoire longue durée — 500 msgs window + Gist backup + Sonnet summary + auto-facts ──
+// Shawn veut que le bot se rappelle de TOUT. Quatre couches:
+// 1. Window live: MAX_HIST=500 messages (prompt caching → cost contenu)
+// 2. Auto-summary Sonnet: quand on dépasse SUMMARY_AT=600, les ~300 plus vieux
+//    sont résumés par Sonnet 4.6 (intelligence supérieure vs Haiku) et compactés
 // 3. Gist backup: sauvé toutes les 30s après modif → survit aux redeploys Render
-const MAX_HIST = parseInt(process.env.MAX_HIST || '200');
-const SUMMARY_AT = parseInt(process.env.SUMMARY_AT || '250');
-const SUMMARY_KEEP = parseInt(process.env.SUMMARY_KEEP || '120'); // garder les 120 plus récents quand on résume
+// 4. Auto-facts: après chaque échange significatif, Haiku extrait les faits
+//    durables (prospect mentionné, email envoyé, config demandée) → kiramem
+const MAX_HIST = parseInt(process.env.MAX_HIST || '500');
+const SUMMARY_AT = parseInt(process.env.SUMMARY_AT || '600');
+const SUMMARY_KEEP = parseInt(process.env.SUMMARY_KEEP || '300'); // garder les 300 plus récents quand on résume
 const rawChats = loadJSON(HIST_FILE, {});
 const chats    = new Map(Object.entries(rawChats));
 for (const [id, hist] of chats.entries()) {
@@ -682,6 +684,11 @@ function addMsg(id, role, content) {
   scheduleHistSave();
   // Trigger summary si on dépasse le seuil (fire-and-forget, ne bloque pas)
   if (h.length > SUMMARY_AT) summarizeOldHistory(id).catch(() => {});
+  // Extraction auto de faits durables après chaque message assistant (fire-and-forget)
+  // Regroupe les derniers échanges user+assistant pour contexte
+  if (role === 'assistant' && h.length >= 2 && typeof content === 'string' && content.length > 50) {
+    extractDurableFacts(id, h).catch(() => {});
+  }
 }
 
 // Gist backup/restore — survit aux redeploys Render (disque /data volatil)
@@ -722,47 +729,59 @@ async function loadHistoryFromGist() {
   } catch (e) { log('WARN', 'GIST', `Load history: ${e.message}`); }
 }
 
-// Résume les vieux messages via Haiku — compacte en 1 seul "CONTEXTE_ANTÉRIEUR"
+// Résume les vieux messages via SONNET 4.6 (intelligence supérieure vs Haiku)
+// — compacte en 1 seul message "[CONTEXTE_ANTÉRIEUR_RÉSUMÉ]" structuré en sections
+let _summaryInFlight = new Set();
 async function summarizeOldHistory(chatId) {
-  if (!API_KEY) return;
-  const h = getHistory(chatId);
-  if (h.length <= SUMMARY_AT) return;
-  // Éviter re-summarize si déjà un résumé en tête et peu de nouveau
-  const first = h[0];
-  const alreadyHasSummary = first?.role === 'user' && typeof first.content === 'string'
-    && first.content.startsWith('[CONTEXTE_ANTÉRIEUR_RÉSUMÉ]');
-  const toCompact = h.slice(0, h.length - SUMMARY_KEEP);
-  if (!toCompact.length) return;
-
+  if (!API_KEY || _summaryInFlight.has(chatId)) return;
+  _summaryInFlight.add(chatId);
   try {
-    // Convertir en texte lisible pour Haiku
+    const h = getHistory(chatId);
+    if (h.length <= SUMMARY_AT) return;
+    const first = h[0];
+    const alreadyHasSummary = first?.role === 'user' && typeof first.content === 'string'
+      && first.content.startsWith('[CONTEXTE_ANTÉRIEUR_RÉSUMÉ]');
+    const toCompact = h.slice(0, h.length - SUMMARY_KEEP);
+    if (!toCompact.length) return;
+
     const asText = toCompact.map(m => {
-      const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content).substring(0, 300);
-      return `${m.role === 'user' ? 'Shawn' : 'Bot'}: ${c.substring(0, 500)}`;
-    }).join('\n').substring(0, 16000);
+      const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content).substring(0, 400);
+      return `${m.role === 'user' ? 'Shawn' : 'Bot'}: ${c.substring(0, 800)}`;
+    }).join('\n').substring(0, 32000);
 
-    const prompt = `Voici un historique de conversation entre Shawn (courtier immobilier RE/MAX) et son assistant IA. Produis un RÉSUMÉ DENSE en français (max 400 mots) qui capture:
-- Les prospects/clients mentionnés (nom, email, téléphone, # Centris, statut)
-- Les décisions prises, documents envoyés, emails rédigés
-- Les configurations/préférences exprimées par Shawn
-- Les problèmes techniques résolus + leurs solutions
-- Les rendez-vous, dates, deadlines mentionnés
+    const prompt = `Conversation entre Shawn Barrette (courtier RE/MAX PRESTIGE Rawdon, shawn@signaturesb.com) et son assistant IA. Produis un RÉSUMÉ DENSE STRUCTURÉ en français organisé par sections (max 800 mots total).
 
-Priorise les INFOS DURABLES utiles pour la suite (pas les "ok", "merci", etc.). Utilise des puces courtes.
+STRUCTURE OBLIGATOIRE:
+## Prospects & clients
+Pour chaque personne mentionnée: nom, coordonnées (tel/email/Centris#), statut (nouveau/visité/offre/gagné/perdu), dossier Dropbox associé, dernière action.
+
+## Actions & envois
+Documents envoyés (à qui, quoi, quand). Emails rédigés. Deals Pipedrive créés/modifiés. Rendez-vous planifiés.
+
+## Configurations & préférences
+Paramétrages demandés par Shawn (env vars, comportements bot, templates). Règles absolues mentionnées (ex: "toujours CC shawn@").
+
+## Problèmes résolus
+Bugs trouvés + fix appliqués. Commits récents importants avec leur impact.
+
+## En cours / à faire
+Tâches non complétées, items "sur glace", prochaines étapes.
+
+Ignorer les "ok", "merci", confirmations simples. Priorité aux INFOS DURABLES pour la suite.
 
 HISTORIQUE:
 ${asText}
 
-Résumé dense:`;
+Résumé structuré:`;
 
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 30000);
+    const t = setTimeout(() => ctrl.abort(), 45000);
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST', signal: ctrl.signal,
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5',
-        max_tokens: 1200,
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2400,
         messages: [{ role: 'user', content: prompt }],
       }),
     });
@@ -772,25 +791,114 @@ Résumé dense:`;
     const sumTxt = data.content?.[0]?.text?.trim() || '';
     if (!sumTxt) return;
 
-    // Si déjà un résumé, on fusionne plutôt que de remplacer
     const previousSummary = alreadyHasSummary
       ? first.content.replace(/^\[CONTEXTE_ANTÉRIEUR_RÉSUMÉ\]\n?/, '').replace(/\n?\[FIN_RÉSUMÉ\]$/, '')
       : '';
     const mergedSummary = previousSummary
-      ? `${previousSummary}\n\n--- Mise à jour ---\n${sumTxt}`
+      ? `${previousSummary}\n\n--- Mise à jour (${new Date().toLocaleDateString('fr-CA')}) ---\n${sumTxt}`
       : sumTxt;
 
     const newFirst = {
       role: 'user',
       content: `[CONTEXTE_ANTÉRIEUR_RÉSUMÉ]\n${mergedSummary}\n[FIN_RÉSUMÉ]`
     };
-    // Garder la queue récente intacte + remplacer tout ce qui précède par le résumé
     const tail = h.slice(h.length - SUMMARY_KEEP);
     h.length = 0;
     h.push(newFirst, ...tail);
     scheduleHistSave();
-    log('OK', 'SUMMARY', `${toCompact.length} messages compactés en résumé (${sumTxt.length} chars) pour chat ${chatId}`);
-  } catch (e) { log('WARN', 'SUMMARY', `Exception: ${e.message}`); }
+    log('OK', 'SUMMARY', `Sonnet: ${toCompact.length} msgs → résumé ${sumTxt.length}c pour chat ${chatId}`);
+  } catch (e) {
+    log('WARN', 'SUMMARY', `Exception: ${e.message}`);
+  } finally {
+    _summaryInFlight.delete(chatId);
+  }
+}
+
+// Extraction AUTO de faits durables après chaque échange significatif.
+// Utilise Haiku (rapide, peu cher) pour identifier: prospects, emails, Centris#,
+// adresses, décisions, configs. Faits appendés à kiramem.facts (dédup).
+let _factExtractInFlight = new Set();
+let _lastFactExtractAt = 0;
+async function extractDurableFacts(chatId, history) {
+  // Throttle: max 1 extraction par 20s (évite spam API)
+  const now = Date.now();
+  if (now - _lastFactExtractAt < 20000) return;
+  if (!API_KEY || _factExtractInFlight.has(chatId)) return;
+  _factExtractInFlight.add(chatId);
+  _lastFactExtractAt = now;
+
+  try {
+    // Prendre les 6 derniers messages pour contexte (3 échanges user+assistant)
+    const recent = history.slice(-6);
+    const asText = recent.map(m => {
+      const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content).substring(0, 300);
+      return `${m.role === 'user' ? 'Shawn' : 'Bot'}: ${c.substring(0, 600)}`;
+    }).join('\n').substring(0, 6000);
+
+    const prompt = `Dans cet échange récent entre Shawn (courtier RE/MAX) et son bot, extrais UNIQUEMENT les FAITS DURABLES qui méritent d'être mémorisés pour la suite. Réponds en JSON array pur, max 5 faits, chacun ≤150 chars.
+
+Critères FAIT DURABLE:
+- Nouveau prospect mentionné (nom + contact + Centris# ou adresse)
+- Document important envoyé ou échoué (qui/quoi/quand/résultat)
+- Décision business prise (prix, stratégie, timing)
+- Configuration/préférence exprimée par Shawn ("je veux toujours X")
+- Problème identifié ou résolu avec impact persistant
+
+PAS de faits:
+- Conversations courtoises, confirmations "ok"
+- Infos évidentes (ex: "Shawn est courtier RE/MAX")
+- Détails techniques transitoires
+
+ÉCHANGE:
+${asText}
+
+Retourne UNIQUEMENT un JSON array: ["fait 1", "fait 2", ...] ou [] si rien à retenir.`;
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        max_tokens: 400,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    clearTimeout(t);
+    if (!res.ok) return;
+    const data = await res.json();
+    const txt = data.content?.[0]?.text?.trim() || '';
+    const jsonMatch = txt.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return;
+    let facts;
+    try { facts = JSON.parse(jsonMatch[0]); } catch { return; }
+    if (!Array.isArray(facts) || facts.length === 0) return;
+
+    // Dédup contre kiramem.facts (lowercase substring)
+    const existing = new Set((kiramem.facts || []).map(f => f.toLowerCase().substring(0, 50)));
+    const added = [];
+    for (const fact of facts) {
+      if (typeof fact !== 'string' || !fact.trim() || fact.length > 200) continue;
+      const key = fact.toLowerCase().substring(0, 50);
+      if (existing.has(key)) continue;
+      kiramem.facts.push(`[auto ${new Date().toLocaleDateString('fr-CA')}] ${fact.trim()}`);
+      existing.add(key);
+      added.push(fact);
+    }
+    if (added.length > 0) {
+      // Cap à 100 faits (garde les plus récents)
+      if (kiramem.facts.length > 100) kiramem.facts.splice(0, kiramem.facts.length - 100);
+      kiramem.updatedAt = new Date().toISOString();
+      saveJSON(MEM_FILE, kiramem);
+      saveMemoryToGist().catch(() => {});
+      log('OK', 'AUTO_FACTS', `+${added.length} fait(s): ${added.map(f => f.substring(0, 60)).join(' | ')}`);
+    }
+  } catch (e) {
+    log('WARN', 'AUTO_FACTS', `Exception: ${e.message}`);
+  } finally {
+    _factExtractInFlight.delete(chatId);
+  }
 }
 
 // ─── Validation messages pour API Claude (prévient erreurs 400) ──────────────
@@ -918,7 +1026,7 @@ function extractMemos(text) {
   const cleaned = text.replace(/\[MEMO:\s*([^\]]+)\]/gi, (_, fact) => { memos.push(fact.trim()); return ''; }).trim();
   if (memos.length) {
     kiramem.facts.push(...memos);
-    if (kiramem.facts.length > 50) kiramem.facts.splice(0, kiramem.facts.length - 50);
+    if (kiramem.facts.length > 100) kiramem.facts.splice(0, kiramem.facts.length - 100);
     kiramem.updatedAt = new Date().toISOString();
     saveJSON(MEM_FILE, kiramem);
     // Throttle: sync Gist max 1x toutes les 5 minutes
@@ -2629,20 +2737,20 @@ Au plaisir,<br>
   const enc   = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
-  // CC explicite (visible par client) — array ou string comma-separated
-  const ccArr = (() => {
-    const raw = opts.cc;
-    if (!raw) return [];
-    if (Array.isArray(raw)) return raw.filter(Boolean);
-    return String(raw).split(',').map(s => s.trim()).filter(Boolean);
-  })();
-  const ccLine = ccArr.length ? [`Cc: ${ccArr.join(', ')}`] : [];
+  // CC — shawn@ TOUJOURS inclus en CC visible (client voit le courtier copié)
+  // + CCs explicites fournis par opts.cc (julie@, autres)
+  // Exception: en preview mode, pas de CC (shawn@ est déjà le To)
+  const ccUserRaw = opts.cc;
+  const ccUser = !ccUserRaw ? [] : (Array.isArray(ccUserRaw) ? ccUserRaw : String(ccUserRaw).split(',')).map(s => String(s).trim()).filter(Boolean);
+  const ccFinal = previewMode
+    ? []
+    : [...new Set([AGENT.email, ...ccUser].filter(e => e && e.toLowerCase() !== realToEmail.toLowerCase()))];
+  const ccLine = ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : [];
 
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${realToEmail}`,
     ...ccLine,
-    ...(previewMode ? [] : [`Bcc: ${AGENT.email}`]),
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
@@ -3697,7 +3805,7 @@ const TOOLS = [
   { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
   // ── Listings Dropbox + envoi docs ──
   { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox (/Terrain en ligne/) par ville, adresse ou numéro Centris. Utilise le cache — résultat instantané. Liste PDFs + photos de chaque dossier trouvé.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
-  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Fouille: match par Centris# ou adresse (index cross-source /Inscription + /Terrain en ligne fusionnés). CC explicite visible par le client, BCC shawn@ auto. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Ne JAMAIS dire que le tool ne supporte pas multi-PDF ou CC — il supporte tout.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'Emails CC séparés par virgules (visible par le client). Ex: "shawn@signaturesb.com,julie@signaturesb.com". BCC shawn@ déjà automatique.' }, fichier: { type: 'string', description: 'OPTIONNEL — pour envoyer UN seul PDF spécifique (nom partiel). Par défaut (non-spécifié): envoie TOUS les docs du dossier.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer le match Dropbox (si Pipedrive ne l\'a pas)' } }, required: ['terme'] } },
+  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Match par Centris# ou adresse via index cross-source /Inscription + /Terrain en ligne fusionnés. shawn@signaturesb.com est TOUJOURS AUTOMATIQUEMENT en Cc visible par le client (pas besoin de le spécifier). CCs additionnels (julie@, autres) via le param cc. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Le tool supporte tout — multi-PDF par défaut, CC, envoi même sans deal Pipedrive si email fourni.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client directement si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'CCs ADDITIONNELS en plus de shawn@ qui est auto (ex: "julie@signaturesb.com"). Séparer par virgules si plusieurs.' }, fichier: { type: 'string', description: 'OPTIONNEL — filtrer UN seul PDF (nom partiel). Par défaut: TOUS les docs envoyés.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer match Dropbox (si absent de Pipedrive)' } }, required: ['terme'] } },
   // ── Sync Claude Code ↔ Bot ──
   { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
   // ── Diagnostics ──
