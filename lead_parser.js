@@ -131,66 +131,153 @@ function parseLeadEmail(body, subject, from) {
   return { nom, telephone, email, centris, adresse, type };
 }
 
-// AI FALLBACK — appelle Claude Haiku si regex échoue (<2 infos extraites)
-// Retourne les infos extraites par AI, merge avec le regex (regex prioritaire)
-async function parseLeadEmailWithAI(body, subject, from, regexResult, { apiKey, logger }) {
+// AI FALLBACK — Claude Sonnet 4.6 avec tool-use structuré (fine pointe)
+// Avantages vs ancien JSON text:
+// - Output typé via input_schema → zéro parsing failure
+// - Confidence par champ → Shawn voit la fiabilité
+// - Body plain ET html envoyés (plus de contexte)
+// - Retry 1× sur erreur API transient
+// - Post-validation aggressive (format phone, email, centris)
+async function parseLeadEmailWithAI(body, subject, from, regexResult, { apiKey, logger, htmlBody }) {
   if (!apiKey) return regexResult;
   const _log = logger || (() => {});
-  const clean = (body || '')
+
+  const cleanTxt = (s, max = 6000) => (s || '')
     .replace(/<style[\s\S]*?<\/style>/gi, '')
     .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>|<\/div>|<\/tr>|<\/td>|<\/li>/gi, '\n')
     .replace(/<[^>]+>/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .substring(0, 4000);
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
+    .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
+    .replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n')
+    .substring(0, max);
 
-  const prompt = `Extrait les informations du CLIENT (pas du courtier) de cet email immobilier. Réponds UNIQUEMENT avec un JSON valide.
+  // Combiner tous les contextes disponibles
+  const contextParts = [`SUJET: ${subject || ''}`, `FROM: ${from || ''}`];
+  if (body) contextParts.push(`CORPS PLAIN:\n${cleanTxt(body, 5000)}`);
+  if (htmlBody && htmlBody !== body) contextParts.push(`CORPS HTML (backup):\n${cleanTxt(htmlBody, 3000)}`);
+  const context = contextParts.join('\n\n');
 
-SUJET: ${subject}
-FROM: ${from}
-CORPS: ${clean}
+  // Tool-use schema: force output structuré
+  const extractionTool = {
+    name: 'enregistrer_infos_lead',
+    description: 'Enregistre les informations du CLIENT (jamais du courtier) extraites d\'un email de lead immobilier.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nom: { type: 'string', description: 'Prénom Nom complet du CLIENT (pas du courtier expéditeur). Vide si absent.' },
+        telephone: { type: 'string', description: '10 chiffres exactement, sans espaces/tirets. Ex: "5149271340". Vide si absent ou invalide.' },
+        email: { type: 'string', description: 'Email du CLIENT en minuscules. Ignorer emails de notification (no-reply, noreply, centris@, signaturesb). Vide si absent.' },
+        centris: { type: 'string', description: 'Numéro Centris/MLS: 7-9 chiffres exactement. Vide si absent.' },
+        adresse: { type: 'string', description: 'Adresse civique de la propriété (sans ville/province). Ex: "456 rue Principale". Vide si absent.' },
+        type: { type: 'string', enum: ['terrain','maison_usagee','plex','construction_neuve','maison_neuve','condo','chalet','autre'], description: 'Type de propriété mentionnée.' },
+        message: { type: 'string', description: 'Le MESSAGE du client s\'il y en a un (texte libre qu\'il a écrit). Vide si formulaire sans message.' },
+        confidence: {
+          type: 'object',
+          description: 'Score de confiance 0-100 par champ extrait.',
+          properties: {
+            nom:       { type: 'number' },
+            telephone: { type: 'number' },
+            email:     { type: 'number' },
+            centris:   { type: 'number' },
+            adresse:   { type: 'number' },
+          },
+        },
+      },
+      required: ['nom', 'telephone', 'email', 'centris', 'adresse', 'type'],
+    },
+  };
 
-Format attendu (utilise "" si absent):
-{"nom":"Prénom Nom du CLIENT","telephone":"10 chiffres ex 5149271340","email":"email du client","centris":"7-9 chiffres","adresse":"adresse sans ville","type":"terrain|maison_usagee|plex|construction_neuve"}
+  const prompt = `Tu analyses un email reçu par un COURTIER IMMOBILIER (Shawn Barrette, shawn@signaturesb.com).
+Extrais les informations du CLIENT (pas du courtier, jamais de Shawn, jamais de RE/MAX).
 
-Ne retourne QUE le JSON, rien d'autre. Pas de markdown, pas d'explication.`;
+Règles strictes:
+- Si un champ n'est PAS présent ou ambigu, mets ""
+- Téléphone: exactement 10 chiffres sans formatage ("5149271340")
+- Email en minuscules, jamais un no-reply/noreply/centris@/signaturesb
+- Centris#: 7-9 chiffres contigus
+- Le "message" est le texte libre écrit par le client (pas les éléments de formulaire)
+- Confidence 0-100: ton niveau de certitude que la valeur est correcte
+
+${context}
+
+Appelle enregistrer_infos_lead avec les valeurs extraites.`;
+
+  const callAPI = async (attempt = 0) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 800,
+          tools: [extractionTool],
+          tool_choice: { type: 'tool', name: 'enregistrer_infos_lead' },
+          messages: [{ role: 'user', content: prompt }],
+        }),
+      });
+      clearTimeout(t);
+      return res;
+    } catch (e) {
+      clearTimeout(t);
+      if (attempt === 0 && (e.name === 'AbortError' || /ECONNRESET|ETIMEDOUT|network/i.test(e.message))) {
+        _log('WARN', 'AI_PARSER', `Retry après: ${e.message}`);
+        return callAPI(1);
+      }
+      throw e;
+    }
+  };
 
   try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 15000);
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      signal: ctrl.signal,
-      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5',
-        max_tokens: 400,
-        messages: [{ role: 'user', content: prompt }],
-      }),
-    });
-    clearTimeout(t);
+    const res = await callAPI();
     if (!res.ok) { _log('WARN', 'AI_PARSER', `HTTP ${res.status}`); return regexResult; }
     const d = await res.json();
-    const txt = d.content?.[0]?.text?.trim() || '';
-    const jsonMatch = txt.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) { _log('WARN', 'AI_PARSER', `Pas de JSON: ${txt.substring(0, 100)}`); return regexResult; }
-    let parsed;
-    try { parsed = JSON.parse(jsonMatch[0]); }
-    catch (e) { _log('WARN', 'AI_PARSER', `JSON.parse fail`); return regexResult; }
+    const toolUse = d.content?.find(c => c.type === 'tool_use');
+    if (!toolUse?.input) { _log('WARN', 'AI_PARSER', `Pas de tool_use output`); return regexResult; }
+    const parsed = toolUse.input;
 
-    // Merge: regex a priorité quand présent, AI comble les trous
+    // Sanitize + validate
+    const telClean = String(parsed.telephone || '').replace(/\D/g, '').replace(/^1/, '').substring(0, 10);
+    const telValid = /^\d{10}$/.test(telClean) ? telClean : '';
+    const emailClean = String(parsed.email || '').toLowerCase().trim();
+    const emailValid = /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(emailClean) &&
+                       !emailClean.includes('signaturesb') &&
+                       !emailClean.includes('noreply') &&
+                       !emailClean.includes('no-reply') &&
+                       !emailClean.includes('nepasrepondre') &&
+                       !emailClean.includes('@centris') &&
+                       !emailClean.includes('@mlsmatrix') &&
+                       !emailClean.includes('@remax-quebec')
+                       ? emailClean : '';
+    const centrisClean = String(parsed.centris || '').replace(/\D/g, '').substring(0, 9);
+    const centrisValid = /^\d{7,9}$/.test(centrisClean) ? centrisClean : '';
+    const nomClean = String(parsed.nom || '').trim().replace(/\s+/g, ' ').substring(0, 100);
+    // Rejeter nom si c'est visiblement pas une personne (Shawn, RE/MAX, compagnie)
+    const nomValid = nomClean && !/shawn|barrette|remax|re\/max|centris|signature/i.test(nomClean) ? nomClean : '';
+    const adresseClean = String(parsed.adresse || '').trim().substring(0, 150);
+
+    // Merge: regex prioritaire quand présent, AI comble les trous
     const merged = {
-      nom:       regexResult.nom       || (parsed.nom || '').trim().substring(0, 100),
-      telephone: regexResult.telephone || (parsed.telephone || '').replace(/\D/g, '').replace(/^1/, '').substring(0, 11),
-      email:     regexResult.email     || (parsed.email || '').toLowerCase().trim(),
-      centris:   regexResult.centris   || String(parsed.centris || '').replace(/\D/g, '').substring(0, 9),
-      adresse:   regexResult.adresse   || (parsed.adresse || '').trim().substring(0, 100),
+      nom:       regexResult.nom       || nomValid,
+      telephone: regexResult.telephone || telValid,
+      email:     regexResult.email     || emailValid,
+      centris:   regexResult.centris   || centrisValid,
+      adresse:   regexResult.adresse   || adresseClean,
       type:      regexResult.type      || parsed.type || 'terrain',
+      message:   (parsed.message || '').substring(0, 500),
+      confidence: parsed.confidence || {},
       _aiUsed:   true,
+      _model:    'claude-sonnet-4-6',
     };
-    // Validation: rejeter si email ou phone du courtier (faux positifs de l'AI)
-    if (merged.email.includes('signaturesb') || merged.email.includes('nepasrepondre')) merged.email = '';
-    if (merged.telephone === '5149271340' && !regexResult.telephone) merged.telephone = ''; // tel Shawn = pas un client
-    _log('OK', 'AI_PARSER', `Extracted: nom=${!!merged.nom} tel=${!!merged.telephone} email=${!!merged.email} centris=${!!merged.centris}`);
+
+    // Protection: rejeter tel Shawn si AI l'a retourné pour le client
+    if (merged.telephone === '5149271340' && !regexResult.telephone) merged.telephone = '';
+
+    _log('OK', 'AI_PARSER', `Extracted (sonnet tool-use): nom=${!!merged.nom} tel=${!!merged.telephone} email=${!!merged.email} centris=${!!merged.centris} adresse=${!!merged.adresse} conf=${JSON.stringify(merged.confidence)}`);
     return merged;
   } catch (e) {
     _log('WARN', 'AI_PARSER', `Exception: ${e.message}`);

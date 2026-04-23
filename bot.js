@@ -2359,15 +2359,54 @@ function gmailDecodeBase64(str) {
   try { return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'); } catch { return ''; }
 }
 
+// Walk récursif TOUS les MIME parts — collecte text/plain ET text/html
+// Handle nested multipart (multipart/alternative inside multipart/mixed, etc.)
+function gmailWalkParts(payload, acc = { plain: '', html: '' }) {
+  if (!payload) return acc;
+  const m = payload.mimeType || '';
+  if (m === 'text/plain' && payload.body?.data) {
+    const t = gmailDecodeBase64(payload.body.data);
+    if (t && !acc.plain) acc.plain = t;
+  } else if (m === 'text/html' && payload.body?.data) {
+    const t = gmailDecodeBase64(payload.body.data);
+    if (t && !acc.html) acc.html = t;
+  }
+  if (Array.isArray(payload.parts)) {
+    for (const p of payload.parts) gmailWalkParts(p, acc);
+  }
+  return acc;
+}
+
+// Retourne le meilleur body pour parsing: text/plain prioritaire, sinon html nettoyé,
+// sinon snippet. Stripe balises HTML, décode entités, squeeze whitespace.
 function gmailExtractBody(payload) {
   if (!payload) return '';
-  if (payload.mimeType === 'text/plain' && payload.body?.data) return gmailDecodeBase64(payload.body.data);
-  if (payload.parts) {
-    for (const part of payload.parts) {
-      if (part.mimeType === 'text/plain' && part.body?.data) return gmailDecodeBase64(part.body.data);
-    }
+  const { plain, html } = gmailWalkParts(payload);
+  if (plain && plain.length > 20) return plain;
+  if (html) {
+    return html
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>|<\/div>|<\/tr>|<\/td>|<\/li>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
+      .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
+  if (plain) return plain;
   return payload.snippet || '';
+}
+
+// Retourne les 2 bodies séparés (plain + html) pour l'AI parser — plus de contexte
+function gmailExtractAllBodies(payload) {
+  if (!payload) return { plain: '', html: '' };
+  return gmailWalkParts(payload);
 }
 
 async function voirEmailsRecents(depuis = '1d') {
@@ -4165,6 +4204,72 @@ function registerHandlers() {
     );
   });
 
+  // /parselead <messageId> — teste extraction sans créer deal. Montre regex + AI side-by-side
+  bot.onText(/\/parselead\s+([a-zA-Z0-9_-]+)/, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const msgId = match[1];
+    try {
+      await bot.sendMessage(msg.chat.id, `🔍 Parse diagnostic Gmail ${msgId}...`);
+      const full = await gmailAPI(`/messages/${msgId}?format=full`);
+      const hdrs = full.payload?.headers || [];
+      const get  = n => hdrs.find(h => h.name.toLowerCase() === n)?.value || '';
+      const from    = get('from');
+      const subject = get('subject');
+      const body    = gmailExtractBody(full.payload);
+      const bodies  = gmailExtractAllBodies(full.payload);
+
+      const source = detectLeadSource(from, subject);
+      const junk = isJunkLeadEmail(subject, from, body);
+      const rgx = parseLeadEmail(body, subject, from);
+      const rgxCount = [rgx.nom, rgx.email, rgx.telephone, rgx.centris, rgx.adresse].filter(Boolean).length;
+
+      let ai = null, aiCount = 0;
+      if (API_KEY) {
+        ai = await parseLeadEmailWithAI(body, subject, from, { nom:'', telephone:'', email:'', centris:'', adresse:'', type:'' }, {
+          apiKey: API_KEY, logger: log, htmlBody: bodies.html,
+        });
+        aiCount = [ai.nom, ai.email, ai.telephone, ai.centris, ai.adresse].filter(Boolean).length;
+      }
+
+      const fmt = (o) => [
+        `  • Nom: \`${o.nom || '(vide)'}\``,
+        `  • Tél: \`${o.telephone || '(vide)'}\``,
+        `  • Email: \`${o.email || '(vide)'}\``,
+        `  • Centris: \`${o.centris || '(vide)'}\``,
+        `  • Adresse: \`${o.adresse || '(vide)'}\``,
+        `  • Type: \`${o.type || '(vide)'}\``,
+      ].join('\n');
+
+      const confLine = ai?.confidence
+        ? `\n*Confidence AI:* nom=${ai.confidence.nom||0}% tel=${ai.confidence.telephone||0}% email=${ai.confidence.email||0}% centris=${ai.confidence.centris||0}% adresse=${ai.confidence.adresse||0}%`
+        : '';
+
+      const report = [
+        `📧 *Parse diagnostic — ${msgId}*`,
+        ``,
+        `*De:* \`${from.substring(0, 80)}\``,
+        `*Sujet:* \`${subject.substring(0, 80)}\``,
+        `*Source:* ${source?.label || '(aucune)'} · *Junk:* ${junk ? 'oui' : 'non'}`,
+        `*Body:* plain=${bodies.plain.length}c, html=${bodies.html.length}c`,
+        ``,
+        `🔹 *REGEX (${rgxCount}/5 infos)*`,
+        fmt(rgx),
+        ``,
+        API_KEY ? `🔸 *AI Sonnet 4.6 tool-use (${aiCount}/5 infos)*` : `🔸 *AI désactivé (ANTHROPIC_API_KEY absent)*`,
+        ai ? fmt(ai) : '',
+        confLine,
+        ai?.message ? `\n*Message client:* _${ai.message.substring(0, 200)}_` : '',
+      ].filter(Boolean).join('\n');
+
+      await bot.sendMessage(msg.chat.id, report, { parse_mode: 'Markdown' }).catch(e => {
+        // Fallback sans markdown si entities cassent
+        bot.sendMessage(msg.chat.id, report.replace(/[*_`]/g, '')).catch(() => {});
+      });
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ Parse diagnostic échoué: ${e.message}`);
+    }
+  });
+
   bot.onText(/\/poller|\/leadstats/, msg => {
     if (!isAllowed(msg)) return;
     const last    = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun).toLocaleTimeString('fr-CA', { timeZone: 'America/Toronto' }) : 'jamais';
@@ -5506,6 +5611,7 @@ async function runGmailLeadPoller(opts = {}) {
           const from    = get('from');
           const subject = get('subject');
           const body    = gmailExtractBody(full.payload);
+          const bodies  = gmailExtractAllBodies(full.payload); // pour AI fallback avec plus de contexte
 
           // Ignorer les emails de Shawn lui-même
           if (from.toLowerCase().includes(shawnEmail)) {
@@ -5525,12 +5631,14 @@ async function runGmailLeadPoller(opts = {}) {
           let lead = parseLeadEmail(body, subject, from);
           let infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
 
-          // AI FALLBACK — si regex extrait <3 infos, appel Claude Haiku pour extraction structurée
-          // Seuil augmenté à <3 (était <2) pour être plus safe
+          // AI FALLBACK — si regex extrait <3 infos, appel Claude Sonnet 4.6 avec tool-use structuré
+          // Passe plain + html bodies pour max contexte (certains formulaires sont HTML-only)
           if (infoCount < 3 && API_KEY) {
-            log('INFO', 'POLLER', `Regex ${infoCount} infos — AI fallback pour "${subject.substring(0,50)}"`);
+            log('INFO', 'POLLER', `Regex ${infoCount} infos — AI fallback (sonnet tool-use) pour "${subject.substring(0,50)}"`);
             try {
-              lead = await parseLeadEmailWithAI(body, subject, from, lead, { apiKey: API_KEY, logger: log });
+              lead = await parseLeadEmailWithAI(body, subject, from, lead, {
+                apiKey: API_KEY, logger: log, htmlBody: bodies.html,
+              });
               infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
             } catch (e) { log('WARN', 'POLLER', `AI fallback: ${e.message}`); }
           }
