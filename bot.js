@@ -6757,8 +6757,13 @@ async function main() {
       }
       runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`));
     }, 8000);
-    // Polling toutes les 5 minutes
-    setInterval(() => runGmailLeadPoller().catch(() => {}), 5 * 60 * 1000);
+    // POLLING HAUTE FRÉQUENCE: 30s par défaut (configurable) — quasi-instantané.
+    // Gmail API quota: 250 unités/user/sec. list_messages = 5 unités. 30s = 0.17 req/sec
+    // = 0.83 unités/sec → on est à 0.3% du quota. Safe.
+    // Override via env var GMAIL_POLL_INTERVAL_MS. Default 30000 = 30s.
+    const POLL_INTERVAL = parseInt(process.env.GMAIL_POLL_INTERVAL_MS || '30000');
+    setInterval(() => runGmailLeadPoller().catch(() => {}), POLL_INTERVAL);
+    log('OK', 'POLLER', `Intervalle polling: ${POLL_INTERVAL/1000}s (quasi-instantané)`);
     // Boot: nettoyer emails GitHub/CI 30s après démarrage (Shawn veut zéro spam)
     setTimeout(() => autoTrashGitHubNoise().catch(() => {}), 30000);
     log('OK', 'BOOT', 'Gmail Lead Poller + auto-trash CI noise activés');
