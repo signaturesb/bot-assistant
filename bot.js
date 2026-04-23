@@ -1083,8 +1083,40 @@ async function buildDropboxIndex() {
       return dropboxIndex;
     }
 
+    // MERGE CROSS-SOURCE — si deux dossiers (dans sources différentes) partagent
+    // le même Centris# OU la même adresse normalisée, fusionne leurs fichiers.
+    // Permet de retrouver "Inscription 26/12345_X" + "Terrain en ligne/12345_X"
+    // comme UN seul match avec tous les fichiers combinés (dédup par filename).
+    const rawFolders = [...folderMap.values()];
+    const mergeKey = f => f.centris ? `c:${f.centris}` : (f.adresse ? `a:${f.adresse.toLowerCase().replace(/\s+/g,' ').trim()}` : `p:${f.path}`);
+    const merged = new Map(); // mergeKey → folder record combiné
+    let mergedCount = 0;
+    for (const f of rawFolders) {
+      const k = mergeKey(f);
+      if (!merged.has(k)) {
+        merged.set(k, { ...f, sources: [f.source], allPaths: [f.path], files: [...f.files] });
+      } else {
+        const existing = merged.get(k);
+        // Fusionner: ajouter source, combiner fichiers (dédup par nom)
+        if (!existing.sources.includes(f.source)) existing.sources.push(f.source);
+        existing.allPaths.push(f.path);
+        const seen = new Set(existing.files.map(x => x.name.toLowerCase()));
+        for (const file of f.files) {
+          if (!seen.has(file.name.toLowerCase())) {
+            existing.files.push(file);
+            seen.add(file.name.toLowerCase());
+          }
+        }
+        // Adresse/rueTokens: garder la version la plus riche
+        if (!existing.adresse && f.adresse) { existing.adresse = f.adresse; existing.rueTokens = f.rueTokens; }
+        if (!existing.centris && f.centris) existing.centris = f.centris;
+        mergedCount++;
+      }
+    }
+    if (mergedCount > 0) log('OK', 'DBX_IDX', `${mergedCount} dossiers fusionnés cross-source (même Centris#/adresse)`);
+
     // Build flat list + indices
-    const folders = [...folderMap.values()];
+    const folders = [...merged.values()];
     const byCentris = {};
     const byStreet = {};
     folders.forEach((f, i) => {
@@ -1893,8 +1925,15 @@ async function matchDropboxAvance(centris, adresse) {
   if (dropboxIndex.folders?.length) {
     const fast = fastDropboxMatch({ centris, adresse, rue: adresse });
     if (fast) {
-      const pdfs = await _listFolderPDFs(fast.folder);
-      return { ...fast, pdfs, candidates: [{ folder: fast.folder, score: fast.score }] };
+      // FILES directement depuis l'index (pas d'API call) — fichiers déjà mergés
+      // cross-source (Inscription + Terrain en ligne combinés). Filter DOC_EXTS.
+      const indexedFiles = (fast.folder.files || [])
+        .filter(x => DOC_EXTS.includes(x.ext))
+        .map(x => ({ name: x.name, path_lower: x.path, '.tag': 'file', size: x.size }));
+      const pdfs = _sortDocsPriority(indexedFiles);
+      // Fallback API scan si l'index a 0 fichiers (dossier récent non indexé)
+      const finalPdfs = pdfs.length ? pdfs : await _listFolderPDFs(fast.folder);
+      return { ...fast, pdfs: finalPdfs, candidates: [{ folder: fast.folder, score: fast.score }], sources: fast.folder.sources || [fast.folder.source] };
     }
   } else {
     // Index pas encore construit → trigger async (ne bloque pas ce lookup)
@@ -4469,17 +4508,25 @@ function registerHandlers() {
       return bot.sendMessage(msg.chat.id, `⚠️ Index pas encore construit. Lance \`/dropbox-reindex\``, { parse_mode: 'Markdown' });
     }
     const ageMin = Math.round((Date.now() - idx.builtAt) / 60000);
-    const sources = [...new Set(idx.folders.map(f => f.source))];
+    // Compte par source (chaque folder peut avoir plusieurs sources après merge)
+    const bySource = {};
+    for (const f of idx.folders) {
+      for (const s of (f.sources || [f.source])) {
+        bySource[s] = (bySource[s] || 0) + 1;
+      }
+    }
+    const mergedFolders = idx.folders.filter(f => (f.sources?.length || 1) > 1).length;
     const withCentris = idx.folders.filter(f => f.centris).length;
     const withoutCentris = idx.folders.length - withCentris;
+    const sourceLines = Object.entries(bySource).sort((a,b) => b[1]-a[1]).map(([s,c]) => `   • ${s} → ${c} dossiers`).join('\n');
     await bot.sendMessage(msg.chat.id,
       `📊 *Index Dropbox*\n` +
       `⏱ Dernier build: il y a ${ageMin} min\n` +
-      `📁 Dossiers: ${idx.totalFolders}\n` +
+      `📁 Dossiers uniques: ${idx.totalFolders}${mergedFolders ? ` (🔀 ${mergedFolders} mergés cross-source)` : ''}\n` +
       `   ✅ avec Centris#: ${withCentris}\n` +
       `   ⚠️ sans Centris#: ${withoutCentris}\n` +
       `📄 Fichiers indexés: ${idx.totalFiles}\n` +
-      `🗂 Sources scannées (${sources.length}):\n${sources.map(s => `   • ${s}`).join('\n')}\n` +
+      `🗂 Sources scannées (${Object.keys(bySource).length}):\n${sourceLines}\n` +
       `🔢 ${Object.keys(idx.byCentris).length} Centris# indexés\n` +
       `🛣 ${Object.keys(idx.byStreet).length} tokens rue indexés`,
       { parse_mode: 'Markdown' }
@@ -4516,13 +4563,16 @@ function registerHandlers() {
     const f = result.folder;
     const fileList = f.files.slice(0, 15).map(x => `   📄 ${x.name}`).join('\n');
     const more = f.files.length > 15 ? `\n   …et ${f.files.length - 15} autres` : '';
+    const sources = f.sources?.length ? f.sources.join(', ') : (f.source || '?');
+    const mergedBadge = f.sources?.length > 1 ? ` 🔀 *MERGED ${f.sources.length} sources*` : '';
+    const allPaths = f.allPaths?.length ? f.allPaths.map(p => `   \`${p}\``).join('\n') : `   \`${f.path}\``;
     await bot.sendMessage(msg.chat.id,
-      `✅ *Match: ${f.adresse || f.name}*\n` +
+      `✅ *Match: ${f.adresse || f.name}*${mergedBadge}\n` +
       `Strategy: ${result.strategy} · Score: ${result.score}/100\n` +
       `Centris: ${f.centris || '(aucun)'}\n` +
-      `Source: ${f.source}\n` +
-      `Chemin: \`${f.path}\`\n` +
-      `📦 ${f.files.length} fichier${f.files.length>1?'s':''}:\n${fileList}${more}`,
+      `Sources (${f.sources?.length || 1}): ${sources}\n` +
+      `Chemins:\n${allPaths}\n` +
+      `📦 ${f.files.length} fichier${f.files.length>1?'s':''} (mergés cross-source, dédup par nom):\n${fileList}${more}`,
       { parse_mode: 'Markdown' }
     );
   });
