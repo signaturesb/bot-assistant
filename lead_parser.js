@@ -32,6 +32,28 @@ function _isBlacklistedName(nomLower) {
   return false;
 }
 
+// Valide qu'un nom est acceptable pour créer un deal Pipedrive au nom du PROSPECT.
+// Retourne false si nom absent, trop court, blacklisté, ou placeholder générique.
+// Utilisé par traiterNouveauLead pour bloquer la création de deal "Prospect Centris"
+// ou "Shawn Barrette" (quand parser capte mal l'émetteur).
+const GENERIC_PLACEHOLDERS = new Set([
+  'prospect', 'client', 'lead', 'madame', 'monsieur', 'mr', 'mme', 'mlle',
+  'prospect centris', 'inconnu', 'unknown', 'n/a', 'na', 'test', 'centris',
+  'formulaire centris', 'demande centris', 'demande', 'visiteur', 'utilisateur',
+]);
+function isValidProspectName(nom) {
+  const s = String(nom || '').trim();
+  if (s.length < 3) return false;
+  const lower = s.toLowerCase();
+  if (GENERIC_PLACEHOLDERS.has(lower)) return false;
+  if (_isBlacklistedName(lower)) return false;
+  // Doit contenir au moins 2 lettres alphabétiques consécutives (pas juste chiffres/symboles)
+  if (!/[a-zà-ÿ]{2,}/i.test(s)) return false;
+  // Rejet: ressemble à email local-part mal nettoyé (ex: "jean.dupont123")
+  if (/\d/.test(s) && !/\s/.test(s)) return false;
+  return true;
+}
+
 function sanitizeProspect(data) {
   const nomLower = (data.nom || '').toLowerCase().trim();
   if (_isBlacklistedName(nomLower)) {
@@ -361,4 +383,5 @@ module.exports = {
   parseLeadEmailWithAI,
   sanitizeProspect,
   leadQualityScore,
+  isValidProspectName,
 };

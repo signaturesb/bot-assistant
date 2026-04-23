@@ -143,6 +143,20 @@ const GIST_ID_FILE    = path.join(DATA_DIR, 'gist_id.txt');
 const VISITES_FILE    = path.join(DATA_DIR, 'visites.json');
 const POLLER_FILE     = path.join(DATA_DIR, 'gmail_poller.json');
 const AUTOENVOI_FILE  = path.join(DATA_DIR, 'autoenvoi_state.json');
+const PENDING_LEADS_FILE = path.join(DATA_DIR, 'pending_leads.json');
+
+// Leads en attente d'info manquante (nom invalide, etc.) — persisté sur disque
+// pour survivre aux redeploys Render. Shawn complète avec "nom Prénom Nom".
+let pendingLeads = [];
+try {
+  if (fs.existsSync(PENDING_LEADS_FILE)) {
+    pendingLeads = JSON.parse(fs.readFileSync(PENDING_LEADS_FILE, 'utf8')) || [];
+  }
+} catch { pendingLeads = []; }
+function savePendingLeads() {
+  try { fs.writeFileSync(PENDING_LEADS_FILE, JSON.stringify(pendingLeads, null, 2)); }
+  catch (e) { console.warn('savePendingLeads:', e.message); }
+}
 
 // ─── Observabilité: Metrics + Circuit Breakers (fine pointe) ──────────────────
 const metrics = {
@@ -2463,9 +2477,28 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
   autoEnvoiState.totalFails = (autoEnvoiState.totalFails || 0) + 1;
   saveJSON(AUTOENVOI_FILE, autoEnvoiState);
 
-  // Alerte Telegram critique + note Pipedrive
+  // Alerte Telegram critique 🚨 (P2) + note Pipedrive
   if (dealId) {
     await pdPost('/notes', { deal_id: dealId, content: `⚠️ Auto-envoi docs ÉCHOUÉ après 3 tentatives: ${String(lastError).substring(0, 200)}` }).catch(() => null);
+  }
+  // Alerte immédiate Shawn — indépendante du msg lead (qui peut être silencé par Telegram)
+  if (ALLOWED_ID) {
+    const terrain = match?.folder?.adresse || match?.folder?.name || centris || '?';
+    const alertMsg = [
+      `🚨 *DOCS NON ENVOYÉS — ACTION REQUISE*`,
+      ``,
+      `👤 Prospect: ${nom || email}`,
+      `📧 Email: ${email}`,
+      `🏡 Terrain: ${terrain}`,
+      `🔁 Tentatives: ${maxRetries}/${maxRetries}`,
+      ``,
+      `❌ Erreur: ${String(lastError).substring(0, 180)}`,
+      ``,
+      `▶️ Réessayer: \`envoie les docs à ${email}\``,
+    ].join('\n');
+    bot.sendMessage(ALLOWED_ID, alertMsg, { parse_mode: 'Markdown' }).catch(() =>
+      bot.sendMessage(ALLOWED_ID, alertMsg.replace(/\*/g, '').replace(/`/g, '')).catch(() => {})
+    );
   }
   return { sent: false, error: lastError, match, attempts: maxRetries };
 }
@@ -2816,20 +2849,25 @@ Au plaisir,<br>
   const enc   = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
-  // CC — shawn@ TOUJOURS inclus en CC visible (client voit le courtier copié)
-  // + CCs explicites fournis par opts.cc (julie@, autres)
-  // Exception: en preview mode, pas de CC (shawn@ est déjà le To)
+  // CC/BCC — shawn@ TOUJOURS en *Bcc invisible* (le client ne voit pas le courtier copié)
+  // + CCs explicites fournis par opts.cc (julie@, autres) restent en Cc visible
+  // Exception: en preview mode, pas de Bcc shawn (shawn@ est déjà le To)
   const ccUserRaw = opts.cc;
   const ccUser = !ccUserRaw ? [] : (Array.isArray(ccUserRaw) ? ccUserRaw : String(ccUserRaw).split(',')).map(s => String(s).trim()).filter(Boolean);
   const ccFinal = previewMode
     ? []
-    : [...new Set([AGENT.email, ...ccUser].filter(e => e && e.toLowerCase() !== realToEmail.toLowerCase()))];
-  const ccLine = ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : [];
+    : [...new Set(ccUser.filter(e => e && e.toLowerCase() !== realToEmail.toLowerCase() && e.toLowerCase() !== AGENT.email.toLowerCase()))];
+  const bccFinal = previewMode
+    ? []
+    : (AGENT.email && AGENT.email.toLowerCase() !== realToEmail.toLowerCase() ? [AGENT.email] : []);
+  const ccLine  = ccFinal.length  ? [`Cc: ${ccFinal.join(', ')}`]   : [];
+  const bccLine = bccFinal.length ? [`Bcc: ${bccFinal.join(', ')}`] : [];
 
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${realToEmail}`,
     ...ccLine,
+    ...bccLine,
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
@@ -3884,7 +3922,7 @@ const TOOLS = [
   { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
   // ── Listings Dropbox + envoi docs ──
   { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox (/Terrain en ligne/) par ville, adresse ou numéro Centris. Utilise le cache — résultat instantané. Liste PDFs + photos de chaque dossier trouvé.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
-  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Match par Centris# ou adresse via index cross-source /Inscription + /Terrain en ligne fusionnés. shawn@signaturesb.com est TOUJOURS AUTOMATIQUEMENT en Cc visible par le client (pas besoin de le spécifier). CCs additionnels (julie@, autres) via le param cc. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Le tool supporte tout — multi-PDF par défaut, CC, envoi même sans deal Pipedrive si email fourni.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client directement si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'CCs ADDITIONNELS en plus de shawn@ qui est auto (ex: "julie@signaturesb.com"). Séparer par virgules si plusieurs.' }, fichier: { type: 'string', description: 'OPTIONNEL — filtrer UN seul PDF (nom partiel). Par défaut: TOUS les docs envoyés.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer match Dropbox (si absent de Pipedrive)' } }, required: ['terme'] } },
+  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Match par Centris# ou adresse via index cross-source /Inscription + /Terrain en ligne fusionnés. shawn@signaturesb.com est TOUJOURS AUTOMATIQUEMENT en Bcc invisible (le client ne le voit PAS dans les destinataires). CCs additionnels visibles (julie@, autres) via le param cc. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Le tool supporte tout — multi-PDF par défaut, CC, envoi même sans deal Pipedrive si email fourni.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client directement si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'CCs ADDITIONNELS en plus de shawn@ qui est auto (ex: "julie@signaturesb.com"). Séparer par virgules si plusieurs.' }, fichier: { type: 'string', description: 'OPTIONNEL — filtrer UN seul PDF (nom partiel). Par défaut: TOUS les docs envoyés.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer match Dropbox (si absent de Pipedrive)' } }, required: ['terme'] } },
   // ── Sync Claude Code ↔ Bot ──
   { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
   // ── Diagnostics ──
@@ -4659,11 +4697,57 @@ function registerHandlers() {
   // Voir liste pending docs
   bot.onText(/\/pending/, msg => {
     if (!isAllowed(msg)) return;
-    if (pendingDocSends.size === 0) return bot.sendMessage(msg.chat.id, '✅ Aucun doc en attente');
-    const lines = [...pendingDocSends.values()].map(p =>
-      `• ${p.nom || p.email} · score ${p.match?.score} · ${p.match?.pdfs.length} PDFs → \`envoie les docs à ${p.email}\``
-    ).join('\n');
-    bot.sendMessage(msg.chat.id, `📦 *Pending (${pendingDocSends.size})*\n\n${lines}`, { parse_mode: 'Markdown' });
+    const pendingNames = pendingLeads.filter(l => l.needsName);
+    if (pendingDocSends.size === 0 && pendingNames.length === 0) {
+      return bot.sendMessage(msg.chat.id, '✅ Aucun lead ni doc en attente');
+    }
+    const parts = [];
+    if (pendingNames.length) {
+      const lines = pendingNames.slice(-10).map(l => {
+        const e = l.extracted || {};
+        const age = Math.round((Date.now() - l.ts) / 60000);
+        return `• ${l.id.slice(-6)} · ${e.email || e.telephone || '?'} · ${e.centris ? '#'+e.centris : (e.adresse || '?')} · il y a ${age}min`;
+      }).join('\n');
+      parts.push(`⚠️ *Noms à confirmer (${pendingNames.length})*\n${lines}\n_Réponds \`nom Prénom Nom\` pour le plus récent._`);
+    }
+    if (pendingDocSends.size) {
+      const lines = [...pendingDocSends.values()].map(p =>
+        `• ${p.nom || p.email} · score ${p.match?.score} · ${p.match?.pdfs.length} PDFs → \`envoie les docs à ${p.email}\``
+      ).join('\n');
+      parts.push(`📦 *Docs en attente (${pendingDocSends.size})*\n${lines}`);
+    }
+    bot.sendMessage(msg.chat.id, parts.join('\n\n'), { parse_mode: 'Markdown' });
+  });
+
+  // "nom Prénom Nom" → complète le plus récent pending lead + relance traiterNouveauLead
+  // Ex: "nom Jean Tremblay" après alerte P1 "⚠️ Lead reçu — nom non identifié"
+  bot.onText(/^nom\s+(.+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const nomProspect = (match[1] || '').trim();
+    if (!isValidProspectName(nomProspect)) {
+      return bot.sendMessage(msg.chat.id, `❌ "${nomProspect}" n'est pas un nom valide. Essaie: \`nom Prénom Nom\``, { parse_mode: 'Markdown' });
+    }
+    const pendingNames = pendingLeads.filter(l => l.needsName);
+    if (!pendingNames.length) {
+      return bot.sendMessage(msg.chat.id, '✅ Aucun lead en attente de nom.');
+    }
+    // Prendre le plus récent
+    const pending = pendingNames[pendingNames.length - 1];
+    pending.nom = nomProspect;
+    pending.needsName = false;
+    pending.resolvedAt = Date.now();
+    // Retirer du tableau pending (garder historique resolved si besoin)
+    pendingLeads = pendingLeads.filter(l => l.id !== pending.id);
+    savePendingLeads();
+
+    await bot.sendMessage(msg.chat.id, `⏳ Reprise du lead avec *${nomProspect}*...`, { parse_mode: 'Markdown' });
+    try {
+      const leadComplet = { ...pending.extracted, nom: nomProspect };
+      await traiterNouveauLead(leadComplet, pending.msgId, pending.from, pending.subject, pending.source, { skipDedup: true });
+    } catch (e) {
+      log('ERR', 'PENDING', `Replay lead ${pending.id}: ${e.message}`);
+      bot.sendMessage(msg.chat.id, `❌ Erreur replay lead: ${e.message.substring(0, 200)}`).catch(() => {});
+    }
   });
 
   // Pause/resume auto-envoi global
@@ -6055,7 +6139,7 @@ let gmailPollerState = loadJSON(POLLER_FILE, { processed: [], lastRun: null, tot
 
 // Sources d'emails → leads immobiliers
 // Lead parsing — extrait dans lead_parser.js pour testabilité
-const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI } = leadParser;
+const { detectLeadSource, isJunkLeadEmail, parseLeadEmail, parseLeadEmailWithAI, isValidProspectName } = leadParser;
 
 // ── Dédoublonnage multi-clé, persisté disque (survit aux redeploys) ─────────
 // Indexe par: email (exact, lower-case), téléphone (10 derniers chiffres),
@@ -6104,11 +6188,12 @@ function leadAlreadyNotifiedRecently(emailOrLead, telephone, centris, nom, sourc
   return false;
 }
 
-async function traiterNouveauLead(lead, msgId, from, subject, source) {
+async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {}) {
   const { nom, telephone, email, centris, adresse, type } = lead;
 
   // DÉDUP multi-clé 7j — email OU tel OU centris# OU (nom+source) = skip
-  if (leadAlreadyNotifiedRecently({ email, telephone, centris, nom, source: source.source })) {
+  // (opts.skipDedup: utilisé par le replay "nom X" sur un pending — même lead, on reprend)
+  if (!opts.skipDedup && leadAlreadyNotifiedRecently({ email, telephone, centris, nom, source: source.source })) {
     log('INFO', 'POLLER', `Dédup 7j: lead ${nom || email || telephone || centris} déjà notifié — skip`);
     // Audit: tracer le dédup pour /lead-audit (sinon silencieux)
     auditLogEvent('lead', 'dedup_skipped', {
@@ -6122,6 +6207,51 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   }
 
   log('OK', 'POLLER', `Lead ${source.label}: ${nom || email || telephone} | Centris: ${centris || '?'}`);
+
+  // ─── P1 — Validation nom prospect AVANT création deal ──────────────────────
+  // Si le parser n'a pas extrait un nom valide (vide, blacklisté, générique):
+  // on met le lead en pending, on alerte Shawn, on attend "nom Prénom Nom"
+  // pour reprendre. Évite les deals pourris "Prospect Centris" ou "Shawn Barrette".
+  if (!isValidProspectName(nom)) {
+    const pendingId = `lead_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const pending = {
+      id: pendingId, ts: Date.now(), needsName: true,
+      msgId, from, subject, source,
+      extracted: { nom: nom || '', telephone: telephone || '', email: email || '', centris: centris || '', adresse: adresse || '', type: type || '' },
+    };
+    pendingLeads.push(pending);
+    // Cap: garder les 50 derniers pending
+    if (pendingLeads.length > 50) pendingLeads = pendingLeads.slice(-50);
+    savePendingLeads();
+    log('WARN', 'POLLER', `Nom invalide "${nom || '(vide)'}" — lead mis en pending (${pendingId})`);
+    auditLogEvent('lead', 'pending_invalid_name', {
+      msgId, at: new Date().toISOString(), source: source?.label,
+      subject: subject?.substring(0, 100), from: from?.substring(0, 120),
+      extracted: pending.extracted, pendingId, decision: 'pending_invalid_name',
+    });
+    if (ALLOWED_ID) {
+      const alertMsg = [
+        `⚠️ *Lead reçu — nom non identifié*`,
+        ``,
+        `📧 Email: ${email || '(vide)'}`,
+        `📞 Tél: ${telephone || '(vide)'}`,
+        `🏡 Centris: ${centris ? `#${centris}` : '(vide)'}`,
+        `📍 Adresse: ${adresse || '(vide)'}`,
+        `📨 Source: ${source?.label || '?'}`,
+        `📝 Sujet: ${(subject || '').substring(0, 80)}`,
+        ``,
+        `❓ *Nom du prospect?*`,
+        `Réponds: \`nom Prénom Nom\` pour créer le deal.`,
+        ``,
+        `ID: \`${pendingId}\``,
+      ].join('\n');
+      bot.sendMessage(ALLOWED_ID, alertMsg, { parse_mode: 'Markdown' }).catch(() =>
+        bot.sendMessage(ALLOWED_ID, alertMsg.replace(/\*/g, '').replace(/`/g, '')).catch(() => {})
+      );
+    }
+    return; // STOP — pas de deal incomplet, on reprend quand Shawn répond "nom X"
+  }
+  // ─── FIN P1 ────────────────────────────────────────────────────────────────
 
   // 1. Créer deal Pipedrive
   let dealTxt = '';
