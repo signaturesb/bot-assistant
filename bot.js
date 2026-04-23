@@ -2353,8 +2353,9 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
     return { sent: false, skipped: true, reason: 'déjà envoyé <24h', match };
   }
 
-  if (!match.folder || match.score < 90 || !match.pdfs?.length) {
-    return { sent: false, skipped: true, reason: `score ${match.score} < 90 ou 0 PDF`, match };
+  const AUTO_THRESHOLD = parseInt(process.env.AUTO_SEND_THRESHOLD || '75');
+  if (!match.folder || match.score < AUTO_THRESHOLD || !match.pdfs?.length) {
+    return { sent: false, skipped: true, reason: `score ${match.score} < ${AUTO_THRESHOLD} ou 0 PDF`, match };
   }
 
   const maxRetries = 3;
@@ -6042,12 +6043,13 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   if (dealId) {
     try { dealFullObj = (await pdGet(`/deals/${dealId}`))?.data; } catch {}
   }
+  // Seuil d'envoi auto configurable (défaut 75 au lieu de 90 — plus agressif,
+  // preview par email toujours envoyé donc Shawn voit avant que le client reçoive)
+  const AUTO_THRESHOLD = parseInt(process.env.AUTO_SEND_THRESHOLD || '75');
   const hasMinInfo = !!(email && nom && (telephone || centris));
   const hasMatch   = dbxMatch?.folder && dbxMatch.pdfs.length > 0;
 
   // GARDE-FOU: détecte nom suspect (= courtier/agent capturé par erreur) → JAMAIS envoi auto
-  // Même avec score 100, si le nom extrait est "Shawn Barrette" ou équivalent, on
-  // met en pending et on alerte Shawn par Telegram pour validation humaine.
   const { BLACKLIST_NAMES } = leadParser;
   const nomLower = String(nom || '').toLowerCase().trim();
   const nomSuspect = nomLower && (BLACKLIST_NAMES || []).some(b =>
@@ -6069,9 +6071,13 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
         { parse_mode: 'Markdown' }
       ).catch(() => {});
     }
-    if (email) pendingDocSends.set(email, { email, nom: '', centris, dealId, deal: dealFullObj, match: dbxMatch });
-    autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto`;
-  } else if (hasMinInfo && hasMatch && dealFullObj && dbxMatch.score >= 90 && !autoSendPaused) {
+    if (email) {
+      pendingDocSends.set(email, { email, nom: '', centris, dealId, deal: dealFullObj, match: dbxMatch });
+      // Preview email → shawn@ même en cas suspect (pour voir ce qui SERAIT envoyé)
+      firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
+    }
+    autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
+  } else if (hasMinInfo && hasMatch && dealFullObj && dbxMatch.score >= AUTO_THRESHOLD && !autoSendPaused) {
     // ✅ AUTO-ENVOI — très confiant du match Dropbox
     try {
       const autoRes = await envoyerDocsAuto({
@@ -6091,26 +6097,25 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
       autoEnvoiMsg = `\n⚠️ Auto-envoi exception: ${e.message.substring(0, 100)}`;
       pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     }
-  } else if (hasMinInfo && hasMatch && dbxMatch.score >= 80) {
-    // 🤔 ZONE D'INCERTITUDE 80-89 — preview par email + confirmer avant envoi
+  } else if (email && hasMatch) {
+    // Score < AUTO_THRESHOLD OU infos incomplètes → preview + pending
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
+    const why = !hasMinInfo
+      ? `infos incomplètes (nom=${nom?'✓':'✗'} email=${email?'✓':'✗'} contact=${(telephone||centris)?'✓':'✗'})`
+      : `score match ${dbxMatch.score}/${AUTO_THRESHOLD}`;
     const docsList = dbxMatch.pdfs.slice(0, 10).map(p => `     • ${p.name}`).join('\n');
-    const more = dbxMatch.pdfs.length > 10 ? `\n     …et ${dbxMatch.pdfs.length - 10} autres` : '';
-    autoEnvoiMsg = `\n🤔 *Match à confirmer* — score ${dbxMatch.score}/100 (zone d'incertitude)\n` +
-                   `   Dossier Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
-                   `   ${dbxMatch.pdfs.length} docs prêts:\n${docsList}${more}\n` +
-                   `   📧 *Preview envoyé sur ${AGENT.email}* — regarde avant de valider\n` +
+    autoEnvoiMsg = `\n📦 *Docs en attente* (${why})\n` +
+                   `   Dossier: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
+                   `   ${dbxMatch.pdfs.length} docs prêts:\n${docsList}\n` +
+                   `   📧 Preview envoyé sur ${AGENT.email}\n` +
                    `   ✅ Dis \`envoie les docs à ${email}\` pour livrer\n` +
                    `   ❌ Dis \`annule ${email}\` pour ignorer`;
-  } else if (email && hasMatch) {
-    // Score <80 ou infos incomplètes — preview par email + brouillon
-    pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
-    firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
-    const why = !hasMinInfo ? `infos incomplètes (${[nom?'nom':null, email?'email':null, (telephone||centris)?'contact':null].filter(Boolean).join('+') || 'rien'})` : `score faible ${dbxMatch.score}`;
-    autoEnvoiMsg = `\n📦 *Docs en attente* (${why})\n   📧 Preview envoyé sur ${AGENT.email}\n   Vérifie et dis \`envoie les docs à ${email}\` si OK`;
   } else if (email && dbxMatch?.candidates?.length) {
     autoEnvoiMsg = `\n🔍 Plusieurs candidats Dropbox — check lequel est le bon avant d'envoyer`;
+  } else if (dealId && email) {
+    // Aucun match Dropbox du tout mais deal créé — alerte pour visibilité
+    autoEnvoiMsg = `\n⚠️ Deal créé mais aucun dossier Dropbox trouvé pour ce terrain. Vérifie avec \`/dropbox-find ${centris || adresse || email}\``;
   }
 
   // Préparer brouillon J+0
