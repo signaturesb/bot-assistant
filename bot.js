@@ -155,8 +155,11 @@ const metrics = {
 };
 function mTick(cat, key) {
   if (cat === 'tools') { metrics.tools[key] = (metrics.tools[key]||0)+1; return; }
-  if (metrics[cat] && typeof metrics[cat][key] === 'number') metrics[cat][key]++;
-  else if (metrics[cat]) metrics[cat][key] = 1;
+  const slot = metrics[cat];
+  if (typeof slot === 'number') { metrics[cat] = slot + 1; return; } // scalar metric (emailsSent, leads)
+  if (slot && typeof slot === 'object') {
+    slot[key] = (typeof slot[key] === 'number' ? slot[key] : 0) + 1;
+  }
 }
 
 // Circuit breaker: après N échecs, coupe le service X minutes (protège cascade failures)
@@ -1711,11 +1714,37 @@ async function matchDropboxAvance(centris, adresse) {
   return { folder: null, score: best?.score || 0, strategy: 'no_match', pdfs: [], candidates: topCandidates };
 }
 
+const DOC_EXTS = ['.pdf','.jpg','.jpeg','.png','.webp','.heic','.gif','.dwg','.dxf','.doc','.docx','.xls','.xlsx','.txt','.rtf'];
+const DOC_MIME = {
+  '.pdf':'application/pdf',
+  '.jpg':'image/jpeg','.jpeg':'image/jpeg',
+  '.png':'image/png','.gif':'image/gif','.webp':'image/webp','.heic':'image/heic',
+  '.dwg':'application/acad','.dxf':'application/dxf',
+  '.doc':'application/msword','.docx':'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls':'application/vnd.ms-excel','.xlsx':'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.txt':'text/plain','.rtf':'application/rtf',
+};
+function _docExt(name) { const m = name.toLowerCase().match(/\.[a-z0-9]+$/); return m ? m[0] : ''; }
+function _docContentType(name) { return DOC_MIME[_docExt(name)] || 'application/octet-stream'; }
+function _sortDocsPriority(docs) {
+  // Fiche_Detaillee en premier, puis PDFs, puis images, puis reste
+  const rank = d => {
+    const n = d.name.toLowerCase();
+    if (/fiche[_\s-]*detaill/i.test(n)) return 0;
+    if (n.endsWith('.pdf')) return 1;
+    if (/\.(jpe?g|png|webp|heic|gif)$/i.test(n)) return 2;
+    return 3;
+  };
+  return [...docs].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+}
+
 async function _listFolderPDFs(folder) {
   try {
     const r = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: false });
     if (!r?.ok) return [];
-    return ((await r.json()).entries || []).filter(x => x.name.toLowerCase().endsWith('.pdf'));
+    const entries = (await r.json()).entries || [];
+    const docs = entries.filter(x => x['.tag'] === 'file' && DOC_EXTS.includes(_docExt(x.name)));
+    return _sortDocsPriority(docs);
   } catch { return []; }
 }
 
@@ -1760,7 +1789,7 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
         autoEnvoiState.log = autoEnvoiState.log.slice(0, 100); // garder 100 dernières
         autoEnvoiState.totalAuto = (autoEnvoiState.totalAuto || 0) + 1;
         saveJSON(AUTOENVOI_FILE, autoEnvoiState);
-        log('OK', 'AUTOENVOI', `${email} <- ${match.pdfs.length} PDFs (${match.strategy}, score ${match.score}, ${ms}ms, try ${attempt + 1})`);
+        log('OK', 'AUTOENVOI', `${email} <- ${match.pdfs.length} docs (${match.strategy}, score ${match.score}, ${ms}ms, try ${attempt + 1})`);
         return { sent: true, match, deliveryMs: ms, attempt: attempt + 1, resultStr: result };
       }
       lastError = result;
@@ -1825,26 +1854,26 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     }
   }
 
-  // 4. Lister les PDFs
+  // 4. Lister TOUS les docs (PDFs + images + plans + Word/Excel) — triés Fiche_Detaillee en premier
   const lr = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: false });
   if (!lr?.ok) return `❌ Impossible de lire ${folder.name}`;
-  const all  = (await lr.json()).entries;
-  const pdfs = all.filter(f => f.name.toLowerCase().endsWith('.pdf'));
+  const all  = (await lr.json()).entries || [];
+  const pdfs = _sortDocsPriority(all.filter(f => f['.tag'] === 'file' && DOC_EXTS.includes(_docExt(f.name))));
   if (!pdfs.length) {
-    return `❌ Aucun PDF dans *${folder.name}*.\nFichiers: ${all.map(f => f.name).join(', ') || '(vide)'}`;
+    return `❌ Aucun document dans *${folder.name}*.\nFichiers: ${all.map(f => f.name).join(', ') || '(vide)'}`;
   }
 
   // Si pas d'email, lister les docs disponibles
   if (!toEmail) {
-    return `📁 *${folder.adresse || folder.name}*\nPDFs: ${pdfs.map(p => p.name).join(', ')}\n\n❓ Pas d'email pour *${deal.title}*.\nFournis: "email docs ${terme} à prenom@exemple.com"`;
+    return `📁 *${folder.adresse || folder.name}*\nDocs (${pdfs.length}): ${pdfs.map(p => p.name).join(', ')}\n\n❓ Pas d'email pour *${deal.title}*.\nFournis: "email docs ${terme} à prenom@exemple.com"`;
   }
 
-  // 5. Filtrer les PDFs à envoyer (si `fichier` spécifié → juste celui-là, sinon TOUS)
+  // 5. Filtrer les docs à envoyer (si `fichier` spécifié → juste celui-là, sinon TOUS)
   const pdfsToSend = fichier
     ? pdfs.filter(p => p.name.toLowerCase().includes(fichier.toLowerCase()))
     : pdfs;
   if (!pdfsToSend.length) {
-    return `❌ Aucun PDF matchant "${fichier}" dans ${folder.name}.\nDisponibles: ${pdfs.map(p=>p.name).join(', ')}`;
+    return `❌ Aucun document matchant "${fichier}" dans ${folder.name}.\nDisponibles: ${pdfs.map(p=>p.name).join(', ')}`;
   }
 
   // 6. Télécharger TOUS les PDFs en parallèle
@@ -2025,11 +2054,11 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     '',
   ];
 
-  // Ajouter chaque PDF comme pièce jointe
+  // Ajouter chaque document comme pièce jointe (Content-Type dynamique selon extension)
   for (const doc of ok) {
     lines.push(
       `--${outer}`,
-      'Content-Type: application/pdf',
+      `Content-Type: ${_docContentType(doc.name)}`,
       `Content-Disposition: attachment; filename="${enc(doc.name)}"`,
       'Content-Transfer-Encoding: base64',
       '',
@@ -4967,7 +4996,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   }
 
   if (dbxMatch?.folder) {
-    docsTxt = `📁 Match Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}* (${dbxMatch.strategy}, score ${dbxMatch.score}, ${dbxMatch.pdfs.length} PDF${dbxMatch.pdfs.length > 1 ? 's' : ''})`;
+    docsTxt = `📁 Match Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}* (${dbxMatch.strategy}, score ${dbxMatch.score}, ${dbxMatch.pdfs.length} doc${dbxMatch.pdfs.length > 1 ? 's' : ''})`;
   } else if (dbxMatch?.candidates?.length) {
     docsTxt = `📁 Candidats Dropbox: ${dbxMatch.candidates.map(c => `${c.folder.adresse || c.folder.name} (${c.score})`).join(', ')}`;
   }
@@ -4992,8 +5021,8 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
         email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch,
       });
       if (autoRes.sent) {
-        autoEnvoiMsg = `\n🚀 *Docs envoyés auto* à ${email}\n   ${dbxMatch.pdfs.length} PDFs · match "${dbxMatch.folder.adresse||dbxMatch.folder.name}" · score ${dbxMatch.score} · ${Math.round(autoRes.deliveryMs/1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
-        auditLogEvent('auto-send', 'docs-sent', { email, centris, score: dbxMatch.score, pdfs: dbxMatch.pdfs.length, ms: autoRes.deliveryMs });
+        autoEnvoiMsg = `\n🚀 *Docs envoyés auto* à ${email}\n   ${dbxMatch.pdfs.length} docs · match "${dbxMatch.folder.adresse||dbxMatch.folder.name}" · score ${dbxMatch.score} · ${Math.round(autoRes.deliveryMs/1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
+        auditLogEvent('auto-send', 'docs-sent', { email, centris, score: dbxMatch.score, docs: dbxMatch.pdfs.length, ms: autoRes.deliveryMs });
       } else if (autoRes.skipped) {
         autoEnvoiMsg = `\n⏭ Auto-envoi skip: ${autoRes.reason}`;
       } else {
@@ -5008,9 +5037,11 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   } else if (hasMinInfo && hasMatch && dbxMatch.score >= 80) {
     // 🤔 ZONE D'INCERTITUDE 80-89 — confirmer avant envoi
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    const docsList = dbxMatch.pdfs.slice(0, 10).map(p => `     • ${p.name}`).join('\n');
+    const more = dbxMatch.pdfs.length > 10 ? `\n     …et ${dbxMatch.pdfs.length - 10} autres` : '';
     autoEnvoiMsg = `\n🤔 *Match à confirmer* — score ${dbxMatch.score}/100 (zone d'incertitude)\n` +
                    `   Dossier Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
-                   `   ${dbxMatch.pdfs.length} PDFs prêts\n` +
+                   `   ${dbxMatch.pdfs.length} docs prêts:\n${docsList}${more}\n` +
                    `   ✅ Dis \`envoie les docs à ${email}\` pour livrer\n` +
                    `   ❌ Dis \`annule ${email}\` pour ignorer`;
   } else if (email && hasMatch) {
