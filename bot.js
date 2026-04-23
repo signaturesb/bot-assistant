@@ -1817,19 +1817,49 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
 }
 
 // Fire-and-forget: envoie le preview email à shawn@ sans bloquer le lead flow
+// Dédup 1h par (clientEmail + folderPath) — évite spam si lead re-traité
+const previewSent = new Map(); // key → timestamp ms
 function firePreviewDocs({ email, nom, centris, deal, match }) {
+  if (!email || !match?.folder) return;
+  const key = `${email}|${match.folder.path || ''}`;
+  const last = previewSent.get(key);
+  if (last && (Date.now() - last) < 60 * 60 * 1000) {
+    log('INFO', 'DOCS', `PREVIEW skip dédup 1h (client: ${email})`);
+    return;
+  }
+  previewSent.set(key, Date.now());
+  // Nettoyage: garder max 200 entrées
+  if (previewSent.size > 200) {
+    const keys = [...previewSent.keys()].slice(0, previewSent.size - 200);
+    for (const k of keys) previewSent.delete(k);
+  }
+
   setImmediate(async () => {
     try {
       const res = await envoyerDocsProspect(nom || email, email, null, {
-        dealHint: deal, folderHint: match?.folder, centrisHint: centris,
+        dealHint: deal, folderHint: match.folder, centrisHint: centris,
         preview: { clientEmail: email, clientName: nom || '' },
       });
       if (typeof res === 'string' && res.startsWith('✅')) {
         log('OK', 'DOCS', `PREVIEW → ${AGENT.email} (client: ${email})`);
       } else {
         log('WARN', 'DOCS', `PREVIEW échec: ${String(res).substring(0, 120)}`);
+        if (ALLOWED_ID) {
+          bot.sendMessage(ALLOWED_ID,
+            `⚠️ *Preview email ÉCHOUÉ* pour ${email}\n${String(res).substring(0, 200)}\n\nLe doc-send reste en attente — tu peux quand même dire \`envoie les docs à ${email}\`.`,
+            { parse_mode: 'Markdown' }
+          ).catch(() => {});
+        }
       }
-    } catch (e) { log('WARN', 'DOCS', `PREVIEW exception: ${e.message}`); }
+    } catch (e) {
+      log('WARN', 'DOCS', `PREVIEW exception: ${e.message}`);
+      if (ALLOWED_ID) {
+        bot.sendMessage(ALLOWED_ID,
+          `⚠️ *Preview email exception* pour ${email}\n${e.message.substring(0, 200)}`,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
+    }
   });
 }
 
