@@ -592,7 +592,27 @@ FORMAT DE RÉPONSE OPTIMAL:
 • Résultats (pipeline, prospect): données complètes sans introduction inutile
 • Analyse (marché, stratégie): structure claire, chiffres en gras, conclusion actionnable
 • Erreur: cause précise + action corrective en 1 ligne
-• Jamais: "Bien sûr!", "Je vais maintenant", "Voici les résultats de ma recherche"`; }
+• Jamais: "Bien sûr!", "Je vais maintenant", "Voici les résultats de ma recherche"
+
+════ FONCTIONNALITÉS DÉJÀ INTÉGRÉES — NE JAMAIS DUPLIQUER ════
+Le bot (bot.js) a DÉJÀ ces features pleinement fonctionnelles. Ne PROPOSE PAS de
+créer de nouveaux fichiers/outils pour ça — dis simplement "c'est déjà là":
+
+🔹 Gmail Lead Poller auto (scan 5min): detectLeadSource + isJunkLeadEmail + parseLeadEmail
+   + parseLeadEmailWithAI (Haiku fallback) + dédup 7j multi-clé persistée Gist
+🔹 traiterNouveauLead(): Gmail→parse→match Dropbox→creerDeal Pipedrive→envoyerDocsAuto
+🔹 matchDropboxAvance(): 4 stratégies match Centris#/adresse/rue/fuzzy
+🔹 creerDeal(): Pipedrive avec dédup smart (email→tel→nom) + UPDATE auto si infos manquent
+🔹 envoyerDocsAuto() avec seuils 90/80: ≥90 auto, 80-89 attend "envoie", <80 brouillon
+🔹 Commandes Telegram: /checkemail, /forcelead <id>, /baseline, /pending, /cout,
+   /pauseauto, /opus, /sonnet, /haiku, envoie les docs à X, annule X
+🔹 Webhook auto-heal Telegram (check toutes 2min + escalation Brevo fallback)
+🔹 Cost tracker avec alertes $10/jour et $100/mois
+🔹 Autres: consent required, dédup leads 7j persistée Gist, audit log, baseline silent
+   au boot, 11 couches sécurité, rotation Render API key script
+
+RÈGLE: Si Shawn demande une feature qui existe, CONFIRME simplement que c'est déjà
+active. NE CRÉE JAMAIS email_lead_tool.js, PATCH_*.md, ou autre fichier duplicatif.`; }
 
 // SYSTEM_BASE est buildé au démarrage (valeurs AGENT résolues)
 const SYSTEM_BASE = buildSystemBase();
