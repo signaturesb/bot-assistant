@@ -2849,25 +2849,20 @@ Au plaisir,<br>
   const enc   = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
-  // CC/BCC — shawn@ TOUJOURS en *Bcc invisible* (le client ne voit pas le courtier copié)
-  // + CCs explicites fournis par opts.cc (julie@, autres) restent en Cc visible
-  // Exception: en preview mode, pas de Bcc shawn (shawn@ est déjà le To)
+  // CC — shawn@ TOUJOURS en Cc visible (le client voit le courtier copié — demande Shawn 2026-04-23)
+  // + CCs explicites fournis par opts.cc (julie@, autres) restent aussi en Cc visible
+  // Exception: en preview mode, pas de Cc (shawn@ est déjà le To)
   const ccUserRaw = opts.cc;
   const ccUser = !ccUserRaw ? [] : (Array.isArray(ccUserRaw) ? ccUserRaw : String(ccUserRaw).split(',')).map(s => String(s).trim()).filter(Boolean);
   const ccFinal = previewMode
     ? []
-    : [...new Set(ccUser.filter(e => e && e.toLowerCase() !== realToEmail.toLowerCase() && e.toLowerCase() !== AGENT.email.toLowerCase()))];
-  const bccFinal = previewMode
-    ? []
-    : (AGENT.email && AGENT.email.toLowerCase() !== realToEmail.toLowerCase() ? [AGENT.email] : []);
-  const ccLine  = ccFinal.length  ? [`Cc: ${ccFinal.join(', ')}`]   : [];
-  const bccLine = bccFinal.length ? [`Bcc: ${bccFinal.join(', ')}`] : [];
+    : [...new Set([AGENT.email, ...ccUser].filter(e => e && e.toLowerCase() !== realToEmail.toLowerCase()))];
+  const ccLine = ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : [];
 
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${realToEmail}`,
     ...ccLine,
-    ...bccLine,
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
@@ -3922,7 +3917,7 @@ const TOOLS = [
   { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
   // ── Listings Dropbox + envoi docs ──
   { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox (/Terrain en ligne/) par ville, adresse ou numéro Centris. Utilise le cache — résultat instantané. Liste PDFs + photos de chaque dossier trouvé.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
-  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Match par Centris# ou adresse via index cross-source /Inscription + /Terrain en ligne fusionnés. shawn@signaturesb.com est TOUJOURS AUTOMATIQUEMENT en Bcc invisible (le client ne le voit PAS dans les destinataires). CCs additionnels visibles (julie@, autres) via le param cc. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Le tool supporte tout — multi-PDF par défaut, CC, envoi même sans deal Pipedrive si email fourni.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client directement si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'CCs ADDITIONNELS en plus de shawn@ qui est auto (ex: "julie@signaturesb.com"). Séparer par virgules si plusieurs.' }, fichier: { type: 'string', description: 'OPTIONNEL — filtrer UN seul PDF (nom partiel). Par défaut: TOUS les docs envoyés.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer match Dropbox (si absent de Pipedrive)' } }, required: ['terme'] } },
+  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Match par Centris# ou adresse via index cross-source /Inscription + /Terrain en ligne fusionnés. shawn@signaturesb.com est TOUJOURS AUTOMATIQUEMENT en Cc visible par le client (pas besoin de le spécifier). CCs additionnels (julie@, autres) via le param cc. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Le tool supporte tout — multi-PDF par défaut, CC, envoi même sans deal Pipedrive si email fourni.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client directement si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'CCs ADDITIONNELS en plus de shawn@ qui est auto (ex: "julie@signaturesb.com"). Séparer par virgules si plusieurs.' }, fichier: { type: 'string', description: 'OPTIONNEL — filtrer UN seul PDF (nom partiel). Par défaut: TOUS les docs envoyés.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer match Dropbox (si absent de Pipedrive)' } }, required: ['terme'] } },
   // ── Sync Claude Code ↔ Bot ──
   { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
   // ── Diagnostics ──
