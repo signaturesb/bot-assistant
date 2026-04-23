@@ -1,5 +1,5 @@
 # ✅ Boot réussi
-_2026-04-22 20 h 00 min 09 s_
+_2026-04-22 21 h 04 min 26 s_
 
 - Modèle: claude-sonnet-4-6
 - Outils: 39
@@ -31,16 +31,7 @@ WARN|CENTRIS|Login: HTTP 200 — location:
 WARN|CENTRIS|Pré-login échoué — retry automatique à la première requête
 OK|PREFLIGHT|✅ Claude API accepte les 39 tools
 OK|BOOT|Webhook Telegram configuré: https://signaturesb-bot-s272.onrender.com/webhook/telegram
-INFO|BOOT|State vide — baseline silencieux 7j au boot (zéro notif rétro)
+OK|GIST|Poller state restauré: 56 processed, 21 leads
+OK|GIST|Dedup restauré: 28 entries
 OK|GMAIL|Token rafraîchi ✓
-OK|BOOT|Baseline silencieux: 15 leads marqués, 8 dédup entries
-INFO|POLLER|Junk: [Anglehart, Jacques] Maison Lanaudiere 225k- (Shawn Barrette <centris@mlsmatrix.com>)
-INFO|POLLER|Regex 1 infos — AI fallback pour "Centris.ca - Demande d’information pour le Chemin "
-OK|AI_PARSER|Extracted: nom=false tel=false email=false centris=true
-OK|POLLER|Lead Centris.ca:  | Centris: 12582379
-WARN|POLLER|Telegram notify: ETELEGRAM: 400 Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 288
-INFO|POLLER|Junk: [Charrette, Stéphane] Maison 430 et moins (Shawn Barrette <centris@mlsmatrix.com>)
-INFO|POLLER|Regex 1 infos — AI fallback pour "Centris.ca - Demande d’information pour le 5e Rang"
-OK|AI_PARSER|Extracted: nom=false tel=false email=false centris=true
-OK|POLLER|Lead Centris.ca:  | Centris: 26063767
 ```
