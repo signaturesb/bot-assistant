@@ -2,6 +2,36 @@
 // Utilisé par bot.js (production) + test_parser.js (suite de tests)
 'use strict';
 
+// BLACKLIST: empêche le parser de capturer Shawn/RE-MAX/Signature SB comme PROSPECT.
+// Causait: emails Centris réexpédiés par Gmail ont "De: Shawn Barrette <shawn@signaturesb.com>"
+// en header → regex capturait Shawn comme nom du client → deal créé au mauvais nom →
+// pas d'envoi auto. Bug résolu 2026-04-23 via sanitizeProspect().
+const BLACKLIST_NAMES = ['shawn', 'shawn barrette', 'barrette', 'signature sb', 'signaturesb', 'remax', 're/max', 'kira'];
+const BLACKLIST_EMAIL_PARTS = ['signaturesb.com', 'shawnbarrette', 'julielem', 'centris.ca', 'mlsmatrix', 'remax-quebec.com', 'noreply', 'no-reply', 'nepasrepondre'];
+
+function sanitizeProspect(data) {
+  const nomLower = (data.nom || '').toLowerCase().trim();
+  if (nomLower && BLACKLIST_NAMES.some(b => nomLower === b || nomLower.startsWith(b + ' ') || nomLower.endsWith(' ' + b) || nomLower.includes(' ' + b + ' '))) {
+    data.nom = ''; // Rejeté — forcera fallback AI
+  }
+  const emailLower = (data.email || '').toLowerCase().trim();
+  if (emailLower && BLACKLIST_EMAIL_PARTS.some(b => emailLower.includes(b))) {
+    data.email = ''; // Rejeté — c'est le courtier ou un système, pas un client
+  }
+  return data;
+}
+
+// Score qualité 0-100 pour décider si AI fallback nécessaire
+function leadQualityScore(data) {
+  let score = 0;
+  if (data.nom && data.nom.length >= 3) score += 30;
+  if (data.email && /@/.test(data.email)) score += 25;
+  if (data.telephone && data.telephone.length >= 10) score += 20;
+  if (data.centris && /^\d{7,9}$/.test(data.centris)) score += 15;
+  if (data.adresse && data.adresse.length >= 5) score += 10;
+  return score;
+}
+
 const LEAD_EMAIL_PATTERNS = [
   { re: /centris/i,               source: 'centris',   label: 'Centris.ca' },
   { re: /remax/i,                 source: 'remax',     label: 'RE/MAX Québec' },
@@ -128,7 +158,7 @@ function parseLeadEmail(body, subject, from) {
   else if (/construction\s+neuve|neuve?|new\s+build/i.test(typeText))        type = 'construction_neuve';
   else if (/terrain|lot\b|land/i.test(typeText))                             type = 'terrain';
 
-  return { nom, telephone, email, centris, adresse, type };
+  return sanitizeProspect({ nom, telephone, email, centris, adresse, type });
 }
 
 // AI FALLBACK — Claude Sonnet 4.6 avec tool-use structuré (fine pointe)
@@ -191,12 +221,22 @@ async function parseLeadEmailWithAI(body, subject, from, regexResult, { apiKey, 
   };
 
   const prompt = `Tu analyses un email reçu par un COURTIER IMMOBILIER (Shawn Barrette, shawn@signaturesb.com).
-Extrais les informations du CLIENT (pas du courtier, jamais de Shawn, jamais de RE/MAX).
+Extrais les informations du CLIENT PROSPECT — JAMAIS celles du courtier.
+
+⚠️ IMPORTANT — Ignore ces noms/emails (c'est le destinataire, pas le prospect):
+- "Shawn Barrette", "Shawn", "Barrette"
+- "Signature SB", "SignatureSB", "RE/MAX", "REMAX"
+- "Kira" (assistant IA), "Julie" (assistante de Shawn)
+- shawn@signaturesb.com, julie@signaturesb.com
+- Tout email @signaturesb.com, @remax-quebec.com, @centris.ca, @mlsmatrix, no-reply@*, noreply@*
+
+Les formulaires Centris/RE-MAX contiennent souvent une section "Coordonnées du client" ou
+"Informations de l'acheteur potentiel" — c'est LÀ qu'est le vrai prospect. Le header
+"De: Shawn Barrette <shawn@signaturesb.com>" est juste Gmail qui réexpédie, pas le client.
 
 Règles strictes:
 - Si un champ n'est PAS présent ou ambigu, mets ""
 - Téléphone: exactement 10 chiffres sans formatage ("5149271340")
-- Email en minuscules, jamais un no-reply/noreply/centris@/signaturesb
 - Centris#: 7-9 chiffres contigus
 - Le "message" est le texte libre écrit par le client (pas les éléments de formulaire)
 - Confidence 0-100: ton niveau de certitude que la valeur est correcte
@@ -277,8 +317,10 @@ Appelle enregistrer_infos_lead avec les valeurs extraites.`;
     // Protection: rejeter tel Shawn si AI l'a retourné pour le client
     if (merged.telephone === '5149271340' && !regexResult.telephone) merged.telephone = '';
 
-    _log('OK', 'AI_PARSER', `Extracted (sonnet tool-use): nom=${!!merged.nom} tel=${!!merged.telephone} email=${!!merged.email} centris=${!!merged.centris} adresse=${!!merged.adresse} conf=${JSON.stringify(merged.confidence)}`);
-    return merged;
+    // Sanitization finale: blacklist Shawn/RE-MAX/Signature SB
+    const sanitized = sanitizeProspect(merged);
+    _log('OK', 'AI_PARSER', `Extracted (sonnet tool-use): nom=${!!sanitized.nom} tel=${!!sanitized.telephone} email=${!!sanitized.email} centris=${!!sanitized.centris} adresse=${!!sanitized.adresse} conf=${JSON.stringify(sanitized.confidence)}`);
+    return sanitized;
   } catch (e) {
     _log('WARN', 'AI_PARSER', `Exception: ${e.message}`);
     return regexResult;
@@ -288,8 +330,12 @@ Appelle enregistrer_infos_lead avec les valeurs extraites.`;
 module.exports = {
   LEAD_EMAIL_PATTERNS,
   LEAD_SUBJECT_RE,
+  BLACKLIST_NAMES,
+  BLACKLIST_EMAIL_PARTS,
   detectLeadSource,
   isJunkLeadEmail,
   parseLeadEmail,
   parseLeadEmailWithAI,
+  sanitizeProspect,
+  leadQualityScore,
 };

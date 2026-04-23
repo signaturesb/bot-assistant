@@ -6045,7 +6045,33 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   const hasMinInfo = !!(email && nom && (telephone || centris));
   const hasMatch   = dbxMatch?.folder && dbxMatch.pdfs.length > 0;
 
-  if (hasMinInfo && hasMatch && dealFullObj && dbxMatch.score >= 90 && !autoSendPaused) {
+  // GARDE-FOU: détecte nom suspect (= courtier/agent capturé par erreur) → JAMAIS envoi auto
+  // Même avec score 100, si le nom extrait est "Shawn Barrette" ou équivalent, on
+  // met en pending et on alerte Shawn par Telegram pour validation humaine.
+  const { BLACKLIST_NAMES } = leadParser;
+  const nomLower = String(nom || '').toLowerCase().trim();
+  const nomSuspect = nomLower && (BLACKLIST_NAMES || []).some(b =>
+    nomLower === b || nomLower.includes(b)
+  );
+  if (nomSuspect) {
+    log('WARN', 'POLLER', `Nom SUSPECT détecté "${nom}" — bloque envoi auto, pending validation`);
+    if (ALLOWED_ID) {
+      bot.sendMessage(ALLOWED_ID,
+        `⚠️ *Lead suspect — validation requise*\n\n` +
+        `Le parser a extrait *"${nom}"* comme nom du prospect, mais c'est un nom blacklisté (courtier/agent/system).\n\n` +
+        `Source email: ${source?.label || '?'}\n` +
+        `Sujet: ${subject?.substring(0, 80) || '?'}\n` +
+        `Email extrait: ${email || '(vide)'}\n` +
+        `Tél: ${telephone || '(vide)'}\n` +
+        `Centris: ${centris || '(vide)'}\n` +
+        `Adresse: ${adresse || '(vide)'}\n\n` +
+        `Vérifie l'email original avec \`/parselead ${msgId || '?'}\` et corrige manuellement.`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+    if (email) pendingDocSends.set(email, { email, nom: '', centris, dealId, deal: dealFullObj, match: dbxMatch });
+    autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto`;
+  } else if (hasMinInfo && hasMatch && dealFullObj && dbxMatch.score >= 90 && !autoSendPaused) {
     // ✅ AUTO-ENVOI — très confiant du match Dropbox
     try {
       const autoRes = await envoyerDocsAuto({
