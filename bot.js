@@ -5310,16 +5310,62 @@ async function main() {
   log('INFO', 'BOOT', 'Step 7: startDailyTasks');
   try { startDailyTasks(); } catch (e) { log('ERR', 'BOOT', `startDailyTasks FATAL: ${e.message}`); throw e; }
 
-  log('INFO', 'BOOT', 'Step 8: configuration WEBHOOK Telegram (au lieu de polling — production-grade)');
-  // WEBHOOK mode au lieu de polling: Telegram push les updates sur notre endpoint HTTPS
-  // Plus robuste, pas de conflict d'instances, pas de polling errors
+  log('INFO', 'BOOT', 'Step 8: configuration WEBHOOK Telegram (auto-healing + secret sync)');
   const webhookUrl = `https://signaturesb-bot-s272.onrender.com/webhook/telegram`;
-  setTimeout(async () => {
+
+  // ── AUTO-HEAL WEBHOOK ──────────────────────────────────────────────────────
+  // Au boot + toutes les 5 min: vérifie que Telegram et le bot ont le même
+  // TELEGRAM_WEBHOOK_SECRET. Si pas sync OU si last_error Telegram → resync.
+  // Garantit qu'on ne se retrouve JAMAIS avec un webhook "401 Unauthorized"
+  // silencieux (qui bloque tout le traffic Telegram vers le bot).
+  async function syncWebhookWithSecret() {
+    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
     try {
-      await bot.setWebHook(webhookUrl);
-      log('OK', 'BOOT', `Webhook Telegram configuré: ${webhookUrl}`);
-    } catch (e) { log('ERR', 'BOOT', `setWebHook (non-fatal): ${e.message}`); }
-  }, 5000);
+      const setParams = {
+        url: webhookUrl,
+        allowed_updates: ['message', 'edited_message', 'callback_query'],
+        max_connections: 40,
+      };
+      if (secret) setParams.secret_token = secret;
+      // setWebHook avec options si library supporte, sinon fetch direct
+      const body = JSON.stringify(setParams);
+      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      const data = await res.json();
+      if (data.ok) log('OK', 'WEBHOOK', `Telegram sync — secret=${secret ? 'set' : 'none'}`);
+      else log('WARN', 'WEBHOOK', `setWebhook: ${data.description}`);
+      return data.ok;
+    } catch (e) {
+      log('WARN', 'WEBHOOK', `sync exception: ${e.message}`);
+      return false;
+    }
+  }
+  async function checkWebhookHealth() {
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`);
+      const data = await res.json();
+      const w = data.result || {};
+      // Si dernière erreur <5min OU pending updates anormalement élevés → resync
+      const now = Math.floor(Date.now()/1000);
+      const errorRecent = w.last_error_date && (now - w.last_error_date) < 300;
+      const tooPending  = (w.pending_update_count || 0) > 20;
+      if (errorRecent || tooPending) {
+        log('WARN', 'WEBHOOK', `Anomaly detected — pending=${w.pending_update_count} lastErr=${w.last_error_message} → resync`);
+        await syncWebhookWithSecret();
+        if (ALLOWED_ID && errorRecent) {
+          bot.sendMessage(ALLOWED_ID, `🔧 *Webhook auto-heal*\nDétecté: ${w.last_error_message}\nResync effectué. Si tu as perdu des messages, renvoie-les.`, { parse_mode: 'Markdown' }).catch(()=>{});
+        }
+      }
+    } catch (e) { log('WARN', 'WEBHOOK', `check: ${e.message}`); }
+  }
+
+  // 1er sync au boot (+5s pour laisser le server démarrer)
+  setTimeout(syncWebhookWithSecret, 5000);
+  // Auto-heal continu toutes les 5 min
+  setInterval(checkWebhookHealth, 5 * 60 * 1000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
