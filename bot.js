@@ -4835,6 +4835,70 @@ function registerHandlers() {
     );
   });
 
+  // /lead-audit <email|centris|msgId> — trace complète du parcours d'un lead
+  bot.onText(/\/lead[-_]?audit\s+(.+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const q = match[1].trim().toLowerCase();
+    const events = (auditLog || []).filter(e => e.category === 'lead').reverse();
+    const hits = events.filter(e => {
+      const d = e.details || {};
+      return d.msgId === q
+        || (d.extracted?.email || '').toLowerCase() === q
+        || (d.extracted?.centris || '') === q
+        || (d.extracted?.email || '').toLowerCase().includes(q)
+        || (d.extracted?.nom || '').toLowerCase().includes(q)
+        || String(d.dealId || '') === q;
+    }).slice(0, 3);
+    if (!hits.length) {
+      return bot.sendMessage(msg.chat.id,
+        `❌ Aucun lead audit trouvé pour "${q}"\n\n` +
+        `Essaie avec: email complet, # Centris (7-9 digits), Gmail messageId, dealId Pipedrive, ou partie du nom.\n` +
+        `${events.length} lead(s) en audit total.`
+      );
+    }
+    for (const ev of hits) {
+      const d = ev.details || {};
+      const ext = d.extracted || {};
+      const m = d.match || {};
+      const lines = [
+        `🔍 *Audit lead* — ${new Date(ev.at).toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}`,
+        `*Décision:* \`${d.decision}\``,
+        ``,
+        `*Source:* ${d.source || '?'}`,
+        `*Sujet:* ${d.subject || '?'}`,
+        `*From:* ${d.from || '?'}`,
+        `*MsgId:* \`${d.msgId || '?'}\``,
+        ``,
+        `*📋 Infos extraites:*`,
+        `  Nom: \`${ext.nom || '(vide)'}\``,
+        `  Tél: \`${ext.telephone || '(vide)'}\``,
+        `  Email: \`${ext.email || '(vide)'}\``,
+        `  Centris: \`${ext.centris || '(vide)'}\``,
+        `  Adresse: \`${ext.adresse || '(vide)'}\``,
+        `  MinInfo: ${d.hasMinInfo ? '✅' : '❌'}`,
+        ``,
+        `*🏢 Pipedrive:*`,
+        `  Deal créé: ${d.dealCreated ? `✅ #${d.dealId}` : '❌'}`,
+        ``,
+        `*📁 Match Dropbox:*`,
+        `  Trouvé: ${m.found ? '✅' : '❌'}`,
+        `  Score: ${m.score}/100 (seuil: ${d.threshold})`,
+        `  Stratégie: \`${m.strategy}\``,
+        `  Dossier: \`${m.folder || '(aucun)'}\``,
+        `  Sources: ${(m.sources || []).join(', ') || '(aucune)'}`,
+        `  Fichiers: ${m.pdfCount || 0}`,
+      ];
+      if (d.suspectName) lines.push(``, `⚠️ *Nom suspect détecté:* \`${d.suspectName}\` — bloqué par garde-fou`);
+      if (d.deliveryMs) lines.push(``, `📮 *Livraison:* ${Math.round(d.deliveryMs/1000)}s · ${d.attempts || 1} tentative(s)`);
+      if (d.error) lines.push(``, `❌ *Erreur:* \`${d.error}\``);
+      if (d.skipReason) lines.push(``, `⏭ *Skip:* ${d.skipReason}`);
+
+      await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' }).catch(() => {
+        bot.sendMessage(msg.chat.id, lines.join('\n').replace(/[*_`]/g, ''));
+      });
+    }
+  });
+
   // /diag — vue santé système complète en un seul coup d'œil (fine pointe)
   bot.onText(/\/diag/i, async msg => {
     if (!isAllowed(msg)) return;
@@ -6109,6 +6173,25 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   const hasMinInfo = !!(email && nom && (telephone || centris));
   const hasMatch   = dbxMatch?.folder && dbxMatch.pdfs.length > 0;
 
+  // AUDIT TRAIL complet — un event par lead avec tout son parcours pour /lead-audit
+  const leadAudit = {
+    msgId, at: new Date().toISOString(),
+    source: source?.label, subject: subject?.substring(0, 100), from: from?.substring(0, 120),
+    extracted: { nom, telephone, email, centris, adresse, type },
+    dealId, dealCreated: !!dealId,
+    match: {
+      found: !!hasMatch,
+      score: dbxMatch?.score || 0,
+      strategy: dbxMatch?.strategy || 'none',
+      folder: dbxMatch?.folder?.name || null,
+      sources: dbxMatch?.folder?.sources || (dbxMatch?.folder?.source ? [dbxMatch.folder.source] : []),
+      pdfCount: dbxMatch?.pdfs?.length || 0,
+    },
+    hasMinInfo,
+    threshold: AUTO_THRESHOLD,
+    decision: 'pending', // mis à jour plus bas
+  };
+
   // GARDE-FOU: détecte nom suspect (= courtier/agent capturé par erreur) → JAMAIS envoi auto
   const { BLACKLIST_NAMES } = leadParser;
   const nomLower = String(nom || '').toLowerCase().trim();
@@ -6131,9 +6214,10 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
         { parse_mode: 'Markdown' }
       ).catch(() => {});
     }
+    leadAudit.decision = 'blocked_suspect_name';
+    leadAudit.suspectName = nom;
     if (email) {
       pendingDocSends.set(email, { email, nom: '', centris, dealId, deal: dealFullObj, match: dbxMatch });
-      // Preview email → shawn@ même en cas suspect (pour voir ce qui SERAIT envoyé)
       firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
@@ -6144,21 +6228,26 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
         email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch,
       });
       if (autoRes.sent) {
+        leadAudit.decision = 'auto_sent'; leadAudit.deliveryMs = autoRes.deliveryMs; leadAudit.attempts = autoRes.attempt;
         autoEnvoiMsg = `\n🚀 *Docs envoyés auto* à ${email}\n   ${dbxMatch.pdfs.length} docs · match "${dbxMatch.folder.adresse||dbxMatch.folder.name}" · score ${dbxMatch.score} · ${Math.round(autoRes.deliveryMs/1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
         auditLogEvent('auto-send', 'docs-sent', { email, centris, score: dbxMatch.score, docs: dbxMatch.pdfs.length, ms: autoRes.deliveryMs });
       } else if (autoRes.skipped) {
+        leadAudit.decision = 'auto_skipped'; leadAudit.skipReason = autoRes.reason;
         autoEnvoiMsg = `\n⏭ Auto-envoi skip: ${autoRes.reason}`;
       } else {
+        leadAudit.decision = 'auto_failed'; leadAudit.error = String(autoRes.error).substring(0, 200); leadAudit.attempts = autoRes.attempts;
         autoEnvoiMsg = `\n⚠️ *Auto-envoi ÉCHOUÉ* après ${autoRes.attempts} tentatives: ${String(autoRes.error).substring(0, 120)}\n   Envoie manuellement: \`envoie les docs à ${email}\``;
         pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
         auditLogEvent('auto-send', 'docs-failed', { email, error: String(autoRes.error).substring(0, 200) });
       }
     } catch (e) {
+      leadAudit.decision = 'auto_exception'; leadAudit.error = e.message.substring(0, 200);
       autoEnvoiMsg = `\n⚠️ Auto-envoi exception: ${e.message.substring(0, 100)}`;
       pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     }
   } else if (email && hasMatch) {
     // Score < AUTO_THRESHOLD OU infos incomplètes → preview + pending
+    leadAudit.decision = 'pending_preview_sent';
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
     const why = !hasMinInfo
@@ -6172,11 +6261,18 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
                    `   ✅ Dis \`envoie les docs à ${email}\` pour livrer\n` +
                    `   ❌ Dis \`annule ${email}\` pour ignorer`;
   } else if (email && dbxMatch?.candidates?.length) {
+    leadAudit.decision = 'multiple_candidates';
     autoEnvoiMsg = `\n🔍 Plusieurs candidats Dropbox — check lequel est le bon avant d'envoyer`;
   } else if (dealId && email) {
     // Aucun match Dropbox du tout mais deal créé — alerte pour visibilité
+    leadAudit.decision = 'no_dropbox_match';
     autoEnvoiMsg = `\n⚠️ Deal créé mais aucun dossier Dropbox trouvé pour ce terrain. Vérifie avec \`/dropbox-find ${centris || adresse || email}\``;
+  } else {
+    leadAudit.decision = 'skipped_no_email_or_deal';
   }
+
+  // PERSIST audit trail — indexé par msgId + email + centris pour /lead-audit
+  auditLogEvent('lead', leadAudit.decision, leadAudit);
 
   // Préparer brouillon J+0
   const prospectNom   = nom || (email?.split('@')[0]) || 'Madame/Monsieur';
