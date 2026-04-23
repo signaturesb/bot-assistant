@@ -9,9 +9,32 @@
 const BLACKLIST_NAMES = ['shawn', 'shawn barrette', 'barrette', 'signature sb', 'signaturesb', 'remax', 're/max', 'kira'];
 const BLACKLIST_EMAIL_PARTS = ['signaturesb.com', 'shawnbarrette', 'julielem', 'centris.ca', 'mlsmatrix', 'remax-quebec.com', 'noreply', 'no-reply', 'nepasrepondre'];
 
+// Match whole-word ou exact — évite false positive sur "Jean Barrette-Tremblay"
+// qui contiendrait "barrette" comme partie légitime du nom.
+function _isBlacklistedName(nomLower) {
+  if (!nomLower) return false;
+  // Exact match
+  if (BLACKLIST_NAMES.includes(nomLower)) return true;
+  // Match avec word boundaries (espace/début/fin)
+  const nomTokens = nomLower.split(/\s+/).filter(Boolean);
+  for (const bl of BLACKLIST_NAMES) {
+    const blTokens = bl.split(/\s+/).filter(Boolean);
+    if (blTokens.length === 1) {
+      // Single-word blacklist (ex: "shawn") → match si c'est un token complet
+      if (nomTokens.includes(blTokens[0])) return true;
+    } else {
+      // Multi-word (ex: "shawn barrette") → match séquence complète
+      const nomJoined = ' ' + nomLower + ' ';
+      const blJoined = ' ' + bl + ' ';
+      if (nomJoined.includes(blJoined)) return true;
+    }
+  }
+  return false;
+}
+
 function sanitizeProspect(data) {
   const nomLower = (data.nom || '').toLowerCase().trim();
-  if (nomLower && BLACKLIST_NAMES.some(b => nomLower === b || nomLower.startsWith(b + ' ') || nomLower.endsWith(' ' + b) || nomLower.includes(' ' + b + ' '))) {
+  if (_isBlacklistedName(nomLower)) {
     data.nom = ''; // Rejeté — forcera fallback AI
   }
   const emailLower = (data.email || '').toLowerCase().trim();

@@ -6128,16 +6128,29 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
         `Sujet: ${subject}`,
       ].filter(Boolean).join('\n');
 
-      dealTxt = await creerDeal({
-        prenom: nom?.split(' ')[0] || nom || '',
-        nom:    nom?.split(' ').slice(1).join(' ') || '',
-        telephone, email, type, source: source.source, centris,
-        note: noteBase,
-      });
-
-      // Récupérer l'ID du deal créé
-      const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nom || email || telephone)}&limit=1`);
-      dealId = sr?.data?.items?.[0]?.item?.id;
+      // Fallback nom: si nom extrait est vide ou suspect, utilise "Madame/Monsieur"
+      // ou l'email local-part. Le deal Pipedrive sera créé avec un label utilisable.
+      const nomFinal = nom || (email ? email.split('@')[0].replace(/[._-]/g, ' ') : 'Prospect Centris');
+      // Retry 3× Pipedrive (backoff 0/2s/5s) — si API down, on essaie plusieurs fois
+      const maxDealRetries = 3;
+      const dealDelays = [0, 2000, 5000];
+      for (let attempt = 0; attempt < maxDealRetries && !dealId; attempt++) {
+        if (dealDelays[attempt]) await new Promise(r => setTimeout(r, dealDelays[attempt]));
+        try {
+          dealTxt = await creerDeal({
+            prenom: nomFinal.split(' ')[0] || nomFinal,
+            nom:    nomFinal.split(' ').slice(1).join(' ') || '',
+            telephone, email, type, source: source.source, centris,
+            note: noteBase,
+          });
+          const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nomFinal || email || telephone)}&limit=1`);
+          dealId = sr?.data?.items?.[0]?.item?.id;
+          if (dealId) break;
+        } catch (e) {
+          dealTxt = `⚠️ Deal attempt ${attempt + 1}/${maxDealRetries}: ${e.message.substring(0, 80)}`;
+          if (attempt === maxDealRetries - 1) log('WARN', 'POLLER', `Deal Pipedrive échoué après ${maxDealRetries} tentatives: ${e.message}`);
+        }
+      }
     } catch (e) { dealTxt = `⚠️ Deal: ${e.message.substring(0, 80)}`; }
   }
 
@@ -6167,11 +6180,24 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
   if (dealId) {
     try { dealFullObj = (await pdGet(`/deals/${dealId}`))?.data; } catch {}
   }
-  // Seuil d'envoi auto configurable (défaut 75 au lieu de 90 — plus agressif,
-  // preview par email toujours envoyé donc Shawn voit avant que le client reçoive)
+  // Seuil d'envoi auto configurable (défaut 75 au lieu de 90 — plus agressif)
   const AUTO_THRESHOLD = parseInt(process.env.AUTO_SEND_THRESHOLD || '75');
-  const hasMinInfo = !!(email && nom && (telephone || centris));
+
+  // hasMinInfo RELAXÉ: email + (Centris# OU tel) suffit — nom pas obligatoire.
+  // Si pas de nom, on utilise "Madame/Monsieur" dans le template (vouvoiement pro).
+  // Avant: exigeait email + nom + (tel || Centris) — bloquait trop de vrais leads
+  // qui remplissent le formulaire Centris sans rentrer leur nom.
+  const hasMinInfo = !!(email && (telephone || centris));
   const hasMatch   = dbxMatch?.folder && dbxMatch.pdfs.length > 0;
+
+  // BOOST SCORE: si Centris# exact match (stratégie index ou live search par #),
+  // on FORCE le score à 100 — c'est le signal le plus fiable possible.
+  if (dbxMatch && centris && dbxMatch.folder?.centris === String(centris).trim()) {
+    dbxMatch.score = Math.max(dbxMatch.score || 0, 100);
+  }
+  if (dbxMatch && /centris_index|live_search_folder_name|filename_centris/i.test(dbxMatch.strategy || '')) {
+    dbxMatch.score = Math.max(dbxMatch.score || 0, 95);
+  }
 
   // AUDIT TRAIL complet — un event par lead avec tout son parcours pour /lead-audit
   const leadAudit = {
@@ -6192,12 +6218,23 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
     decision: 'pending', // mis à jour plus bas
   };
 
-  // GARDE-FOU: détecte nom suspect (= courtier/agent capturé par erreur) → JAMAIS envoi auto
+  // GARDE-FOU: détecte nom suspect (= courtier/agent capturé par erreur)
+  // Utilise la détection whole-word de lead_parser (évite false positive sur
+  // "Jean Barrette-Tremblay" qui contiendrait "barrette" comme nom légitime).
   const { BLACKLIST_NAMES } = leadParser;
   const nomLower = String(nom || '').toLowerCase().trim();
-  const nomSuspect = nomLower && (BLACKLIST_NAMES || []).some(b =>
-    nomLower === b || nomLower.includes(b)
-  );
+  const nomTokens = nomLower.split(/\s+/).filter(Boolean);
+  let nomSuspect = false;
+  if (nomLower) {
+    if (BLACKLIST_NAMES.includes(nomLower)) nomSuspect = true;
+    else {
+      for (const bl of BLACKLIST_NAMES) {
+        const blTokens = bl.split(/\s+/).filter(Boolean);
+        if (blTokens.length === 1 && nomTokens.includes(blTokens[0])) { nomSuspect = true; break; }
+        if (blTokens.length > 1 && (' ' + nomLower + ' ').includes(' ' + bl + ' ')) { nomSuspect = true; break; }
+      }
+    }
+  }
   if (nomSuspect) {
     log('WARN', 'POLLER', `Nom SUSPECT détecté "${nom}" — bloque envoi auto, pending validation`);
     if (ALLOWED_ID) {
@@ -6221,11 +6258,14 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
       firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
-  } else if (hasMinInfo && hasMatch && dealFullObj && dbxMatch.score >= AUTO_THRESHOLD && !autoSendPaused) {
-    // ✅ AUTO-ENVOI — très confiant du match Dropbox
+  } else if (hasMinInfo && hasMatch && dbxMatch.score >= AUTO_THRESHOLD && !autoSendPaused) {
+    // ✅ AUTO-ENVOI — on procède MÊME SI Pipedrive a failé (dealFullObj peut être null).
+    // Le match Dropbox + email + (tel ou Centris) sont suffisants pour un vrai lead.
     try {
+      // Stub deal si Pipedrive down, permet à envoyerDocsAuto de travailler
+      const dealForSend = dealFullObj || { id: null, title: nom || email, [PD_FIELD_CENTRIS]: centris || '' };
       const autoRes = await envoyerDocsAuto({
-        email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch,
+        email, nom: nom || email.split('@')[0], centris, dealId: dealId || null, deal: dealForSend, match: dbxMatch,
       });
       if (autoRes.sent) {
         leadAudit.decision = 'auto_sent'; leadAudit.deliveryMs = autoRes.deliveryMs; leadAudit.attempts = autoRes.attempt;
