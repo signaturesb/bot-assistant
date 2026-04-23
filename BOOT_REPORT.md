@@ -1,9 +1,9 @@
 # ✅ Boot réussi
-_2026-04-22 22 h 15 min 13 s_
+_2026-04-22 22 h 18 min 08 s_
 
 - Modèle: claude-sonnet-4-6
 - Outils: 39
-- Uptime: 17s
+- Uptime: 16s
 - Centris: ⏳
 - Dropbox: ✅
 
@@ -25,12 +25,12 @@ OK|BOOT|Gmail Lead Poller + auto-trash CI noise activés
 INFO|BOOT|Step 6: registerHandlers
 INFO|BOOT|Step 7: startDailyTasks
 OK|CRON|Tâches: visites 7h, digest 8h→Julie, sync BOT_STATUS chaque heure, monitoring 10min
-INFO|BOOT|Step 8: configuration WEBHOOK Telegram (au lieu de polling — production-grade)
+INFO|BOOT|Step 8: configuration WEBHOOK Telegram (auto-healing + secret sync)
 OK|BOOT|✅ Kira démarrée [claude-sonnet-4-6] — /tmp — mémos:1 — tools:39 — port:10000
 WARN|CENTRIS|Login: HTTP 200 — location: 
 WARN|CENTRIS|Pré-login échoué — retry automatique à la première requête
 OK|PREFLIGHT|✅ Claude API accepte les 39 tools
-OK|BOOT|Webhook Telegram configuré: https://signaturesb-bot-s272.onrender.com/webhook/telegram
+OK|WEBHOOK|Telegram sync — secret=set
 OK|GIST|Poller state restauré: 56 processed, 21 leads
 OK|GIST|Dedup restauré: 28 entries
 OK|GMAIL|Token rafraîchi ✓
