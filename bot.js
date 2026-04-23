@@ -6027,6 +6027,50 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   }
 
   // ── Admin endpoints — protégés par WEBHOOK_SECRET (accès assistant) ──────
+  // /admin/audit?token=X → dump complet pour diagnostic à distance (leads,
+  // pending, poller stats, audit log, dernières erreurs). Utilisé par Claude
+  // Code pour investiguer sans roundtrip Telegram.
+  if (req.method === 'GET' && url.startsWith('/admin/audit')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const filter = ((req.url || '').split('q=')[1]?.split('&')[0] || '').toLowerCase();
+    let events = auditLog.slice(-100).reverse();
+    if (filter) {
+      const f = decodeURIComponent(filter);
+      events = events.filter(e => JSON.stringify(e).toLowerCase().includes(f));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      now: new Date().toISOString(),
+      auditLog: events.slice(0, 50),
+      auditTotal: auditLog.length,
+      pendingLeads: pendingLeads.slice(-20),
+      pendingDocSends: [...(pendingDocSends?.values() || [])].map(p => ({
+        email: p.email, nom: p.nom, centris: p.centris,
+        score: p.match?.score, folder: p.match?.folder?.name,
+        pdfs: p.match?.pdfs?.length,
+      })),
+      pollerStats,
+      gmailPollerState: {
+        lastRun: gmailPollerState.lastRun,
+        totalLeads: gmailPollerState.totalLeads,
+        processedCount: gmailPollerState.processed?.length || 0,
+        last10Processed: (gmailPollerState.processed || []).slice(-10),
+      },
+      autoSendPaused,
+      autoEnvoiState: {
+        totalAuto: autoEnvoiState?.totalAuto || 0,
+        totalFails: autoEnvoiState?.totalFails || 0,
+        last5: (autoEnvoiState?.log || []).slice(0, 5),
+      },
+      metrics: { ...metrics, tools: undefined },
+      lastApiError: metrics.lastApiError,
+    }, null, 2));
+    return;
+  }
+
   if (req.method === 'GET' && url === '/admin/chat-history') {
     const token = (req.url || '').split('token=')[1]?.split('&')[0];
     if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
@@ -6198,7 +6242,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       reason: 'déjà notifié dans les 7 derniers jours (multi-clé)',
       decision: 'dedup_skipped',
     });
-    return;
+    return { decision: 'dedup_skipped' };
   }
 
   log('OK', 'POLLER', `Lead ${source.label}: ${nom || email || telephone} | Centris: ${centris || '?'}`);
@@ -6240,11 +6284,9 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
         ``,
         `ID: \`${pendingId}\``,
       ].join('\n');
-      bot.sendMessage(ALLOWED_ID, alertMsg, { parse_mode: 'Markdown' }).catch(() =>
-        bot.sendMessage(ALLOWED_ID, alertMsg.replace(/\*/g, '').replace(/`/g, '')).catch(() => {})
-      );
+      await sendTelegramWithFallback(alertMsg, { category: 'P1-pending-invalid-name', pendingId });
     }
-    return; // STOP — pas de deal incomplet, on reprend quand Shawn répond "nom X"
+    return { decision: 'pending_invalid_name', pendingId }; // STOP — pas de deal incomplet, on reprend quand Shawn répond "nom X"
   }
   // ─── FIN P1 ────────────────────────────────────────────────────────────────
 
@@ -6478,10 +6520,69 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     msg += `\n⚠️ Pas d'email — appelle directement: ${telephone || '(non fourni)'}`;
   }
 
-  await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' }).catch(e => {
-    log('WARN', 'POLLER', `Telegram notify: ${e.message}`);
-    bot.sendMessage(ALLOWED_ID, msg.replace(/\*/g, '').replace(/_/g, '')).catch(() => {});
-  });
+  const sent = await sendTelegramWithFallback(msg, { category: 'lead-notif', leadId: msgId, email, centris });
+  return { decision: leadAudit.decision, dealId, notifySent: sent };
+}
+
+// Envoi Telegram avec fallback: essaie markdown → plain → email Gmail à shawn@
+// Utilisé pour TOUTES les notifs critiques (leads, alertes échec, validations P1).
+// Garantit que Shawn est averti même si Telegram API est down ou le bot expulsé du chat.
+async function sendTelegramWithFallback(msg, ctx = {}) {
+  if (!ALLOWED_ID) return false;
+  // 1. Markdown
+  try {
+    await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' });
+    return true;
+  } catch (e1) {
+    log('WARN', 'NOTIFY', `Telegram markdown failed (${ctx.category || '?'}): ${e1.message.substring(0, 140)}`);
+    // 2. Plain text
+    try {
+      const plain = msg.replace(/\*/g, '').replace(/_/g, '').replace(/`/g, '');
+      await bot.sendMessage(ALLOWED_ID, plain);
+      return true;
+    } catch (e2) {
+      log('ERR', 'NOTIFY', `Telegram plain failed (${ctx.category || '?'}): ${e2.message.substring(0, 140)}`);
+      auditLogEvent('notify', 'telegram_double_fail', {
+        category: ctx.category, context: ctx,
+        markdownErr: e1.message.substring(0, 200),
+        plainErr: e2.message.substring(0, 200),
+      });
+      // 3. Fallback email Gmail sur shawn@ — dernière chance
+      try {
+        const token = await getGmailToken();
+        if (token && AGENT.email) {
+          const subj = `🚨 Bot notif fallback — ${ctx.category || 'notification'}`;
+          const body = `Telegram a échoué 2x. Notification originale:\n\n${msg}\n\nContexte: ${JSON.stringify(ctx, null, 2)}\n\n— Bot kira (auto-fallback)`;
+          const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+          const mime = [
+            `From: Bot kira <${AGENT.email}>`,
+            `To: ${AGENT.email}`,
+            `Subject: ${enc(subj)}`,
+            'MIME-Version: 1.0',
+            'Content-Type: text/plain; charset=UTF-8',
+            'Content-Transfer-Encoding: 8bit',
+            '',
+            body,
+          ].join('\r\n');
+          const raw = Buffer.from(mime).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+          await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ raw }),
+          });
+          log('OK', 'NOTIFY', `Fallback email → ${AGENT.email} (${ctx.category})`);
+          auditLogEvent('notify', 'email_fallback_sent', { category: ctx.category });
+          return true;
+        }
+      } catch (e3) {
+        log('ERR', 'NOTIFY', `Email fallback failed: ${e3.message.substring(0, 140)}`);
+        auditLogEvent('notify', 'all_notify_channels_failed', {
+          category: ctx.category, emailErr: e3.message.substring(0, 200),
+        });
+      }
+      return false;
+    }
+  }
 }
 
 // Stats poller (pour /health + debug P0)
@@ -6527,7 +6628,7 @@ const pollerStats = {
   lastRun: null,
   lastDuration: 0,
   lastError: null,
-  lastScan: { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, errors: 0 },
+  lastScan: { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, autoSent: 0, pending: 0, dedup: 0, processed: 0, errors: 0 },
   totalsFound: 0, totalsJunk: 0, totalsNoSource: 0, totalsLowInfo: 0, totalsDealCreated: 0, totalsErrors: 0,
 };
 
@@ -6649,7 +6750,7 @@ async function runGmailLeadPoller(opts = {}) {
   }
 
   pollerStats.runs++;
-  const scan = { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, errors: 0 };
+  const scan = { found: 0, junk: 0, noSource: 0, lowInfo: 0, dealCreated: 0, autoSent: 0, pending: 0, dedup: 0, processed: 0, errors: 0 };
   const problems = []; // emails qui matchent mais n'ont pas abouti — pour alerte P0
   try {
     const token = await getGmailToken();
@@ -6751,10 +6852,16 @@ async function runGmailLeadPoller(opts = {}) {
             gmailPollerState.processed.push(id); continue;
           }
 
-          await traiterNouveauLead(lead, id, from, subject, source);
+          const result = await traiterNouveauLead(lead, id, from, subject, source) || {};
           gmailPollerState.processed.push(id);
           gmailPollerState.totalLeads = (gmailPollerState.totalLeads || 0) + 1;
-          scan.dealCreated++;
+          scan.processed++;
+          // Compteurs honnêtes par décision — `dealCreated` ne monte QUE si Pipedrive
+          // a réellement créé un deal (result.dealId présent)
+          if (result.dealId) scan.dealCreated++;
+          if (result.decision === 'auto_sent') scan.autoSent++;
+          else if (result.decision === 'dedup_skipped') scan.dedup++;
+          else if (String(result.decision || '').startsWith('pending')) scan.pending++;
           newLeads++;
           await new Promise(r => setTimeout(r, 1500));
         } catch (e) {
@@ -6780,6 +6887,10 @@ async function runGmailLeadPoller(opts = {}) {
     pollerStats.totalsNoSource   += scan.noSource;
     pollerStats.totalsLowInfo    += scan.lowInfo;
     pollerStats.totalsDealCreated+= scan.dealCreated;
+    pollerStats.totalsAutoSent   = (pollerStats.totalsAutoSent || 0) + scan.autoSent;
+    pollerStats.totalsPending    = (pollerStats.totalsPending || 0) + scan.pending;
+    pollerStats.totalsDedup      = (pollerStats.totalsDedup || 0) + scan.dedup;
+    pollerStats.totalsProcessed  = (pollerStats.totalsProcessed || 0) + scan.processed;
     pollerStats.totalsErrors     += scan.errors;
     pollerStats.lastRun = new Date().toISOString();
     pollerStats.lastDuration = Date.now() - t0;
@@ -6808,7 +6919,10 @@ async function runGmailLeadPoller(opts = {}) {
     }
 
     if (newLeads > 0) {
-      log('OK', 'POLLER', `Scan: ${scan.found} found | ${scan.junk} junk | ${scan.dealCreated} deals | ${newLeads} nouveaux`);
+      log('OK', 'POLLER',
+        `Scan: ${scan.found} found | ${scan.processed} traités | ${scan.autoSent} auto-sent | ` +
+        `${scan.pending} pending | ${scan.dealCreated} deals | ${scan.dedup} dedup | ${scan.errors} err`
+      );
     }
   } catch (e) {
     pollerStats.lastError = e.message;
@@ -7068,6 +7182,25 @@ async function main() {
   setInterval(() => savePollerStateToGist().catch(()=>{}), 6 * 60 * 60 * 1000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
+
+  // ── Self-test Telegram: ping Shawn au boot pour confirmer connectivité ────
+  // Si ce message arrive pas à chaque redeploy → problème Telegram webhook/token.
+  // Timeout 10s pour laisser le webhook se sync d'abord.
+  setTimeout(async () => {
+    const bootMsg = [
+      `✅ *Bot redémarré*`,
+      `🤖 Modèle: \`${currentModel}\``,
+      `🛠 Outils: ${TOOLS.length}`,
+      `📊 Leads en attente: ${pendingLeads.filter(l=>l.needsName).length}`,
+      `📦 Docs en attente: ${(typeof pendingDocSends !== 'undefined' ? pendingDocSends.size : 0)}`,
+      `⏱ Poller: ${(parseInt(process.env.GMAIL_POLL_INTERVAL_MS || '30000')/1000)}s`,
+      ``,
+      `_Test d'envoi: si tu lis ce message, Telegram fonctionne._`,
+    ].join('\n');
+    const sent = await sendTelegramWithFallback(bootMsg, { category: 'boot-self-test' });
+    if (sent) log('OK', 'BOOT', '✅ Self-test Telegram: notif reçue par Shawn');
+    else log('WARN', 'BOOT', '⚠️ Self-test Telegram: tous canaux ont échoué (check ALLOWED_ID + TELEGRAM_BOT_TOKEN)');
+  }, 10000);
 
   setTimeout(() => syncStatusGitHub().catch(() => {}), 30000);
 
