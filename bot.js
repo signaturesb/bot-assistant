@@ -1816,6 +1816,23 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
   return { sent: false, error: lastError, match, attempts: maxRetries };
 }
 
+// Fire-and-forget: envoie le preview email à shawn@ sans bloquer le lead flow
+function firePreviewDocs({ email, nom, centris, deal, match }) {
+  setImmediate(async () => {
+    try {
+      const res = await envoyerDocsProspect(nom || email, email, null, {
+        dealHint: deal, folderHint: match?.folder, centrisHint: centris,
+        preview: { clientEmail: email, clientName: nom || '' },
+      });
+      if (typeof res === 'string' && res.startsWith('✅')) {
+        log('OK', 'DOCS', `PREVIEW → ${AGENT.email} (client: ${email})`);
+      } else {
+        log('WARN', 'DOCS', `PREVIEW échec: ${String(res).substring(0, 120)}`);
+      }
+    } catch (e) { log('WARN', 'DOCS', `PREVIEW exception: ${e.message}`); }
+  });
+}
+
 async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
 
@@ -1914,17 +1931,33 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   const propLabel = folder.adresse || folder.name;
   const now       = new Date();
   const dateMois  = now.toLocaleDateString('fr-CA', { month:'long', year:'numeric', timeZone:'America/Toronto' });
-  const sujet     = `Documents — ${propLabel} | ${AGENT.compagnie}`;
+
+  // MODE PREVIEW — redirige vers shawn@ avec bandeau "pas encore envoyé"
+  const previewMode   = !!opts.preview;
+  const clientEmail   = previewMode ? (opts.preview.clientEmail || toEmail) : null;
+  const clientName    = previewMode ? (opts.preview.clientName || '') : null;
+  const realToEmail   = previewMode ? AGENT.email : toEmail;
+  const sujet         = previewMode
+    ? `[🔍 PREVIEW — pour ${clientName ? clientName + ' <' + clientEmail + '>' : clientEmail}] Documents — ${propLabel}`
+    : `Documents — ${propLabel} | ${AGENT.compagnie}`;
 
   // Liste des pièces jointes en HTML
   const pjListHTML = ok.map(d =>
     `<tr><td style="padding:4px 0;color:#f5f5f7;font-size:13px;">📎 ${d.name} <span style="color:#666;font-size:11px;">(${Math.round(d.size/1024)} KB)</span></td></tr>`
   ).join('');
 
+  // Bandeau preview (injecté seulement en mode preview)
+  const previewBanner = previewMode ? `
+<div style="background:#1a0a0a;border:2px solid #aa0721;border-radius:8px;padding:18px 20px;margin:0 0 20px;">
+<div style="color:#aa0721;font-size:11px;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;">🔍 Preview — pas encore envoyé</div>
+<div style="color:#f5f5f7;font-size:14px;line-height:1.6;margin-bottom:8px;">Voici <strong>exactement</strong> ce qui sera envoyé à <strong style="color:#aa0721;">${clientName || ''} &lt;${clientEmail}&gt;</strong>.</div>
+<div style="color:#cccccc;font-size:13px;line-height:1.6;">✅ Sur Telegram, réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#aa0721;">envoie les docs à ${clientEmail}</code> pour livrer au client.<br>❌ Réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#666;">annule ${clientEmail}</code> pour ignorer.</div>
+</div>` : '';
+
   // Contenu métier — injecté dans le master template à la place d'INTRO_TEXTE
   // NOTE: le master template Dropbox a DÉJÀ un bloc "Programme référence" à la fin,
   // donc on ne le duplique PAS ici.
-  const contentHTML = `
+  const contentHTML = `${previewBanner}
 <p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Veuillez trouver ci-joint la documentation concernant la propriété <strong style="color:#f5f5f7;">${propLabel}</strong>.</p>
 
 <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px 20px;margin:16px 0;">
@@ -2029,8 +2062,8 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
 
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
-    `To: ${toEmail}`,
-    `Bcc: ${AGENT.email}`,
+    `To: ${realToEmail}`,
+    ...(previewMode ? [] : [`Bcc: ${AGENT.email}`]),
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
@@ -2086,13 +2119,17 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     return `❌ Gmail erreur ${sendRes.status}: ${errMsg.substring(0, 200)}`;
   }
 
-  // 9. Note Pipedrive (liste des docs envoyés)
-  const noteContent = `Documents envoyés à ${toEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}):\n${ok.map(d => `• ${d.name}`).join('\n')}`;
+  // 9. Note Pipedrive — skip en mode preview (c'est juste un preview, pas une vraie livraison)
+  const skippedMsg = fails.length > 0 ? `\n⚠️ ${fails.length} doc(s) échec téléchargement: ${fails.map(f=>f.name).join(', ')}` : '';
+  if (previewMode) {
+    log('OK', 'DOCS', `PREVIEW envoyé à ${realToEmail} (${ok.length} docs, pour client ${clientEmail})`);
+    return `✅ *PREVIEW envoyé* à *${realToEmail}*\n   Aperçu de ce qui sera envoyé à *${clientEmail}*\n   ${ok.length} pièce${ok.length>1?'s':''} jointe${ok.length>1?'s':''}: ${ok.map(d=>d.name).join(', ')}${skippedMsg}`;
+  }
+  const noteContent = `Documents envoyés à ${realToEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}):\n${ok.map(d => `• ${d.name}`).join('\n')}`;
   const noteRes = await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => null);
   const noteLabel = noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée';
 
-  const skippedMsg = fails.length > 0 ? `\n⚠️ ${fails.length} PDF(s) échec téléchargement: ${fails.map(f=>f.name).join(', ')}` : '';
-  return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${toEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${skippedMsg}`;
+  return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${realToEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${skippedMsg}`;
 }
 
 // ─── Brevo ────────────────────────────────────────────────────────────────────
@@ -5035,20 +5072,23 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
       pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     }
   } else if (hasMinInfo && hasMatch && dbxMatch.score >= 80) {
-    // 🤔 ZONE D'INCERTITUDE 80-89 — confirmer avant envoi
+    // 🤔 ZONE D'INCERTITUDE 80-89 — preview par email + confirmer avant envoi
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
     const docsList = dbxMatch.pdfs.slice(0, 10).map(p => `     • ${p.name}`).join('\n');
     const more = dbxMatch.pdfs.length > 10 ? `\n     …et ${dbxMatch.pdfs.length - 10} autres` : '';
     autoEnvoiMsg = `\n🤔 *Match à confirmer* — score ${dbxMatch.score}/100 (zone d'incertitude)\n` +
                    `   Dossier Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
                    `   ${dbxMatch.pdfs.length} docs prêts:\n${docsList}${more}\n` +
+                   `   📧 *Preview envoyé sur ${AGENT.email}* — regarde avant de valider\n` +
                    `   ✅ Dis \`envoie les docs à ${email}\` pour livrer\n` +
                    `   ❌ Dis \`annule ${email}\` pour ignorer`;
   } else if (email && hasMatch) {
-    // Score <80 ou infos incomplètes — brouillon seulement
+    // Score <80 ou infos incomplètes — preview par email + brouillon
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
     const why = !hasMinInfo ? `infos incomplètes (${[nom?'nom':null, email?'email':null, (telephone||centris)?'contact':null].filter(Boolean).join('+') || 'rien'})` : `score faible ${dbxMatch.score}`;
-    autoEnvoiMsg = `\n📦 *Docs en attente* (${why})\n   Vérifie et dis \`envoie les docs à ${email}\` si OK`;
+    autoEnvoiMsg = `\n📦 *Docs en attente* (${why})\n   📧 Preview envoyé sur ${AGENT.email}\n   Vérifie et dis \`envoie les docs à ${email}\` si OK`;
   } else if (email && dbxMatch?.candidates?.length) {
     autoEnvoiMsg = `\n🔍 Plusieurs candidats Dropbox — check lequel est le bon avant d'envoyer`;
   }
