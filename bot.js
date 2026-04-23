@@ -220,6 +220,7 @@ let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, dea
 // pendingEmails/pendingDocSends + Shawn dit "envoie" OU être un cron approuvé.
 const CONSENT_REQUIRED = true;
 const POLLER_ENABLED = process.env.POLLER_ENABLED !== 'false'; // kill switch via env
+let autoSendPaused = false; // toggle via /pauseauto command
 
 // ─── Mode réflexion (Opus 4.7 thinking) ──────────────────────────────────────
 let thinkingMode = false; // toggle via /penser
@@ -3618,6 +3619,70 @@ function registerHandlers() {
     );
   });
 
+  // Confirmer envoi docs depuis pending (zone 80-89 confirmation requise)
+  bot.onText(/^envoie\s+(?:les\s+)?docs?\s+(?:à|a)\s+(\S+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const target = match[1].toLowerCase().trim();
+    // Trouver dans pendingDocSends par email exact ou nom
+    let pending = null;
+    for (const [email, p] of pendingDocSends) {
+      if (email.toLowerCase() === target || p.nom?.toLowerCase().includes(target.toLowerCase())) {
+        pending = p;
+        pendingDocSends.delete(email);
+        break;
+      }
+    }
+    if (!pending) {
+      return bot.sendMessage(msg.chat.id, `❌ Aucun pending match pour "${target}". Utilise /pending pour voir la liste.`);
+    }
+    await bot.sendMessage(msg.chat.id, `📤 Envoi docs à ${pending.email}...`);
+    try {
+      const r = await envoyerDocsAuto(pending);
+      if (r.sent) {
+        await bot.sendMessage(msg.chat.id, `✅ Envoyé · ${pending.match.pdfs.length} PDFs · ${Math.round(r.deliveryMs/1000)}s`);
+        auditLogEvent('manual-send', 'docs-sent', { email: pending.email, confirmed: true });
+      } else {
+        await bot.sendMessage(msg.chat.id, `⚠️ Échec: ${r.error || r.reason}`);
+      }
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+    }
+  });
+
+  // Annuler un pending docs
+  bot.onText(/^(?:annule|cancel)\s+(\S+)/i, (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const target = match[1].toLowerCase().trim();
+    let cancelled = null;
+    for (const [email, p] of pendingDocSends) {
+      if (email.toLowerCase() === target || p.nom?.toLowerCase().includes(target.toLowerCase())) {
+        cancelled = email;
+        pendingDocSends.delete(email);
+        break;
+      }
+    }
+    bot.sendMessage(msg.chat.id, cancelled ? `🗑 Annulé: ${cancelled}` : `❌ Aucun pending pour "${target}"`);
+  });
+
+  // Voir liste pending docs
+  bot.onText(/\/pending/, msg => {
+    if (!isAllowed(msg)) return;
+    if (pendingDocSends.size === 0) return bot.sendMessage(msg.chat.id, '✅ Aucun doc en attente');
+    const lines = [...pendingDocSends.values()].map(p =>
+      `• ${p.nom || p.email} · score ${p.match?.score} · ${p.match?.pdfs.length} PDFs → \`envoie les docs à ${p.email}\``
+    ).join('\n');
+    bot.sendMessage(msg.chat.id, `📦 *Pending (${pendingDocSends.size})*\n\n${lines}`, { parse_mode: 'Markdown' });
+  });
+
+  // Pause/resume auto-envoi global
+  bot.onText(/\/pauseauto/, msg => {
+    if (!isAllowed(msg)) return;
+    autoSendPaused = !autoSendPaused;
+    bot.sendMessage(msg.chat.id, autoSendPaused
+      ? '⏸ Auto-envoi docs PAUSÉ — tout passera en brouillon jusqu\'à /pauseauto'
+      : '▶️ Auto-envoi docs REPRIS — envois ≥90 automatiques.');
+  });
+
   bot.onText(/\/cout|\/cost/, msg => {
     if (!isAllowed(msg)) return;
     const d = today(), m = thisMonth();
@@ -4737,19 +4802,54 @@ async function traiterNouveauLead(lead, msgId, from, subject, source) {
     docsTxt = `📁 Candidats Dropbox: ${dbxMatch.candidates.map(c => `${c.folder.adresse || c.folder.name} (${c.score})`).join(', ')}`;
   }
 
-  // AUTO-ENVOI DÉSACTIVÉ (2026-04-22) — Shawn veut confirmer avant tout email
-  // Règle permanente: jamais d'email envoyé sans son OK explicite via Telegram.
-  // Ancien flow: auto-envoi si match ≥90 → désactivé.
-  // Nouveau flow: brouillon prêt + notification Telegram → Shawn dit "envoie".
+  // AUTO-ENVOI — flow 3 seuils (validé par Shawn 2026-04-22):
+  //   Score ≥90  → envoi automatique direct (très confiant du match)
+  //   Score 80-89→ notif AVANT, attend confirmation "envoie" (zone d'incertitude)
+  //   Score <80  → brouillon seulement
+  // Conditions pré-requises: email + nom + (téléphone OU centris#) = 3 infos min
+  // Dédup 7j garantit zéro doublon de tout ce flow.
   let dealFullObj = null;
   if (dealId) {
     try { dealFullObj = (await pdGet(`/deals/${dealId}`))?.data; } catch {}
   }
-  if (email && dbxMatch?.folder && dbxMatch.pdfs.length > 0) {
+  const hasMinInfo = !!(email && nom && (telephone || centris));
+  const hasMatch   = dbxMatch?.folder && dbxMatch.pdfs.length > 0;
+
+  if (hasMinInfo && hasMatch && dealFullObj && dbxMatch.score >= 90 && !autoSendPaused) {
+    // ✅ AUTO-ENVOI — très confiant du match Dropbox
+    try {
+      const autoRes = await envoyerDocsAuto({
+        email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch,
+      });
+      if (autoRes.sent) {
+        autoEnvoiMsg = `\n🚀 *Docs envoyés auto* à ${email}\n   ${dbxMatch.pdfs.length} PDFs · match "${dbxMatch.folder.adresse||dbxMatch.folder.name}" · score ${dbxMatch.score} · ${Math.round(autoRes.deliveryMs/1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
+        auditLogEvent('auto-send', 'docs-sent', { email, centris, score: dbxMatch.score, pdfs: dbxMatch.pdfs.length, ms: autoRes.deliveryMs });
+      } else if (autoRes.skipped) {
+        autoEnvoiMsg = `\n⏭ Auto-envoi skip: ${autoRes.reason}`;
+      } else {
+        autoEnvoiMsg = `\n⚠️ *Auto-envoi ÉCHOUÉ* après ${autoRes.attempts} tentatives: ${String(autoRes.error).substring(0, 120)}\n   Envoie manuellement: \`envoie les docs à ${email}\``;
+        pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+        auditLogEvent('auto-send', 'docs-failed', { email, error: String(autoRes.error).substring(0, 200) });
+      }
+    } catch (e) {
+      autoEnvoiMsg = `\n⚠️ Auto-envoi exception: ${e.message.substring(0, 100)}`;
+      pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    }
+  } else if (hasMinInfo && hasMatch && dbxMatch.score >= 80) {
+    // 🤔 ZONE D'INCERTITUDE 80-89 — confirmer avant envoi
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
-    autoEnvoiMsg = `\n📦 *Docs prêts à envoyer* (score ${dbxMatch.score}, ${dbxMatch.pdfs.length} PDFs)\n   Dis \`envoie les docs à ${email}\` pour livrer.`;
-  } else if (email && dbxMatch?.folder && dbxMatch.score >= 70) {
-    autoEnvoiMsg = `\n🤔 Match ambigü (score ${dbxMatch.score}) — dis *"envoie les docs à ${email}"* pour confirmer`;
+    autoEnvoiMsg = `\n🤔 *Match à confirmer* — score ${dbxMatch.score}/100 (zone d'incertitude)\n` +
+                   `   Dossier Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
+                   `   ${dbxMatch.pdfs.length} PDFs prêts\n` +
+                   `   ✅ Dis \`envoie les docs à ${email}\` pour livrer\n` +
+                   `   ❌ Dis \`annule ${email}\` pour ignorer`;
+  } else if (email && hasMatch) {
+    // Score <80 ou infos incomplètes — brouillon seulement
+    pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    const why = !hasMinInfo ? `infos incomplètes (${[nom?'nom':null, email?'email':null, (telephone||centris)?'contact':null].filter(Boolean).join('+') || 'rien'})` : `score faible ${dbxMatch.score}`;
+    autoEnvoiMsg = `\n📦 *Docs en attente* (${why})\n   Vérifie et dis \`envoie les docs à ${email}\` si OK`;
+  } else if (email && dbxMatch?.candidates?.length) {
+    autoEnvoiMsg = `\n🔍 Plusieurs candidats Dropbox — check lequel est le bon avant d'envoyer`;
   }
 
   // Préparer brouillon J+0
