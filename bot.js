@@ -2228,29 +2228,48 @@ function firePreviewDocs({ email, nom, centris, deal, match }) {
 }
 
 async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
-  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
-
   // 1. Chercher deal — ou utiliser hint si fourni (auto-envoi)
-  let deal;
+  // FALLBACK bulletproof: si pas de deal Pipedrive OU pas de PD_KEY, on continue
+  // quand même si on a un email + (Centris# ou adresse via opts.centrisHint / terme).
+  let deal = null;
   if (opts.dealHint) {
     deal = opts.dealHint;
-  } else {
-    const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
-    const deals = sr?.data?.items || [];
-    if (!deals.length) return `Aucun deal "${terme}" — crée-le d'abord.`;
-    deal = deals[0].item;
+  } else if (PD_KEY) {
+    try {
+      const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+      const deals = sr?.data?.items || [];
+      if (deals.length) deal = deals[0].item;
+    } catch (e) { log('WARN', 'DOCS', `Pipedrive search: ${e.message}`); }
   }
-  const centris = deal[PD_FIELD_CENTRIS] || opts.centrisHint || '';
+  const centris = (deal && deal[PD_FIELD_CENTRIS]) || opts.centrisHint || '';
+  // Stub deal si pas trouvé mais email fourni → on peut quand même envoyer
+  if (!deal) {
+    const emailFromTerme = /@/.test(terme) ? terme.trim() : '';
+    if (!emailDest && !emailFromTerme) {
+      return `❌ Pas de deal Pipedrive "${terme}" ET pas d'email fourni.\nFournis: "envoie docs [nom] à email@exemple.com" OU crée le deal d'abord.`;
+    }
+    deal = { id: null, title: terme, [PD_FIELD_CENTRIS]: opts.centrisHint || '' };
+  }
 
   // 2. Email destination
   let toEmail = emailDest || '';
+  if (!toEmail && /@/.test(terme)) toEmail = terme.trim();
   if (!toEmail && deal.person_id) {
-    const p = await pdGet(`/persons/${deal.person_id}`);
-    toEmail = p?.data?.email?.find(e => e.primary)?.value || p?.data?.email?.[0]?.value || '';
+    try {
+      const p = await pdGet(`/persons/${deal.person_id}`);
+      toEmail = p?.data?.email?.find(e => e.primary)?.value || p?.data?.email?.[0]?.value || '';
+    } catch {}
   }
 
-  // 3. Dossier Dropbox — folder hint (auto) ou recherche
+  // 3. Dossier Dropbox — folder hint (auto) ou fastDropboxMatch via index complet
   let folder = opts.folderHint || null;
+  if (!folder) {
+    // Utilise l'index cross-source (Inscription + Terrain en ligne mergés)
+    if (dropboxIndex.folders?.length) {
+      const fast = fastDropboxMatch({ centris, adresse: deal.title || terme, rue: terme });
+      if (fast) folder = fast.folder;
+    }
+  }
   if (!folder) {
     let dossiers = dropboxTerrains;
     if (!dossiers.length) { await loadDropboxStructure(); dossiers = dropboxTerrains; }
@@ -2489,9 +2508,19 @@ Au plaisir,<br>
   const enc   = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const textBody = `Bonjour,\n\nVeuillez trouver ci-joint ${ok.length} document${ok.length>1?'s':''} concernant ${propLabel}:\n${ok.map(d=>`• ${d.name}`).join('\n')}\n\nN'hésitez pas si vous avez des questions — ${AGENT.telephone}.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
 
+  // CC explicite (visible par client) — array ou string comma-separated
+  const ccArr = (() => {
+    const raw = opts.cc;
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.filter(Boolean);
+    return String(raw).split(',').map(s => s.trim()).filter(Boolean);
+  })();
+  const ccLine = ccArr.length ? [`Cc: ${ccArr.join(', ')}`] : [];
+
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${realToEmail}`,
+    ...ccLine,
     ...(previewMode ? [] : [`Bcc: ${AGENT.email}`]),
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
@@ -3547,7 +3576,7 @@ const TOOLS = [
   { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
   // ── Listings Dropbox + envoi docs ──
   { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox (/Terrain en ligne/) par ville, adresse ou numéro Centris. Utilise le cache — résultat instantané. Liste PDFs + photos de chaque dossier trouvé.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
-  { name: 'envoyer_docs_prospect',   description: 'Flow COMPLET: trouve dossier Dropbox par Centris (dans Pipedrive) → télécharge PDF → envoie par Gmail avec pièce jointe → note Pipedrive. Utiliser quand Shawn dit "envoie les docs à [nom]".', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive' }, email: { type: 'string', description: 'Email destination si différent de Pipedrive' }, fichier: { type: 'string', description: 'Nom partiel du PDF spécifique (optionnel — premier PDF par défaut)' } }, required: ['terme'] } },
+  { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Fouille: match par Centris# ou adresse (index cross-source /Inscription + /Terrain en ligne fusionnés). CC explicite visible par le client, BCC shawn@ auto. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Ne JAMAIS dire que le tool ne supporte pas multi-PDF ou CC — il supporte tout.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'Emails CC séparés par virgules (visible par le client). Ex: "shawn@signaturesb.com,julie@signaturesb.com". BCC shawn@ déjà automatique.' }, fichier: { type: 'string', description: 'OPTIONNEL — pour envoyer UN seul PDF spécifique (nom partiel). Par défaut (non-spécifié): envoie TOUS les docs du dossier.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer le match Dropbox (si Pipedrive ne l\'a pas)' } }, required: ['terme'] } },
   // ── Sync Claude Code ↔ Bot ──
   { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
   // ── Diagnostics ──
@@ -3628,7 +3657,10 @@ async function executeTool(name, input, chatId) {
       }
       case 'envoyer_rapport_comparables': return await envoyerRapportComparables({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14, email: input.email, statut: input.statut || 'vendu' });
       case 'chercher_listing_dropbox': return await chercherListingDropbox(input.terme);
-      case 'envoyer_docs_prospect':    return await envoyerDocsProspect(input.terme, input.email, input.fichier);
+      case 'envoyer_docs_prospect':    return await envoyerDocsProspect(input.terme, input.email, input.fichier, {
+        cc: input.cc ? String(input.cc).split(',').map(s => s.trim()).filter(Boolean) : [],
+        centrisHint: input.centris || '',
+      });
       case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
       case 'voir_conversation':    return await voirConversation(input.terme);
       case 'envoyer_email': {
