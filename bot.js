@@ -1740,7 +1740,9 @@ function _sortDocsPriority(docs) {
 
 async function _listFolderPDFs(folder) {
   try {
-    const r = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: false });
+    // Scan récursif: capture aussi les fichiers dans sous-dossiers Photos/, Plans/,
+    // Certificats/, etc. — les brokers structurent souvent leurs terrains comme ça.
+    const r = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: true });
     if (!r?.ok) return [];
     const entries = (await r.json()).entries || [];
     const docs = entries.filter(x => x['.tag'] === 'file' && DOC_EXTS.includes(_docExt(x.name)));
@@ -1959,7 +1961,8 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   }
 
   // 4. Lister TOUS les docs (PDFs + images + plans + Word/Excel) — triés Fiche_Detaillee en premier
-  const lr = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: false });
+  // Scan récursif: capture sous-dossiers Photos/, Plans/, Certificats/, etc.
+  const lr = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: true });
   if (!lr?.ok) return `❌ Impossible de lire ${folder.name}`;
   const all  = (await lr.json()).entries || [];
   const pdfs = _sortDocsPriority(all.filter(f => f['.tag'] === 'file' && DOC_EXTS.includes(_docExt(f.name))));
