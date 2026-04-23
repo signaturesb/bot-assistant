@@ -954,6 +954,229 @@ async function downloadDropboxFile(filePath) {
   const filename = p.split('/').pop();
   return { buffer, filename };
 }
+// ═══════════════════════════════════════════════════════════════════════════
+// DROPBOX INDEX COMPLET — scan récursif paginé de tous les terrains + fichiers
+// Objectif: lookup O(1) par Centris#, rue, adresse. Connaître 100% du Dropbox.
+// Persisté sur disque + sync Gist. Reconstruit au boot + cron 30min.
+// ═══════════════════════════════════════════════════════════════════════════
+const DROPBOX_INDEX_FILE = path.join(DATA_DIR || '/tmp', 'dropbox_index.json');
+let dropboxIndex = {
+  builtAt: 0,
+  totalFolders: 0,
+  totalFiles: 0,
+  folders: [],       // [{ name, path, centris, adresse, rueTokens, files: [{name,path,ext,size}] }]
+  byCentris: {},     // { "12582379": folderIdx }
+  byStreet: {},      // { "principale": [folderIdx, ...], "rang": [...] }
+};
+try { dropboxIndex = loadJSON(DROPBOX_INDEX_FILE, dropboxIndex); } catch {}
+
+// Parse folder name → { centris, adresse, rueTokens }
+function _parseFolderMeta(name) {
+  const m = name.match(/(?:_NoCentris_|(?:^|_))(\d{7,9})(?=_|$)/);
+  const centris = m ? m[1] : '';
+  const adresse = name
+    .replace(/_NoCentris_\d+/g, '')
+    .replace(/(?:^|_)\d{7,9}(?=_|$)/g, '')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Tokens rue normalisés (lowercase, sans accents, sans mots courts)
+  const rueTokens = adresse.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '') // remove accents
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length >= 3 && !/^\d+$/.test(t)); // drop numéros civiques
+  return { centris, adresse, rueTokens };
+}
+
+// Paginated list_folder recursive — récupère TOUT dans la hiérarchie
+async function _dropboxListAll(rootPath) {
+  const all = [];
+  const startRes = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', {
+    path: rootPath, recursive: true, include_non_downloadable_files: false,
+  });
+  if (!startRes?.ok) return all;
+  let data = await startRes.json();
+  all.push(...(data.entries || []));
+  while (data.has_more && data.cursor) {
+    const next = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder/continue', { cursor: data.cursor });
+    if (!next?.ok) break;
+    data = await next.json();
+    all.push(...(data.entries || []));
+  }
+  return all;
+}
+
+async function buildDropboxIndex() {
+  const t0 = Date.now();
+
+  // AUTO-DISCOVERY: scan TOUS les dossiers top-level de Dropbox sauf exclusions
+  // Permet au bot de connaître 100% du Dropbox (terrains, inscriptions, maisons, etc.)
+  // Override explicite possible via DROPBOX_LISTING_PATHS="/a,/b" si Shawn veut limiter
+  let configuredPaths;
+  if (process.env.DROPBOX_LISTING_PATHS) {
+    configuredPaths = process.env.DROPBOX_LISTING_PATHS.split(',').map(p => p.trim()).filter(Boolean);
+  } else {
+    // Discover: list / → filter folders → exclude known non-listings
+    const excludeRe = /^(email[_\s]?templates?|contacts?|assets?|archives?|apps?|private|backup|templates?|_|\.)/i;
+    try {
+      const rootRes = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '', recursive: false });
+      if (rootRes?.ok) {
+        const rootData = await rootRes.json();
+        configuredPaths = (rootData.entries || [])
+          .filter(e => e['.tag'] === 'folder' && !excludeRe.test(e.name))
+          .map(e => e.path_display);
+        log('INFO', 'DBX_IDX', `Auto-discovery: ${configuredPaths.length} dossiers top-level à indexer`);
+      }
+    } catch (e) { log('WARN', 'DBX_IDX', `Auto-discovery échouée: ${e.message}`); }
+    if (!configuredPaths || !configuredPaths.length) {
+      configuredPaths = [AGENT.dbx_terrains]; // fallback safety
+    }
+  }
+  const folderMap = new Map(); // path_lower → folder record
+
+  try {
+    for (const rootRaw of configuredPaths) {
+      const root = '/' + rootRaw.replace(/^\//, '');
+      const entries = await _dropboxListAll(root);
+      if (!entries.length) {
+        log('WARN', 'DBX_IDX', `Aucune entrée sous ${root}`);
+        continue;
+      }
+      const depth = root.split('/').filter(Boolean).length;
+      for (const e of entries) {
+        const parts = e.path_lower.split('/').filter(Boolean);
+        const terrainSlug = parts[depth];
+        if (!terrainSlug) continue;
+        const terrainPath = '/' + parts.slice(0, depth + 1).join('/');
+        if (e['.tag'] === 'folder' && parts.length === depth + 1) {
+          const meta = _parseFolderMeta(e.name);
+          if (!folderMap.has(terrainPath)) {
+            folderMap.set(terrainPath, {
+              name: e.name, path: e.path_lower,
+              centris: meta.centris, adresse: meta.adresse, rueTokens: meta.rueTokens,
+              source: root, files: [],
+            });
+          } else {
+            const f = folderMap.get(terrainPath);
+            f.name = e.name; f.centris = meta.centris; f.adresse = meta.adresse;
+            f.rueTokens = meta.rueTokens; f.source = root;
+          }
+        } else if (e['.tag'] === 'file') {
+          if (!folderMap.has(terrainPath)) {
+            folderMap.set(terrainPath, {
+              name: terrainSlug, path: terrainPath, centris: '', adresse: '',
+              rueTokens: [], source: root, files: [],
+            });
+          }
+          const ext = (e.name.toLowerCase().match(/\.[a-z0-9]+$/) || [''])[0];
+          folderMap.get(terrainPath).files.push({
+            name: e.name, path: e.path_lower, ext, size: e.size || 0,
+          });
+        }
+      }
+    }
+
+    if (folderMap.size === 0) {
+      log('WARN', 'DBX_IDX', `Aucune entrée trouvée dans ${configuredPaths.join(', ')}`);
+      return dropboxIndex;
+    }
+
+    // Build flat list + indices
+    const folders = [...folderMap.values()];
+    const byCentris = {};
+    const byStreet = {};
+    folders.forEach((f, i) => {
+      if (f.centris) byCentris[f.centris] = i;
+      for (const tok of f.rueTokens) {
+        if (!byStreet[tok]) byStreet[tok] = [];
+        byStreet[tok].push(i);
+      }
+    });
+
+    dropboxIndex = {
+      builtAt: Date.now(),
+      totalFolders: folders.length,
+      totalFiles: folders.reduce((s, f) => s + f.files.length, 0),
+      folders, byCentris, byStreet,
+    };
+    saveJSON(DROPBOX_INDEX_FILE, dropboxIndex);
+
+    // Mettre à jour aussi dropboxTerrains (legacy — pour compat matchDropboxAvance)
+    dropboxTerrains = folders.map(f => ({
+      name: f.name, path: f.path, centris: f.centris, adresse: f.adresse,
+    }));
+
+    log('OK', 'DBX_IDX', `Index: ${folders.length} dossiers, ${dropboxIndex.totalFiles} fichiers · ${Math.round((Date.now()-t0)/1000)}s · ${Object.keys(byCentris).length} Centris# · ${Object.keys(byStreet).length} tokens rue`);
+    return dropboxIndex;
+  } catch (e) {
+    log('WARN', 'DBX_IDX', `build failed: ${e.message}`);
+    return dropboxIndex;
+  }
+}
+
+// Fast lookup — utilise l'index construit pour matcher un lead
+// Retourne le MEILLEUR match avec score confidence, ou null si rien
+function fastDropboxMatch({ centris, adresse, rue }) {
+  if (!dropboxIndex.folders?.length) return null;
+
+  // Strategy 1: Centris# exact (score 100)
+  if (centris) {
+    const idx = dropboxIndex.byCentris[String(centris).trim()];
+    if (idx !== undefined) {
+      const f = dropboxIndex.folders[idx];
+      return { folder: f, score: 100, strategy: 'centris_index' };
+    }
+  }
+
+  // Strategy 2: Scan filenames pour Centris# (dossier n'a pas # mais fichier oui)
+  if (centris) {
+    for (let i = 0; i < dropboxIndex.folders.length; i++) {
+      const f = dropboxIndex.folders[i];
+      if (f.files.some(x => x.name.includes(String(centris)))) {
+        return { folder: f, score: 88, strategy: 'filename_centris_index' };
+      }
+    }
+  }
+
+  // Strategy 3: Adresse complète fuzzy (numéro civique + rue)
+  const q = _addrTokens(adresse || '');
+  if (q.numero || q.mots.size) {
+    let best = null;
+    for (const f of dropboxIndex.folders) {
+      const t = _addrTokens(f.adresse || f.name);
+      let score = 0;
+      if (q.numero && t.numero && q.numero === t.numero) score += 50;
+      if (q.mots.size && t.mots.size) {
+        const inter = [...q.mots].filter(m => t.mots.has(m)).length;
+        const union = new Set([...q.mots, ...t.mots]).size;
+        score += Math.round(45 * (inter / Math.max(1, union)));
+      }
+      if (score > (best?.score || 0)) best = { folder: f, score, strategy: 'fuzzy_index' };
+    }
+    if (best && best.score >= 60) return best;
+  }
+
+  // Strategy 4: Rue seule (e.g. "Chemin du Lac" sans numéro)
+  const streetQuery = (rue || adresse || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  const streetTokens = streetQuery.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(t => t.length >= 3 && !/^\d+$/.test(t));
+  if (streetTokens.length) {
+    const votes = new Map(); // folderIdx → count
+    for (const tok of streetTokens) {
+      const hits = dropboxIndex.byStreet[tok] || [];
+      for (const i of hits) votes.set(i, (votes.get(i) || 0) + 1);
+    }
+    if (votes.size) {
+      const best = [...votes.entries()].sort((a, b) => b[1] - a[1])[0];
+      const score = Math.min(75, 40 + best[1] * 15);
+      return { folder: dropboxIndex.folders[best[0]], score, strategy: 'street_index' };
+    }
+  }
+
+  return null;
+}
+
 async function loadDropboxStructure() {
   const sections = [
     { path: '',                     label: 'Racine' },
@@ -1665,6 +1888,19 @@ function _addrTokens(s) {
 }
 
 async function matchDropboxAvance(centris, adresse) {
+  // FAST PATH — utilise l'index complet en priorité (scan 100% Dropbox précalculé)
+  // Fallback sur l'ancienne logique si l'index n'est pas prêt ou ne trouve rien
+  if (dropboxIndex.folders?.length) {
+    const fast = fastDropboxMatch({ centris, adresse, rue: adresse });
+    if (fast) {
+      const pdfs = await _listFolderPDFs(fast.folder);
+      return { ...fast, pdfs, candidates: [{ folder: fast.folder, score: fast.score }] };
+    }
+  } else {
+    // Index pas encore construit → trigger async (ne bloque pas ce lookup)
+    buildDropboxIndex().catch(() => {});
+  }
+
   let dossiers = dropboxTerrains;
   if (!dossiers.length) { await loadDropboxStructure(); dossiers = dropboxTerrains; }
   if (!dossiers.length) return { folder: null, score: 0, strategy: 'no_folders', pdfs: [], candidates: [] };
@@ -4204,6 +4440,93 @@ function registerHandlers() {
     );
   });
 
+  // /dropbox-reindex — force rebuild de l'index Dropbox complet (toutes inscriptions)
+  bot.onText(/\/dropbox[-_]?reindex/i, async msg => {
+    if (!isAllowed(msg)) return;
+    await bot.sendMessage(msg.chat.id, '🔄 Rebuild index Dropbox complet (peut prendre 10-30s)...');
+    try {
+      const idx = await buildDropboxIndex();
+      const ago = idx.builtAt ? `${Math.round((Date.now() - idx.builtAt) / 1000)}s` : 'maintenant';
+      await bot.sendMessage(msg.chat.id,
+        `✅ *Index Dropbox reconstruit*\n` +
+        `   📁 ${idx.totalFolders} dossiers\n` +
+        `   📄 ${idx.totalFiles} fichiers indexés\n` +
+        `   🔢 ${Object.keys(idx.byCentris).length} Centris# indexés\n` +
+        `   🛣 ${Object.keys(idx.byStreet).length} tokens de rue\n` +
+        `   ⏱ construit il y a ${ago}`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ Reindex échoué: ${e.message}`);
+    }
+  });
+
+  // /dropbox-stats — vue rapide de l'état de l'index
+  bot.onText(/\/dropbox[-_]?stats/i, async msg => {
+    if (!isAllowed(msg)) return;
+    const idx = dropboxIndex;
+    if (!idx.folders?.length) {
+      return bot.sendMessage(msg.chat.id, `⚠️ Index pas encore construit. Lance \`/dropbox-reindex\``, { parse_mode: 'Markdown' });
+    }
+    const ageMin = Math.round((Date.now() - idx.builtAt) / 60000);
+    const sources = [...new Set(idx.folders.map(f => f.source))];
+    const withCentris = idx.folders.filter(f => f.centris).length;
+    const withoutCentris = idx.folders.length - withCentris;
+    await bot.sendMessage(msg.chat.id,
+      `📊 *Index Dropbox*\n` +
+      `⏱ Dernier build: il y a ${ageMin} min\n` +
+      `📁 Dossiers: ${idx.totalFolders}\n` +
+      `   ✅ avec Centris#: ${withCentris}\n` +
+      `   ⚠️ sans Centris#: ${withoutCentris}\n` +
+      `📄 Fichiers indexés: ${idx.totalFiles}\n` +
+      `🗂 Sources scannées (${sources.length}):\n${sources.map(s => `   • ${s}`).join('\n')}\n` +
+      `🔢 ${Object.keys(idx.byCentris).length} Centris# indexés\n` +
+      `🛣 ${Object.keys(idx.byStreet).length} tokens rue indexés`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // /dropbox-find <requête> — cherche dans l'index par Centris#, adresse, rue
+  // Ex: /dropbox-find 12582379  /dropbox-find chemin du lac  /dropbox-find 456 rue principale
+  bot.onText(/\/dropbox[-_]?find\s+(.+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const q = match[1].trim();
+    if (!dropboxIndex.folders?.length) {
+      return bot.sendMessage(msg.chat.id, `⚠️ Index vide. Lance \`/dropbox-reindex\``, { parse_mode: 'Markdown' });
+    }
+
+    // Essaie Centris# si numérique, sinon adresse/rue
+    const isNum = /^\d{7,9}$/.test(q);
+    const result = fastDropboxMatch(
+      isNum ? { centris: q, adresse: '', rue: '' } : { centris: '', adresse: q, rue: q }
+    );
+
+    if (!result) {
+      // Fallback: top 5 matches fuzzy par tokens
+      const tokens = q.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').split(/\s+/).filter(t => t.length >= 3);
+      const scored = dropboxIndex.folders.map(f => ({
+        folder: f,
+        score: tokens.filter(t => f.name.toLowerCase().includes(t) || f.adresse.toLowerCase().includes(t)).length
+      })).filter(x => x.score > 0).sort((a,b) => b.score - a.score).slice(0, 5);
+      if (!scored.length) return bot.sendMessage(msg.chat.id, `❌ Rien trouvé pour "${q}"`);
+      const list = scored.map(s => `  • *${s.folder.adresse || s.folder.name}* (${s.folder.files.length} fichiers, Centris: ${s.folder.centris || '?'})`).join('\n');
+      return bot.sendMessage(msg.chat.id, `🔍 *${scored.length} candidats pour "${q}":*\n${list}`, { parse_mode: 'Markdown' });
+    }
+
+    const f = result.folder;
+    const fileList = f.files.slice(0, 15).map(x => `   📄 ${x.name}`).join('\n');
+    const more = f.files.length > 15 ? `\n   …et ${f.files.length - 15} autres` : '';
+    await bot.sendMessage(msg.chat.id,
+      `✅ *Match: ${f.adresse || f.name}*\n` +
+      `Strategy: ${result.strategy} · Score: ${result.score}/100\n` +
+      `Centris: ${f.centris || '(aucun)'}\n` +
+      `Source: ${f.source}\n` +
+      `Chemin: \`${f.path}\`\n` +
+      `📦 ${f.files.length} fichier${f.files.length>1?'s':''}:\n${fileList}${more}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
   // /parselead <messageId> — teste extraction sans créer deal. Montre regex + AI side-by-side
   bot.onText(/\/parselead\s+([a-zA-Z0-9_-]+)/, async (msg, match) => {
     if (!isAllowed(msg)) return;
@@ -5736,8 +6059,10 @@ async function main() {
     } catch (e) { log('WARN', 'BOOT', `Dropbox refresh exception: ${e.message}`); }
   }
 
-  log('INFO', 'BOOT', 'Step 2: load Dropbox structure');
+  log('INFO', 'BOOT', 'Step 2: load Dropbox structure + index');
   try { await loadDropboxStructure(); } catch (e) { log('WARN', 'BOOT', `Dropbox struct: ${e.message}`); }
+  // Build index complet en background (non bloquant — lookup rapide dès que prêt)
+  buildDropboxIndex().catch(e => log('WARN', 'BOOT', `Dropbox index build: ${e.message}`));
 
   log('INFO', 'BOOT', 'Step 3: init Gist');
   try { await initGistId(); } catch (e) { log('WARN', 'BOOT', `Gist init: ${e.message}`); }
@@ -5756,6 +6081,8 @@ async function main() {
   // Refresh structure Dropbox toutes les 30min — terrain cache toujours à jour
   setInterval(async () => {
     await loadDropboxStructure().catch(e => log('WARN', 'DROPBOX', `Refresh structure: ${e.message}`));
+    // Rebuild index complet en parallèle (scan récursif + indexation)
+    buildDropboxIndex().catch(e => log('WARN', 'DROPBOX', `Rebuild index: ${e.message}`));
   }, 30 * 60 * 1000);
 
   // ── Anthropic Health Check — ping Haiku pour détecter credit/auth problems
