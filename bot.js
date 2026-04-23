@@ -3186,6 +3186,102 @@ async function executeToolSafe(name, input, chatId) {
   ]);
 }
 
+// ─── Health score dynamique 0-100 + anomaly detection ───────────────────────
+function computeHealthScore() {
+  let score = 100;
+  const issues = [];
+  // Subsystems down (max -30)
+  const subsystemsCheck = {
+    pipedrive: !!PD_KEY,
+    brevo:     !!BREVO_KEY,
+    gmail:     !!(process.env.GMAIL_CLIENT_ID && gmailToken),
+    dropbox:   !!dropboxToken,
+    github:    !!process.env.GITHUB_TOKEN,
+  };
+  const downSubs = Object.entries(subsystemsCheck).filter(([,v]) => !v).map(([k]) => k);
+  if (downSubs.length) { score -= downSubs.length * 8; issues.push(`subsystems_down:${downSubs.join(',')}`); }
+
+  // Errors récentes (max -20)
+  const errTotal = metrics.errors.total || 0;
+  if (errTotal > 30) { score -= 20; issues.push('errors_high'); }
+  else if (errTotal > 10) { score -= 10; issues.push('errors_moderate'); }
+
+  // Webhook health (max -20)
+  const wh = global.__webhookHealth;
+  if (wh?.status === 'degraded') { score -= 20; issues.push('webhook_degraded'); }
+  else if (wh?.consecutiveFails >= 2) { score -= 10; issues.push('webhook_unstable'); }
+
+  // Anthropic credit (max -30)
+  if (metrics.lastApiError && /credit|billing|auth/i.test(metrics.lastApiError.message || '')) {
+    const age = Date.now() - new Date(metrics.lastApiError.at).getTime();
+    if (age < 30*60*1000) { score -= 30; issues.push('anthropic_credit'); }
+  }
+
+  // Poller staleness (max -15)
+  if (gmailPollerState.lastRun) {
+    const minsAgo = (Date.now() - new Date(gmailPollerState.lastRun).getTime()) / 60000;
+    if (minsAgo > 20) { score -= 15; issues.push('poller_stale'); }
+    else if (minsAgo > 10) { score -= 5; issues.push('poller_slow'); }
+  }
+
+  // Circuits ouverts (max -15)
+  const openCircuits = Object.values(circuits).filter(c => Date.now() < c.openUntil).length;
+  if (openCircuits >= 3) { score -= 15; issues.push(`circuits_open:${openCircuits}`); }
+  else if (openCircuits >= 1) { score -= 5; }
+
+  score = Math.max(0, Math.min(100, score));
+  const status = score >= 90 ? 'excellent' : score >= 70 ? 'good' : score >= 50 ? 'degraded' : 'critical';
+  return { score, status, issues };
+}
+
+// Anomaly detection — run every 6h, alert si patterns anormaux
+const anomalyState = { lastCheck: 0, lastAlerts: {} };
+async function detectAnomalies() {
+  anomalyState.lastCheck = Date.now();
+  const anomalies = [];
+  const now = Date.now();
+
+  // 1. Poller silent >30min (critique)
+  if (gmailPollerState.lastRun) {
+    const mins = (now - new Date(gmailPollerState.lastRun).getTime()) / 60000;
+    if (mins > 30) anomalies.push({ key: 'poller_silent', msg: `Poller silencieux depuis ${Math.round(mins)}min`, severity: 'high' });
+  }
+
+  // 2. Zero leads en 24h (alors qu'on s'y attend — check poller actif)
+  const pollerStatsRef = pollerStats;
+  if (pollerStatsRef.runs > 50 && pollerStatsRef.totalsDealCreated === 0) {
+    anomalies.push({ key: 'no_leads_24h', msg: `${pollerStatsRef.runs} polls mais 0 deal créé — parser probablement cassé`, severity: 'high' });
+  }
+
+  // 3. Cost spike aujourd'hui >$20
+  const todayCost = costTracker.daily[today()] || 0;
+  if (todayCost > 20) anomalies.push({ key: 'cost_spike', msg: `$${todayCost.toFixed(2)} dépensé aujourd'hui — inhabituel`, severity: 'medium' });
+
+  // 4. Taux erreur >20% sur les dernières 100 calls
+  const claudeCalls = metrics.api.claude || 0;
+  const errTotal = metrics.errors.total || 0;
+  if (claudeCalls > 20 && (errTotal / claudeCalls) > 0.2) {
+    anomalies.push({ key: 'error_rate_high', msg: `${Math.round(100*errTotal/claudeCalls)}% erreurs (${errTotal}/${claudeCalls})`, severity: 'high' });
+  }
+
+  // 5. Health score <70
+  const hs = computeHealthScore();
+  if (hs.score < 70) anomalies.push({ key: 'health_low', msg: `Score ${hs.score}/100 — issues: ${hs.issues.join(', ')}`, severity: hs.score < 50 ? 'high' : 'medium' });
+
+  // Alerte Telegram avec cooldown 6h par anomalie
+  for (const a of anomalies) {
+    const lastAlert = anomalyState.lastAlerts[a.key] || 0;
+    if (now - lastAlert > 6 * 60 * 60 * 1000) {
+      anomalyState.lastAlerts[a.key] = now;
+      if (ALLOWED_ID) {
+        bot.sendMessage(ALLOWED_ID, `⚠️ *Anomalie détectée (${a.severity})*\n${a.msg}`, { parse_mode: 'Markdown' }).catch(()=>{});
+      }
+      auditLogEvent('anomaly', a.key, { msg: a.msg, severity: a.severity });
+    }
+  }
+  return anomalies;
+}
+
 // ─── Rate limiting anti-abuse sur webhooks (par IP + route) ──────────────────
 const webhookRateMap = new Map(); // "ip:url" → [timestamps recent]
 function webhookRateOK(ip, url, maxPerMin = 20) {
@@ -3701,6 +3797,41 @@ function registerHandlers() {
     bot.sendMessage(msg.chat.id, autoSendPaused
       ? '⏸ Auto-envoi docs PAUSÉ — tout passera en brouillon jusqu\'à /pauseauto'
       : '▶️ Auto-envoi docs REPRIS — envois ≥90 automatiques.');
+  });
+
+  bot.onText(/\/score|\/sante/, async msg => {
+    if (!isAllowed(msg)) return;
+    const h = computeHealthScore();
+    const emoji = h.score >= 90 ? '🟢' : h.score >= 70 ? '🟡' : h.score >= 50 ? '🟠' : '🔴';
+    const anomalies = await detectAnomalies();
+    const anomaliesStr = anomalies.length
+      ? '\n\n*Anomalies détectées:*\n' + anomalies.map(a => `• ${a.severity === 'high' ? '🚨' : '⚠️'} ${a.msg}`).join('\n')
+      : '\n\n✅ Aucune anomalie';
+    bot.sendMessage(msg.chat.id,
+      `${emoji} *Health Score: ${h.score}/100*\nStatus: \`${h.status}\`\n\n` +
+      (h.issues.length ? `*Issues:*\n${h.issues.map(i => `• ${i}`).join('\n')}` : '✅ Tous systèmes OK') +
+      anomaliesStr,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.onText(/\/backup/, async msg => {
+    if (!isAllowed(msg)) return;
+    await bot.sendMessage(msg.chat.id, '💾 Backup en cours...');
+    try {
+      await savePollerStateToGist();
+      await bot.sendMessage(msg.chat.id,
+        `✅ Backup complet dans Gist\n\n` +
+        `• Poller: ${gmailPollerState.processed.length} IDs, ${gmailPollerState.totalLeads} leads\n` +
+        `• Dédup: ${recentLeadsByKey.size} entrées\n` +
+        `• Mémoire Kira: ${kiramem.facts.length} faits\n` +
+        `• Audit: ${auditLog.length} events\n\n` +
+        `Restaure auto au prochain boot.`
+      );
+      auditLogEvent('backup', 'manual', { processed: gmailPollerState.processed.length });
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+    }
   });
 
   bot.onText(/\/cout|\/cost/, msg => {
@@ -4541,6 +4672,7 @@ const server = http.createServer((req, res) => {
         by_model:        Object.fromEntries(Object.entries(costTracker.byModel).map(([k,v])=>[k, Number(v.toFixed(2))])),
       },
       webhook_health: global.__webhookHealth || { status: 'not_initialized' },
+      health_score: computeHealthScore(),
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(health, null, 2));
@@ -5478,6 +5610,14 @@ async function main() {
   // 1er sync au boot (+5s), puis check santé toutes les 2 min (plus agressif)
   setTimeout(() => syncWebhookWithSecret('boot'), 5000);
   setInterval(checkWebhookHealth, 2 * 60 * 1000);
+
+  // ── Anomaly detection + backup state réguliers ───────────────────────────
+  // Anomaly check toutes les 30min (équilibre réactivité vs spam)
+  setInterval(() => detectAnomalies().catch(e => log('WARN', 'ANOMALY', e.message)), 30 * 60 * 1000);
+  // 1er check 2min après boot (laisse le temps au poller de tourner)
+  setTimeout(() => detectAnomalies().catch(()=>{}), 2 * 60 * 1000);
+  // Backup Gist toutes les 6h (survit aux redeploys + disaster recovery)
+  setInterval(() => savePollerStateToGist().catch(()=>{}), 6 * 60 * 60 * 1000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
