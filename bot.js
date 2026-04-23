@@ -2164,25 +2164,85 @@ function _addrTokens(s) {
   return { numero, mots: new Set(mots), raw: n };
 }
 
+// FALLBACK TEMPS RÉEL — Dropbox search_v2 API quand l'index ne trouve pas.
+// Cherche Centris# ou adresse dans TOUT Dropbox (pas juste les paths indexés)
+// et retourne le dossier parent du premier match. Utile si terrain ajouté après
+// le dernier index rebuild, ou dans un dossier non-scanné.
+async function dropboxLiveSearch(query) {
+  if (!query || String(query).length < 3) return null;
+  try {
+    const res = await dropboxAPI('https://api.dropboxapi.com/2/files/search_v2', {
+      query: String(query),
+      options: { max_results: 25, file_status: 'active', filename_only: false },
+    });
+    if (!res?.ok) return null;
+    const data = await res.json();
+    const matches = data.matches || [];
+    if (!matches.length) return null;
+    // Prioriser: dossier avec Centris# exact dans le nom
+    const folderCandidates = new Map(); // path → {folder, score, reason}
+    for (const m of matches) {
+      const meta = m.metadata?.metadata;
+      if (!meta) continue;
+      if (meta['.tag'] === 'folder' && meta.name.includes(String(query))) {
+        folderCandidates.set(meta.path_lower, { meta, score: 95, reason: 'folder_name' });
+      } else if (meta['.tag'] === 'file') {
+        // Fichier trouvé → remonte au dossier parent immédiat
+        const parent = meta.path_lower.split('/').slice(0, -1).join('/');
+        if (!folderCandidates.has(parent)) {
+          folderCandidates.set(parent, { meta: { name: parent.split('/').pop(), path_lower: parent }, score: 82, reason: 'filename_match' });
+        }
+      }
+    }
+    if (!folderCandidates.size) return null;
+    const [bestPath, best] = [...folderCandidates.entries()].sort((a,b) => b[1].score - a[1].score)[0];
+    // Extraire centris/adresse du nom
+    const folderName = best.meta.name;
+    const parsed = _parseFolderMeta(folderName);
+    const folder = {
+      name: folderName, path: bestPath,
+      centris: parsed.centris, adresse: parsed.adresse,
+      source: '(live search)',
+    };
+    const pdfs = await _listFolderPDFs(folder);
+    log('OK', 'DBX_LIVE', `Trouvé "${folderName}" via search live (${best.reason}, score ${best.score}, ${pdfs.length} docs)`);
+    return { folder, score: best.score, strategy: `live_search_${best.reason}`, pdfs };
+  } catch (e) {
+    log('WARN', 'DBX_LIVE', `Search échoué: ${e.message}`);
+    return null;
+  }
+}
+
 async function matchDropboxAvance(centris, adresse) {
-  // FAST PATH — utilise l'index complet en priorité (scan 100% Dropbox précalculé)
-  // Fallback sur l'ancienne logique si l'index n'est pas prêt ou ne trouve rien
+  // FAST PATH 1 — index précalculé (O(1) par Centris#)
   if (dropboxIndex.folders?.length) {
     const fast = fastDropboxMatch({ centris, adresse, rue: adresse });
     if (fast) {
-      // FILES directement depuis l'index (pas d'API call) — fichiers déjà mergés
-      // cross-source (Inscription + Terrain en ligne combinés). Filter DOC_EXTS.
       const indexedFiles = (fast.folder.files || [])
         .filter(x => DOC_EXTS.includes(x.ext))
         .map(x => ({ name: x.name, path_lower: x.path, '.tag': 'file', size: x.size }));
       const pdfs = _sortDocsPriority(indexedFiles);
-      // Fallback API scan si l'index a 0 fichiers (dossier récent non indexé)
       const finalPdfs = pdfs.length ? pdfs : await _listFolderPDFs(fast.folder);
       return { ...fast, pdfs: finalPdfs, candidates: [{ folder: fast.folder, score: fast.score }], sources: fast.folder.sources || [fast.folder.source] };
     }
   } else {
-    // Index pas encore construit → trigger async (ne bloque pas ce lookup)
     buildDropboxIndex().catch(() => {});
+  }
+
+  // FAST PATH 2 — Dropbox search LIVE (fallback si l'index rate)
+  // Cherche d'abord par Centris#, puis par adresse. Trouve même les dossiers
+  // pas encore indexés (nouveaux, mal classés, etc.)
+  if (centris) {
+    const liveRes = await dropboxLiveSearch(centris);
+    if (liveRes?.folder && liveRes.pdfs?.length) {
+      return { ...liveRes, candidates: [{ folder: liveRes.folder, score: liveRes.score }], sources: [liveRes.folder.source] };
+    }
+  }
+  if (adresse && adresse.length >= 5) {
+    const liveRes = await dropboxLiveSearch(adresse);
+    if (liveRes?.folder && liveRes.pdfs?.length) {
+      return { ...liveRes, candidates: [{ folder: liveRes.folder, score: Math.max(70, liveRes.score - 10) }], sources: [liveRes.folder.source] };
+    }
   }
 
   let dossiers = dropboxTerrains;
