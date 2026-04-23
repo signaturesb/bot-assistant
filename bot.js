@@ -3165,6 +3165,36 @@ async function executeToolSafe(name, input, chatId) {
   ]);
 }
 
+// ─── Rate limiting anti-abuse sur webhooks (par IP + route) ──────────────────
+const webhookRateMap = new Map(); // "ip:url" → [timestamps recent]
+function webhookRateOK(ip, url, maxPerMin = 20) {
+  const key = `${ip}:${url}`;
+  const now = Date.now();
+  const window = 60 * 1000;
+  let hits = webhookRateMap.get(key) || [];
+  hits = hits.filter(t => now - t < window);
+  if (hits.length >= maxPerMin) return false;
+  hits.push(now);
+  webhookRateMap.set(key, hits);
+  // Purge périodique
+  if (webhookRateMap.size > 500) {
+    for (const [k, arr] of webhookRateMap) if (!arr.some(t => now - t < window)) webhookRateMap.delete(k);
+  }
+  return true;
+}
+
+// ─── Audit log persistant — actions sensibles tracées ────────────────────────
+// Stocke dans Gist (survit aux redeploys) les actions: deploys, env changes,
+// auth failures, key usage. Shawn peut consulter via /audit.
+const AUDIT_FILE = path.join(DATA_DIR, 'audit.json');
+let auditLog = loadJSON(AUDIT_FILE, []);
+function auditLogEvent(category, event, details = {}) {
+  auditLog.push({ at: new Date().toISOString(), category, event, details });
+  if (auditLog.length > 200) auditLog = auditLog.slice(-200);
+  saveJSON(AUDIT_FILE, auditLog);
+  log('INFO', 'AUDIT', `${category}/${event} ${JSON.stringify(details).substring(0, 100)}`);
+}
+
 // ─── Cost tracking Anthropic ─────────────────────────────────────────────────
 // Prix par million tokens (2026 pricing Anthropic)
 const PRICING = {
@@ -4514,9 +4544,16 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
-  // ── GitHub webhook — sync instant au lieu de polling 30min ────────────────
-  // ── Webhook Telegram (remplace polling — plus fiable en production) ──────
+  // ── Webhook Telegram — PROTÉGÉ par X-Telegram-Bot-Api-Secret-Token ───────
+  // Sans ce header, n'importe qui peut injecter des commandes dans le bot.
+  // Le secret est configuré côté Telegram via setWebhook(secret_token).
   if (req.method === 'POST' && url === '/webhook/telegram') {
+    const tgSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    const provided = req.headers['x-telegram-bot-api-secret-token'];
+    if (tgSecret && provided !== tgSecret) {
+      log('WARN', 'SECURITY', `Webhook Telegram — bad/missing secret-token from ${req.socket.remoteAddress}`);
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
     let body = '';
     req.on('data', chunk => { body += chunk; if (body.length > 100000) req.destroy(); });
     req.on('end', () => {
@@ -4529,10 +4566,21 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ── Webhook GitHub — PROTÉGÉ par HMAC SHA-256 signature ──────────────────
   if (req.method === 'POST' && url === '/webhook/github') {
+    const ghSecret = process.env.GITHUB_WEBHOOK_SECRET;
     let body = '';
     req.on('data', chunk => { body += chunk; if (body.length > 100000) req.destroy(); });
     req.on('end', async () => {
+      if (ghSecret) {
+        const crypto = require('crypto');
+        const sig = req.headers['x-hub-signature-256'] || '';
+        const expected = 'sha256=' + crypto.createHmac('sha256', ghSecret).update(body).digest('hex');
+        if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+          log('WARN', 'SECURITY', `Webhook GitHub — bad/missing HMAC from ${req.socket.remoteAddress}`);
+          res.writeHead(401); res.end('unauthorized'); return;
+        }
+      }
       res.writeHead(200); res.end('ok');
       try {
         const event = req.headers['x-github-event'] || '';
@@ -4548,10 +4596,21 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   }
 
   if (req.method === 'POST' && ['/webhook/centris', '/webhook/sms', '/webhook/reply'].includes(url)) {
+    // Rate limiting par IP — anti-abuse (20 req/min max)
+    if (!webhookRateOK(req.socket.remoteAddress, url)) {
+      log('WARN', 'SECURITY', `Rate limit hit: ${req.socket.remoteAddress} → ${url}`);
+      res.writeHead(429); res.end('too many requests'); return;
+    }
     const wSecret = process.env.WEBHOOK_SECRET;
-    if (wSecret) {
-      const provided = req.headers['x-webhook-secret'] || req.headers['authorization']?.replace(/^Bearer\s+/i, '');
-      if (provided !== wSecret) { res.writeHead(401); res.end('unauthorized'); return; }
+    // OBLIGATOIRE — pas d'auth optionnelle sur webhooks publics
+    if (!wSecret) {
+      log('ERR', 'SECURITY', 'WEBHOOK_SECRET manquant — webhooks rejetés par sécurité');
+      res.writeHead(503); res.end('webhook secret not configured'); return;
+    }
+    const provided = req.headers['x-webhook-secret'] || req.headers['authorization']?.replace(/^Bearer\s+/i, '');
+    if (provided !== wSecret) {
+      log('WARN', 'SECURITY', `Webhook ${url} — bad secret from ${req.socket.remoteAddress}`);
+      res.writeHead(401); res.end('unauthorized'); return;
     }
     let body = '';
     req.on('data', chunk => { body += chunk; if (body.length > 50000) req.destroy(); });
