@@ -652,17 +652,27 @@ function getSystem() {
   return dyn ? SYSTEM_BASE + '\n\n' + dyn : SYSTEM_BASE;
 }
 
-// ─── Historique (40 messages max, persistant) ─────────────────────────────────
-const MAX_HIST = 40;
+// ─── Historique longue durée — 200 msgs window + Gist backup + auto-summary ──
+// Shawn veut que le bot se rappelle de tout. Trois couches:
+// 1. Window live: MAX_HIST=200 messages (prompt caching → cost contenu)
+// 2. Auto-summary: quand on dépasse SUMMARY_AT=250, les 100 plus vieux
+//    sont résumés par Haiku et compactés en 1 message [CONTEXTE_ANTÉRIEUR]
+// 3. Gist backup: sauvé toutes les 30s après modif → survit aux redeploys Render
+const MAX_HIST = parseInt(process.env.MAX_HIST || '200');
+const SUMMARY_AT = parseInt(process.env.SUMMARY_AT || '250');
+const SUMMARY_KEEP = parseInt(process.env.SUMMARY_KEEP || '120'); // garder les 120 plus récents quand on résume
 const rawChats = loadJSON(HIST_FILE, {});
 const chats    = new Map(Object.entries(rawChats));
 for (const [id, hist] of chats.entries()) {
   if (!Array.isArray(hist) || hist.length === 0) chats.delete(id);
 }
-let saveTimer = null;
+let saveTimer = null, gistSaveTimer = null;
 function scheduleHistSave() {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => saveJSON(HIST_FILE, Object.fromEntries(chats)), 1000);
+  // Backup Gist débounce 30s (survit redeploys Render)
+  if (gistSaveTimer) clearTimeout(gistSaveTimer);
+  gistSaveTimer = setTimeout(() => saveHistoryToGist().catch(() => {}), 30000);
 }
 function getHistory(id) { if (!chats.has(id)) chats.set(id, []); return chats.get(id); }
 function addMsg(id, role, content) {
@@ -670,6 +680,117 @@ function addMsg(id, role, content) {
   h.push({ role, content });
   if (h.length > MAX_HIST) h.splice(0, h.length - MAX_HIST);
   scheduleHistSave();
+  // Trigger summary si on dépasse le seuil (fire-and-forget, ne bloque pas)
+  if (h.length > SUMMARY_AT) summarizeOldHistory(id).catch(() => {});
+}
+
+// Gist backup/restore — survit aux redeploys Render (disque /data volatil)
+async function saveHistoryToGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const payload = { savedAt: new Date().toISOString(), chats: Object.fromEntries(chats) };
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      method: 'PATCH',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files: { 'history.json': { content: JSON.stringify(payload, null, 2) } } })
+    });
+    if (!res.ok) log('WARN', 'GIST', `Save history HTTP ${res.status}`);
+  } catch (e) { log('WARN', 'GIST', `Save history: ${e.message}`); }
+}
+async function loadHistoryFromGist() {
+  if (!gistId || !process.env.GITHUB_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, { headers: githubHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    const content = data.files?.['history.json']?.content;
+    if (!content) return;
+    const parsed = JSON.parse(content);
+    if (!parsed.chats) return;
+    // Ne restaure que si le local est plus vide (pas de clobber — disk prioritaire)
+    const localTotal = [...chats.values()].reduce((s, h) => s + h.length, 0);
+    const gistTotal = Object.values(parsed.chats).reduce((s, h) => s + (h?.length || 0), 0);
+    if (localTotal === 0 && gistTotal > 0) {
+      for (const [id, h] of Object.entries(parsed.chats)) {
+        if (Array.isArray(h) && h.length > 0) chats.set(id, h);
+      }
+      saveJSON(HIST_FILE, Object.fromEntries(chats));
+      log('OK', 'GIST', `History restauré depuis Gist: ${gistTotal} messages sur ${Object.keys(parsed.chats).length} chats (dernière save: ${parsed.savedAt})`);
+    } else if (gistTotal > 0) {
+      log('INFO', 'GIST', `History disque: ${localTotal} msgs · Gist: ${gistTotal} msgs — garde le disque`);
+    }
+  } catch (e) { log('WARN', 'GIST', `Load history: ${e.message}`); }
+}
+
+// Résume les vieux messages via Haiku — compacte en 1 seul "CONTEXTE_ANTÉRIEUR"
+async function summarizeOldHistory(chatId) {
+  if (!API_KEY) return;
+  const h = getHistory(chatId);
+  if (h.length <= SUMMARY_AT) return;
+  // Éviter re-summarize si déjà un résumé en tête et peu de nouveau
+  const first = h[0];
+  const alreadyHasSummary = first?.role === 'user' && typeof first.content === 'string'
+    && first.content.startsWith('[CONTEXTE_ANTÉRIEUR_RÉSUMÉ]');
+  const toCompact = h.slice(0, h.length - SUMMARY_KEEP);
+  if (!toCompact.length) return;
+
+  try {
+    // Convertir en texte lisible pour Haiku
+    const asText = toCompact.map(m => {
+      const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content).substring(0, 300);
+      return `${m.role === 'user' ? 'Shawn' : 'Bot'}: ${c.substring(0, 500)}`;
+    }).join('\n').substring(0, 16000);
+
+    const prompt = `Voici un historique de conversation entre Shawn (courtier immobilier RE/MAX) et son assistant IA. Produis un RÉSUMÉ DENSE en français (max 400 mots) qui capture:
+- Les prospects/clients mentionnés (nom, email, téléphone, # Centris, statut)
+- Les décisions prises, documents envoyés, emails rédigés
+- Les configurations/préférences exprimées par Shawn
+- Les problèmes techniques résolus + leurs solutions
+- Les rendez-vous, dates, deadlines mentionnés
+
+Priorise les INFOS DURABLES utiles pour la suite (pas les "ok", "merci", etc.). Utilise des puces courtes.
+
+HISTORIQUE:
+${asText}
+
+Résumé dense:`;
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 30000);
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        max_tokens: 1200,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    clearTimeout(t);
+    if (!res.ok) { log('WARN', 'SUMMARY', `HTTP ${res.status}`); return; }
+    const data = await res.json();
+    const sumTxt = data.content?.[0]?.text?.trim() || '';
+    if (!sumTxt) return;
+
+    // Si déjà un résumé, on fusionne plutôt que de remplacer
+    const previousSummary = alreadyHasSummary
+      ? first.content.replace(/^\[CONTEXTE_ANTÉRIEUR_RÉSUMÉ\]\n?/, '').replace(/\n?\[FIN_RÉSUMÉ\]$/, '')
+      : '';
+    const mergedSummary = previousSummary
+      ? `${previousSummary}\n\n--- Mise à jour ---\n${sumTxt}`
+      : sumTxt;
+
+    const newFirst = {
+      role: 'user',
+      content: `[CONTEXTE_ANTÉRIEUR_RÉSUMÉ]\n${mergedSummary}\n[FIN_RÉSUMÉ]`
+    };
+    // Garder la queue récente intacte + remplacer tout ce qui précède par le résumé
+    const tail = h.slice(h.length - SUMMARY_KEEP);
+    h.length = 0;
+    h.push(newFirst, ...tail);
+    scheduleHistSave();
+    log('OK', 'SUMMARY', `${toCompact.length} messages compactés en résumé (${sumTxt.length} chars) pour chat ${chatId}`);
+  } catch (e) { log('WARN', 'SUMMARY', `Exception: ${e.message}`); }
 }
 
 // ─── Validation messages pour API Claude (prévient erreurs 400) ──────────────
@@ -6236,8 +6357,10 @@ async function main() {
   log('INFO', 'BOOT', 'Step 3: init Gist');
   try { await initGistId(); } catch (e) { log('WARN', 'BOOT', `Gist init: ${e.message}`); }
 
-  log('INFO', 'BOOT', 'Step 4: load memory');
+  log('INFO', 'BOOT', 'Step 4: load memory + history');
   try { await loadMemoryFromGist(); } catch (e) { log('WARN', 'BOOT', `Memory: ${e.message}`); }
+  // Restaurer l'historique depuis Gist si le disque /data est vide (post redeploy Render)
+  try { await loadHistoryFromGist(); } catch (e) { log('WARN', 'BOOT', `History Gist: ${e.message}`); }
 
   log('INFO', 'BOOT', 'Step 5: load session live context');
   try { await loadSessionLiveContext(); } catch (e) { log('WARN', 'BOOT', `Session live: ${e.message}`); }
