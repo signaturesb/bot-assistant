@@ -159,28 +159,15 @@ function savePendingLeads() {
   catch (e) { console.warn('savePendingLeads:', e.message); }
 }
 
-// pendingDocSends (Map email → pending) persisté sur disque — charge au boot,
-// sauvegarde sur chaque set/delete via wrappers. Survit redeploys Render.
-try {
-  if (fs.existsSync(PENDING_DOCS_FILE)) {
-    const arr = JSON.parse(fs.readFileSync(PENDING_DOCS_FILE, 'utf8')) || [];
-    for (const [k, v] of arr) pendingDocSends.set(k, v);
-  }
-} catch { /* silent: bad json → start fresh */ }
+// pendingDocSends persistence wiré après déclaration de la Map (voir ~L234).
+// (code déplacé pour éviter TDZ ReferenceError au chargement du module)
 function savePendingDocs() {
   try {
+    if (typeof pendingDocSends === 'undefined') return;
     const arr = [...pendingDocSends.entries()];
     fs.writeFileSync(PENDING_DOCS_FILE, JSON.stringify(arr, null, 2));
   } catch (e) { console.warn('savePendingDocs:', e.message); }
 }
-// Wrap set/delete pour auto-persist + tag _firstSeen (utilisé par auto-recovery cron)
-const _pdsSet = pendingDocSends.set.bind(pendingDocSends);
-const _pdsDel = pendingDocSends.delete.bind(pendingDocSends);
-pendingDocSends.set = (k, v) => {
-  if (v && typeof v === 'object' && !v._firstSeen) v._firstSeen = Date.now();
-  const r = _pdsSet(k, v); savePendingDocs(); return r;
-};
-pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
 
 // ─── Observabilité: Metrics + Circuit Breakers (fine pointe) ──────────────────
 const metrics = {
@@ -256,8 +243,24 @@ const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
 const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
 let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match, _firstSeen }
-// pendingDocSends est persisté sur disque — survit redeploys Render.
-// Ne pas référencer DATA_DIR ici (pas encore défini); init complet fait plus bas.
+
+// ── pendingDocSends: charge depuis disque + wrap set/delete pour auto-persist.
+// Survit aux redeploys Render. (savePendingDocs() est défini plus haut)
+try {
+  if (fs.existsSync(PENDING_DOCS_FILE)) {
+    const arr = JSON.parse(fs.readFileSync(PENDING_DOCS_FILE, 'utf8')) || [];
+    for (const [k, v] of arr) pendingDocSends.set(k, v);
+  }
+} catch { /* silent: bad json → start fresh */ }
+{
+  const _pdsSet = pendingDocSends.set.bind(pendingDocSends);
+  const _pdsDel = pendingDocSends.delete.bind(pendingDocSends);
+  pendingDocSends.set = (k, v) => {
+    if (v && typeof v === 'object' && !v._firstSeen) v._firstSeen = Date.now();
+    const r = _pdsSet(k, v); savePendingDocs(); return r;
+  };
+  pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
+}
 
 // RÈGLE ABSOLUE — aucun email/sms/action externe sans consent Shawn explicite
 // Désactive tous les auto-envois. Toute action "sortante" doit passer par
@@ -4819,6 +4822,165 @@ function registerHandlers() {
     );
   });
 
+  // /diagnose — test EN LIVE chaque composant critique + rapport RED/YELLOW/GREEN
+  // Diagnostic en 1 commande. Utile après deploy ou quand un truc semble cassé.
+  bot.onText(/\/diagnose|\/diag\b/, async msg => {
+    if (!isAllowed(msg)) return;
+    const chatId = msg.chat.id;
+    await bot.sendMessage(chatId, '🔬 Diagnostic en cours — tests live sur tous les composants...');
+    const checks = [];
+    const t0 = Date.now();
+
+    // 1. Gmail API (list 1 message)
+    try {
+      const r = await gmailAPI('/messages?maxResults=1').catch(() => null);
+      checks.push({ name: 'Gmail API', ok: !!r?.messages, detail: r?.messages ? `${r.messages.length} msg ok` : 'échec list' });
+    } catch (e) { checks.push({ name: 'Gmail API', ok: false, detail: e.message.substring(0, 80) }); }
+
+    // 2. Gmail token (refresh check)
+    try {
+      const tok = await getGmailToken();
+      checks.push({ name: 'Gmail token', ok: !!tok, detail: tok ? `valide (${tok.substring(0,10)}...)` : 'NULL — refresh échoué' });
+    } catch (e) { checks.push({ name: 'Gmail token', ok: false, detail: e.message.substring(0, 80) }); }
+
+    // 3. Dropbox API
+    try {
+      const r = await dropboxAPI('https://api.dropboxapi.com/2/users/get_current_account', {});
+      checks.push({ name: 'Dropbox API', ok: !!r?.ok, detail: r?.ok ? 'auth ok' : `HTTP ${r?.status || '?'}` });
+    } catch (e) { checks.push({ name: 'Dropbox API', ok: false, detail: e.message.substring(0, 80) }); }
+
+    // 4. Dropbox index
+    const idxCount = dropboxIndex?.folders?.length || 0;
+    checks.push({ name: 'Dropbox index', ok: idxCount > 10, detail: `${idxCount} dossiers (legacy: ${dropboxTerrains.length} terrains)` });
+
+    // 5. Pipedrive API
+    if (PD_KEY) {
+      try {
+        const r = await pdGet('/users/me').catch(() => null);
+        checks.push({ name: 'Pipedrive API', ok: !!r?.data, detail: r?.data ? `user ${r.data.email}` : 'échec' });
+      } catch (e) { checks.push({ name: 'Pipedrive API', ok: false, detail: e.message.substring(0, 80) }); }
+    } else { checks.push({ name: 'Pipedrive API', ok: false, detail: 'PD_KEY manquant' }); }
+
+    // 6. Anthropic API (Haiku ping léger)
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(10000),
+      });
+      checks.push({ name: 'Anthropic API', ok: r.ok, detail: r.ok ? 'haiku ping ok' : `HTTP ${r.status}` });
+    } catch (e) { checks.push({ name: 'Anthropic API', ok: false, detail: e.message.substring(0, 80) }); }
+
+    // 7. Telegram webhook
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`, { signal: AbortSignal.timeout(8000) });
+      const j = await r.json();
+      const pending = j.result?.pending_update_count || 0;
+      checks.push({ name: 'Telegram webhook', ok: !!j.result?.url && pending < 10, detail: j.result?.url ? `url ok, pending=${pending}` : 'pas configuré' });
+    } catch (e) { checks.push({ name: 'Telegram webhook', ok: false, detail: e.message.substring(0, 80) }); }
+
+    // 8. Disque (DATA_DIR writable)
+    try {
+      const testFile = path.join(DATA_DIR, '.diag_write');
+      fs.writeFileSync(testFile, String(Date.now()));
+      fs.unlinkSync(testFile);
+      checks.push({ name: 'Disque (DATA_DIR)', ok: true, detail: DATA_DIR });
+    } catch (e) { checks.push({ name: 'Disque (DATA_DIR)', ok: false, detail: e.message.substring(0, 80) }); }
+
+    // 9. Poller fraîcheur
+    const lastRunMs = gmailPollerState.lastRun ? Date.now() - new Date(gmailPollerState.lastRun).getTime() : Infinity;
+    checks.push({ name: 'Poller activité', ok: lastRunMs < 5 * 60 * 1000, detail: `dernier run il y a ${Math.round(lastRunMs / 1000)}s` });
+
+    // 10. Pending counts
+    const pDocs = typeof pendingDocSends !== 'undefined' ? pendingDocSends.size : 0;
+    const pNames = pendingLeads.filter(l => l.needsName).length;
+    checks.push({ name: 'Pending', ok: pDocs < 5 && pNames < 3, detail: `${pDocs} docs + ${pNames} noms en attente` });
+
+    // 11. Retry state
+    const stuckRetries = Object.entries(leadRetryState || {}).filter(([, v]) => v.count >= 3).length;
+    checks.push({ name: 'Retry counter', ok: stuckRetries === 0, detail: stuckRetries ? `${stuckRetries} leads coincés` : 'aucun blocage' });
+
+    // 12. Cost tracker (jour)
+    const todayCost = costTracker?.daily?.[today()] || 0;
+    checks.push({ name: 'Coût aujourd\'hui', ok: todayCost < 10, detail: `$${todayCost.toFixed(2)}` });
+
+    // 13. Health score global
+    const h = computeHealthScore();
+    checks.push({ name: 'Health score', ok: h.score >= 70, detail: `${h.score}/100 (${h.status})` });
+
+    const dur = Date.now() - t0;
+    const nOK = checks.filter(c => c.ok).length;
+    const nFail = checks.length - nOK;
+    const globalEmoji = nFail === 0 ? '🟢' : nFail <= 2 ? '🟡' : '🔴';
+    const lines = checks.map(c => `${c.ok ? '✅' : '🔴'} *${c.name}* — ${c.detail}`);
+    const summary = [
+      `${globalEmoji} *Diagnostic complet* (${dur}ms)`,
+      ``,
+      `${nOK}/${checks.length} systèmes OK`,
+      ``,
+      ...lines,
+    ].join('\n');
+    await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' }).catch(() =>
+      bot.sendMessage(chatId, summary.replace(/[*_`]/g, '')).catch(() => {})
+    );
+  });
+
+  // /test-email <centris#> [email] — simule un lead Centris factice pour valider le pipeline
+  // Utile après deploy pour vérifier auto-send de bout en bout sans attendre un vrai Centris.
+  // Ex: /test-email 26621771 testprospect@example.com
+  bot.onText(/\/test[-_]?email\s+(\d{7,9})(?:\s+(\S+@\S+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const centrisNum = match[1];
+    const email = match[2] || 'test-prospect@example.com';
+    await bot.sendMessage(msg.chat.id, `🧪 *Test pipeline* — Centris #${centrisNum}, email ${email}`, { parse_mode: 'Markdown' });
+
+    const fakeLead = {
+      nom: 'Test Prospect',
+      telephone: '5145551234',
+      email,
+      centris: centrisNum,
+      adresse: '',
+      type: 'terrain',
+    };
+    const fakeMsgId = `test_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const fakeFrom = 'Centris Test <noreply@centris.ca>';
+    const fakeSubject = `TEST — Demande Centris #${centrisNum}`;
+    const fakeSource = { source: 'centris', label: 'Centris.ca (TEST)' };
+
+    try {
+      const result = await traiterNouveauLead(fakeLead, fakeMsgId, fakeFrom, fakeSubject, fakeSource, { skipDedup: true });
+      await bot.sendMessage(msg.chat.id,
+        `🧪 *Résultat test*\n` +
+        `Décision: \`${result?.decision || '(void)'}\`\n` +
+        `Deal ID: ${result?.dealId || '(aucun)'}\n` +
+        `Notif envoyée: ${result?.notifySent ? '✅' : '❌'}\n\n` +
+        `Run \`/lead-audit ${fakeMsgId}\` pour trace complète.`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ Test a throw: ${e.message.substring(0, 200)}`);
+    }
+  });
+
+  // /flush-pending — retry IMMÉDIATEMENT tous les pendingDocSends (bypass seuil 5min)
+  bot.onText(/\/flush[-_]?pending/i, async msg => {
+    if (!isAllowed(msg)) return;
+    const n = pendingDocSends.size;
+    if (n === 0) return bot.sendMessage(msg.chat.id, '✅ Aucun pending à flush.');
+    await bot.sendMessage(msg.chat.id, `⚡ Flush ${n} pending doc-sends (force retry)...`);
+    let sent = 0, failed = 0;
+    for (const [email, pending] of [...pendingDocSends.entries()]) {
+      try {
+        const r = await envoyerDocsAuto(pending);
+        if (r.sent) { pendingDocSends.delete(email); sent++; }
+        else if (r.skipped) log('INFO', 'FLUSH', `${email}: ${r.reason}`);
+        else failed++;
+      } catch (e) { failed++; log('WARN', 'FLUSH', `${email}: ${e.message.substring(0, 100)}`); }
+    }
+    await bot.sendMessage(msg.chat.id, `✅ Flush terminé — ${sent} envoyés, ${failed} échoués.`);
+  });
+
   bot.onText(/\/backup/, async msg => {
     if (!isAllowed(msg)) return;
     await bot.sendMessage(msg.chat.id, '💾 Backup en cours...');
@@ -6083,7 +6245,7 @@ process.on('SIGTERM', async () => {
 });
 
 // ─── HTTP server (health + webhooks) ─────────────────────────────────────────
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = (req.url || '/').split('?')[0];
 
   // ── Health endpoint détaillé (JSON) — observabilité complète ──────────────
@@ -6262,6 +6424,146 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       metrics: { ...metrics, tools: undefined },
       lastApiError: metrics.lastApiError,
     }, null, 2));
+    return;
+  }
+
+  // /admin/diagnose?token=X — diag live via HTTP (sans Telegram)
+  if (req.method === 'GET' && url.startsWith('/admin/diagnose')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const checks = {};
+    // Gmail
+    try { const r = await gmailAPI('/messages?maxResults=1').catch(() => null); checks.gmailAPI = !!r?.messages; } catch { checks.gmailAPI = false; }
+    try { const t = await getGmailToken(); checks.gmailToken = !!t; } catch { checks.gmailToken = false; }
+    // Dropbox
+    try { const r = await dropboxAPI('https://api.dropboxapi.com/2/users/get_current_account', {}); checks.dropboxAPI = !!r?.ok; } catch { checks.dropboxAPI = false; }
+    checks.dropboxIndex = (dropboxIndex?.folders?.length || 0) > 10;
+    // Pipedrive
+    if (PD_KEY) { try { const r = await pdGet('/users/me').catch(() => null); checks.pipedrive = !!r?.data; } catch { checks.pipedrive = false; } }
+    else checks.pipedrive = false;
+    // Anthropic
+    try {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(10000),
+      });
+      checks.anthropic = r.ok;
+    } catch { checks.anthropic = false; }
+    // Telegram
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`, { signal: AbortSignal.timeout(8000) });
+      const j = await r.json();
+      checks.telegramWebhook = !!j.result?.url;
+      checks.telegramPendingUpdates = j.result?.pending_update_count || 0;
+    } catch { checks.telegramWebhook = false; }
+    // State
+    checks.dataDir = DATA_DIR;
+    checks.pendingDocs = pendingDocSends.size;
+    checks.pendingNames = pendingLeads.filter(l => l.needsName).length;
+    checks.processedMsgIds = gmailPollerState.processed.length;
+    checks.dedupKeys = recentLeadsByKey.size;
+    checks.lastPollerRun = gmailPollerState.lastRun;
+    checks.autoSendPaused = autoSendPaused;
+    checks.healthScore = computeHealthScore();
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ at: new Date().toISOString(), checks }, null, 2));
+    return;
+  }
+
+  // POST /admin/retry-centris?token=X&centris=123 — force-retry lead par Centris#
+  if (req.method === 'POST' && url.startsWith('/admin/retry-centris')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const centrisNum = ((req.url || '').split('centris=')[1]?.split('&')[0] || '').replace(/\D/g, '');
+    if (!centrisNum || centrisNum.length < 7) {
+      res.writeHead(400); res.end('centris# (7-9 digits) requis'); return;
+    }
+    // Purger clés dedup
+    let purgedKeys = 0;
+    for (const k of [...recentLeadsByKey.keys()]) {
+      if (k === 'c:' + centrisNum) { recentLeadsByKey.delete(k); purgedKeys++; }
+    }
+    // Purger msgIds processed
+    let purgedIds = 0, extractedCount = 0;
+    try {
+      const list = await gmailAPI(`/messages?maxResults=20&q=${encodeURIComponent(centrisNum)}`).catch(() => null);
+      for (const m of list?.messages || []) {
+        const idx = gmailPollerState.processed.indexOf(m.id);
+        if (idx >= 0) { gmailPollerState.processed.splice(idx, 1); purgedIds++; }
+        if (leadRetryState[m.id]) delete leadRetryState[m.id];
+        try {
+          const full = await gmailAPI(`/messages/${m.id}?format=full`).catch(() => null);
+          if (full) {
+            const hdrs = full.payload?.headers || [];
+            const get = n => hdrs.find(h => h.name.toLowerCase() === n)?.value || '';
+            const lead = parseLeadEmail(gmailExtractBody(full.payload), get('subject'), get('from'));
+            const source = detectLeadSource(get('from'), get('subject'));
+            if (source) {
+              for (const k of buildLeadKeys({ ...lead, centris: lead.centris || centrisNum, source: source.source })) {
+                if (recentLeadsByKey.has(k)) { recentLeadsByKey.delete(k); purgedKeys++; }
+              }
+              extractedCount++;
+            }
+          }
+        } catch {}
+      }
+      saveLeadRetryState(); saveLeadsDedup(); saveJSON(POLLER_FILE, gmailPollerState);
+    } catch (e) { /* log and continue */ }
+    // Kick off async scan
+    runGmailLeadPoller({ forceSince: '48h' }).catch(() => {});
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, centrisNum, purgedKeys, purgedIds, extractedCount, scanTriggered: true }));
+    return;
+  }
+
+  // POST /admin/flush-pending?token=X — retry tous les pendingDocSends immédiatement
+  if (req.method === 'POST' && url.startsWith('/admin/flush-pending')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const results = [];
+    for (const [email, pending] of [...pendingDocSends.entries()]) {
+      try {
+        const r = await envoyerDocsAuto(pending);
+        if (r.sent) { pendingDocSends.delete(email); results.push({ email, sent: true }); }
+        else results.push({ email, sent: false, reason: r.reason || r.error });
+      } catch (e) { results.push({ email, sent: false, error: e.message.substring(0, 150) }); }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, count: results.length, results }));
+    return;
+  }
+
+  // POST /admin/test-email?token=X&centris=123&email=x@y.com — simule lead factice
+  if (req.method === 'POST' && url.startsWith('/admin/test-email')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const centrisNum = ((req.url || '').split('centris=')[1]?.split('&')[0] || '').replace(/\D/g, '');
+    const email = decodeURIComponent((req.url || '').split('email=')[1]?.split('&')[0] || 'test-prospect@example.com');
+    if (!centrisNum) { res.writeHead(400); res.end('centris# requis'); return; }
+    const fakeLead = { nom: 'Test Prospect', telephone: '5145551234', email, centris: centrisNum, adresse: '', type: 'terrain' };
+    const fakeMsgId = `admintest_${Date.now()}`;
+    try {
+      const result = await traiterNouveauLead(
+        fakeLead, fakeMsgId, 'Admin Test <admin@bot>', `TEST — Demande Centris #${centrisNum}`,
+        { source: 'centris', label: 'Centris.ca (ADMIN TEST)' }, { skipDedup: true }
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, result, msgId: fakeMsgId }, null, 2));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
     return;
   }
 
@@ -6918,16 +7220,17 @@ async function baselineSilentAtBoot() {
   log('OK', 'BOOT', `Baseline silencieux: ${marked} leads marqués, ${recentLeadsByKey.size} dédup entries`);
 }
 
-// ── autoTrashGitHubNoise — supprime auto les emails notifications GitHub/Dependabot/CI
+// ── autoTrashGitHubNoise — supprime auto les emails notifications GitHub/Render/CI
 // Shawn ne veut plus être notifié par courriel — le bot nettoie tout seul.
 // Run: 30s après boot + cron quotidien 6h (+ manuel via /cleanemail)
+// Couvre: GitHub, Dependabot, CI, Render deploys (succeeded/failed), Vercel, Netlify.
 async function autoTrashGitHubNoise(opts = {}) {
   try {
     const token = await getGmailToken();
     if (!token) return { trashed: 0, skipped: 'no_gmail' };
 
     const maxAge = opts.maxAge || '30d';
-    // Tous les emails GitHub/Dependabot/CI (notifs, PR, run failed, workflow)
+    // Sources de bruit auto-nettoyées: GitHub, Render, PaaS communs
     const query = [
       '(',
       'from:notifications@github.com',
@@ -6936,6 +7239,19 @@ async function autoTrashGitHubNoise(opts = {}) {
       'OR cc:push@noreply.github.com',
       'OR cc:state_change@noreply.github.com',
       'OR cc:comment@noreply.github.com',
+      // Render: deploys, alerts, service updates
+      'OR from:no-reply@render.com',
+      'OR from:noreply@render.com',
+      'OR from:notify@render.com',
+      'OR from:@render.com',
+      'OR subject:"Deploy failed"',
+      'OR subject:"Deploy succeeded"',
+      'OR subject:"Deploy live"',
+      'OR subject:"Your service"',
+      // Autres PaaS courants
+      'OR from:@vercel.com',
+      'OR from:@netlify.com',
+      'OR from:@fly.io',
       ')',
       `newer_than:${maxAge}`,
       '-in:trash',
@@ -6954,7 +7270,7 @@ async function autoTrashGitHubNoise(opts = {}) {
         log('WARN', 'CLEANUP', `trash ${m.id}: ${e.message.substring(0, 80)}`);
       }
     }
-    log('OK', 'CLEANUP', `Auto-trashed ${trashed} emails GitHub/CI`);
+    log('OK', 'CLEANUP', `Auto-trashed ${trashed} emails (GitHub + Render + PaaS)`);
     return { trashed };
   } catch (e) {
     log('WARN', 'CLEANUP', `autoTrashGitHubNoise: ${e.message}`);
@@ -7313,7 +7629,10 @@ async function main() {
         log('INFO', 'BOOT', 'State vide — baseline silencieux 7j au boot (zéro notif rétro)');
         await baselineSilentAtBoot().catch(e => log('WARN', 'BOOT', `Baseline: ${e.message}`));
       }
-      runGmailLeadPoller().catch(e => log('WARN', 'POLLER', `Boot: ${e.message}`));
+      // Scan normal + catch-up 4h pour attraper les leads arrivés pendant le redeploy.
+      // Les leads récents non-processed seront traités. Ceux déjà dedup sont skip.
+      log('INFO', 'BOOT', 'Boot catch-up scan 4h — récupération leads pendant redeploy');
+      runGmailLeadPoller({ forceSince: '4h' }).catch(e => log('WARN', 'POLLER', `Boot catch-up: ${e.message}`));
     }, 8000);
     // POLLING HAUTE FRÉQUENCE: 30s par défaut (configurable) — quasi-instantané.
     // Gmail API quota: 250 unités/user/sec. list_messages = 5 unités. 30s = 0.17 req/sec
