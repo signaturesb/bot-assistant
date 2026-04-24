@@ -6247,11 +6247,15 @@ const server = http.createServer(async (req, res) => {
   // ── Health endpoint détaillé (JSON) — observabilité complète ──────────────
   if (req.method === 'GET' && url === '/health') {
     const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
+    const commit = (process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown').substring(0, 7);
+    const branch = process.env.RENDER_GIT_BRANCH || 'unknown';
     const health = {
       status: 'ok',
       timestamp: new Date().toISOString(),
       uptime_sec: uptimeS,
       uptime_human: `${Math.floor(uptimeS/3600)}h ${Math.floor((uptimeS%3600)/60)}m`,
+      commit,
+      branch,
       model: currentModel,
       thinking: thinkingMode,
       tools: TOOLS.length,
@@ -6374,8 +6378,17 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
 
   // Root '/' uniquement — PAS un catch-all (sinon ça mange les /admin/*)
   if (req.method === 'GET' && (url === '/' || url === '')) {
+    const commit = (process.env.RENDER_GIT_COMMIT || 'unknown').substring(0, 7);
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(`Assistant SignatureSB OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length}`);
+    res.end(`Assistant SignatureSB OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length} — commit:${commit}`);
+    return;
+  }
+  // /version — commit SHA + uptime (public, pas de token requis)
+  if (req.method === 'GET' && url === '/version') {
+    const commit = (process.env.RENDER_GIT_COMMIT || 'unknown').substring(0, 7);
+    const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ commit, branch: process.env.RENDER_GIT_BRANCH, uptime_sec: uptimeS, model: currentModel, tools: TOOLS.length }));
     return;
   }
 
