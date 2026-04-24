@@ -364,10 +364,28 @@ function getQuotaStatus() {
   };
 }
 
+// Vider le cache (tous les fichiers .json dans cacheDir) — utilisé par /admin/firecrawl/clear-cache
+function clearCache() {
+  try {
+    if (!fs.existsSync(CONFIG.cacheDir)) return { ok: true, deleted: 0 };
+    const files = fs.readdirSync(CONFIG.cacheDir).filter(f => f.endsWith('.json'));
+    let deleted = 0;
+    for (const f of files) {
+      try { fs.unlinkSync(path.join(CONFIG.cacheDir, f)); deleted++; } catch {}
+    }
+    auditLog('cache_clear', '*', true, { deleted });
+    return { ok: true, deleted };
+  } catch (e) {
+    auditLog('cache_clear', '*', false, { error: e.message });
+    return { ok: false, error: e.message };
+  }
+}
+
 module.exports = {
   scrapMunicipalite,
   scrapUrl: scrapUrlPublic,
   getQuotaStatus,
+  clearCache,
   MUNICIPALITES,
   SUJETS_MOTS_CLES,
 };

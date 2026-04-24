@@ -266,10 +266,9 @@ try {
   pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
 }
 
-// RÈGLE ABSOLUE — aucun email/sms/action externe sans consent Shawn explicite
-// Désactive tous les auto-envois. Toute action "sortante" doit passer par
-// pendingEmails/pendingDocSends + Shawn dit "envoie" OU être un cron approuvé.
-const CONSENT_REQUIRED = true;
+// NOTE: consent implicite via seuils score (≥75 auto, <75 preview+pending)
+// + blacklist nom + isValidProspectName. Aucun email/SMS ne part sans au moins
+// un de ces checks validés. Voir sendTelegramWithFallback pour notifs Shawn.
 const POLLER_ENABLED = process.env.POLLER_ENABLED !== 'false'; // kill switch via env
 let autoSendPaused = false; // toggle via /pauseauto command
 
@@ -4871,6 +4870,126 @@ function registerHandlers() {
     );
   });
 
+  // /today — agenda du jour en 1 vue (visites, pending, stats 24h, anomalies)
+  bot.onText(/\/today|\/jour|\/agenda/i, async msg => {
+    if (!isAllowed(msg)) return;
+    const now = new Date();
+    const todayStr = now.toDateString();
+    const ago24h = Date.now() - 24 * 3600 * 1000;
+
+    // 1. Visites aujourd'hui
+    const visites = loadJSON(VISITES_FILE, []);
+    const visitesToday = visites.filter(v => new Date(v.date).toDateString() === todayStr)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    // 2. Pending
+    const pendingNames = pendingLeads.filter(l => l.needsName);
+    const pendingDocs = typeof pendingDocSends !== 'undefined' ? [...pendingDocSends.values()] : [];
+
+    // 3. Stats poller 24h (grosso modo — basé sur totalsDepuisBoot)
+    const pollerLastRun = gmailPollerState.lastRun ? new Date(gmailPollerState.lastRun) : null;
+    const pollerAge = pollerLastRun ? Math.round((Date.now() - pollerLastRun.getTime()) / 60000) : null;
+
+    // 4. Leads audit trail 24h
+    const recentLeads = (auditLog || []).filter(e =>
+      e.category === 'lead' && new Date(e.at).getTime() > ago24h
+    );
+    const leadsByDecision = {};
+    for (const e of recentLeads) {
+      const d = e.details?.decision || 'unknown';
+      leadsByDecision[d] = (leadsByDecision[d] || 0) + 1;
+    }
+
+    // 5. Anomalies actives
+    const anomalies = await detectAnomalies().catch(() => []);
+
+    // Compose message
+    const lines = [];
+    const dateStr = now.toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
+    lines.push(`📅 *Aujourd'hui — ${dateStr}*`);
+    lines.push('');
+
+    // Visites
+    if (visitesToday.length) {
+      lines.push(`🏡 *Visites (${visitesToday.length})*`);
+      for (const v of visitesToday) {
+        const t = new Date(v.date).toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+        lines.push(`  ${t} — ${v.nom}${v.adresse ? ' · ' + v.adresse : ''}`);
+      }
+      lines.push('');
+    } else {
+      lines.push('🏡 Aucune visite aujourd\'hui');
+      lines.push('');
+    }
+
+    // Action requise
+    const actions = [];
+    if (pendingNames.length) actions.push(`⚠️ *${pendingNames.length} lead(s) sans nom* — réponds \`nom Prénom Nom\``);
+    if (pendingDocs.length) actions.push(`📦 *${pendingDocs.length} doc(s) en attente* — \`/pending\` pour liste`);
+    if (anomalies.length) {
+      for (const a of anomalies.slice(0, 3)) {
+        actions.push(`${a.severity === 'high' ? '🚨' : '⚠️'} ${a.msg}`);
+      }
+    }
+    if (actions.length) {
+      lines.push('*Action requise:*');
+      for (const a of actions) lines.push(`  ${a}`);
+      lines.push('');
+    }
+
+    // Stats 24h
+    lines.push('*Leads 24h:*');
+    if (Object.keys(leadsByDecision).length === 0) {
+      lines.push(`  Aucun lead traité dans les 24h`);
+    } else {
+      const decisionEmoji = {
+        auto_sent: '🚀', pending_preview_sent: '📦', pending_invalid_name: '⚠️',
+        dedup_skipped: '♻️', auto_failed: '❌', auto_exception: '❌',
+        no_dropbox_match: '🔍', blocked_suspect_name: '🛑',
+        multiple_candidates: '🔀', max_retries_exhausted: '💀',
+      };
+      for (const [d, n] of Object.entries(leadsByDecision).sort((a, b) => b[1] - a[1])) {
+        lines.push(`  ${decisionEmoji[d] || '•'} ${d}: ${n}`);
+      }
+    }
+    lines.push('');
+
+    // Poller health
+    if (pollerAge !== null) {
+      const healthEmoji = pollerAge < 2 ? '🟢' : pollerAge < 10 ? '🟡' : '🔴';
+      lines.push(`${healthEmoji} Poller: dernier run il y a ${pollerAge}min`);
+    } else {
+      lines.push('🔴 Poller: jamais tourné');
+    }
+
+    // Cost
+    const todayCost = costTracker?.daily?.[today()] || 0;
+    if (todayCost > 0) lines.push(`💰 Coût Anthropic aujourd'hui: $${todayCost.toFixed(2)}`);
+
+    await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' }).catch(() =>
+      bot.sendMessage(msg.chat.id, lines.join('\n').replace(/[*_`]/g, '')).catch(() => {})
+    );
+  });
+
+  // /logs [N] [cat] — tail ring buffer depuis Telegram (debug rapide)
+  bot.onText(/\/logs(?:\s+(\d+))?(?:\s+(\w+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const tail = Math.min(50, parseInt(match[1] || '20'));
+    const catFilter = (match[2] || '').toUpperCase();
+    let entries = logRingBuffer.slice(-tail);
+    if (catFilter) entries = entries.filter(e => String(e.cat).toUpperCase().includes(catFilter));
+    if (!entries.length) return bot.sendMessage(msg.chat.id, `Aucun log${catFilter ? ` pour cat=${catFilter}` : ''}.`);
+    const lines = entries.slice(-20).map(e => {
+      const ts = new Date(e.ts).toLocaleTimeString('fr-CA', { hour12: false });
+      return `${ts} [${e.niveau}|${e.cat}] ${String(e.msg).substring(0, 120)}`;
+    }).join('\n');
+    // Telegram limite 4096 chars — tronque si trop long
+    const txt = `\`\`\`\n${lines.substring(0, 3500)}\n\`\`\``;
+    bot.sendMessage(msg.chat.id, txt, { parse_mode: 'Markdown' }).catch(() =>
+      bot.sendMessage(msg.chat.id, lines.substring(0, 3500)).catch(() => {})
+    );
+  });
+
   // /firecrawl — statut quota + dernières villes scrapées
   bot.onText(/\/firecrawl\b/i, async msg => {
     if (!isAllowed(msg)) return;
@@ -6047,6 +6166,47 @@ function startDailyTasks() {
       .catch(e => log('WARN', 'KEEPALIVE', `self-ping: ${e.message.substring(0, 60)}`));
   }, 10 * 60 * 1000);
 
+  // LEAD AGING ESCALATION — ping si pending >4h (max 1×/jour par lead)
+  // Évite qu'un pending reste silencieusement oublié si Shawn n'a pas vu la notif.
+  setInterval(async () => {
+    if (!ALLOWED_ID) return;
+    const now = Date.now();
+    const AGE_LIMIT = 4 * 60 * 60 * 1000; // 4h
+    const DAILY_COOLDOWN = 23 * 60 * 60 * 1000; // ~1×/jour
+
+    // 1. Pending leads needsName
+    for (const p of pendingLeads.filter(l => l.needsName)) {
+      if (now - p.ts < AGE_LIMIT) continue;
+      if (p._lastEscalation && now - p._lastEscalation < DAILY_COOLDOWN) continue;
+      p._lastEscalation = now;
+      const ageH = Math.round((now - p.ts) / 3600000);
+      const e = p.extracted || {};
+      await sendTelegramWithFallback(
+        `⏰ *Lead pending depuis ${ageH}h* — nom toujours manquant\n` +
+        `📧 ${e.email || '(vide)'}\n🏡 ${e.centris ? '#' + e.centris : (e.adresse || '?')}\n\n` +
+        `Réponds \`nom Prénom Nom\` pour reprendre OU \`/pending\` pour tout voir.`,
+        { category: 'lead-aging-escalation', pendingId: p.id, ageH }
+      );
+      savePendingLeads(); // pour persister _lastEscalation
+    }
+
+    // 2. Pending docs
+    for (const [email, p] of (typeof pendingDocSends !== 'undefined' ? pendingDocSends.entries() : [])) {
+      const age = now - (p._firstSeen || now);
+      if (age < AGE_LIMIT) continue;
+      if (p._lastEscalation && now - p._lastEscalation < DAILY_COOLDOWN) continue;
+      p._lastEscalation = now;
+      savePendingDocs();
+      const ageH = Math.round(age / 3600000);
+      await sendTelegramWithFallback(
+        `⏰ *Docs en attente depuis ${ageH}h* — ${email}\n` +
+        `Score: ${p.match?.score || '?'} · ${p.match?.pdfs?.length || '?'} PDFs\n\n` +
+        `\`envoie les docs à ${email}\` OU \`annule ${email}\``,
+        { category: 'pending-docs-aging', email, ageH }
+      );
+    }
+  }, 30 * 60 * 1000); // toutes les 30min
+
   // MEMORY MONITORING — alerte si heap >85% (préviens OOM avant crash Render)
   // Render starter plan = 512MB RSS. Node heapTotal s'ajuste dynamiquement mais
   // si heapUsed approche rss limit → pression GC + risque crash.
@@ -6703,6 +6863,24 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // POST /admin/firecrawl/clear-cache?token=X — vide le cache scraping
+  if (req.method === 'POST' && url.startsWith('/admin/firecrawl/clear-cache')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    try {
+      const { clearCache } = require('./firecrawl_scraper');
+      const r = clearCache();
+      res.writeHead(r.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: e.message }));
+    }
+    return;
+  }
+
   // POST /admin/flush-pending?token=X — retry tous les pendingDocSends immédiatement
   if (req.method === 'POST' && url.startsWith('/admin/flush-pending')) {
     const token = (req.url || '').split('token=')[1]?.split('&')[0];
@@ -6911,6 +7089,16 @@ function markLeadProcessed(leadOrKeys) {
   if (!keys.length) return;
   const now = Date.now();
   for (const k of keys) recentLeadsByKey.set(k, now);
+  // CAP: limiter à 5000 entries (FIFO) — prévient memory leak long-terme.
+  // TTL 7j purge normalement, mais si purge loupée et trafic élevé, on cap.
+  const MAX_DEDUP_ENTRIES = 5000;
+  if (recentLeadsByKey.size > MAX_DEDUP_ENTRIES) {
+    const overflow = recentLeadsByKey.size - MAX_DEDUP_ENTRIES;
+    const oldest = [...recentLeadsByKey.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .slice(0, overflow);
+    for (const [k] of oldest) recentLeadsByKey.delete(k);
+  }
   saveLeadsDedup();
 }
 
