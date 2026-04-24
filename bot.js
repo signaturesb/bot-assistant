@@ -2507,25 +2507,21 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
   if (dealId) {
     await pdPost('/notes', { deal_id: dealId, content: `⚠️ Auto-envoi docs ÉCHOUÉ après 3 tentatives: ${String(lastError).substring(0, 200)}` }).catch(() => null);
   }
-  // Alerte immédiate Shawn — indépendante du msg lead (qui peut être silencé par Telegram)
-  if (ALLOWED_ID) {
-    const terrain = match?.folder?.adresse || match?.folder?.name || centris || '?';
-    const alertMsg = [
-      `🚨 *DOCS NON ENVOYÉS — ACTION REQUISE*`,
-      ``,
-      `👤 Prospect: ${nom || email}`,
-      `📧 Email: ${email}`,
-      `🏡 Terrain: ${terrain}`,
-      `🔁 Tentatives: ${maxRetries}/${maxRetries}`,
-      ``,
-      `❌ Erreur: ${String(lastError).substring(0, 180)}`,
-      ``,
-      `▶️ Réessayer: \`envoie les docs à ${email}\``,
-    ].join('\n');
-    bot.sendMessage(ALLOWED_ID, alertMsg, { parse_mode: 'Markdown' }).catch(() =>
-      bot.sendMessage(ALLOWED_ID, alertMsg.replace(/\*/g, '').replace(/`/g, '')).catch(() => {})
-    );
-  }
+  // Alerte immédiate Shawn — via sendTelegramWithFallback (md → plain → email backup)
+  const terrain = match?.folder?.adresse || match?.folder?.name || centris || '?';
+  const alertMsg = [
+    `🚨 *DOCS NON ENVOYÉS — ACTION REQUISE*`,
+    ``,
+    `👤 Prospect: ${nom || email}`,
+    `📧 Email: ${email}`,
+    `🏡 Terrain: ${terrain}`,
+    `🔁 Tentatives: ${maxRetries}/${maxRetries}`,
+    ``,
+    `❌ Erreur: ${String(lastError).substring(0, 180)}`,
+    ``,
+    `▶️ Réessayer: \`envoie les docs à ${email}\``,
+  ].join('\n');
+  await sendTelegramWithFallback(alertMsg, { category: 'P2-docs-failed', email, centris });
   return { sent: false, error: lastError, match, attempts: maxRetries };
 }
 
@@ -4184,8 +4180,30 @@ async function detectAnomalies() {
 
   // 2. Zero leads en 24h (alors qu'on s'y attend — check poller actif)
   const pollerStatsRef = pollerStats;
-  if (pollerStatsRef.runs > 50 && pollerStatsRef.totalsDealCreated === 0) {
-    anomalies.push({ key: 'no_leads_24h', msg: `${pollerStatsRef.runs} polls mais 0 deal créé — parser probablement cassé`, severity: 'high' });
+  if (pollerStatsRef.runs > 50 && pollerStatsRef.totalsProcessed === 0) {
+    anomalies.push({ key: 'no_leads_processed', msg: `${pollerStatsRef.runs} polls mais 0 lead traité — source detection ou parser cassé`, severity: 'high' });
+  }
+
+  // 2b. Silence poller anormal en heures ouvrables (8h-20h America/Toronto jours semaine).
+  // Le métier immobilier génère normalement ≥1 lead/24h. Si 24h sans rien → alerte.
+  const nowDate = new Date();
+  const torontoHour = (nowDate.getUTCHours() - 4 + 24) % 24; // approx EDT
+  const torontoDay = nowDate.getUTCDay(); // 0=dim 6=sam
+  const isBusinessHours = torontoDay >= 1 && torontoDay <= 5 && torontoHour >= 8 && torontoHour <= 20;
+  if (isBusinessHours && pollerStatsRef.runs > 200 && pollerStatsRef.totalsAutoSent === 0 && pollerStatsRef.totalsPending === 0) {
+    anomalies.push({ key: 'business_silence', msg: `Business hours + ${pollerStatsRef.runs} polls mais 0 auto-sent/pending — qqch est cassé`, severity: 'high' });
+  }
+
+  // 2c. Pendings qui s'accumulent (>5 pendingDocSends OU >3 pendingLeads needsName)
+  const pendingDocsCount = typeof pendingDocSends !== 'undefined' ? pendingDocSends.size : 0;
+  const pendingNamesCount = typeof pendingLeads !== 'undefined' ? pendingLeads.filter(l => l.needsName).length : 0;
+  if (pendingDocsCount > 5) anomalies.push({ key: 'pending_docs_pileup', msg: `${pendingDocsCount} pending doc-sends accumulés — auto-send bloqué?`, severity: 'medium' });
+  if (pendingNamesCount > 3) anomalies.push({ key: 'pending_names_pileup', msg: `${pendingNamesCount} leads sans nom valide — parser AI peut-être cassé`, severity: 'medium' });
+
+  // 2d. Retry counter dangereusement haut (lead coincé en boucle)
+  const highRetries = Object.entries(leadRetryState || {}).filter(([,v]) => v.count >= 3).length;
+  if (highRetries >= 2) {
+    anomalies.push({ key: 'high_retry_leads', msg: `${highRetries} leads avec >=3 retries — issue technique persistante`, severity: 'medium' });
   }
 
   // 3. Cost spike aujourd'hui >$20
@@ -4203,13 +4221,18 @@ async function detectAnomalies() {
   const hs = computeHealthScore();
   if (hs.score < 70) anomalies.push({ key: 'health_low', msg: `Score ${hs.score}/100 — issues: ${hs.issues.join(', ')}`, severity: hs.score < 50 ? 'high' : 'medium' });
 
-  // Alerte Telegram avec cooldown 6h par anomalie
+  // Alerte Telegram avec cooldown 6h par anomalie (high severity → 2h cooldown)
   for (const a of anomalies) {
+    const cooldown = a.severity === 'high' ? 2 * 60 * 60 * 1000 : 6 * 60 * 60 * 1000;
     const lastAlert = anomalyState.lastAlerts[a.key] || 0;
-    if (now - lastAlert > 6 * 60 * 60 * 1000) {
+    if (now - lastAlert > cooldown) {
       anomalyState.lastAlerts[a.key] = now;
-      if (ALLOWED_ID) {
-        bot.sendMessage(ALLOWED_ID, `⚠️ *Anomalie détectée (${a.severity})*\n${a.msg}`, { parse_mode: 'Markdown' }).catch(()=>{});
+      const msg = `⚠️ *Anomalie détectée (${a.severity})*\n${a.msg}`;
+      // sendTelegramWithFallback: md → plain → email
+      if (typeof sendTelegramWithFallback === 'function') {
+        sendTelegramWithFallback(msg, { category: 'anomaly', key: a.key }).catch(() => {});
+      } else if (ALLOWED_ID) {
+        bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' }).catch(() => {});
       }
       auditLogEvent('anomaly', a.key, { msg: a.msg, severity: a.severity });
     }
@@ -4281,12 +4304,12 @@ function trackCost(model, usage) {
   if (todayCost > 10 && !costTracker.alertsSent[`d${d}-10`]) {
     costTracker.alertsSent[`d${d}-10`] = true;
     saveJSON(COST_FILE, costTracker);
-    if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `💰 *Coût Anthropic aujourd'hui: $${todayCost.toFixed(2)}*\nSeuil 10$/jour atteint. Mois: $${monthCost.toFixed(2)}.`, { parse_mode: 'Markdown' }).catch(()=>{});
+    sendTelegramWithFallback(`💰 *Coût Anthropic aujourd'hui: $${todayCost.toFixed(2)}*\nSeuil 10$/jour atteint. Mois: $${monthCost.toFixed(2)}.`, { category: 'cost-daily-threshold' }).catch(() => {});
   }
   if (monthCost > 100 && !costTracker.alertsSent[`m${m}-100`]) {
     costTracker.alertsSent[`m${m}-100`] = true;
     saveJSON(COST_FILE, costTracker);
-    if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `💰 *Anthropic mois: $${monthCost.toFixed(2)}*\nSeuil 100$/mois atteint. Vérifier usage dans /cout.`, { parse_mode: 'Markdown' }).catch(()=>{});
+    sendTelegramWithFallback(`💰 *Anthropic mois: $${monthCost.toFixed(2)}*\nSeuil 100$/mois atteint. Vérifier usage dans /cout.`, { category: 'cost-monthly-threshold' }).catch(() => {});
   }
 }
 
@@ -4664,8 +4687,8 @@ function registerHandlers() {
       `🗑 ${s.junk} junk filtered\n` +
       `🔍 ${s.noSource} sans source\n` +
       `⚠️ ${s.lowInfo} info insuffisante (P0 alert envoyée si >0)\n` +
-      `✅ ${s.dealCreated} deals créés\n` +
-      `❌ ${s.errors} erreurs\n\n` +
+      `✅ ${s.processed} traités | 🚀 ${s.autoSent || 0} auto-sent | ⏳ ${s.pending || 0} pending | 📋 ${s.dealCreated} deals\n` +
+      `♻️ ${s.dedup || 0} dedup skip · ❌ ${s.errors} erreurs\n\n` +
       `Total depuis boot: ${gmailPollerState.totalLeads} leads`
     );
   });
@@ -4920,6 +4943,83 @@ function registerHandlers() {
       : `✅ ${res.trashed} emails mis à la corbeille.\n\nAuto-clean: boot + tous les jours à 6h.`);
   });
 
+  // /retry-centris <#> → purge dedup (keys + processed msgIds matching) + scan 48h
+  // Utilisé pour récupérer un lead qui a été dedup'd à tort sous l'ancien flow.
+  // Ex: /retry-centris 26621771 → retraite la demande d'Erika
+  bot.onText(/\/retry[-_]?centris\s+(\d{7,9})/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const centrisNum = match[1];
+    await bot.sendMessage(msg.chat.id, `🔄 Purge dedup + scan pour Centris #${centrisNum}...`);
+
+    // 1. Purger toutes les clés recentLeadsByKey qui contiennent ce #
+    let purgedKeys = 0;
+    const prefix = 'c:' + centrisNum;
+    for (const k of [...recentLeadsByKey.keys()]) {
+      if (k === prefix || k.startsWith(`${prefix}:`)) {
+        recentLeadsByKey.delete(k);
+        purgedKeys++;
+      }
+    }
+    saveLeadsDedup();
+
+    // 2. Chercher Gmail msgIds qui mentionnent ce # → retirer du processed[]
+    //    pour forcer leur retraitement au prochain scan
+    let purgedIds = 0;
+    try {
+      const list = await gmailAPI(`/messages?maxResults=20&q=${encodeURIComponent(centrisNum)}`).catch(() => null);
+      const msgs = list?.messages || [];
+      for (const m of msgs) {
+        const idx = gmailPollerState.processed.indexOf(m.id);
+        if (idx >= 0) {
+          gmailPollerState.processed.splice(idx, 1);
+          purgedIds++;
+        }
+        // Clear retry counter aussi
+        if (leadRetryState[m.id]) { delete leadRetryState[m.id]; }
+      }
+      saveLeadRetryState();
+      saveJSON(POLLER_FILE, gmailPollerState);
+    } catch (e) {
+      log('WARN', 'RETRY', `Gmail search: ${e.message}`);
+    }
+
+    // 3. Lancer scan 48h en async — les msgIds purgés seront retrouvés et retraités
+    await bot.sendMessage(msg.chat.id,
+      `✅ Purgé: ${purgedKeys} clé(s) dedup + ${purgedIds} msgId(s) processed\n` +
+      `🚀 Scan 48h lancé — les messages seront retraités.`);
+    runGmailLeadPoller({ forceSince: '48h' }).catch(e =>
+      bot.sendMessage(msg.chat.id, `⚠️ Scan exception: ${e.message.substring(0, 200)}`).catch(() => {})
+    );
+  });
+
+  // /retry-email <email> → même chose mais par email au lieu de Centris#
+  bot.onText(/\/retry[-_]?email\s+(\S+@\S+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const email = match[1].trim().toLowerCase();
+    await bot.sendMessage(msg.chat.id, `🔄 Purge dedup + scan pour ${email}...`);
+    let purgedKeys = 0;
+    const prefix = 'e:' + email;
+    for (const k of [...recentLeadsByKey.keys()]) {
+      if (k === prefix) { recentLeadsByKey.delete(k); purgedKeys++; }
+    }
+    saveLeadsDedup();
+    let purgedIds = 0;
+    try {
+      const list = await gmailAPI(`/messages?maxResults=20&q=from:${encodeURIComponent(email)}`).catch(() => null);
+      const msgs = list?.messages || [];
+      for (const m of msgs) {
+        const idx = gmailPollerState.processed.indexOf(m.id);
+        if (idx >= 0) { gmailPollerState.processed.splice(idx, 1); purgedIds++; }
+        if (leadRetryState[m.id]) delete leadRetryState[m.id];
+      }
+      saveLeadRetryState();
+      saveJSON(POLLER_FILE, gmailPollerState);
+    } catch {}
+    await bot.sendMessage(msg.chat.id,
+      `✅ Purgé: ${purgedKeys} clé(s) + ${purgedIds} msgId(s)\n🚀 Scan 48h lancé.`);
+    runGmailLeadPoller({ forceSince: '48h' }).catch(() => {});
+  });
+
   bot.onText(/\/forcelead\s+([a-zA-Z0-9_-]+)/, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const msgId = match[1];
@@ -4932,10 +5032,13 @@ function registerHandlers() {
     );
     const s = pollerStats.lastScan;
     await bot.sendMessage(msg.chat.id,
-      s.dealCreated > 0 ? `✅ Lead traité!` :
-      s.lowInfo > 0 ? `⚠️ Info insuffisante même après AI fallback — voir P0 alert` :
-      s.junk > 0 ? `🗑 Filtré comme junk` :
-      s.noSource > 0 ? `🔍 Pas reconnu comme lead (source inconnue)` :
+      s.autoSent > 0  ? `✅ Lead auto-envoyé (${s.autoSent})!` :
+      s.dealCreated > 0 ? `✅ Deal Pipedrive créé (${s.dealCreated})` :
+      s.pending > 0   ? `⏳ Lead en pending (${s.pending}) — check /pending` :
+      s.processed > 0 ? `✅ Lead traité (${s.processed}) — décision: voir /lead-audit ${msgId}` :
+      s.lowInfo > 0   ? `⚠️ Info insuffisante même après AI fallback` :
+      s.junk > 0      ? `🗑 Filtré comme junk` :
+      s.noSource > 0  ? `🔍 Pas reconnu comme lead (source inconnue)` :
       `❌ Aucun traitement — vérifie Gmail ID`
     );
   });
@@ -5253,14 +5356,16 @@ function registerHandlers() {
       `*Dernier scan:*\n` +
       `📬 Trouvés: ${s.found} · 🗑 Junk: ${s.junk}\n` +
       `🔍 Pas source: ${s.noSource} · ⚠️ Low info: ${s.lowInfo}\n` +
-      `✅ Deals: ${s.dealCreated} · ❌ Erreurs: ${s.errors}\n\n` +
+      `✅ Traités: ${s.processed || 0} · 🚀 Auto-sent: ${s.autoSent || 0} · ⏳ Pending: ${s.pending || 0}\n` +
+      `📋 Deals Pipedrive: ${s.dealCreated} · ♻️ Dedup: ${s.dedup || 0} · ❌ Erreurs: ${s.errors}\n\n` +
       `*Cumulatif:*\n` +
       `Total leads: ${gmailPollerState.totalLeads || 0}\n` +
       `Total found: ${t.totalsFound} · Junk: ${t.totalsJunk}\n` +
-      `Deals créés: ${t.totalsDealCreated} · Low info: ${t.totalsLowInfo}\n` +
+      `Traités: ${t.totalsProcessed || 0} · Auto-sent: ${t.totalsAutoSent || 0} · Pending: ${t.totalsPending || 0}\n` +
+      `Deals Pipedrive: ${t.totalsDealCreated} · Low info: ${t.totalsLowInfo}\n` +
       `IDs mémorisés: ${gmailPollerState.processed?.length || 0}\n` +
       (pollerStats.lastError ? `\n⚠️ Dernière erreur: ${pollerStats.lastError.substring(0, 100)}` : '') +
-      `\n\nCommandes:\n/checkemail — scan 48h\n/forcelead <id> — force retraitement`,
+      `\n\nCommandes:\n/checkemail — scan 48h\n/forcelead <id> — force retraitement\n/retry-centris <#> — reprendre lead dedup'd\n/retry-email <email> — reprendre par email`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -5692,23 +5797,22 @@ function startDailyTasks() {
       .catch(e => log('WARN', 'KEEPALIVE', `self-ping: ${e.message.substring(0, 60)}`));
   }, 10 * 60 * 1000);
 
-  // AUTO-RECOVERY pendingDocSends — toutes les 10min, retry les envois en attente
-  // qui ont plus de 20min. Évite qu'un auto-envoi échoué reste coincé indéfiniment
-  // si un truc temporaire (Dropbox glitch, Gmail rate limit) a bloqué la première
-  // tentative. Max 2 cycles de retry auto (40min total) avant abandon.
+  // AUTO-RECOVERY pendingDocSends — toutes les 2min, retry les envois en attente
+  // qui ont plus de 5min. Premier retry possible à ~7min, pas 30min. Max 4 cycles
+  // auto (13min total) avant abandon explicite via Telegram. Un prospect attend pas.
   setInterval(async () => {
     if (autoSendPaused || !pendingDocSends || pendingDocSends.size === 0) return;
     const now = Date.now();
     const toRetry = [];
     for (const [email, pending] of pendingDocSends.entries()) {
       const age = now - (pending._firstSeen || now);
-      if (age < 20 * 60 * 1000) continue; // <20min → laisse le temps à Shawn
+      if (age < 5 * 60 * 1000) continue; // <5min → laisse une chance au premier envoi
       pending._recoveryAttempts = (pending._recoveryAttempts || 0) + 1;
-      if (pending._recoveryAttempts > 2) continue; // abandon après 2 cycles (40min+)
+      if (pending._recoveryAttempts > 4) continue; // abandon après 4 cycles
       toRetry.push({ email, pending });
     }
     if (!toRetry.length) return;
-    log('INFO', 'RECOVERY', `Auto-retry ${toRetry.length} pendingDocSends (>20min)`);
+    log('INFO', 'RECOVERY', `Auto-retry ${toRetry.length} pendingDocSends (>5min)`);
     for (const { email, pending } of toRetry) {
       try {
         const r = await envoyerDocsAuto(pending);
@@ -5721,17 +5825,18 @@ function startDailyTasks() {
           auditLogEvent('auto-recovery', 'success', { email, attempts: pending._recoveryAttempts });
         } else if (r.skipped) {
           log('INFO', 'RECOVERY', `${email}: skip (${r.reason})`);
-        } else if (pending._recoveryAttempts >= 2) {
+        } else if (pending._recoveryAttempts >= 4) {
           await sendTelegramWithFallback(
-            `⚠️ *Auto-recovery ABANDONNÉ* pour ${email}\n   ${pending._recoveryAttempts} tentatives ratées — intervention manuelle\n   \`envoie les docs à ${email}\``,
+            `⚠️ *Auto-recovery ABANDONNÉ* pour ${email}\n   ${pending._recoveryAttempts} tentatives ratées — intervention manuelle requise\n   \`envoie les docs à ${email}\``,
             { category: 'auto-recovery-gaveup', email }
           );
+          auditLogEvent('auto-recovery', 'gave_up', { email, attempts: pending._recoveryAttempts });
         }
       } catch (e) {
         log('WARN', 'RECOVERY', `${email}: ${e.message.substring(0, 150)}`);
       }
     }
-  }, 10 * 60 * 1000);
+  }, 2 * 60 * 1000); // Toutes les 2min — premier retry possible à ~7min après un fail
 
   // (pendingDocSends.set wrappé au niveau init — tag _firstSeen + auto-persist)
 
@@ -6937,7 +7042,37 @@ async function runGmailLeadPoller(opts = {}) {
           }
 
           const source = detectLeadSource(from, subject);
-          if (!source) { scan.noSource++; gmailPollerState.processed.push(id); continue; }
+          if (!source) {
+            scan.noSource++;
+            // Si le sujet ressemble à un lead (demande/visite/intéressé/centris#) MAIS
+            // la source n'est pas reconnue → on alerte Shawn avec le sujet+from brut.
+            // Un courriel légitime avec source inconnue ne doit JAMAIS être silencieusement filtré.
+            const suspectLead = /demande|visite|intéress|interet|centris|propriété|propri[ée]t[ée]|maison|terrain|acheteur|vendeur|informations?|question/i.test(subject)
+              || /\b\d{7,9}\b/.test(subject);
+            if (suspectLead && ALLOWED_ID) {
+              // Dédup 6h par msgId pour éviter spam si même email apparaît X fois au polling
+              const key = `nosource:${id}`;
+              if (!recentLeadsByKey.has(key)) {
+                recentLeadsByKey.set(key, Date.now());
+                saveLeadsDedup();
+                const alertMsg = [
+                  `🔍 *Email filtré (source inconnue) — vérif requise*`,
+                  ``,
+                  `Un email qui RESSEMBLE à un lead mais dont la source ne matche`,
+                  `aucun pattern connu (Centris/RE-MAX/Realtor/DuProprio/social).`,
+                  ``,
+                  `📝 Sujet: ${subject?.substring(0, 120)}`,
+                  `📨 De: ${from?.substring(0, 150)}`,
+                  `🆔 \`${id}\``,
+                  ``,
+                  `Si c'est un vrai lead, \`/forcelead ${id}\` pour forcer.`,
+                ].join('\n');
+                sendTelegramWithFallback(alertMsg, { category: 'noSource-suspect', msgId: id }).catch(() => {});
+                auditLogEvent('lead', 'noSource_suspect', { msgId: id, subject: subject?.substring(0, 200), from: from?.substring(0, 200) });
+              }
+            }
+            gmailPollerState.processed.push(id); continue;
+          }
 
           let lead = parseLeadEmail(body, subject, from);
           let infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
@@ -7368,10 +7503,16 @@ async function main() {
       if (badIdx) {
         const badTool = TOOLS[parseInt(badIdx[1])]?.name || '?';
         log('ERR', 'PREFLIGHT', `🚨 TOOL REJETÉ: "${badTool}" — regex [a-zA-Z0-9_-] violée`);
-        if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🚨 *BOT EN PANNE*\nTool "${badTool}" invalide pour ${currentModel}.\nFix immédiat requis — accent ou caractère spécial dans le nom.`, { parse_mode: 'Markdown' }).catch(()=>{});
+        sendTelegramWithFallback(
+          `🚨 *BOT EN PANNE*\nTool "${badTool}" invalide pour ${currentModel}.\nFix immédiat requis — accent ou caractère spécial dans le nom.`,
+          { category: 'preflight-tool-rejected', badTool }
+        ).catch(() => {});
       } else if (e.status === 400) {
         log('ERR', 'PREFLIGHT', `🚨 API 400: ${msg.substring(0, 200)}`);
-        if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🚨 *Claude API 400*\n${msg.substring(0, 200)}`, { parse_mode: 'Markdown' }).catch(()=>{});
+        sendTelegramWithFallback(
+          `🚨 *Claude API 400*\n${msg.substring(0, 200)}`,
+          { category: 'preflight-api-400' }
+        ).catch(() => {});
       } else {
         log('WARN', 'PREFLIGHT', `API test: ${msg.substring(0, 150)}`);
       }
