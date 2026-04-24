@@ -2556,21 +2556,17 @@ function firePreviewDocs({ email, nom, centris, deal, match }) {
         log('OK', 'DOCS', `PREVIEW → ${AGENT.email} (client: ${email})`);
       } else {
         log('WARN', 'DOCS', `PREVIEW échec: ${String(res).substring(0, 120)}`);
-        if (ALLOWED_ID) {
-          bot.sendMessage(ALLOWED_ID,
-            `⚠️ *Preview email ÉCHOUÉ* pour ${email}\n${String(res).substring(0, 200)}\n\nLe doc-send reste en attente — tu peux quand même dire \`envoie les docs à ${email}\`.`,
-            { parse_mode: 'Markdown' }
-          ).catch(() => {});
-        }
+        sendTelegramWithFallback(
+          `⚠️ *Preview email ÉCHOUÉ* pour ${email}\n${String(res).substring(0, 200)}\n\nLe doc-send reste en attente — tu peux quand même dire \`envoie les docs à ${email}\`.`,
+          { category: 'preview-failed', email }
+        ).catch(() => {});
       }
     } catch (e) {
       log('WARN', 'DOCS', `PREVIEW exception: ${e.message}`);
-      if (ALLOWED_ID) {
-        bot.sendMessage(ALLOWED_ID,
-          `⚠️ *Preview email exception* pour ${email}\n${e.message.substring(0, 200)}`,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-      }
+      sendTelegramWithFallback(
+        `⚠️ *Preview email exception* pour ${email}\n${e.message.substring(0, 200)}`,
+        { category: 'preview-exception', email }
+      ).catch(() => {});
     }
   });
 }
@@ -7111,10 +7107,38 @@ async function sendTelegramWithFallback(msg, ctx = {}) {
         }
       } catch (e3) {
         log('ERR', 'NOTIFY', `Email fallback failed: ${e3.message.substring(0, 140)}`);
-        auditLogEvent('notify', 'all_notify_channels_failed', {
-          category: ctx.category, emailErr: e3.message.substring(0, 200),
-        });
       }
+      // 4. SMS Brevo — dernière chance (niveau "le téléphone vibre c'est urgent")
+      // N'activé que pour catégories critiques pour éviter spam SMS (coût + nuisance)
+      const smsCategories = /lead-notif|lead-abandoned|P1-pending|P2-docs-failed|preflight|cost-monthly/i;
+      if (BREVO_KEY && AGENT?.telephone && smsCategories.test(ctx.category || '')) {
+        try {
+          const phone = AGENT.telephone.replace(/\D/g, '');
+          const e164 = phone.length === 10 ? '+1' + phone : '+' + phone;
+          const shortMsg = msg.replace(/[*_`]/g, '').substring(0, 150);
+          const smsRes = await fetch('https://api.brevo.com/v3/transactionalSMS/sms', {
+            method: 'POST',
+            headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sender: 'KiraBot',
+              recipient: e164,
+              content: `Bot SignatureSB (${ctx.category || 'alert'}): ${shortMsg}`,
+              type: 'transactional',
+            }),
+          });
+          if (smsRes.ok) {
+            log('OK', 'NOTIFY', `Fallback SMS → ${e164} (${ctx.category})`);
+            auditLogEvent('notify', 'sms_fallback_sent', { category: ctx.category });
+            return true;
+          }
+          log('WARN', 'NOTIFY', `SMS fallback failed: ${smsRes.status}`);
+        } catch (e4) {
+          log('ERR', 'NOTIFY', `SMS exception: ${e4.message.substring(0, 140)}`);
+        }
+      }
+      auditLogEvent('notify', 'all_notify_channels_failed', {
+        category: ctx.category, context: ctx,
+      });
       return false;
     }
   }
