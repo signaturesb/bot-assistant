@@ -30,6 +30,19 @@ const CONFIG = {
 try { if (!fs.existsSync(CONFIG.cacheDir)) fs.mkdirSync(CONFIG.cacheDir, { recursive: true }); } catch {}
 
 // ═══════════════════════════════════════════════════════
+// CIRCUIT BREAKER — open après 3 échecs consécutifs, close après 10min
+// ═══════════════════════════════════════════════════════
+const circuit = { fails: 0, openUntil: 0 };
+function circuitIsOpen() { return Date.now() < circuit.openUntil; }
+function circuitRecordFail() {
+  circuit.fails++;
+  if (circuit.fails >= 3) {
+    circuit.openUntil = Date.now() + 10 * 60 * 1000; // 10min open
+  }
+}
+function circuitRecordSuccess() { circuit.fails = 0; circuit.openUntil = 0; }
+
+// ═══════════════════════════════════════════════════════
 // VILLES PRÉ-CONFIGURÉES (Lanaudière + MRC)
 // ═══════════════════════════════════════════════════════
 
@@ -192,6 +205,12 @@ async function scrapUrlRaw(url) {
     return { markdown: cached.markdown, fromCache: true, cached_at: cached.cached_at };
   }
 
+  // Circuit breaker: si ouvert, court-circuit avec erreur claire
+  if (circuitIsOpen()) {
+    const remainingMin = Math.ceil((circuit.openUntil - Date.now()) / 60000);
+    throw new Error(`Circuit breaker OPEN — Firecrawl inaccessible (retry dans ~${remainingMin}min). Utilise le cache ou téléphone direct.`);
+  }
+
   const quota = checkQuota();
   if (!quota.ok) throw new Error(quota.message);
 
@@ -224,6 +243,7 @@ async function scrapUrlRaw(url) {
       const metadata = data.data.metadata || {};
       setCached(url, markdown, metadata);
       incrementQuota();
+      circuitRecordSuccess();
       auditLog('scrape_api', url, true, { attempt, chars: markdown.length });
       return { markdown, fromCache: false, metadata };
     } catch (e) {
@@ -236,7 +256,8 @@ async function scrapUrlRaw(url) {
       }
     }
   }
-  auditLog('scrape_api', url, false, { error: lastError.message });
+  circuitRecordFail();
+  auditLog('scrape_api', url, false, { error: lastError.message, circuitFails: circuit.fails });
   throw lastError;
 }
 
@@ -335,6 +356,11 @@ function getQuotaStatus() {
     mois: state.month, utilise: state.count, quota: CONFIG.quotaMonthly,
     restant, pourcentage: pct,
     statut: pct >= 100 ? '🔴 ÉPUISÉ' : pct >= 80 ? '🟡 ATTENTION' : '🟢 OK',
+    circuit: {
+      open: circuitIsOpen(),
+      fails: circuit.fails,
+      openRemainingSec: Math.max(0, Math.ceil((circuit.openUntil - Date.now()) / 1000)),
+    },
   };
 }
 

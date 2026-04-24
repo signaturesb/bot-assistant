@@ -62,17 +62,21 @@ if (!process.env.OPENAI_API_KEY)   { console.warn('⚠️  OPENAI_API_KEY absent
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 const bootStartTs = Date.now();
-const bootLogsCapture = [];
+const bootLogsCapture = []; // 2 min window pour crash reports
+const logRingBuffer = [];   // ring buffer persistant (dernières 500 lignes) pour /admin/logs
 function log(niveau, cat, msg) {
   const ts  = new Date().toLocaleTimeString('fr-CA', { hour12: false });
   const ico = { INFO:'📋', OK:'✅', WARN:'⚠️ ', ERR:'❌', IN:'📥', OUT:'📤' }[niveau] || '•';
   const line = `[${ts}] ${ico} [${cat}] ${msg}`;
   console.log(line);
-  // Capturer les logs durant les 2 premières minutes pour diagnostic
+  // Capture boot logs (première 2 minutes)
   if (Date.now() - bootStartTs < 120000) {
     bootLogsCapture.push(`${niveau}|${cat}|${msg}`);
     if (bootLogsCapture.length > 500) bootLogsCapture.shift();
   }
+  // Ring buffer ALWAYS-ON pour /admin/logs (dernières 500 lignes, toutes phases)
+  logRingBuffer.push({ ts: Date.now(), niveau, cat, msg: String(msg).substring(0, 500) });
+  if (logRingBuffer.length > 500) logRingBuffer.shift();
 }
 
 // ─── Anti-crash global ────────────────────────────────────────────────────────
@@ -2948,8 +2952,26 @@ Au plaisir,<br>
     return `✅ *PREVIEW envoyé* à *${realToEmail}*\n   Aperçu de ce qui sera envoyé à *${clientEmail}*\n   ${ok.length} pièce${ok.length>1?'s':''} jointe${ok.length>1?'s':''}: ${ok.map(d=>d.name).join(', ')}${convMsg}${convSkipMsg}${skippedMsg}`;
   }
   const noteContent = `Documents envoyés à ${realToEmail} (${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}):\n${ok.map(d => `• ${d.name}`).join('\n')}${convResult?.imagesMerged > 0 ? `\n(${convResult.imagesMerged} photos combinées en 1 PDF)` : ''}${convertedSkipped?.length > 0 ? `\nFichiers non convertibles skipped: ${convertedSkipped.map(s=>s.name).join(', ')}` : ''}`;
-  const noteRes = await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => null);
-  const noteLabel = noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée';
+  // IDEMPOTENCY: vérifier si une note "Documents envoyés à <email>" existe
+  // déjà dans les 24h pour ce deal — évite 3 notes identiques si retry.
+  let skipNote = false;
+  if (deal.id) {
+    try {
+      const existing = await pdGet(`/deals/${deal.id}/flow?limit=20`).catch(() => null);
+      const items = existing?.data || [];
+      const dayAgo = Date.now() - 24 * 3600 * 1000;
+      const dupFound = items.some(it => {
+        const c = it?.data?.content || it?.data?.note || '';
+        const ts = new Date(it?.data?.add_time || 0).getTime();
+        return ts > dayAgo && c.includes(`Documents envoyés à ${realToEmail}`);
+      });
+      if (dupFound) { skipNote = true; log('INFO', 'PIPEDRIVE', `Note idempotent: existe déjà <24h pour ${realToEmail} deal #${deal.id}`); }
+    } catch { /* best-effort, fall through */ }
+  }
+  const noteRes = skipNote ? null : await pdPost('/notes', { deal_id: deal.id, content: noteContent }).catch(() => null);
+  const noteLabel = skipNote
+    ? '📝 Note Pipedrive skip (existe déjà <24h)'
+    : (noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée');
 
   return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${realToEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${convMsg}${convSkipMsg}${skippedMsg}`;
 }
@@ -6025,6 +6047,33 @@ function startDailyTasks() {
       .catch(e => log('WARN', 'KEEPALIVE', `self-ping: ${e.message.substring(0, 60)}`));
   }, 10 * 60 * 1000);
 
+  // MEMORY MONITORING — alerte si heap >85% (préviens OOM avant crash Render)
+  // Render starter plan = 512MB RSS. Node heapTotal s'ajuste dynamiquement mais
+  // si heapUsed approche rss limit → pression GC + risque crash.
+  let _lastMemAlert = 0;
+  setInterval(() => {
+    try {
+      const mem = process.memoryUsage();
+      const heapPct = (mem.heapUsed / mem.heapTotal) * 100;
+      const rssMB = Math.round(mem.rss / 1024 / 1024);
+      const heapUsedMB = Math.round(mem.heapUsed / 1024 / 1024);
+      const heapTotalMB = Math.round(mem.heapTotal / 1024 / 1024);
+      // Alert si heap >85% ET RSS >400MB (proche limit 512MB Render starter)
+      const cooldown = 30 * 60 * 1000; // max 1 alert/30min
+      if (heapPct > 85 && rssMB > 400 && Date.now() - _lastMemAlert > cooldown) {
+        _lastMemAlert = Date.now();
+        log('WARN', 'MEMORY', `Heap ${heapPct.toFixed(0)}% | heap ${heapUsedMB}/${heapTotalMB}MB | RSS ${rssMB}MB`);
+        if (typeof sendTelegramWithFallback === 'function') {
+          sendTelegramWithFallback(
+            `🧠 *Memory pressure élevée*\nHeap ${heapPct.toFixed(0)}% (${heapUsedMB}/${heapTotalMB}MB)\nRSS ${rssMB}MB / ~512MB limit\n\nInvestiguer si persiste — possible memory leak.`,
+            { category: 'memory-pressure', heapPct: heapPct.toFixed(0), rssMB }
+          ).catch(() => {});
+        }
+        auditLogEvent('memory', 'high_pressure', { heapPct: heapPct.toFixed(0), heapUsedMB, heapTotalMB, rssMB });
+      }
+    } catch (e) { /* non-bloquant */ }
+  }, 5 * 60 * 1000);
+
   // AUTO-RECOVERY pendingDocSends — toutes les 2min, retry les envois en attente
   // qui ont plus de 5min. Premier retry possible à ~7min, pas 30min. Max 4 cycles
   // auto (13min total) avant abandon explicite via Telegram. Un prospect attend pas.
@@ -6284,13 +6333,54 @@ async function handleWebhook(route, data) {
 }
 
 // ─── Arrêt propre ─────────────────────────────────────────────────────────────
-process.on('SIGTERM', async () => {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveJSON(HIST_FILE, Object.fromEntries(chats));
-  await saveMemoryToGist().catch(() => {});
-  log('OK', 'BOOT', 'Arrêt propre');
+// Graceful shutdown: flush TOUT sur disque + attendre traitements en cours max 15s
+// avant d'exit. Render envoie SIGTERM puis kill dans 30s → on a le temps.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log('INFO', 'SHUTDOWN', `${signal} reçu — arrêt propre démarré`);
+
+  const timeoutMs = 15000;
+  const start = Date.now();
+
+  // 1. Stop acceptation nouvelles tâches (timer save + poller handled elsewhere)
+  if (typeof saveTimer !== 'undefined' && saveTimer) clearTimeout(saveTimer);
+
+  // 2. Flush TOUT l'état sur disque (synchrone pour garantir)
+  try {
+    saveJSON(HIST_FILE, Object.fromEntries(chats));
+    log('OK', 'SHUTDOWN', 'chats history flushé');
+  } catch (e) { log('WARN', 'SHUTDOWN', `chats: ${e.message}`); }
+  try {
+    if (typeof savePendingLeads === 'function') savePendingLeads();
+    if (typeof savePendingDocs === 'function') savePendingDocs();
+    if (typeof saveLeadRetryState === 'function') saveLeadRetryState();
+    if (typeof saveLeadsDedup === 'function') saveLeadsDedup();
+    if (typeof gmailPollerState !== 'undefined') saveJSON(POLLER_FILE, gmailPollerState);
+    if (typeof autoEnvoiState !== 'undefined') saveJSON(AUTOENVOI_FILE, autoEnvoiState);
+    log('OK', 'SHUTDOWN', 'pending/retry/dedup/poller/autoenvoi flushés');
+  } catch (e) { log('WARN', 'SHUTDOWN', `state flush: ${e.message}`); }
+
+  // 3. Backup Gist (async mais borné)
+  try {
+    await Promise.race([
+      saveMemoryToGist().catch(() => {}),
+      new Promise(r => setTimeout(r, 5000)),
+    ]);
+    await Promise.race([
+      (typeof savePollerStateToGist === 'function' ? savePollerStateToGist() : Promise.resolve()).catch(() => {}),
+      new Promise(r => setTimeout(r, 5000)),
+    ]);
+    log('OK', 'SHUTDOWN', 'Gist backup tenté');
+  } catch {}
+
+  const elapsed = Date.now() - start;
+  log('OK', 'SHUTDOWN', `arrêt propre complet en ${elapsed}ms`);
   process.exit(0);
-});
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 // ─── HTTP server (health + webhooks) ─────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
@@ -6486,6 +6576,34 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       metrics: { ...metrics, tools: undefined },
       lastApiError: metrics.lastApiError,
     }, null, 2));
+    return;
+  }
+
+  // /admin/logs?token=X&tail=200&cat=POLLER&level=WARN — ring buffer logs
+  if (req.method === 'GET' && url.startsWith('/admin/logs')) {
+    const token = (req.url || '').split('token=')[1]?.split('&')[0];
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    const tail = Math.min(500, parseInt((req.url || '').split('tail=')[1]?.split('&')[0] || '200'));
+    const catFilter = decodeURIComponent((req.url || '').split('cat=')[1]?.split('&')[0] || '');
+    const levelFilter = decodeURIComponent((req.url || '').split('level=')[1]?.split('&')[0] || '');
+    let entries = logRingBuffer.slice(-tail);
+    if (catFilter) entries = entries.filter(e => String(e.cat).toUpperCase().includes(catFilter.toUpperCase()));
+    if (levelFilter) entries = entries.filter(e => String(e.niveau).toUpperCase() === levelFilter.toUpperCase());
+    // Text format par défaut (facile à lire), ?format=json pour JSON
+    const format = (req.url || '').split('format=')[1]?.split('&')[0];
+    if (format === 'json') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ count: entries.length, bufferSize: logRingBuffer.length, entries }, null, 2));
+    } else {
+      const lines = entries.map(e => {
+        const ts = new Date(e.ts).toISOString();
+        return `${ts} ${e.niveau.padEnd(4)} [${e.cat.padEnd(10)}] ${e.msg}`;
+      }).join('\n');
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(`# logs (${entries.length}/${logRingBuffer.length})\n${lines}\n`);
+    }
     return;
   }
 
