@@ -4943,50 +4943,68 @@ function registerHandlers() {
       : `✅ ${res.trashed} emails mis à la corbeille.\n\nAuto-clean: boot + tous les jours à 6h.`);
   });
 
-  // /retry-centris <#> → purge dedup (keys + processed msgIds matching) + scan 48h
-  // Utilisé pour récupérer un lead qui a été dedup'd à tort sous l'ancien flow.
-  // Ex: /retry-centris 26621771 → retraite la demande d'Erika
+  // /retry-centris <#> → purge COMPLÈTE: dedup keys (centris+email+tel+nom) +
+  // processed msgIds + retry counters, puis scan 48h. Pour récupérer un lead
+  // dedup'd sous l'ancien flow. Ex: /retry-centris 26621771 → retraite Erika.
   bot.onText(/\/retry[-_]?centris\s+(\d{7,9})/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const centrisNum = match[1];
-    await bot.sendMessage(msg.chat.id, `🔄 Purge dedup + scan pour Centris #${centrisNum}...`);
+    await bot.sendMessage(msg.chat.id, `🔄 Purge dedup complète + scan pour Centris #${centrisNum}...`);
 
-    // 1. Purger toutes les clés recentLeadsByKey qui contiennent ce #
+    // 1a. Purger clé centris directe
     let purgedKeys = 0;
-    const prefix = 'c:' + centrisNum;
-    for (const k of [...recentLeadsByKey.keys()]) {
-      if (k === prefix || k.startsWith(`${prefix}:`)) {
-        recentLeadsByKey.delete(k);
-        purgedKeys++;
-      }
-    }
-    saveLeadsDedup();
+    const centrisKey = 'c:' + centrisNum;
+    if (recentLeadsByKey.has(centrisKey)) { recentLeadsByKey.delete(centrisKey); purgedKeys++; }
 
-    // 2. Chercher Gmail msgIds qui mentionnent ce # → retirer du processed[]
-    //    pour forcer leur retraitement au prochain scan
+    // 2. Chercher Gmail msgIds qui mentionnent ce # → extraire email/tel/nom,
+    //    purger AUSSI leurs clés dedup (sinon le lead reste bloqué par l'email)
     let purgedIds = 0;
+    let extractedCount = 0;
     try {
       const list = await gmailAPI(`/messages?maxResults=20&q=${encodeURIComponent(centrisNum)}`).catch(() => null);
       const msgs = list?.messages || [];
       for (const m of msgs) {
         const idx = gmailPollerState.processed.indexOf(m.id);
-        if (idx >= 0) {
-          gmailPollerState.processed.splice(idx, 1);
-          purgedIds++;
-        }
-        // Clear retry counter aussi
-        if (leadRetryState[m.id]) { delete leadRetryState[m.id]; }
+        if (idx >= 0) { gmailPollerState.processed.splice(idx, 1); purgedIds++; }
+        if (leadRetryState[m.id]) delete leadRetryState[m.id];
+
+        // Extraire email/tel/nom pour purger leurs clés dedup respectives
+        try {
+          const full = await gmailAPI(`/messages/${m.id}?format=full`).catch(() => null);
+          if (full) {
+            const hdrs = full.payload?.headers || [];
+            const get = n => hdrs.find(h => h.name.toLowerCase() === n)?.value || '';
+            const from    = get('from');
+            const subject = get('subject');
+            const body    = gmailExtractBody(full.payload);
+            const lead = parseLeadEmail(body, subject, from);
+            const source = detectLeadSource(from, subject);
+            if (source && lead) {
+              const keys = buildLeadKeys({
+                email: lead.email, telephone: lead.telephone,
+                centris: lead.centris || centrisNum, nom: lead.nom, source: source.source,
+              });
+              for (const k of keys) {
+                if (recentLeadsByKey.has(k)) { recentLeadsByKey.delete(k); purgedKeys++; }
+              }
+              extractedCount++;
+            }
+          }
+        } catch {}
       }
       saveLeadRetryState();
+      saveLeadsDedup();
       saveJSON(POLLER_FILE, gmailPollerState);
     } catch (e) {
       log('WARN', 'RETRY', `Gmail search: ${e.message}`);
     }
 
-    // 3. Lancer scan 48h en async — les msgIds purgés seront retrouvés et retraités
     await bot.sendMessage(msg.chat.id,
-      `✅ Purgé: ${purgedKeys} clé(s) dedup + ${purgedIds} msgId(s) processed\n` +
-      `🚀 Scan 48h lancé — les messages seront retraités.`);
+      `✅ Purge complète:\n` +
+      `   • ${purgedKeys} clé(s) dedup (centris + email + tel + nom)\n` +
+      `   • ${purgedIds} msgId(s) processed\n` +
+      `   • ${extractedCount} email(s) analysé(s)\n` +
+      `🚀 Scan 48h lancé — traitement complet au prochain cycle.`);
     runGmailLeadPoller({ forceSince: '48h' }).catch(e =>
       bot.sendMessage(msg.chat.id, `⚠️ Scan exception: ${e.message.substring(0, 200)}`).catch(() => {})
     );
