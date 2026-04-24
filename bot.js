@@ -3943,7 +3943,11 @@ const TOOLS = [
   { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
   // ── Diagnostics ──
   { name: 'tester_dropbox',  description: 'Tester la connexion Dropbox et diagnostiquer les problèmes de tokens. Utiliser quand Dropbox semble brisé.', input_schema: { type: 'object', properties: {} } },
-  { name: 'voir_template_dropbox', description: 'Lire les informations du master template email depuis Dropbox. Pour vérifier les placeholders disponibles.', input_schema: { type: 'object', properties: {} }, cache_control: { type: 'ephemeral' } }
+  { name: 'voir_template_dropbox', description: 'Lire les informations du master template email depuis Dropbox. Pour vérifier les placeholders disponibles.', input_schema: { type: 'object', properties: {} } },
+
+  // ── Firecrawl (scraping municipal) ────────────────────────────────────────
+  { name: 'scraper_site_municipal', description: 'Scraper le site d\'une municipalité québécoise pour obtenir règlements de zonage, marges latérales, permis, taxes. Cache 30j. Fallback téléphone auto si scrape échoue. Villes: sainte-julienne, rawdon, chertsey, saint-calixte, saint-jean-de-matha, saint-didace, matawinie, d-autray.', input_schema: { type: 'object', properties: { ville: { type: 'string', description: 'Nom ville slug (sainte-julienne, rawdon, chertsey, saint-calixte, saint-jean-de-matha, saint-didace, matawinie, d-autray)' }, sujet: { type: 'string', enum: ['zonage', 'urbanisme', 'permis', 'taxes', 'riveraine'], description: 'Type info (défaut zonage)' } }, required: ['ville'] } },
+  { name: 'scraper_url', description: 'Scraper n\'importe quelle URL et extraire markdown (règlements, PDFs convertis, pages gouv). Utiliser mots_cles pour filtrer la section pertinente.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète https://...' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'Mots-clés pour filtrer la section (ex: ["marge","latérale","recul"])' } }, required: ['url'] }, cache_control: { type: 'ephemeral' } },
 ];
 
 // Cache les tools (statiques) — réduit coût API
@@ -4101,6 +4105,29 @@ async function executeTool(name, input, chatId) {
         const size = Math.round(html.length / 1024);
         return `✅ *Master Template trouvé*\n\nTaille: ${size} KB\nPlaceholders {{ params.X }}: ${unique.length}\n\n${unique.map(p => `• ${p}`).join('\n')}\n\nLogos base64: ${html.includes('data:image/png;base64') ? '✅ présents' : '⚠️ absents'}`;
       }
+
+      case 'scraper_site_municipal': {
+        const firecrawl = require('./firecrawl_scraper');
+        const { ville, sujet = 'zonage' } = input || {};
+        if (!ville) return `❌ Ville requise. Ex: "Sainte-Julienne"`;
+        const r = await firecrawl.scrapMunicipalite(ville, sujet);
+        if (!r.success) {
+          return `⚠️ *Scrape échoué* pour ${r.ville || ville} (${sujet}):\n${r.error}\n\n${r.fallback || ''}`;
+        }
+        return `✅ *${r.ville}* — ${r.sujet}${r.fromCache ? ` (cache ${r.cached_at?.substring(0, 10)})` : ''}\n` +
+               `📍 ${r.url}\n📞 ${r.telephone}${r.note_urbanisme ? ' (' + r.note_urbanisme + ')' : ''}\n` +
+               `📊 Quota: ${r.quota}\n\n${r.contenu.substring(0, 3000)}${r.contenu.length > 3000 ? '\n\n...(tronqué)' : ''}`;
+      }
+
+      case 'scraper_url': {
+        const firecrawl = require('./firecrawl_scraper');
+        const { url, mots_cles = [] } = input || {};
+        if (!url) return `❌ URL requise`;
+        const r = await firecrawl.scrapUrl(url, mots_cles);
+        if (!r.success) return `❌ ${r.error}`;
+        return `✅ *Scrape réussi*${r.fromCache ? ' (cache)' : ''}\n📍 ${r.url}\n📊 Quota: ${r.quota}\n\n${r.contenu.substring(0, 3000)}${r.contenu.length > 3000 ? '\n\n...(tronqué)' : ''}`;
+      }
+
       default: return `Outil inconnu: ${name}`;
     }
   } catch (err) {
@@ -4178,9 +4205,13 @@ async function detectAnomalies() {
   }
 
   // 2. Zero leads en 24h (alors qu'on s'y attend — check poller actif)
+  // NB: ignorer l'alerte si totalsDedup > 0 (dedup fonctionne = c'est normal qu'aucun
+  // nouveau lead ne soit processé si tout l'historique est déjà vu).
   const pollerStatsRef = pollerStats;
-  if (pollerStatsRef.runs > 50 && pollerStatsRef.totalsProcessed === 0) {
-    anomalies.push({ key: 'no_leads_processed', msg: `${pollerStatsRef.runs} polls mais 0 lead traité — source detection ou parser cassé`, severity: 'high' });
+  const totalProcessingSignal = (pollerStatsRef.totalsProcessed || 0) + (pollerStatsRef.totalsDedup || 0);
+  if (pollerStatsRef.runs > 200 && totalProcessingSignal === 0 && (pollerStatsRef.totalsFound || 0) > 0) {
+    // 200 polls + des emails trouvés + mais 0 traité/dedup = parser vraiment cassé
+    anomalies.push({ key: 'no_leads_processed', msg: `${pollerStatsRef.runs} polls, ${pollerStatsRef.totalsFound} emails vus, mais 0 traité/dedup — source detection ou parser cassé`, severity: 'high' });
   }
 
   // 2b. Silence poller anormal en heures ouvrables (8h-20h America/Toronto jours semaine).
@@ -4816,6 +4847,27 @@ function registerHandlers() {
       anomaliesStr,
       { parse_mode: 'Markdown' }
     );
+  });
+
+  // /firecrawl — statut quota + dernières villes scrapées
+  bot.onText(/\/firecrawl\b/i, async msg => {
+    if (!isAllowed(msg)) return;
+    try {
+      const { getQuotaStatus, MUNICIPALITES } = require('./firecrawl_scraper');
+      const q = getQuotaStatus();
+      const villes = Object.keys(MUNICIPALITES).join(', ');
+      await bot.sendMessage(msg.chat.id,
+        `🔥 *Firecrawl Status*\n${q.statut}\n` +
+        `📊 ${q.utilise}/${q.quota} scrapes utilisés (${q.pourcentage}%)\n` +
+        `✅ Restant ce mois: ${q.restant}\n` +
+        `📅 Mois: ${q.mois}\n\n` +
+        `*Villes pré-configurées:*\n${villes}\n\n` +
+        `Exemples: "grille de zonage Sainte-Julienne" · "règlement riveraine Rawdon" · "permis Chertsey"`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      bot.sendMessage(msg.chat.id, `❌ Firecrawl: ${e.message.substring(0, 200)}`);
+    }
   });
 
   // /diagnose — test EN LIVE chaque composant critique + rapport RED/YELLOW/GREEN
