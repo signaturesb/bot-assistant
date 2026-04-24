@@ -6372,7 +6372,8 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
-  if (req.method === 'GET') {
+  // Root '/' uniquement — PAS un catch-all (sinon ça mange les /admin/*)
+  if (req.method === 'GET' && (url === '/' || url === '')) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(`Assistant SignatureSB OK — ${new Date().toISOString()} — tools:${TOOLS.length} — mémos:${kiramem.facts.length}`);
     return;
