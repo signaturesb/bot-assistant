@@ -4852,8 +4852,8 @@ function registerHandlers() {
                 const source = detectLeadSource(from, subject);
                 if (source) {
                   const lead = parseLeadEmail(body, subject, from);
-                  // Mark dans dedup sans notifier
-                  leadAlreadyNotifiedRecently({
+                  // Baseline: marque dans dedup sans notifier (ancienne logique: mark-on-sight)
+                  markLeadProcessed({
                     email: lead.email,
                     telephone: lead.telephone,
                     centris: lead.centris,
@@ -5666,6 +5666,55 @@ function startDailyTasks() {
       .catch(e => log('WARN', 'KEEPALIVE', `self-ping: ${e.message.substring(0, 60)}`));
   }, 10 * 60 * 1000);
 
+  // AUTO-RECOVERY pendingDocSends — toutes les 10min, retry les envois en attente
+  // qui ont plus de 20min. Évite qu'un auto-envoi échoué reste coincé indéfiniment
+  // si un truc temporaire (Dropbox glitch, Gmail rate limit) a bloqué la première
+  // tentative. Max 2 cycles de retry auto (40min total) avant abandon.
+  setInterval(async () => {
+    if (autoSendPaused || !pendingDocSends || pendingDocSends.size === 0) return;
+    const now = Date.now();
+    const toRetry = [];
+    for (const [email, pending] of pendingDocSends.entries()) {
+      const age = now - (pending._firstSeen || now);
+      if (age < 20 * 60 * 1000) continue; // <20min → laisse le temps à Shawn
+      pending._recoveryAttempts = (pending._recoveryAttempts || 0) + 1;
+      if (pending._recoveryAttempts > 2) continue; // abandon après 2 cycles (40min+)
+      toRetry.push({ email, pending });
+    }
+    if (!toRetry.length) return;
+    log('INFO', 'RECOVERY', `Auto-retry ${toRetry.length} pendingDocSends (>20min)`);
+    for (const { email, pending } of toRetry) {
+      try {
+        const r = await envoyerDocsAuto(pending);
+        if (r.sent) {
+          pendingDocSends.delete(email);
+          await sendTelegramWithFallback(
+            `🔄 *Auto-recovery* — docs finalement envoyés à ${email}\n   Après ${pending._recoveryAttempts} tentative(s) de récupération · ${r.match?.pdfs?.length || '?'} PDFs`,
+            { category: 'auto-recovery-success', email }
+          );
+          auditLogEvent('auto-recovery', 'success', { email, attempts: pending._recoveryAttempts });
+        } else if (r.skipped) {
+          log('INFO', 'RECOVERY', `${email}: skip (${r.reason})`);
+        } else if (pending._recoveryAttempts >= 2) {
+          await sendTelegramWithFallback(
+            `⚠️ *Auto-recovery ABANDONNÉ* pour ${email}\n   ${pending._recoveryAttempts} tentatives ratées — intervention manuelle\n   \`envoie les docs à ${email}\``,
+            { category: 'auto-recovery-gaveup', email }
+          );
+        }
+      } catch (e) {
+        log('WARN', 'RECOVERY', `${email}: ${e.message.substring(0, 150)}`);
+      }
+    }
+  }, 10 * 60 * 1000);
+
+  // Tag _firstSeen au moment où un pending est créé (utilisé par le cron ci-dessus)
+  // On hook le Map.set pour capturer le timestamp
+  const _origPendingSet = pendingDocSends.set.bind(pendingDocSends);
+  pendingDocSends.set = (k, v) => {
+    if (v && typeof v === 'object' && !v._firstSeen) v._firstSeen = Date.now();
+    return _origPendingSet(k, v);
+  };
+
   // Rafraîchissement BOT_STATUS.md chaque heure (au lieu de 1×/jour)
   // Garantit que Claude Code peut toujours reprendre avec l'état le plus récent
   setInterval(() => syncStatusGitHub().catch(() => {}), 60 * 60 * 1000);
@@ -5789,7 +5838,9 @@ async function handleWebhook(route, data) {
       } else {
         msg += `⚠️ Pas d'email — appelle directement: ${tel || 'tel non fourni'}`;
       }
-      await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' });
+      await sendTelegramWithFallback(msg, { category: 'webhook-centris', centris: centrisNum, email });
+      // Mark dedup APRÈS notification — si crash avant, webhook retry ne causera pas doublon
+      markLeadProcessed({ email, telephone: tel, centris: centrisForDedup, nom, source: 'centris' });
     }
 
     // ── SMS ENTRANT — Match Pipedrive + contexte + brouillon réponse ──────────
@@ -6205,7 +6256,10 @@ function buildLeadKeys({ email, telephone, centris, nom, source }) {
 }
 
 function leadAlreadyNotifiedRecently(emailOrLead, telephone, centris, nom, source) {
-  // Support 2 signatures: (email, phone) legacy OU ({email, telephone, centris, nom, source}) nouveau
+  // LEGACY: check-only (plus de mark écrit). Support 2 signatures.
+  // Nouveau flow: les callers doivent appeler markLeadProcessed() APRÈS
+  // traitement réussi — pas au premier coup d'œil. Ça permet le retry
+  // automatique au prochain poll si quelque chose plante en cours de route.
   const lead = typeof emailOrLead === 'object' ? emailOrLead : { email: emailOrLead, telephone, centris, nom, source };
   const now = Date.now();
   const TTL = 7 * 24 * 60 * 60 * 1000;
@@ -6221,10 +6275,46 @@ function leadAlreadyNotifiedRecently(emailOrLead, telephone, centris, nom, sourc
       return true;
     }
   }
-  // Marque toutes les clés pour bloquer futures occurrences même partielles
+  return false;
+}
+
+// Marquer un lead comme traité avec succès — à appeler UNIQUEMENT quand
+// traiterNouveauLead arrive à une décision finale (notif envoyée, auto-sent,
+// pending validé, etc.). Si on crash avant cet appel, prochain poll retry.
+function markLeadProcessed(leadOrKeys) {
+  const keys = Array.isArray(leadOrKeys) ? leadOrKeys : buildLeadKeys(leadOrKeys);
+  if (!keys.length) return;
+  const now = Date.now();
   for (const k of keys) recentLeadsByKey.set(k, now);
   saveLeadsDedup();
-  return false;
+}
+
+// Tracker retry par Gmail msgId — max 5 tentatives avant giving up.
+// Persisté sur disque pour survivre redeploys.
+const LEAD_RETRY_FILE = path.join(DATA_DIR, 'lead_retry.json');
+let leadRetryState = {};
+try {
+  if (fs.existsSync(LEAD_RETRY_FILE)) leadRetryState = JSON.parse(fs.readFileSync(LEAD_RETRY_FILE, 'utf8')) || {};
+} catch { leadRetryState = {}; }
+function saveLeadRetryState() {
+  try { fs.writeFileSync(LEAD_RETRY_FILE, JSON.stringify(leadRetryState, null, 2)); } catch {}
+}
+function getRetryCount(msgId) { return leadRetryState[msgId]?.count || 0; }
+function incRetryCount(msgId, err) {
+  if (!leadRetryState[msgId]) leadRetryState[msgId] = { count: 0, firstSeen: Date.now() };
+  leadRetryState[msgId].count++;
+  leadRetryState[msgId].lastTry = Date.now();
+  leadRetryState[msgId].lastErr = String(err || '').substring(0, 200);
+  saveLeadRetryState();
+  // Purge entrées >7j
+  const TTL = 7 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  for (const [k, v] of Object.entries(leadRetryState)) {
+    if (v.firstSeen && now - v.firstSeen > TTL) delete leadRetryState[k];
+  }
+}
+function resetRetryCount(msgId) {
+  if (leadRetryState[msgId]) { delete leadRetryState[msgId]; saveLeadRetryState(); }
 }
 
 async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {}) {
@@ -6667,7 +6757,8 @@ async function baselineSilentAtBoot() {
             const source = detectLeadSource(from, subject);
             if (source) {
               const lead = parseLeadEmail(body, subject, from);
-              leadAlreadyNotifiedRecently({
+              // Boot silent baseline: marque dans dedup sans notifier
+              markLeadProcessed({
                 email: lead.email, telephone: lead.telephone, centris: lead.centris,
                 nom: lead.nom, source: source.source,
               });
@@ -6852,12 +6943,50 @@ async function runGmailLeadPoller(opts = {}) {
             gmailPollerState.processed.push(id); continue;
           }
 
-          const result = await traiterNouveauLead(lead, id, from, subject, source) || {};
+          // Retry guard: max 5 tentatives par Gmail msgId avant giving up
+          const retryCount = getRetryCount(id);
+          const MAX_RETRIES = 5;
+          if (retryCount >= MAX_RETRIES) {
+            log('WARN', 'POLLER', `msg ${id}: ${retryCount} tentatives — SKIP définitif (giving up)`);
+            gmailPollerState.processed.push(id); // OK: on accepte l'échec définitif
+            auditLogEvent('lead', 'max_retries_exhausted', {
+              msgId: id, attempts: retryCount, lastErr: leadRetryState[id]?.lastErr,
+              subject: subject?.substring(0, 100), from: from?.substring(0, 120),
+            });
+            continue;
+          }
+
+          let result = {};
+          try {
+            result = await traiterNouveauLead(lead, id, from, subject, source) || {};
+          } catch (eLead) {
+            // Échec — NE PAS marquer processed, laisser retry au prochain poll
+            incRetryCount(id, eLead.message);
+            log('WARN', 'POLLER', `Lead ${id} tentative ${retryCount + 1}/${MAX_RETRIES} ÉCHOUÉE: ${eLead.message.substring(0, 150)}`);
+            scan.errors++;
+            if (retryCount + 1 >= MAX_RETRIES) {
+              // Escalation finale
+              await sendTelegramWithFallback(
+                `🚨 *LEAD ABANDONNÉ après ${MAX_RETRIES} tentatives*\n` +
+                `MsgId: \`${id}\`\nSujet: ${subject?.substring(0, 100)}\nFrom: ${from?.substring(0, 120)}\n` +
+                `Dernière erreur: ${eLead.message.substring(0, 200)}\n\n` +
+                `Le bot arrête de réessayer. Inspecte manuellement via /lead-audit ${id}.`,
+                { category: 'lead-abandoned', msgId: id }
+              );
+              gmailPollerState.processed.push(id); // abandon: marque pour ne plus revenir
+            }
+            continue;
+          }
+
+          // Succès: mark processed + reset retry + dedup + compteurs
           gmailPollerState.processed.push(id);
           gmailPollerState.totalLeads = (gmailPollerState.totalLeads || 0) + 1;
+          resetRetryCount(id);
+          // Mark dedup UNIQUEMENT ici (après succès end-to-end) — pas au premier coup d'œil
+          if (result.decision !== 'dedup_skipped') {
+            markLeadProcessed({ email: lead.email, telephone: lead.telephone, centris: lead.centris, nom: lead.nom, source: source.source });
+          }
           scan.processed++;
-          // Compteurs honnêtes par décision — `dealCreated` ne monte QUE si Pipedrive
-          // a réellement créé un deal (result.dealId présent)
           if (result.dealId) scan.dealCreated++;
           if (result.decision === 'auto_sent') scan.autoSent++;
           else if (result.decision === 'dedup_skipped') scan.dedup++;
