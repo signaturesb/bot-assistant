@@ -144,6 +144,7 @@ const VISITES_FILE    = path.join(DATA_DIR, 'visites.json');
 const POLLER_FILE     = path.join(DATA_DIR, 'gmail_poller.json');
 const AUTOENVOI_FILE  = path.join(DATA_DIR, 'autoenvoi_state.json');
 const PENDING_LEADS_FILE = path.join(DATA_DIR, 'pending_leads.json');
+const PENDING_DOCS_FILE  = path.join(DATA_DIR, 'pending_docs.json');
 
 // Leads en attente d'info manquante (nom invalide, etc.) — persisté sur disque
 // pour survivre aux redeploys Render. Shawn complète avec "nom Prénom Nom".
@@ -157,6 +158,29 @@ function savePendingLeads() {
   try { fs.writeFileSync(PENDING_LEADS_FILE, JSON.stringify(pendingLeads, null, 2)); }
   catch (e) { console.warn('savePendingLeads:', e.message); }
 }
+
+// pendingDocSends (Map email → pending) persisté sur disque — charge au boot,
+// sauvegarde sur chaque set/delete via wrappers. Survit redeploys Render.
+try {
+  if (fs.existsSync(PENDING_DOCS_FILE)) {
+    const arr = JSON.parse(fs.readFileSync(PENDING_DOCS_FILE, 'utf8')) || [];
+    for (const [k, v] of arr) pendingDocSends.set(k, v);
+  }
+} catch { /* silent: bad json → start fresh */ }
+function savePendingDocs() {
+  try {
+    const arr = [...pendingDocSends.entries()];
+    fs.writeFileSync(PENDING_DOCS_FILE, JSON.stringify(arr, null, 2));
+  } catch (e) { console.warn('savePendingDocs:', e.message); }
+}
+// Wrap set/delete pour auto-persist + tag _firstSeen (utilisé par auto-recovery cron)
+const _pdsSet = pendingDocSends.set.bind(pendingDocSends);
+const _pdsDel = pendingDocSends.delete.bind(pendingDocSends);
+pendingDocSends.set = (k, v) => {
+  if (v && typeof v === 'object' && !v._firstSeen) v._firstSeen = Date.now();
+  const r = _pdsSet(k, v); savePendingDocs(); return r;
+};
+pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
 
 // ─── Observabilité: Metrics + Circuit Breakers (fine pointe) ──────────────────
 const metrics = {
@@ -231,7 +255,9 @@ const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
 const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
-let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match }
+let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match, _firstSeen }
+// pendingDocSends est persisté sur disque — survit redeploys Render.
+// Ne pas référencer DATA_DIR ici (pas encore défini); init complet fait plus bas.
 
 // RÈGLE ABSOLUE — aucun email/sms/action externe sans consent Shawn explicite
 // Désactive tous les auto-envois. Toute action "sortante" doit passer par
@@ -5707,13 +5733,7 @@ function startDailyTasks() {
     }
   }, 10 * 60 * 1000);
 
-  // Tag _firstSeen au moment où un pending est créé (utilisé par le cron ci-dessus)
-  // On hook le Map.set pour capturer le timestamp
-  const _origPendingSet = pendingDocSends.set.bind(pendingDocSends);
-  pendingDocSends.set = (k, v) => {
-    if (v && typeof v === 'object' && !v._firstSeen) v._firstSeen = Date.now();
-    return _origPendingSet(k, v);
-  };
+  // (pendingDocSends.set wrappé au niveau init — tag _firstSeen + auto-persist)
 
   // Rafraîchissement BOT_STATUS.md chaque heure (au lieu de 1×/jour)
   // Garantit que Claude Code peut toujours reprendre avec l'état le plus récent
