@@ -6827,6 +6827,95 @@ function registerHandlers() {
     for (const c of chunks) await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(msg.chat.id, c).catch(() => {}));
   });
 
+  // /extract [msgId|last|N] — extract info contact (email/tél/Centris#) de n'importe
+  // quel email reçu, même si pas détecté comme lead. Utile pour récupérer info même
+  // si Pipedrive a échoué ou si le format est inhabituel.
+  // Sans arg: dernier email Gmail. Avec arg "last 5": 5 derniers. Avec msgId: spécifique.
+  bot.onText(/^\/extract(?:\s+(.+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const arg = (match[1] || '').trim();
+    if (!process.env.GMAIL_CLIENT_ID) return bot.sendMessage(msg.chat.id, '❌ Gmail pas configuré');
+    await bot.sendMessage(msg.chat.id, `🔍 *Extraction contact info...*\n_${arg || 'dernier email reçu'}_`, { parse_mode: 'Markdown' });
+
+    let msgIds = [];
+    try {
+      if (/^[a-zA-Z0-9_-]{10,}$/.test(arg)) {
+        msgIds = [arg]; // msgId Gmail spécifique
+      } else {
+        const limit = parseInt(arg) || 1;
+        const list = await gmailAPI(`/messages?maxResults=${Math.min(limit, 10)}&q=in:inbox`).catch(() => null);
+        msgIds = (list?.messages || []).slice(0, Math.min(limit, 5)).map(m => m.id);
+      }
+      if (!msgIds.length) return bot.sendMessage(msg.chat.id, `❌ Aucun email trouvé`);
+
+      for (const id of msgIds) {
+        try {
+          const full = await gmailAPI(`/messages/${id}?format=full`).catch(() => null);
+          if (!full) continue;
+          const hdrs = full.payload?.headers || [];
+          const get = n => hdrs.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
+          const from = get('from');
+          const subject = get('subject');
+          const date = get('date');
+          const body = gmailExtractBody(full.payload);
+
+          // Extract via regex
+          let lead = parseLeadEmail(body, subject, from);
+          let infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+
+          // AI deep scrape si <4 fields
+          if (infoCount < 4 && API_KEY) {
+            try {
+              const enriched = await parseLeadEmailWithAI(body, subject, from, lead, {
+                apiKey: API_KEY, logger: log, htmlBody: body,
+              });
+              if (enriched && (enriched.nom || enriched.email || enriched.centris)) {
+                lead = enriched;
+                infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+              }
+            } catch {}
+          }
+
+          const source = detectLeadSource(from, subject) || { source: 'inconnu', label: 'Source inconnue' };
+          const lines = [
+            `📧 *Email \`${id.substring(0, 12)}...\`*`,
+            `📨 *De:* ${from?.substring(0, 80) || '?'}`,
+            `📝 *Sujet:* ${subject?.substring(0, 80) || '?'}`,
+            `📅 ${date?.substring(0, 30) || '?'}`,
+            `🏷 Source: ${source.label}`,
+            ``,
+            `*🎯 Info extraite (${infoCount}/5):*`,
+            `  👤 Nom: ${lead.nom || '_(non trouvé)_'}`,
+            `  📞 Tél: ${lead.telephone || '_(non trouvé)_'}`,
+            `  ✉️ Email: ${lead.email || '_(non trouvé)_'}`,
+            `  🏡 Centris: ${lead.centris || '_(non trouvé)_'}`,
+            `  📍 Adresse: ${lead.adresse || '_(non trouvé)_'}`,
+            `  📦 Type: ${lead.type || 'terrain'}`,
+          ];
+
+          // Buttons inline pour actions rapides
+          const buttons = [];
+          if (lead.email) {
+            buttons.push({ text: '🚀 Envoyer fiche', callback_data: `extract_send:${id}` });
+          }
+          if (lead.centris && lead.email) {
+            buttons.push({ text: '📊 Info terrain', callback_data: `audit:${lead.centris}` });
+          }
+          buttons.push({ text: '🔄 Re-process', callback_data: `extract_reprocess:${id}` });
+
+          const replyMarkup = buttons.length ? { inline_keyboard: [buttons] } : undefined;
+          await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown', reply_markup: replyMarkup }).catch(() =>
+            bot.sendMessage(msg.chat.id, lines.join('\n').replace(/[*_`]/g, ''), replyMarkup ? { reply_markup: replyMarkup } : {}).catch(() => {})
+          );
+        } catch (e) {
+          await bot.sendMessage(msg.chat.id, `⚠️ Extract msg ${id.substring(0, 12)}: ${e.message?.substring(0, 100)}`);
+        }
+      }
+    } catch (e) {
+      bot.sendMessage(msg.chat.id, `❌ ${e.message?.substring(0, 200)}`);
+    }
+  });
+
   // /campaigns — liste campagnes Brevo suspended + boutons inline confirm/cancel
   // Remplace le système confirmserver Mac fragile (Cloudflare tunnel volatile).
   // Bot appelle directement Brevo API → robuste, jamais down.
