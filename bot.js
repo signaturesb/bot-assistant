@@ -5840,28 +5840,75 @@ function registerHandlers() {
             await bot.sendMessage(chatId, `❌ Preview: ${e.message?.substring(0, 200)}`);
           }
         } else {
-          const newStatus = action === 'cmp_send' ? 'queued' : 'suspended';
-          const verb = action === 'cmp_send' ? '✅ Confirmé — partira à scheduledAt' : '🚫 Annulé — reste suspendu';
-          await bot.answerCallbackQuery(cbq.id, { text: verb });
-          try {
-            const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/status`, {
-              method: 'PUT',
-              headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ status: newStatus }),
-              signal: AbortSignal.timeout(15000),
-            });
-            if (r.ok || r.status === 204) {
-              if (chatId && msgId) {
-                const newMarkup = { inline_keyboard: [[{ text: action === 'cmp_send' ? '✅ Confirmé' : '🚫 Annulé', callback_data: 'noop' }]] };
-                await bot.editMessageReplyMarkup(newMarkup, { chat_id: chatId, message_id: msgId }).catch(() => {});
+          // BUG FIX 2026-04-25: PUT /status?status=queued envoie IMMÉDIATEMENT
+          // (ignore scheduledAt). Pour confirmer une campagne suspendue ET
+          // respecter sa date prévue, on update via PUT /emailCampaigns/{id}
+          // avec le scheduledAt récupéré — Brevo bascule en "queued for schedule".
+          if (action === 'cmp_send') {
+            await bot.answerCallbackQuery(cbq.id, { text: '⏳ Confirmation...' });
+            try {
+              // 1. Fetch scheduledAt actuel
+              const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+                headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
+              }).then(r => r.json());
+              const sched = det.scheduledAt;
+              const schedMs = sched ? new Date(sched).getTime() : 0;
+              const isFuture = schedMs > Date.now() + 60000; // >1 min dans le futur
+
+              // 2a. Si scheduledAt dans le futur → PUT scheduledAt (Brevo respecte la date)
+              // 2b. Si pas de scheduledAt ou passé → POST sendNow (envoi immédiat)
+              let r, label;
+              if (isFuture) {
+                r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+                  method: 'PUT',
+                  headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ scheduledAt: sched }),
+                  signal: AbortSignal.timeout(15000),
+                });
+                label = `✅ Confirmé — envoi ${new Date(sched).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' })}`;
+              } else {
+                r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/sendNow`, {
+                  method: 'POST',
+                  headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
+                });
+                label = `✅ Envoyée maintenant`;
               }
-              auditLogEvent('campaign', action === 'cmp_send' ? 'confirmed' : 'cancelled', { campaignId });
-            } else {
-              const err = await r.text().catch(() => '');
-              await bot.sendMessage(chatId, `❌ Brevo ${r.status}: ${err.substring(0, 200)}`);
+              if (r.ok || r.status === 204) {
+                if (chatId && msgId) {
+                  const newMarkup = { inline_keyboard: [[{ text: label, callback_data: 'noop' }]] };
+                  await bot.editMessageReplyMarkup(newMarkup, { chat_id: chatId, message_id: msgId }).catch(() => {});
+                }
+                await bot.sendMessage(chatId, label);
+                auditLogEvent('campaign', 'confirmed', { campaignId, scheduledAt: sched, mode: isFuture ? 'scheduled' : 'sendNow' });
+              } else {
+                const err = await r.text().catch(() => '');
+                await bot.sendMessage(chatId, `❌ Brevo ${r.status}: ${err.substring(0, 200)}`);
+              }
+            } catch (e) {
+              await bot.sendMessage(chatId, `❌ ${e.message?.substring(0, 200)}`);
             }
-          } catch (e) {
-            await bot.sendMessage(chatId, `❌ ${e.message?.substring(0, 200)}`);
+          } else { // cmp_cancel
+            await bot.answerCallbackQuery(cbq.id, { text: '🚫 Annulation...' });
+            try {
+              const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/status`, {
+                method: 'PUT',
+                headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: 'suspended' }),
+                signal: AbortSignal.timeout(15000),
+              });
+              if (r.ok || r.status === 204) {
+                if (chatId && msgId) {
+                  const newMarkup = { inline_keyboard: [[{ text: '🚫 Annulé', callback_data: 'noop' }]] };
+                  await bot.editMessageReplyMarkup(newMarkup, { chat_id: chatId, message_id: msgId }).catch(() => {});
+                }
+                auditLogEvent('campaign', 'cancelled', { campaignId });
+              } else {
+                const err = await r.text().catch(() => '');
+                await bot.sendMessage(chatId, `❌ Brevo ${r.status}: ${err.substring(0, 200)}`);
+              }
+            } catch (e) {
+              await bot.sendMessage(chatId, `❌ ${e.message?.substring(0, 200)}`);
+            }
           }
         }
       } else if (action === 'noop') {
