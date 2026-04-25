@@ -3473,7 +3473,25 @@ async function historiqueContact(terme) {
 }
 
 // ─── Whisper (voix → texte) ───────────────────────────────────────────────────
-async function transcrire(audioBuffer) {
+// Prompt OPTIMISÉ pour reconnaissance vocabulaire Shawn: termes immobilier QC,
+// noms locaux, marques partenaires, expressions courantes courtier, commandes
+// du bot. Whisper utilise ce prompt comme "biais" — augmente précision sur ces
+// mots-clés quand ils sont prononcés. Limite OpenAI: 224 tokens max prompt.
+const WHISPER_PROMPT_BASE =
+  // Métier + commandes courantes Shawn
+  `Shawn Barrette, courtier RE/MAX Prestige Rawdon, Lanaudière. ` +
+  `Commandes bot: envoie les docs à, annule, info Centris, cherche, scrape, pdf, today, diagnose. ` +
+  // Acteurs partenaires
+  `Julie Lemieux assistante, ProFab Jordan Brouillette, Desjardins, Centris, RE/MAX Québec, OACIQ, AMF, APCIQ. ` +
+  // Termes immobilier QC
+  `terrain, plex, duplex, triplex, maison usagée, construction neuve, fosse septique, puits artésien, ` +
+  `marge latérale, bande riveraine, certificat de localisation, TPS TVQ, mise de fonds, hypothèque, préapprobation, ` +
+  `inscription, fiche descriptive, offre d'achat acceptée, contre-proposition, courtier inscripteur, courtier collaborateur, ` +
+  // Lieux fréquents Lanaudière + Rive-Nord
+  `Rawdon, Sainte-Julienne, Saint-Calixte, Chertsey, Saint-Jean-de-Matha, Saint-Didace, Joliette, Berthierville, ` +
+  `Mascouche, Terrebonne, Repentigny, Saint-Donat, Saint-Côme, Notre-Dame-de-la-Merci, Entrelacs, MRC Matawinie, MRC D'Autray.`;
+
+async function transcrire(audioBuffer, opts = {}) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error('OPENAI_API_KEY non configuré dans Render');
   if (audioBuffer.length > 24 * 1024 * 1024) throw new Error('Message vocal trop long (max ~15 min)');
@@ -3481,14 +3499,38 @@ async function transcrire(audioBuffer) {
   formData.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'voice.ogg');
   formData.append('model', 'whisper-1');
   formData.append('language', 'fr');
-  formData.append('prompt', 'Immobilier québécois: Centris, Pipedrive, terrain, plex, courtier, ProFab, Desjardins, fosse septique, Rawdon, Saint-Julienne, Lanaudière, RE/MAX Prestige, offre d\'achat, TVQ.');
+  // Prompt: base + contexte récent (noms de prospects récents pour meilleure reco)
+  let prompt = WHISPER_PROMPT_BASE;
+  if (opts.recentContext) {
+    // Append les noms/Centris# des derniers leads pour booster reconnaissance
+    const ctx = opts.recentContext.substring(0, 200); // garde sous limite tokens
+    prompt = (prompt + ' ' + ctx).substring(0, 1000);
+  }
+  formData.append('prompt', prompt);
+  // Temperature 0 = max déterminisme (pas de variation aléatoire)
+  formData.append('temperature', '0');
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 30000);
   try {
     const res = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', signal: controller.signal, headers: { 'Authorization': `Bearer ${key}` }, body: formData });
     if (!res.ok) { const err = await res.text(); throw new Error(`Whisper HTTP ${res.status}: ${err.substring(0, 150)}`); }
     const data = await res.json();
-    return data.text?.trim() || null;
+    let text = data.text?.trim() || null;
+    if (text) {
+      // Post-correction: Whisper a tendance à mal entendre certains noms — fix manuel
+      text = text
+        .replace(/\bSente Julienne\b/gi, 'Sainte-Julienne')
+        .replace(/\bSainte Julienne\b/gi, 'Sainte-Julienne')
+        .replace(/\bRedon\b/gi, 'Rawdon').replace(/\bReadon\b/gi, 'Rawdon')
+        .replace(/\bCentrice\b/gi, 'Centris').replace(/\bcentriste?\b/gi, 'Centris')
+        .replace(/\bpipe drive\b/gi, 'Pipedrive')
+        .replace(/\bpro fab\b/gi, 'ProFab')
+        .replace(/\bdesjardin\b/gi, 'Desjardins')
+        .replace(/\bre max\b/gi, 'RE/MAX')
+        .replace(/\bmatawini\b/gi, 'Matawinie')
+        .replace(/\bdupropraio\b/gi, 'DuProprio');
+    }
+    return text;
   } catch (e) {
     if (e.name === 'AbortError') throw new Error('Transcription trop longue (timeout 30s)');
     throw e;
@@ -6627,7 +6669,18 @@ function registerHandlers() {
       const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
       const res      = await fetch(fileUrl);
       const buffer   = Buffer.from(await res.arrayBuffer());
-      const texte    = await transcrire(buffer);
+
+      // Contexte récent: noms prospects récents + Centris# actifs
+      // Whisper utilise ça comme "biais" pour mieux reconnaître ces mots
+      const recentNames = (auditLog || [])
+        .filter(e => e.category === 'lead' && e.details?.extracted)
+        .slice(-10)
+        .flatMap(e => [e.details.extracted.nom, e.details.extracted.centris ? `#${e.details.extracted.centris}` : null])
+        .filter(Boolean)
+        .join(', ');
+      const recentContext = recentNames || '';
+
+      const texte = await transcrire(buffer, { recentContext });
 
       if (!texte) { await bot.sendMessage(chatId, '❌ Impossible de transcrire ce message vocal.'); return; }
 
