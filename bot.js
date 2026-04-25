@@ -167,18 +167,14 @@ try {
   }
 } catch { pendingLeads = []; }
 function savePendingLeads() {
-  try { fs.writeFileSync(PENDING_LEADS_FILE, JSON.stringify(pendingLeads, null, 2)); }
-  catch (e) { console.warn('savePendingLeads:', e.message); }
+  safeWriteJSON(PENDING_LEADS_FILE, pendingLeads);
 }
 
 // pendingDocSends persistence wiré après déclaration de la Map (voir ~L234).
 // (code déplacé pour éviter TDZ ReferenceError au chargement du module)
 function savePendingDocs() {
-  try {
-    if (typeof pendingDocSends === 'undefined') return;
-    const arr = [...pendingDocSends.entries()];
-    fs.writeFileSync(PENDING_DOCS_FILE, JSON.stringify(arr, null, 2));
-  } catch (e) { console.warn('savePendingDocs:', e.message); }
+  if (typeof pendingDocSends === 'undefined') return;
+  safeWriteJSON(PENDING_DOCS_FILE, [...pendingDocSends.entries()]);
 }
 
 // ─── Observabilité: Metrics + Circuit Breakers (fine pointe) ──────────────────
@@ -244,8 +240,12 @@ function loadJSON(file, fallback) {
   return fallback;
 }
 function saveJSON(file, data) {
-  try { fs.writeFileSync(file, JSON.stringify(data), 'utf8'); }
-  catch (e) { log('ERR', 'IO', `Sauvegarde ${file}: ${e.message}`); }
+  // Atomic write via tmp + rename (évite corruption si crash mid-write)
+  try {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (e) { log('ERR', 'IO', `Sauvegarde ${file}: ${e.message}`); }
 }
 
 // ─── Clients ──────────────────────────────────────────────────────────────────
@@ -289,6 +289,38 @@ function cronTimeout(label, fn, timeoutMs = 120000) {
   ]);
 }
 
+// ─── safeCron — wrapper pour setInterval async qui CATCH tout ────────────
+// Empêche une exception dans un cron de propager (et potentiellement crash
+// l'event loop ou laisser un état inconsistant). Combine cronTimeout + catch.
+// Usage: safeCron('label', async () => {...}, 60000) au lieu de setInterval.
+function safeCron(label, fn, intervalMs, opts = {}) {
+  const timeoutMs = opts.timeoutMs || Math.min(intervalMs * 0.8, 120000);
+  const wrapped = async () => {
+    try {
+      await cronTimeout(label, fn, timeoutMs);
+    } catch (e) {
+      log('ERR', 'CRON', `${label} unhandled: ${e.message?.substring(0, 200) || e}`);
+    }
+  };
+  return setInterval(wrapped, intervalMs);
+}
+
+// ─── safeWriteJSON — écriture atomique pour fichiers critiques ──────────
+// Écrit dans `file.tmp` puis `rename(tmp, file)`. Garantit que même un crash
+// mid-write ne corrompt pas le fichier (rename est atomique sur la plupart
+// des FS POSIX). Si le tmp existe déjà (crash précédent), il est écrasé.
+function safeWriteJSON(file, data) {
+  try {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (e) {
+    log('WARN', 'PERSIST', `safeWriteJSON ${path.basename(file)}: ${e.message?.substring(0, 100)}`);
+    return false;
+  }
+}
+
 // ─── HTML escape helper — protection XSS ─────────────────────────────────
 // Toute valeur dérivée d'un lead (nom, adresse, email, etc.) qui est
 // injectée dans un template HTML DOIT passer par escapeHtml() pour éviter
@@ -320,11 +352,8 @@ try {
   }
 } catch { emailOutbox = []; }
 function saveEmailOutbox() {
-  try {
-    // Cap 1000 entrées (FIFO) pour éviter croissance illimitée
-    if (emailOutbox.length > 1000) emailOutbox = emailOutbox.slice(-1000);
-    fs.writeFileSync(EMAIL_OUTBOX_FILE, JSON.stringify(emailOutbox, null, 2));
-  } catch (e) { console.warn('saveEmailOutbox:', e.message); }
+  if (emailOutbox.length > 1000) emailOutbox = emailOutbox.slice(-1000);
+  safeWriteJSON(EMAIL_OUTBOX_FILE, emailOutbox);
 }
 
 /**
@@ -6582,7 +6611,8 @@ function startDailyTasks() {
 
   // LEAD AGING ESCALATION — ping si pending >4h (max 1×/jour par lead)
   // Évite qu'un pending reste silencieusement oublié si Shawn n'a pas vu la notif.
-  setInterval(async () => {
+  // Wrappé safeCron: throw interne ne casse PAS l'interval.
+  safeCron('lead-aging', async () => {
     if (!ALLOWED_ID) return;
     const now = Date.now();
     const AGE_LIMIT = 4 * 60 * 60 * 1000; // 4h
@@ -6619,7 +6649,7 @@ function startDailyTasks() {
         { category: 'pending-docs-aging', email, ageH }
       );
     }
-  }, 30 * 60 * 1000); // toutes les 30min
+  }, 30 * 60 * 1000); // toutes les 30min — wrappé safeCron
 
   // ─── BREVO AUTOMATION AUDIT (cron 6h) ────────────────────────────────────
   // Liste les automations Brevo actives et alerte Shawn si un nouveau workflow
@@ -7652,7 +7682,7 @@ try {
   if (fs.existsSync(LEAD_RETRY_FILE)) leadRetryState = JSON.parse(fs.readFileSync(LEAD_RETRY_FILE, 'utf8')) || {};
 } catch { leadRetryState = {}; }
 function saveLeadRetryState() {
-  try { fs.writeFileSync(LEAD_RETRY_FILE, JSON.stringify(leadRetryState, null, 2)); } catch {}
+  safeWriteJSON(LEAD_RETRY_FILE, leadRetryState);
 }
 function getRetryCount(msgId) { return leadRetryState[msgId]?.count || 0; }
 function incRetryCount(msgId, err) {
