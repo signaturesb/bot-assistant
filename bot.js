@@ -3809,6 +3809,35 @@ const CENTRIS_BASE = 'https://www.centris.ca';
 // Session Centris (expire 2h)
 let centrisSession = { cookies: '', expiry: 0, authenticated: false };
 
+// ─── MFA Bridge — coordination Mac SMS bridge ↔ Centris OAuth flow ────────
+let pendingMFACode = null;       // dernier code reçu non consommé
+let mfaWaiters = [];             // resolveurs Promise en attente d'un code
+const smsBridgeHealth = { alive: false, lastHeartbeat: 0, lastCodeAt: 0, totalCodes: 0 };
+
+// Attend un code MFA depuis le bridge SMS Mac, max timeoutMs.
+// Si déjà un code en attente non consommé (récent <2min), le retourne tout de suite.
+async function awaitMFACode(timeoutMs = 120000) {
+  // Code déjà disponible <2min?
+  if (pendingMFACode && Date.now() - pendingMFACode.receivedAt < 120000) {
+    const code = pendingMFACode.code;
+    pendingMFACode = null;
+    return code;
+  }
+  // Attendre un nouveau code
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      mfaWaiters = mfaWaiters.filter(r => r !== resolve);
+      reject(new Error(`Timeout MFA ${timeoutMs/1000}s — pas de code SMS reçu via bridge Mac`));
+    }, timeoutMs);
+    const wrappedResolve = (code) => {
+      clearTimeout(t);
+      pendingMFACode = null; // consommé
+      resolve(code);
+    };
+    mfaWaiters.push(wrappedResolve);
+  });
+}
+
 // Headers communs Centris (simule mobile app)
 const CENTRIS_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
@@ -8551,6 +8580,62 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
           logActivity(`Sync GitHub: ${data.commits?.length||0} commits — SESSION_LIVE rechargé`);
         }
       } catch (e) { log('WARN', 'WEBHOOK', `GitHub: ${e.message}`); }
+    });
+    return;
+  }
+
+  // ─── /webhook/sms-bridge — pont iMessage Mac → bot pour codes MFA Centris ──
+  // Daemon Mac envoie ici les codes 6-digits captés depuis chat.db (Messages app).
+  // Auth: HMAC SHA-256 du body avec SMS_BRIDGE_SECRET partagé.
+  // Le code est stocké dans pendingMFA pour être consommé par le flow OAuth Centris.
+  if (req.method === 'POST' && url === '/webhook/sms-bridge') {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 30)) {
+      res.writeHead(429); res.end('too many requests'); return;
+    }
+    const expectedSecret = process.env.SMS_BRIDGE_SECRET || process.env.WEBHOOK_SECRET;
+    if (!expectedSecret) { res.writeHead(503); res.end('SMS_BRIDGE_SECRET not configured'); return; }
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 10000) req.destroy(); });
+    req.on('end', () => {
+      try {
+        // HMAC validation
+        const sigProvided = req.headers['x-bridge-signature'] || '';
+        const cryptoMod = require('crypto');
+        const expected = cryptoMod.createHmac('sha256', expectedSecret).update(body).digest('hex');
+        if (!sigProvided || !cryptoMod.timingSafeEqual(Buffer.from(sigProvided), Buffer.from(expected))) {
+          log('WARN', 'SECURITY', `SMS bridge bad HMAC from ${req.socket.remoteAddress}`);
+          res.writeHead(401); res.end('unauthorized'); return;
+        }
+        const data = JSON.parse(body);
+        // Heartbeat (daemon vivant)
+        if (data.heartbeat) {
+          smsBridgeHealth.lastHeartbeat = Date.now();
+          smsBridgeHealth.alive = true;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, type: 'heartbeat-ack' }));
+          return;
+        }
+        // Code MFA reçu
+        if (data.code && /^\d{4,8}$/.test(String(data.code))) {
+          pendingMFACode = { code: String(data.code), receivedAt: Date.now(), sender: data.sender, text: data.text?.substring(0, 200) };
+          // Notifie tous les waiters MFA (résolveurs en attente)
+          for (const resolver of mfaWaiters) {
+            try { resolver(pendingMFACode.code); } catch {}
+          }
+          mfaWaiters = [];
+          smsBridgeHealth.lastCodeAt = Date.now();
+          smsBridgeHealth.totalCodes = (smsBridgeHealth.totalCodes || 0) + 1;
+          log('OK', 'SMS-BRIDGE', `Code MFA reçu (${data.sender || '?'})`);
+          auditLogEvent('sms-bridge', 'code_received', { sender: data.sender, masked: data.code.substring(0,2)+'****' });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, type: 'code-ingested' }));
+          return;
+        }
+        res.writeHead(400); res.end('invalid payload');
+      } catch (e) {
+        log('WARN', 'SMS-BRIDGE', `Parse: ${e.message}`);
+        res.writeHead(400); res.end('bad json');
+      }
     });
     return;
   }

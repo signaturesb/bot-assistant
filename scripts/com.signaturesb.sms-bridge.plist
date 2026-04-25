@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Pont iMessage Mac → Bot Render pour codes MFA Centris/Auth0 -->
+    <!-- Always on, auto-restart si crash, log rotation 5MB -->
+    <key>Label</key>
+    <string>com.signaturesb.sms-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/signaturesb/Documents/github/Claude, code Telegram/scripts/sms-bridge.js</string>
+    </array>
+
+    <!-- Variables d'environnement (secret HMAC + URL bot) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SMS_BRIDGE_WEBHOOK</key>
+        <string>https://signaturesb-bot-s272.onrender.com/webhook/sms-bridge</string>
+        <!-- SMS_BRIDGE_SECRET injecté via launchctl setenv (voir install) -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Démarre au login + au boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Auto-restart si crash (KeepAlive bulletproof) -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Throttle restart si crash boucle (min 30s entre tentatives) -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Run as user, niceness normal -->
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/Users/signaturesb/Documents/github/Claude, code Telegram/logs/sms-bridge.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/signaturesb/Documents/github/Claude, code Telegram/logs/sms-bridge.stderr.log</string>
+
+    <!-- Exit avec status 0 si stable, sinon LaunchAgent restart -->
+    <key>ExitTimeOut</key>
+    <integer>10</integer>
+</dict>
+</plist>
