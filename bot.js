@@ -7764,28 +7764,22 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
-  // ─── RÈGLE ABSOLUE 2026-04-25 — CONSENT_REQUIRED ────────────────────────
-  // Zéro courriel ne s'envoie sans accord explicite de Shawn via Telegram.
-  // Tous les leads avec match → preview shawn@ + pending, JAMAIS auto-envoi.
-  // Shawn a dit: "souvent des clients me disent qu'il reçoivent des courriels
-  //  de ma part, et je n'étais même pas au courant"
-  // → branche auto-envoi à score ≥75 retirée. La logique pending preview
-  //   ci-dessous gère TOUS les cas. /pauseauto reste pour killswitch global.
-  } else if (false) { // legacy auto-send désactivé — laissé en place 1 cycle pour audit
-    // Score < AUTO_THRESHOLD OU infos incomplètes → preview + pending
+  // ─── RÈGLE CONSENT_REQUIRED — TOUS les leads → preview + pending ────────
+  // Tous les leads avec match Dropbox passent par preview shawn@ + pending
+  // Telegram avec boutons inline. JAMAIS d'auto-envoi (Shawn 2026-04-25).
+  } else if (email && hasMatch) {
     leadAudit.decision = 'pending_preview_sent';
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
     const why = !hasMinInfo
       ? `infos incomplètes (nom=${nom?'✓':'✗'} email=${email?'✓':'✗'} contact=${(telephone||centris)?'✓':'✗'})`
-      : `score match ${dbxMatch.score}/${AUTO_THRESHOLD}`;
+      : `match score ${dbxMatch.score}/100`;
     const docsList = dbxMatch.pdfs.slice(0, 10).map(p => `     • ${p.name}`).join('\n');
-    autoEnvoiMsg = `\n📦 *Docs en attente* (${why})\n` +
+    autoEnvoiMsg = `\n📦 *Docs prêts — attend ton OK* (${why})\n` +
                    `   Dossier: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
-                   `   ${dbxMatch.pdfs.length} docs prêts:\n${docsList}\n` +
+                   `   ${dbxMatch.pdfs.length} docs:\n${docsList}\n` +
                    `   📧 Preview envoyé sur ${AGENT.email}\n` +
-                   `   ✅ Dis \`envoie les docs à ${email}\` pour livrer\n` +
-                   `   ❌ Dis \`annule ${email}\` pour ignorer`;
+                   `   ✅ Click le bouton ci-dessous OU dis \`envoie les docs à ${email}\``;
   } else if (email && dbxMatch?.candidates?.length) {
     leadAudit.decision = 'multiple_candidates';
     autoEnvoiMsg = `\n🔍 Plusieurs candidats Dropbox — check lequel est le bon avant d'envoyer`;
