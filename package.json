@@ -14,7 +14,10 @@
     "security-status": "node scripts/security-status.js",
     "doctor": "node scripts/doctor.js",
     "audit-history": "bash scripts/audit-history.sh",
+    "test": "node test_all.js",
+    "test-smoke": "node test_all.js --smoke",
     "test-parser": "node test_parser.js",
+    "test-firecrawl": "node test_firecrawl.js",
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {

@@ -276,6 +276,19 @@ try {
 
 // (rate limiting webhooks géré par webhookRateOK() défini plus bas — DRY)
 
+// ─── Timeout wrapper pour crons ──────────────────────────────────────────
+// Empêche un cron stuck (API hang, infinite loop) de bloquer event loop
+// indéfiniment. Si timeout dépassé → log + sortie propre, prochain run réessaie.
+function cronTimeout(label, fn, timeoutMs = 120000) {
+  return Promise.race([
+    Promise.resolve().then(fn).catch(e => log('WARN', 'CRON', `${label}: ${e.message?.substring(0, 150) || e}`)),
+    new Promise(res => setTimeout(() => {
+      log('WARN', 'CRON', `${label}: TIMEOUT ${timeoutMs/1000}s — abandonné`);
+      res();
+    }, timeoutMs)),
+  ]);
+}
+
 // ─── HTML escape helper — protection XSS ─────────────────────────────────
 // Toute valeur dérivée d'un lead (nom, adresse, email, etc.) qui est
 // injectée dans un template HTML DOIT passer par escapeHtml() pour éviter
@@ -1700,13 +1713,18 @@ async function loadPollerStateFromGist() {
 async function savePollerStateToGist() {
   if (!gistId || !process.env.GITHUB_TOKEN) return;
   try {
+    const files = {
+      'gmail_poller.json': { content: JSON.stringify(gmailPollerState, null, 2) },
+      'leads_dedup.json':  { content: JSON.stringify(Object.fromEntries(recentLeadsByKey), null, 2) },
+    };
+    // Backup email_outbox aussi (audit trail des envois) — garde 200 derniers
+    if (typeof emailOutbox !== 'undefined' && emailOutbox.length) {
+      files['email_outbox.json'] = { content: JSON.stringify(emailOutbox.slice(-200), null, 2) };
+    }
     await fetch(`https://api.github.com/gists/${gistId}`, {
       method: 'PATCH',
       headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ files: {
-        'gmail_poller.json': { content: JSON.stringify(gmailPollerState, null, 2) },
-        'leads_dedup.json':  { content: JSON.stringify(Object.fromEntries(recentLeadsByKey), null, 2) },
-      }})
+      body: JSON.stringify({ files }),
     });
   } catch (e) { log('WARN', 'GIST', `Save poller: ${e.message}`); }
 }
@@ -5323,6 +5341,64 @@ function registerHandlers() {
     }
   });
 
+  // /help (alias /aide /commandes) — liste auto-générée des commandes + tools
+  bot.onText(/\/help|\/aide|\/commandes/i, async msg => {
+    if (!isAllowed(msg)) return;
+    const sections = [
+      '*🎯 ACTIONS LEAD*',
+      '`/today` `/jour` `/agenda` — agenda du jour',
+      '`/pending` — leads + docs en attente',
+      '`/lead-audit <query>` — trace lead',
+      '`/retry-centris <#>` — récupère lead dedup',
+      '`/retry-email <email>` — équivalent par email',
+      '`/forcelead <msgId>` — force traitement Gmail msg',
+      '`/test-email <#> [email]` — simule lead factice',
+      '`/flush-pending` — retry tous pendings (avec consent)',
+      '`nom Prénom Nom` — complète pending lead',
+      '`envoie les docs à <email>` — confirme envoi',
+      '`annule <email>` — annule pending',
+      '',
+      '*📊 STATUS / DIAGNOSTIC*',
+      '`/diagnose` `/diag` — test 13 composants',
+      '`/score` `/sante` — health score 0-100',
+      '`/cout` `/cost` — coûts Anthropic + cache',
+      '`/quota` `/plan` — plan SaaS + quotas',
+      '`/checkemail` — scan manuel 48h',
+      '`/poller` — stats Gmail poller',
+      '`/logs [N] [cat]` — dernières N logs',
+      '`/firecrawl` — quota scraping',
+      '',
+      '*🔧 OPS*',
+      '`/pauseauto` — toggle auto-envoi global',
+      '`/baseline` — marque tous leads vus comme déjà traités',
+      '`/backup` — backup Gist manuel',
+      '`/cleanemail` — purge emails GitHub/Render/CI',
+      '`/parselead <msgId>` — debug parser',
+      '`/status` `/reset` `/start`',
+      '',
+      `*🛠 TOOLS DISPONIBLES* (${TOOLS.length})`,
+      '_Kira utilise ces outils automatiquement quand tu lui parles:_',
+      ...TOOLS.map(t => `• \`${t.name}\``).reduce((acc, line) => {
+        const last = acc[acc.length - 1] || '';
+        if (last.length + line.length > 80) acc.push(line); else acc[acc.length - 1] = last ? last + ' · ' + line : line;
+        return acc;
+      }, []),
+    ].join('\n');
+    // Telegram limite 4096 chars — split si trop long
+    const chunks = [];
+    let current = '';
+    for (const line of sections.split('\n')) {
+      if ((current + line + '\n').length > 3800) { chunks.push(current); current = ''; }
+      current += line + '\n';
+    }
+    if (current) chunks.push(current);
+    for (const chunk of chunks) {
+      await bot.sendMessage(msg.chat.id, chunk, { parse_mode: 'Markdown' }).catch(() =>
+        bot.sendMessage(msg.chat.id, chunk.replace(/[*_`]/g, '')).catch(() => {})
+      );
+    }
+  });
+
   // /firecrawl — statut quota + dernières villes scrapées
   bot.onText(/\/firecrawl\b/i, async msg => {
     if (!isAllowed(msg)) return;
@@ -8692,23 +8768,110 @@ async function main() {
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
-  // ── Self-test Telegram: ping Shawn au boot pour confirmer connectivité ────
-  // Si ce message arrive pas à chaque redeploy → problème Telegram webhook/token.
-  // Timeout 10s pour laisser le webhook se sync d'abord.
+  // ── PRE-FLIGHT CHECK COMPLET au boot ────────────────────────────────────
+  // Vérifie env vars critiques + ping chaque API + check disk space.
+  // Si misconfig détectée → alerte Telegram immédiate avec diagnostic exact.
+  // 10s après boot pour laisser le webhook se sync d'abord.
   setTimeout(async () => {
-    const bootMsg = [
-      `✅ *Bot redémarré*`,
+    const checks = [];
+    const t0 = Date.now();
+
+    // Env vars critiques
+    const envRequired = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_ALLOWED_USER_ID', 'ANTHROPIC_API_KEY'];
+    const envMissing = envRequired.filter(v => !process.env[v]);
+    if (envMissing.length) checks.push({ ok: false, label: 'Env vars critiques', detail: `MANQUANT: ${envMissing.join(', ')}` });
+    else checks.push({ ok: true, label: 'Env vars critiques', detail: 'OK' });
+
+    // Env vars optionnels (warn si manquant mais pas bloquant)
+    const envOptional = { GMAIL_CLIENT_ID: 'Gmail désactivé', PIPEDRIVE_API_KEY: 'Pipedrive désactivé', BREVO_API_KEY: 'Brevo désactivé', DROPBOX_REFRESH_TOKEN: 'Dropbox désactivé' };
+    const optMissing = Object.entries(envOptional).filter(([k]) => !process.env[k]).map(([,v]) => v);
+    checks.push({ ok: optMissing.length === 0, label: 'Env vars optionnels', detail: optMissing.length ? optMissing.join(', ') : 'tous présents' });
+
+    // Disk space
+    try {
+      const stat = fs.statSync(DATA_DIR);
+      const testFile = path.join(DATA_DIR, '.preflight_write');
+      fs.writeFileSync(testFile, 'ok'); fs.unlinkSync(testFile);
+      checks.push({ ok: true, label: 'Disque writable', detail: DATA_DIR });
+    } catch (e) {
+      checks.push({ ok: false, label: 'Disque writable', detail: e.message.substring(0, 80) });
+    }
+
+    // Ping Telegram (self-test connectivité)
+    let tgOK = false;
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, { signal: AbortSignal.timeout(8000) });
+      tgOK = r.ok;
+      checks.push({ ok: tgOK, label: 'Telegram API', detail: tgOK ? 'getMe OK' : `HTTP ${r.status}` });
+    } catch (e) { checks.push({ ok: false, label: 'Telegram API', detail: e.message.substring(0, 80) }); }
+
+    // Ping Anthropic
+    if (process.env.ANTHROPIC_API_KEY) {
+      try {
+        const r = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 5, messages: [{ role: 'user', content: 'ok' }] }),
+          signal: AbortSignal.timeout(10000),
+        });
+        checks.push({ ok: r.ok, label: 'Anthropic API', detail: r.ok ? 'haiku ping OK' : `HTTP ${r.status}` });
+      } catch (e) { checks.push({ ok: false, label: 'Anthropic API', detail: e.message.substring(0, 80) }); }
+    }
+
+    // Ping Pipedrive si configuré
+    if (PD_KEY) {
+      try {
+        const r = await pdGet('/users/me').catch(() => null);
+        checks.push({ ok: !!r?.data, label: 'Pipedrive API', detail: r?.data ? `user ${r.data.email || 'OK'}` : 'échec' });
+      } catch (e) { checks.push({ ok: false, label: 'Pipedrive API', detail: e.message.substring(0, 80) }); }
+    }
+
+    // Ping Dropbox si configuré
+    if (process.env.DROPBOX_REFRESH_TOKEN) {
+      try {
+        const r = await dropboxAPI('https://api.dropboxapi.com/2/users/get_current_account', {});
+        checks.push({ ok: !!r?.ok, label: 'Dropbox API', detail: r?.ok ? 'auth OK' : `HTTP ${r?.status || '?'}` });
+      } catch (e) { checks.push({ ok: false, label: 'Dropbox API', detail: e.message.substring(0, 80) }); }
+    }
+
+    // Ping Gmail si configuré
+    if (process.env.GMAIL_CLIENT_ID) {
+      try {
+        const tok = await getGmailToken();
+        checks.push({ ok: !!tok, label: 'Gmail token', detail: tok ? 'refresh OK' : 'NULL' });
+      } catch (e) { checks.push({ ok: false, label: 'Gmail token', detail: e.message.substring(0, 80) }); }
+    }
+
+    // Ping Firecrawl si configuré
+    if (process.env.FIRECRAWL_API_KEY) {
+      try {
+        const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${process.env.FIRECRAWL_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: 'https://example.com', formats: ['markdown'] }),
+          signal: AbortSignal.timeout(15000),
+        });
+        checks.push({ ok: r.ok, label: 'Firecrawl API', detail: r.ok ? 'scrape OK' : `HTTP ${r.status}` });
+      } catch (e) { checks.push({ ok: false, label: 'Firecrawl API', detail: e.message.substring(0, 80) }); }
+    }
+
+    const dur = Date.now() - t0;
+    const failed = checks.filter(c => !c.ok);
+    const lines = [
+      failed.length === 0 ? `✅ *Bot démarré — tous systèmes OK* (${dur}ms)` : `🚨 *Bot démarré — ${failed.length} problème(s) détecté(s)*`,
+      ``,
       `🤖 Modèle: \`${currentModel}\``,
       `🛠 Outils: ${TOOLS.length}`,
       `📊 Leads en attente: ${pendingLeads.filter(l=>l.needsName).length}`,
       `📦 Docs en attente: ${(typeof pendingDocSends !== 'undefined' ? pendingDocSends.size : 0)}`,
-      `⏱ Poller: ${(parseInt(process.env.GMAIL_POLL_INTERVAL_MS || '30000')/1000)}s`,
       ``,
-      `_Test d'envoi: si tu lis ce message, Telegram fonctionne._`,
+      ...checks.map(c => `${c.ok ? '✅' : '🔴'} ${c.label}: ${c.detail}`),
     ].join('\n');
-    const sent = await sendTelegramWithFallback(bootMsg, { category: 'boot-self-test' });
-    if (sent) log('OK', 'BOOT', '✅ Self-test Telegram: notif reçue par Shawn');
-    else log('WARN', 'BOOT', '⚠️ Self-test Telegram: tous canaux ont échoué (check ALLOWED_ID + TELEGRAM_BOT_TOKEN)');
+
+    const sent = await sendTelegramWithFallback(lines, { category: failed.length ? 'boot-preflight-issues' : 'boot-preflight-ok' });
+    if (sent) log('OK', 'BOOT', `✅ Pre-flight: ${checks.length - failed.length}/${checks.length} OK`);
+    else log('WARN', 'BOOT', '⚠️ Pre-flight envoyé localement seulement — Telegram non joignable');
+    if (failed.length) auditLogEvent('boot', 'preflight_issues', { failed: failed.map(f => ({ label: f.label, detail: f.detail })) });
   }, 10000);
 
   setTimeout(() => syncStatusGitHub().catch(() => {}), 30000);
