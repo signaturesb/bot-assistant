@@ -4235,14 +4235,38 @@ async function detectAnomalies() {
     anomalies.push({ key: 'no_leads_processed', msg: `${pollerStatsRef.runs} polls, ${pollerStatsRef.totalsFound} emails vus, mais 0 traité/dedup — source detection ou parser cassé`, severity: 'high' });
   }
 
-  // 2b. Silence poller anormal en heures ouvrables (8h-20h America/Toronto jours semaine).
-  // Le métier immobilier génère normalement ≥1 lead/24h. Si 24h sans rien → alerte.
+  // 2b. Silence poller anormal en heures ouvrables.
+  // Définition VRAIE du silence: 0 lead processé OU dedup'd depuis le boot
+  // après >500 polls (pas juste 0 auto-sent: un lead peut être auto_skipped,
+  // no_dropbox_match, blocked, etc. — c'est de l'activité légitime).
   const nowDate = new Date();
-  const torontoHour = (nowDate.getUTCHours() - 4 + 24) % 24; // approx EDT
-  const torontoDay = nowDate.getUTCDay(); // 0=dim 6=sam
+  const torontoHour = (nowDate.getUTCHours() - 4 + 24) % 24;
+  const torontoDay = nowDate.getUTCDay();
   const isBusinessHours = torontoDay >= 1 && torontoDay <= 5 && torontoHour >= 8 && torontoHour <= 20;
-  if (isBusinessHours && pollerStatsRef.runs > 200 && pollerStatsRef.totalsAutoSent === 0 && pollerStatsRef.totalsPending === 0) {
-    anomalies.push({ key: 'business_silence', msg: `Business hours + ${pollerStatsRef.runs} polls mais 0 auto-sent/pending — qqch est cassé`, severity: 'high' });
+  const totalActivity = (pollerStatsRef.totalsProcessed || 0) + (pollerStatsRef.totalsDedup || 0);
+  if (isBusinessHours && pollerStatsRef.runs > 500 && totalActivity === 0 && (pollerStatsRef.totalsFound || 0) > 100) {
+    anomalies.push({
+      key: 'business_silence',
+      msg: `${pollerStatsRef.runs} polls + ${pollerStatsRef.totalsFound} emails mais 0 lead vu — source detection ou parser cassé`,
+      severity: 'high',
+    });
+  }
+  // 2b-bis: alerte SOFT si 0 auto-sent ET 0 pending depuis longtemps (peut-être
+  // que tous les leads sont auto_skipped ou no_match). Severity medium.
+  if (isBusinessHours && pollerStatsRef.runs > 1000 &&
+      (pollerStatsRef.totalsAutoSent || 0) === 0 &&
+      (pollerStatsRef.totalsPending || 0) === 0 &&
+      (pollerStatsRef.totalsProcessed || 0) > 5) {
+    const reasons = [];
+    if (pollerStatsRef.totalsNoMatch) reasons.push(`${pollerStatsRef.totalsNoMatch} no_dropbox_match`);
+    if (pollerStatsRef.totalsAutoSkipped) reasons.push(`${pollerStatsRef.totalsAutoSkipped} auto_skipped`);
+    if (pollerStatsRef.totalsAutoFailed) reasons.push(`${pollerStatsRef.totalsAutoFailed} auto_failed`);
+    if (pollerStatsRef.totalsBlocked) reasons.push(`${pollerStatsRef.totalsBlocked} blocked`);
+    anomalies.push({
+      key: 'no_auto_send_warning',
+      msg: `${pollerStatsRef.totalsProcessed} leads traités mais 0 auto-sent · ${reasons.join(' · ') || 'voir /lead-audit'}`,
+      severity: 'medium',
+    });
   }
 
   // 2c. Pendings qui s'accumulent (>5 pendingDocSends OU >3 pendingLeads needsName)
@@ -4945,14 +4969,30 @@ function registerHandlers() {
       const decisionEmoji = {
         auto_sent: '🚀', pending_preview_sent: '📦', pending_invalid_name: '⚠️',
         dedup_skipped: '♻️', auto_failed: '❌', auto_exception: '❌',
-        no_dropbox_match: '🔍', blocked_suspect_name: '🛑',
+        auto_skipped: '⏭', no_dropbox_match: '🔍', blocked_suspect_name: '🛑',
         multiple_candidates: '🔀', max_retries_exhausted: '💀',
+        skipped_no_email_or_deal: '📭',
       };
       for (const [d, n] of Object.entries(leadsByDecision).sort((a, b) => b[1] - a[1])) {
         lines.push(`  ${decisionEmoji[d] || '•'} ${d}: ${n}`);
       }
     }
     lines.push('');
+
+    // Stats poller cumulatives (pourquoi 0 auto-sent éventuel)
+    const ps = pollerStats;
+    if (ps.totalsProcessed > 0 && (ps.totalsAutoSent || 0) === 0) {
+      lines.push('⚠️ *Aucun auto-sent depuis boot — pourquoi?*');
+      const breakdown = [];
+      if (ps.totalsNoMatch) breakdown.push(`🔍 ${ps.totalsNoMatch} no_dropbox_match`);
+      if (ps.totalsAutoSkipped) breakdown.push(`⏭ ${ps.totalsAutoSkipped} auto_skipped (score <${process.env.AUTO_SEND_THRESHOLD || 75})`);
+      if (ps.totalsAutoFailed) breakdown.push(`❌ ${ps.totalsAutoFailed} auto_failed`);
+      if (ps.totalsBlocked) breakdown.push(`🛑 ${ps.totalsBlocked} blocked_suspect_name`);
+      if (ps.totalsSkippedNoEmail) breakdown.push(`📭 ${ps.totalsSkippedNoEmail} pas d'email`);
+      lines.push(...breakdown.map(b => `  ${b}`));
+      lines.push(`  💡 Inspect: \`/lead-audit <email>\` pour voir le détail d'un lead`);
+      lines.push('');
+    }
 
     // Poller health
     if (pollerAge !== null) {
@@ -7873,9 +7913,18 @@ async function runGmailLeadPoller(opts = {}) {
           }
           scan.processed++;
           if (result.dealId) scan.dealCreated++;
-          if (result.decision === 'auto_sent') scan.autoSent++;
-          else if (result.decision === 'dedup_skipped') scan.dedup++;
-          else if (String(result.decision || '').startsWith('pending')) scan.pending++;
+          // Compteurs exhaustifs par décision (chaque lead doit incrémenter UN bucket)
+          const dec = String(result.decision || 'unknown');
+          if (dec === 'auto_sent')              scan.autoSent++;
+          else if (dec === 'dedup_skipped')     scan.dedup++;
+          else if (dec.startsWith('pending'))   scan.pending++;
+          else if (dec === 'auto_skipped')      scan.autoSkipped = (scan.autoSkipped || 0) + 1;
+          else if (dec === 'auto_failed' || dec === 'auto_exception') scan.autoFailed = (scan.autoFailed || 0) + 1;
+          else if (dec === 'no_dropbox_match')  scan.noMatch = (scan.noMatch || 0) + 1;
+          else if (dec === 'multiple_candidates') scan.multiCandidate = (scan.multiCandidate || 0) + 1;
+          else if (dec === 'blocked_suspect_name') scan.blocked = (scan.blocked || 0) + 1;
+          else if (dec === 'skipped_no_email_or_deal') scan.skippedNoEmail = (scan.skippedNoEmail || 0) + 1;
+          else                                  scan.otherDecision = (scan.otherDecision || 0) + 1;
           newLeads++;
           await new Promise(r => setTimeout(r, 1500));
         } catch (e) {
@@ -7905,6 +7954,11 @@ async function runGmailLeadPoller(opts = {}) {
     pollerStats.totalsPending    = (pollerStats.totalsPending || 0) + scan.pending;
     pollerStats.totalsDedup      = (pollerStats.totalsDedup || 0) + scan.dedup;
     pollerStats.totalsProcessed  = (pollerStats.totalsProcessed || 0) + scan.processed;
+    pollerStats.totalsAutoSkipped= (pollerStats.totalsAutoSkipped || 0) + (scan.autoSkipped || 0);
+    pollerStats.totalsAutoFailed = (pollerStats.totalsAutoFailed || 0) + (scan.autoFailed || 0);
+    pollerStats.totalsNoMatch    = (pollerStats.totalsNoMatch || 0) + (scan.noMatch || 0);
+    pollerStats.totalsBlocked    = (pollerStats.totalsBlocked || 0) + (scan.blocked || 0);
+    pollerStats.totalsSkippedNoEmail = (pollerStats.totalsSkippedNoEmail || 0) + (scan.skippedNoEmail || 0);
     pollerStats.totalsErrors     += scan.errors;
     pollerStats.lastRun = new Date().toISOString();
     pollerStats.lastDuration = Date.now() - t0;
