@@ -1387,9 +1387,15 @@ async function dropboxAPI(apiUrl, body, isDownload = false) {
     const ok = await refreshDropboxToken();
     if (!ok) { log('ERR', 'DROPBOX', 'Refresh échoué — Dropbox inaccessible'); return null; }
   }
+  // Endpoints sans paramètres (ex: /users/get_current_account) doivent avoir
+  // body=null, pas {}. Dropbox retourne 400 sur {} pour ces endpoints.
+  const noBodyEndpoints = /\/users\/get_current_account|\/users\/get_space_usage/;
+  const isNoBody = noBodyEndpoints.test(apiUrl) || body === null;
   const makeReq = (token) => isDownload
     ? fetch(apiUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify(body) } })
-    : fetch(apiUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    : isNoBody
+      ? fetch(apiUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } })
+      : fetch(apiUrl, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   let res = await makeReq(dropboxToken);
   if (res.status === 401) {
     log('WARN', 'DROPBOX', 'Token expiré — refresh...');
