@@ -429,7 +429,19 @@ if (!Array.isArray(kiramem.facts)) kiramem.facts = [];
 
 function buildMemoryBlock() {
   if (!kiramem.facts.length) return '';
-  return `\n\n📝 Mémoire persistante:\n${kiramem.facts.map(f => `- ${f}`).join('\n')}`;
+  // Grouper par catégorie pour que Claude fasse des liens stratégiques
+  const groups = {};
+  for (const f of kiramem.facts) {
+    const m = f.match(/\[(CLIENT|PARTENAIRE|MARCHE|VENTE|PROPRIETE|STRATEGIE|REFERENCE)\]/);
+    const cat = m ? m[1] : 'AUTRE';
+    (groups[cat] ||= []).push(f);
+  }
+  const order = ['CLIENT', 'PROPRIETE', 'VENTE', 'MARCHE', 'REFERENCE', 'PARTENAIRE', 'STRATEGIE', 'AUTRE'];
+  const sections = order.filter(c => groups[c]?.length).map(cat => {
+    const emoji = { CLIENT:'👤', PROPRIETE:'🏡', VENTE:'💰', MARCHE:'📊', REFERENCE:'🔗', PARTENAIRE:'🤝', STRATEGIE:'⚙️', AUTRE:'📝' }[cat];
+    return `${emoji} ${cat} (${groups[cat].length}):\n${groups[cat].map(f => `  - ${f.replace(/^\[\w+\]\s*/, '')}`).join('\n')}`;
+  }).join('\n\n');
+  return `\n\n━━ MÉMOIRE STRATÉGIQUE (utilise pour faire des liens entre prospects, propriétés, ventes) ━━\n${sections}`;
 }
 
 // ─── System prompt (dynamique — fondation SaaS) ───────────────────────────────
@@ -1058,24 +1070,28 @@ async function extractDurableFacts(chatId, history) {
       return `${m.role === 'user' ? AGENT.prenom : 'Bot'}: ${c.substring(0, 600)}`;
     }).join('\n').substring(0, 6000);
 
-    const prompt = `Dans cet échange récent entre Shawn (courtier RE/MAX) et son bot, extrais UNIQUEMENT les FAITS DURABLES qui méritent d'être mémorisés pour la suite. Réponds en JSON array pur, max 5 faits, chacun ≤150 chars.
+    const prompt = `Dans cet échange récent entre Shawn (courtier RE/MAX Lanaudière) et son bot, extrais les FAITS STRATÉGIQUES qui peuvent augmenter ses ventes futures. Préfixe chaque fait avec sa CATÉGORIE entre crochets.
 
-Critères FAIT DURABLE:
-- Nouveau prospect mentionné (nom + contact + Centris# ou adresse)
-- Document important envoyé ou échoué (qui/quoi/quand/résultat)
-- Décision business prise (prix, stratégie, timing)
-- Configuration/préférence exprimée par Shawn ("je veux toujours X")
-- Problème identifié ou résolu avec impact persistant
+Catégories possibles (utilise le tag exact):
+- [CLIENT] Préférences/comportement d'un prospect/acheteur (ex: "Jean Tremblay préfère terrains avec puits, budget 200K")
+- [PARTENAIRE] Info sur partenaire/courtier collègue/inspecteur (ex: "Inspecteur Dupuis 514-555 disponible weekends")
+- [MARCHE] Tendance/donnée marché Lanaudière observée (ex: "Terrains Rawdon <1 acre se vendent en <30j en 2026")
+- [VENTE] Pattern qui a converti (ex: "Argument financement ProFab a fermé le deal Tremblay")
+- [PROPRIETE] Spécificité d'une inscription (ex: "Centris #X a problème puits identifié, baisser prix de 5K")
+- [STRATEGIE] Décision/préférence Shawn pour le bot ("toujours envoyer fiche détaillée en premier")
+- [REFERENCE] Lien entre clients (ex: "Marie Dubois a référé Sophie L. — terrain Chertsey")
 
 PAS de faits:
-- Conversations courtoises, confirmations "ok"
-- Infos évidentes (ex: "Shawn est courtier RE/MAX")
-- Détails techniques transitoires
+- Conversations courtoises, confirmations "ok", "merci"
+- Infos évidentes (Shawn est courtier RE/MAX)
+- Détails techniques bot transitoires
+- Activité simple sans insight (ex: "deal X créé")
 
 ÉCHANGE:
 ${asText}
 
-Retourne UNIQUEMENT un JSON array: ["fait 1", "fait 2", ...] ou [] si rien à retenir.`;
+Max 5 faits stratégiques, chacun ≤180 chars (avec catégorie).
+Retourne UNIQUEMENT un JSON array: ["[CLIENT] fait 1", "[MARCHE] fait 2", ...] ou [] si rien à retenir.`;
 
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 10000);
@@ -1110,8 +1126,8 @@ Retourne UNIQUEMENT un JSON array: ["fait 1", "fait 2", ...] ou [] si rien à re
       added.push(fact);
     }
     if (added.length > 0) {
-      // Cap à 100 faits (garde les plus récents)
-      if (kiramem.facts.length > 100) kiramem.facts.splice(0, kiramem.facts.length - 100);
+      // Cap à 200 faits (garde les plus récents) — augmenté pour mémoire stratégique catégorisée
+      if (kiramem.facts.length > 200) kiramem.facts.splice(0, kiramem.facts.length - 200);
       kiramem.updatedAt = new Date().toISOString();
       saveJSON(MEM_FILE, kiramem);
       saveMemoryToGist().catch(() => {});
@@ -5684,6 +5700,158 @@ function registerHandlers() {
     }
   });
 
+  // /insights — DASHBOARD STRATÉGIQUE pour augmenter ventes
+  // Connecte Pipedrive + audit log + mémoire pour identifier:
+  //   • Leads chauds (haute probabilité conversion)
+  //   • Deals à risque (stagnants depuis X jours)
+  //   • Opportunités cross-sell (matchs récurrents)
+  //   • Actions recommandées immédiates
+  bot.onText(/^\/insights|\/strategie|\/intelligence/i, async msg => {
+    if (!isAllowed(msg)) return;
+    if (!PD_KEY) return bot.sendMessage(msg.chat.id, '❌ PIPEDRIVE_API_KEY requis pour /insights');
+    await bot.sendMessage(msg.chat.id, `🧠 *Analyse stratégique en cours...*\n_(Pipedrive + audit log + mémoire)_`, { parse_mode: 'Markdown' });
+
+    const t0 = Date.now();
+    // Parallélisation: tout en même temps
+    const [actifs, gagnes, leadsAudit] = await Promise.all([
+      pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=100`).catch(() => null),
+      pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=won&limit=50`).catch(() => null),
+      Promise.resolve((auditLog || []).filter(e => e.category === 'lead').slice(-100)),
+    ]);
+    const dealsActifs = actifs?.data || [];
+    const dealsGagnes = gagnes?.data || [];
+    const now = Date.now();
+
+    // 1. LEADS CHAUDS — score basé sur activité récente + étape avancée + qualité extraction
+    const leadsChauds = [];
+    for (const d of dealsActifs) {
+      const ageJ = d.add_time ? Math.floor((now - new Date(d.add_time).getTime()) / 86400000) : 999;
+      const lastActJ = d.last_activity_date ? Math.floor((now - new Date(d.last_activity_date).getTime()) / 86400000) : 999;
+      let score = 50;
+      // Étape avancée = chaud
+      if (d.stage_id === 52) score += 25; // visite prévue
+      if (d.stage_id === 53) score += 30; // visite faite
+      if (d.stage_id === 54) score += 35; // offre
+      // Activité récente
+      if (lastActJ <= 1) score += 20;
+      else if (lastActJ <= 3) score += 10;
+      else if (lastActJ > 14) score -= 20;
+      // Lead frais
+      if (ageJ <= 7) score += 15;
+      // Valeur deal
+      if (d.value > 200000) score += 10;
+      if (score >= 80) leadsChauds.push({ deal: d, score, ageJ, lastActJ });
+    }
+    leadsChauds.sort((a, b) => b.score - a.score);
+
+    // 2. DEALS À RISQUE — actifs mais aucune activité récente OU stagnants
+    const dealsRisque = [];
+    for (const d of dealsActifs) {
+      const ageJ = d.add_time ? Math.floor((now - new Date(d.add_time).getTime()) / 86400000) : 0;
+      const lastActJ = d.last_activity_date ? Math.floor((now - new Date(d.last_activity_date).getTime()) / 86400000) : ageJ;
+      // Stagnant = aucune action depuis 7j+ ET ouvert depuis >5j
+      if (lastActJ >= 7 && ageJ >= 5 && d.stage_id !== 55) {
+        dealsRisque.push({ deal: d, ageJ, lastActJ });
+      }
+    }
+    dealsRisque.sort((a, b) => b.lastActJ - a.lastActJ);
+
+    // 3. PATTERNS LEADS récents — quelle source convertit le mieux?
+    const sourceStats = {};
+    for (const e of leadsAudit) {
+      const src = e.details?.source || 'inconnu';
+      const dec = e.details?.decision || 'unknown';
+      sourceStats[src] = sourceStats[src] || { total: 0, autoSent: 0, pending: 0, dedup: 0 };
+      sourceStats[src].total++;
+      if (dec === 'auto_sent') sourceStats[src].autoSent++;
+      else if (dec.startsWith('pending')) sourceStats[src].pending++;
+      else if (dec === 'dedup_skipped') sourceStats[src].dedup++;
+    }
+
+    // 4. WINS récents — moyenne valeur deal gagné dernier 30j
+    const recentWins = dealsGagnes.filter(d => {
+      const closeT = d.close_time || d.won_time;
+      return closeT && (now - new Date(closeT).getTime()) < 30 * 86400000;
+    });
+    const avgWonValue = recentWins.length ? recentWins.reduce((s, d) => s + (d.value || 0), 0) / recentWins.length : 0;
+    const totalWonValue = recentWins.reduce((s, d) => s + (d.value || 0), 0);
+
+    const dur = ((Date.now() - t0) / 1000).toFixed(1);
+    const lines = [
+      `🧠 *Insights Stratégiques* (${dur}s)`,
+      ``,
+      `*📈 Wins 30 derniers jours:*`,
+      `  ${recentWins.length} deals gagnés · $${totalWonValue.toLocaleString('fr-CA')} total`,
+      `  Moyenne par deal: $${Math.round(avgWonValue).toLocaleString('fr-CA')}`,
+      ``,
+    ];
+
+    // Leads chauds
+    if (leadsChauds.length) {
+      lines.push(`*🔥 LEADS CHAUDS — priorité contact (${leadsChauds.length}):*`);
+      for (const { deal, score, ageJ, lastActJ } of leadsChauds.slice(0, 5)) {
+        const stage = (typeof PD_STAGES !== 'undefined' && PD_STAGES[deal.stage_id]) || `stage ${deal.stage_id}`;
+        lines.push(`  🌶 *${deal.title}* (score ${score})`);
+        lines.push(`     ${stage} · ${ageJ}j · dernière act ${lastActJ}j`);
+        if (deal.value > 0) lines.push(`     Valeur: $${deal.value.toLocaleString('fr-CA')}`);
+      }
+      lines.push('');
+    }
+
+    // Deals à risque
+    if (dealsRisque.length) {
+      lines.push(`*⚠️ DEALS À RISQUE — relance recommandée (${dealsRisque.length}):*`);
+      for (const { deal, ageJ, lastActJ } of dealsRisque.slice(0, 5)) {
+        const stage = (typeof PD_STAGES !== 'undefined' && PD_STAGES[deal.stage_id]) || `stage ${deal.stage_id}`;
+        lines.push(`  ❄️  *${deal.title}*`);
+        lines.push(`     ${stage} · ${ageJ}j ouvert · ${lastActJ}j sans contact`);
+        lines.push(`     💡 Suggestion: \`creer_activite ${deal.title} appel\``);
+      }
+      lines.push('');
+    }
+
+    // Patterns sources
+    const sortedSources = Object.entries(sourceStats).sort((a, b) => b[1].total - a[1].total);
+    if (sortedSources.length) {
+      lines.push(`*📊 SOURCES (${leadsAudit.length} leads récents):*`);
+      for (const [src, s] of sortedSources.slice(0, 5)) {
+        const conversionRate = s.total > 0 ? Math.round((s.autoSent / s.total) * 100) : 0;
+        lines.push(`  ${src}: ${s.total} leads · ${s.autoSent} auto-sent (${conversionRate}%) · ${s.pending} pending`);
+      }
+      lines.push('');
+    }
+
+    // Pipeline summary
+    const stageGroups = {};
+    for (const d of dealsActifs) {
+      const stage = (typeof PD_STAGES !== 'undefined' && PD_STAGES[d.stage_id]) || `stage ${d.stage_id}`;
+      stageGroups[stage] = (stageGroups[stage] || 0) + 1;
+    }
+    if (Object.keys(stageGroups).length) {
+      lines.push(`*📂 PIPELINE actuel (${dealsActifs.length} deals actifs):*`);
+      for (const [s, n] of Object.entries(stageGroups).sort((a, b) => b[1] - a[1])) {
+        lines.push(`  ${s}: ${n}`);
+      }
+      lines.push('');
+    }
+
+    // Actions recommandées
+    lines.push(`*⚡ ACTIONS RECOMMANDÉES AUJOURD'HUI:*`);
+    if (leadsChauds.length > 0) lines.push(`  📞 Appeler les ${Math.min(3, leadsChauds.length)} leads les plus chauds (score >80)`);
+    if (dealsRisque.length > 0) lines.push(`  💬 Relancer ${dealsRisque.length} deal(s) stagnant(s) >7j`);
+    if (recentWins.length === 0) lines.push(`  ⚠️ Aucun deal gagné en 30j — analyser le pipeline`);
+    if (!leadsChauds.length && !dealsRisque.length) lines.push(`  ✅ Pipeline propre — focus prospection`);
+
+    const txt = lines.join('\n');
+    const chunks = [];
+    for (let i = 0; i < txt.length; i += 3800) chunks.push(txt.slice(i, i + 3800));
+    for (const c of chunks) {
+      await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() =>
+        bot.sendMessage(msg.chat.id, c.replace(/[*_`]/g, '')).catch(() => {})
+      );
+    }
+  });
+
   // /recent [heures] — TOUT ce que le bot a fait dans les N dernières heures
   // Audit log + email outbox + webhooks + erreurs, tout en 1 message.
   // Pour: "qu'est-ce qui s'est passé pendant que j'étais sur le terrain?"
@@ -8217,6 +8385,39 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
 
   log('OK', 'POLLER', `Lead ${source.label}: ${nom || email || telephone} | Centris: ${centris || '?'}`);
 
+  // ─── CROSS-RÉFÉRENCE — détecter prospect récurrent ─────────────────────
+  // Cherche dans Pipedrive si email/tel/nom existe déjà = lead récurrent.
+  // Si oui → flag dans audit + suggestion approche basée sur historique
+  // (genre "ce prospect a déjà eu visite il y a 3 mois sur autre terrain").
+  let _recurrentInfo = null;
+  if (PD_KEY && (email || telephone)) {
+    try {
+      const searchTerms = [email, telephone].filter(Boolean);
+      for (const term of searchTerms) {
+        const sr = await pdGet(`/persons/search?term=${encodeURIComponent(term)}&limit=2`).catch(() => null);
+        const persons = sr?.data?.items || [];
+        if (persons.length > 0) {
+          const p = persons[0].item;
+          // Cherche les deals associés à cette personne
+          const dealsRes = await pdGet(`/persons/${p.id}/deals?limit=10`).catch(() => null);
+          const oldDeals = dealsRes?.data || [];
+          if (oldDeals.length > 0) {
+            _recurrentInfo = {
+              personId: p.id,
+              personName: p.name,
+              dealCount: oldDeals.length,
+              lastDealTitle: oldDeals[0]?.title,
+              lastDealStage: oldDeals[0]?.stage_id,
+              lastDealStatus: oldDeals[0]?.status,
+            };
+            log('INFO', 'POLLER', `🔗 RÉCURRENT détecté: ${p.name} (${oldDeals.length} deal(s) passés)`);
+            break;
+          }
+        }
+      }
+    } catch (e) { log('WARN', 'POLLER', `Cross-réf: ${e.message?.substring(0, 100)}`); }
+  }
+
   // ─── P1 — Validation nom prospect AVANT création deal ──────────────────────
   // Si le parser n'a pas extrait un nom valide (vide, blacklisté, générique):
   // on met le lead en pending, on alerte Shawn, on attend "nom Prénom Nom"
@@ -8517,6 +8718,12 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   // 3. Notifier Shawn immédiatement
   if (!ALLOWED_ID) return;
   let msg = `🔔 *Nouveau lead ${source.label}!*\n\n`;
+  // Flag récurrent en HAUT du message — info stratégique
+  if (_recurrentInfo) {
+    msg += `🔗 *PROSPECT RÉCURRENT* — ${_recurrentInfo.dealCount} deal(s) passés\n`;
+    msg += `   Dernier: ${_recurrentInfo.lastDealTitle?.substring(0, 60) || '?'}\n\n`;
+    leadAudit.recurrent = _recurrentInfo;
+  }
   if (nom)       msg += `👤 *${nom}*\n`;
   if (telephone) msg += `📞 ${telephone}\n`;
   if (email)     msg += `✉️ ${email}\n`;
