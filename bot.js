@@ -4097,7 +4097,9 @@ const TOOLS = [
 
   // ── Firecrawl (scraping municipal) ────────────────────────────────────────
   { name: 'scraper_site_municipal', description: 'Scraper le site d\'une municipalité québécoise pour obtenir règlements de zonage, marges latérales, permis, taxes. Cache 30j. Fallback téléphone auto si scrape échoue. Villes: sainte-julienne, rawdon, chertsey, saint-calixte, saint-jean-de-matha, saint-didace, matawinie, d-autray.', input_schema: { type: 'object', properties: { ville: { type: 'string', description: 'Nom ville slug (sainte-julienne, rawdon, chertsey, saint-calixte, saint-jean-de-matha, saint-didace, matawinie, d-autray)' }, sujet: { type: 'string', enum: ['zonage', 'urbanisme', 'permis', 'taxes', 'riveraine'], description: 'Type info (défaut zonage)' } }, required: ['ville'] } },
-  { name: 'scraper_url', description: 'Scraper n\'importe quelle URL et extraire markdown (règlements, PDFs convertis, pages gouv). Utiliser mots_cles pour filtrer la section pertinente.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète https://...' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'Mots-clés pour filtrer la section (ex: ["marge","latérale","recul"])' } }, required: ['url'] }, cache_control: { type: 'ephemeral' } },
+  { name: 'scraper_url', description: 'Scraper n\'importe quelle URL et extraire markdown (règlements, PDFs convertis, pages gouv). Utiliser mots_cles pour filtrer la section pertinente.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète https://...' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'Mots-clés pour filtrer la section (ex: ["marge","latérale","recul"])' } }, required: ['url'] } },
+  // ── Recherche web temps réel (Perplexity Sonar) ───────────────────────────
+  { name: 'recherche_web', description: 'Recherche web temps réel avec sources citées. Pour stats marché immobilier QC, taux hypothécaires actuels, nouvelles règles OACIQ/AMF, comparables récents. Nécessite PERPLEXITY_API_KEY env var.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Question naturelle (ex: "tendance prix terrains Lanaudière 2026", "taux hypothécaire Desjardins aujourd\'hui")' } }, required: ['question'] }, cache_control: { type: 'ephemeral' } },
 ];
 
 // Cache les tools (statiques) — réduit coût API
@@ -4276,6 +4278,43 @@ async function executeTool(name, input, chatId) {
         const r = await firecrawl.scrapUrl(url, mots_cles);
         if (!r.success) return `❌ ${r.error}`;
         return `✅ *Scrape réussi*${r.fromCache ? ' (cache)' : ''}\n📍 ${r.url}\n📊 Quota: ${r.quota}\n\n${r.contenu.substring(0, 3000)}${r.contenu.length > 3000 ? '\n\n...(tronqué)' : ''}`;
+      }
+
+      case 'recherche_web': {
+        if (!process.env.PERPLEXITY_API_KEY) {
+          return `❌ PERPLEXITY_API_KEY absent dans Render env vars.\nSign up: perplexity.ai/api → Generate key → ajouter dans dashboard Render.`;
+        }
+        const { question } = input || {};
+        if (!question) return `❌ Question requise`;
+        try {
+          const r = await fetch('https://api.perplexity.ai/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${process.env.PERPLEXITY_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: 'sonar',
+              messages: [
+                { role: 'system', content: 'Tu es un assistant expert en immobilier québécois. Réponses courtes (max 300 mots), sources citées, focus Lanaudière/Rive-Nord si pertinent.' },
+                { role: 'user', content: question },
+              ],
+              max_tokens: 500,
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+          if (!r.ok) {
+            const err = await r.text().catch(() => '');
+            return `❌ Perplexity ${r.status}: ${err.substring(0, 200)}`;
+          }
+          const data = await r.json();
+          const answer = data.choices?.[0]?.message?.content || '(vide)';
+          const citations = data.citations || data.choices?.[0]?.message?.citations || [];
+          const sources = citations.length ? `\n\n*Sources:*\n${citations.slice(0, 5).map((c, i) => `${i+1}. ${c}`).join('\n')}` : '';
+          return `🔍 *${question}*\n\n${answer}${sources}`;
+        } catch (e) {
+          return `❌ Recherche web: ${e.message.substring(0, 200)}`;
+        }
       }
 
       default: return `Outil inconnu: ${name}`;
@@ -4498,6 +4537,12 @@ function trackCost(model, usage) {
   costTracker.monthly[m] = (costTracker.monthly[m] || 0) + cost;
   costTracker.total += cost;
   costTracker.byModel[model] = (costTracker.byModel[model] || 0) + cost;
+  // Cache hit metrics — verify prompt caching effectiveness
+  costTracker.cacheStats = costTracker.cacheStats || { hits: 0, writes: 0, totalInput: 0, totalCacheRead: 0 };
+  costTracker.cacheStats.totalInput     += (usage.input_tokens || 0);
+  costTracker.cacheStats.totalCacheRead += (usage.cache_read_input_tokens || 0);
+  if (usage.cache_read_input_tokens > 0) costTracker.cacheStats.hits++;
+  if (usage.cache_creation_input_tokens > 0) costTracker.cacheStats.writes++;
   // Purge daily >30j, monthly >12m
   const cutoffDay = new Date(Date.now() - 30*86400000).toISOString().slice(0,10);
   Object.keys(costTracker.daily).forEach(k => { if (k < cutoffDay) delete costTracker.daily[k]; });
@@ -5492,13 +5537,17 @@ function registerHandlers() {
     const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
     const daysElapsed = new Date().getDate();
     const projection = daysElapsed > 0 ? (monthCost / daysElapsed * daysInMonth) : 0;
+    // Cache stats — confirme efficacité prompt caching
+    const cs = costTracker.cacheStats || {};
+    const cacheRatio = cs.totalInput > 0 ? Math.round((cs.totalCacheRead / (cs.totalInput + cs.totalCacheRead)) * 100) : 0;
+    const cacheLine = cs.hits ? `\n🚀 Cache: ${cs.hits} hits / ${cs.writes} writes · ${cacheRatio}% input depuis cache` : '';
     bot.sendMessage(msg.chat.id,
       `💰 *Coût Anthropic*\n\n` +
       `📅 Aujourd'hui: *$${todayCost.toFixed(4)}*\n` +
       `📆 Ce mois: *$${monthCost.toFixed(2)}*\n` +
       `📊 Projection mois: ~$${projection.toFixed(2)}\n` +
       `🏆 Total cumul: $${totalCost.toFixed(2)}\n\n` +
-      `*Par modèle:*\n${byModel}\n\n` +
+      `*Par modèle:*\n${byModel}${cacheLine}\n\n` +
       `Seuils d'alerte: $10/jour · $100/mois`,
       { parse_mode: 'Markdown' }
     );
