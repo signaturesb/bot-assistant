@@ -22,7 +22,9 @@ const JULIE_EMAIL = process.env.JULIE_EMAIL || 'julie@signaturesb.com';
 let   currentModel = process.env.MODEL || 'claude-sonnet-4-6';
 
 // ─── AGENT_CONFIG — Foundation SaaS multi-courtier ───────────────────────────
-// Toutes les valeurs courtier-spécifiques ici. Pour un autre courtier: changer les env vars.
+// Toutes les valeurs courtier-spécifiques ici. Pour un autre courtier: changer
+// les env vars dans Render. Les fallbacks de Shawn restent pour ne pas casser
+// la prod actuelle, mais sont signalés au boot si le courtier-cible diffère.
 const AGENT = {
   nom:          process.env.AGENT_NOM       || 'Shawn Barrette',
   prenom:       process.env.AGENT_PRENOM    || 'Shawn',
@@ -36,11 +38,16 @@ const AGENT = {
   region:       process.env.AGENT_REGION    || 'Lanaudière · Rive-Nord',
   pipeline_id:  parseInt(process.env.PD_PIPELINE_ID || '7'),
   specialites:  process.env.AGENT_SPECS     || 'terrains, maisons usagées, plexs, construction neuve',
-  partenaire:   process.env.AGENT_PARTNER   || 'ProFab — Jordan Brouillette 514-291-3018 (0$ comptant via Desjardins)',
+  // partenaire: optionnel par défaut. Shawn a un deal ProFab spécifique mais
+  // chaque courtier configure le sien (ou vide pour ne rien afficher).
+  partenaire:   process.env.AGENT_PARTNER   || '',
   couleur:      process.env.AGENT_COULEUR   || '#aa0721',
   dbx_terrains: process.env.DBX_TERRAINS   || '/Terrain en ligne',
   dbx_templates:process.env.DBX_TEMPLATES  || '/Liste de contact/email_templates',
   dbx_contacts: process.env.DBX_CONTACTS   || '/Contacts',
+  // Plan SaaS du tenant (solo, pro, enterprise) — détermine quotas + features
+  plan:         process.env.AGENT_PLAN      || 'solo',
+  tenantId:     process.env.AGENT_TENANT_ID || 'shawn-default',
 };
 
 // Pipedrive custom field IDs (from .env.shared / Render)
@@ -792,7 +799,7 @@ async function summarizeOldHistory(chatId) {
 
     const asText = toCompact.map(m => {
       const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content).substring(0, 400);
-      return `${m.role === 'user' ? 'Shawn' : 'Bot'}: ${c.substring(0, 800)}`;
+      return `${m.role === 'user' ? AGENT.prenom : 'Bot'}: ${c.substring(0, 800)}`;
     }).join('\n').substring(0, 32000);
 
     const prompt = `Conversation entre Shawn Barrette (courtier RE/MAX PRESTIGE Rawdon, shawn@signaturesb.com) et son assistant IA. Produis un RÉSUMÉ DENSE STRUCTURÉ en français organisé par sections (max 800 mots total).
@@ -878,7 +885,7 @@ async function extractDurableFacts(chatId, history) {
     const recent = history.slice(-6);
     const asText = recent.map(m => {
       const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content).substring(0, 300);
-      return `${m.role === 'user' ? 'Shawn' : 'Bot'}: ${c.substring(0, 600)}`;
+      return `${m.role === 'user' ? AGENT.prenom : 'Bot'}: ${c.substring(0, 600)}`;
     }).join('\n').substring(0, 6000);
 
     const prompt = `Dans cet échange récent entre Shawn (courtier RE/MAX) et son bot, extrais UNIQUEMENT les FAITS DURABLES qui méritent d'être mémorisés pour la suite. Réponds en JSON array pur, max 5 faits, chacun ≤150 chars.
@@ -2482,6 +2489,8 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
       const ms = Date.now() - t0;
 
       if (typeof result === 'string' && result.startsWith('✅')) {
+        // Plan quota tracking — autoSent +1 (jour)
+        try { require('./plan_quotas').recordUsage('autoSentPerDay', 1); } catch {}
         autoEnvoiState.sent[dedupKey] = Date.now();
         autoEnvoiState.log.unshift({
           timestamp: Date.now(), email, nom, centris,
@@ -5030,6 +5039,36 @@ function registerHandlers() {
     bot.sendMessage(msg.chat.id, txt, { parse_mode: 'Markdown' }).catch(() =>
       bot.sendMessage(msg.chat.id, lines.substring(0, 3500)).catch(() => {})
     );
+  });
+
+  // /quota (alias /plan) — état des quotas SaaS du plan courant
+  bot.onText(/\/quota|\/plan\b/i, async msg => {
+    if (!isAllowed(msg)) return;
+    try {
+      const { getQuotaSnapshot } = require('./plan_quotas');
+      const snap = getQuotaSnapshot(AGENT.plan || 'solo');
+      const lines = [
+        `💼 *Plan ${snap.plan}* — ${snap.pricePerMonth}$/mois`,
+        `Tenant: \`${AGENT.tenantId || 'default'}\``,
+        ``,
+        `*Quotas:*`,
+      ];
+      for (const [r, q] of Object.entries(snap.resources)) {
+        const emoji = q.status === 'blocked' ? '🔴' : q.status === 'warn' ? '🟡' : '🟢';
+        const label = r.replace(/PerDay$/, '/j').replace(/PerMonth$/, '/mois');
+        const limStr = q.limit === Infinity ? '∞' : q.limit;
+        const pctStr = q.limit !== Infinity ? ` (${q.pct}%)` : '';
+        lines.push(`${emoji} ${label}: ${q.current}/${limStr}${pctStr}`);
+      }
+      lines.push('');
+      lines.push(`*Features:*`);
+      for (const [f, ok] of Object.entries(snap.features)) {
+        lines.push(`  ${ok ? '✅' : '❌'} ${f}`);
+      }
+      await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+    } catch (e) {
+      bot.sendMessage(msg.chat.id, `❌ Quota: ${e.message.substring(0, 200)}`);
+    }
   });
 
   // /firecrawl — statut quota + dernières villes scrapées

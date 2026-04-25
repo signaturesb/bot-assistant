@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kira Bot — L'assistant IA pour courtiers immobiliers</title>
+<meta name="description" content="Capture chaque demande Centris/RE-MAX en 30 secondes. Envoi automatique des documents au prospect. Plus jamais une opportunité manquée.">
+<style>
+  *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0a0a0a;
+    --bg-card: #111111;
+    --border: #1e1e1e;
+    --text: #f5f5f7;
+    --text-muted: #999;
+    --text-dim: #666;
+    --accent: #aa0721;
+    --accent-hover: #c8082a;
+    --green: #4ade80;
+  }
+  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hover); }
+
+  .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+  header { padding: 32px 0 24px; border-bottom: 1px solid var(--border); }
+  .nav { display: flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap; }
+  .logo { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; }
+  .logo span { color: var(--accent); }
+  nav ul { display: flex; gap: 24px; list-style: none; }
+  nav a { color: var(--text-muted); font-size: 14px; }
+  nav a:hover { color: var(--text); }
+
+  .cta-button { display: inline-block; background: var(--accent); color: white !important; padding: 14px 28px; border-radius: 4px; font-weight: 700; font-size: 14px; letter-spacing: 1px; text-transform: uppercase; transition: background 0.2s; }
+  .cta-button:hover { background: var(--accent-hover); }
+
+  /* Hero */
+  .hero { padding: 80px 0 60px; text-align: center; }
+  .hero-eyebrow { color: var(--accent); font-size: 11px; font-weight: 800; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 18px; }
+  .hero h1 { font-family: Georgia, serif; font-size: clamp(36px, 6vw, 64px); line-height: 1.1; letter-spacing: -1px; margin-bottom: 20px; }
+  .hero h1 em { color: var(--accent); font-style: italic; }
+  .hero-sub { color: var(--text-muted); font-size: 18px; max-width: 720px; margin: 0 auto 32px; }
+  .hero-stats { display: flex; justify-content: center; gap: 48px; flex-wrap: wrap; margin: 40px 0; }
+  .hero-stats .stat { text-align: center; }
+  .hero-stats .stat strong { display: block; font-family: Georgia, serif; font-size: 48px; color: var(--accent); font-weight: 800; line-height: 1; }
+  .hero-stats .stat span { color: var(--text-muted); font-size: 12px; letter-spacing: 1.5px; text-transform: uppercase; margin-top: 8px; display: block; }
+
+  /* Sections */
+  section { padding: 64px 0; border-top: 1px solid var(--border); }
+  .section-eyebrow { color: var(--accent); font-size: 10px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 12px; }
+  h2 { font-family: Georgia, serif; font-size: clamp(28px, 4vw, 42px); line-height: 1.2; margin-bottom: 32px; }
+  h2 em { color: var(--accent); font-style: italic; }
+
+  /* Features grid */
+  .grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 24px; transition: border-color 0.2s, transform 0.2s; }
+  .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .card-icon { font-size: 32px; margin-bottom: 16px; }
+  .card h3 { font-size: 16px; margin-bottom: 8px; font-weight: 700; }
+  .card p { color: var(--text-muted); font-size: 14px; }
+
+  /* Workflow */
+  .workflow { display: grid; gap: 24px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 32px; }
+  .step { position: relative; padding: 24px; background: var(--bg-card); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0; }
+  .step-num { font-family: Georgia, serif; font-size: 32px; color: var(--accent); font-weight: 800; line-height: 1; margin-bottom: 8px; }
+  .step h3 { font-size: 15px; margin-bottom: 6px; }
+  .step p { color: var(--text-muted); font-size: 13px; }
+
+  /* Pricing */
+  .pricing { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-top: 32px; }
+  .price-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 32px 24px; text-align: center; }
+  .price-card.featured { border: 2px solid var(--accent); position: relative; }
+  .price-card.featured::before { content: 'POPULAIRE'; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: var(--accent); color: white; padding: 4px 12px; border-radius: 4px; font-size: 10px; font-weight: 700; letter-spacing: 1.5px; }
+  .price-card h3 { font-size: 14px; letter-spacing: 2px; text-transform: uppercase; color: var(--text-muted); margin-bottom: 16px; }
+  .price-amount { font-family: Georgia, serif; font-size: 56px; font-weight: 800; color: var(--text); line-height: 1; margin-bottom: 4px; }
+  .price-amount span { font-size: 16px; color: var(--text-muted); font-weight: 400; }
+  .price-card ul { list-style: none; margin: 24px 0; text-align: left; }
+  .price-card li { padding: 8px 0; color: var(--text-muted); font-size: 14px; border-bottom: 1px solid var(--border); }
+  .price-card li::before { content: '✓ '; color: var(--green); margin-right: 6px; font-weight: 800; }
+  .price-card li.no::before { content: '— '; color: var(--text-dim); }
+  .price-card li.no { color: var(--text-dim); }
+
+  /* CTA */
+  .cta-section { background: linear-gradient(180deg, var(--bg) 0%, #1a0a0a 100%); padding: 80px 0; text-align: center; border-top: 4px solid var(--accent); }
+  .cta-section h2 { margin-bottom: 16px; }
+  .cta-section p { color: var(--text-muted); font-size: 18px; max-width: 600px; margin: 0 auto 32px; }
+
+  /* Footer */
+  footer { padding: 32px 0; text-align: center; color: var(--text-dim); font-size: 13px; border-top: 1px solid var(--border); }
+  footer a { color: var(--text-muted); margin: 0 12px; }
+
+  @media (max-width: 600px) {
+    .hero { padding: 48px 0 32px; }
+    .hero-stats { gap: 32px; }
+    section { padding: 48px 0; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+<div class="container nav">
+  <div class="logo">Kira<span>·</span>Bot</div>
+  <nav>
+    <ul>
+      <li><a href="#features">Features</a></li>
+      <li><a href="#workflow">Comment ça marche</a></li>
+      <li><a href="#pricing">Prix</a></li>
+      <li><a href="#contact">Contact</a></li>
+    </ul>
+  </nav>
+</div>
+</header>
+
+<section class="hero">
+<div class="container">
+  <div class="hero-eyebrow">L'IA pour courtiers immobiliers</div>
+  <h1>Tu reçois une demande Centris.<br><em>30 secondes plus tard, le prospect a déjà ses documents.</em></h1>
+  <p class="hero-sub">Kira surveille tes courriels en continu, capture chaque lead Centris/RE-MAX/Realtor.ca, envoie les bons documents au bon prospect, crée le deal Pipedrive et te notifie sur Telegram. Tu fais le suivi, l'IA fait le travail répétitif.</p>
+  <a href="#contact" class="cta-button">Commencer un essai gratuit 14 jours</a>
+
+  <div class="hero-stats">
+    <div class="stat"><strong>30s</strong><span>Réponse au lead</span></div>
+    <div class="stat"><strong>100%</strong><span>Leads capturés</span></div>
+    <div class="stat"><strong>0$</strong><span>Frais cachés</span></div>
+    <div class="stat"><strong>24/7</strong><span>Toujours actif</span></div>
+  </div>
+</div>
+</section>
+
+<section id="features">
+<div class="container">
+  <div class="section-eyebrow">⚡ Features</div>
+  <h2>Tout ce dont tu as besoin, <em>rien de plus</em>.</h2>
+  <div class="grid">
+    <div class="card"><div class="card-icon">📩</div><h3>Capture leads automatique</h3><p>Scan Gmail toutes les 30 secondes. Centris, RE-MAX, Realtor, DuProprio — tout est traité.</p></div>
+    <div class="card"><div class="card-icon">📦</div><h3>Envoi auto des docs</h3><p>Match Dropbox par # Centris. Photos, fiche, certificats — tous les docs partent automatiquement avec ton template branded.</p></div>
+    <div class="card"><div class="card-icon">🏢</div><h3>Pipedrive intégré</h3><p>Deal créé, étape "Nouveau lead", note avec source + Centris#, brouillon J+0 prêt à envoyer.</p></div>
+    <div class="card"><div class="card-icon">📱</div><h3>Notifs Telegram temps réel</h3><p>Tu reçois chaque lead direct dans ton Telegram avec toutes les infos. Réponds en 1 click.</p></div>
+    <div class="card"><div class="card-icon">🛡️</div><h3>Self-healing</h3><p>Retry automatique 3 niveaux. 4 canaux de fallback (Telegram → email → SMS). Aucun lead perdu.</p></div>
+    <div class="card"><div class="card-icon">🌐</div><h3>Scraping municipal</h3><p>Demande "marges latérales Sainte-Julienne" et reçois la grille de zonage en 3s. 8 villes Lanaudière incluses.</p></div>
+    <div class="card"><div class="card-icon">📊</div><h3>Audit trail complet</h3><p>Trace de chaque lead: source, extraction, match, décision. Plus jamais "qu'est-ce qui s'est passé?".</p></div>
+    <div class="card"><div class="card-icon">🔍</div><h3>Comparables (Pro+)</h3><p>Comparables vendus via Centris agent + DuProprio. Rapport email pro pour tes vendeurs.</p></div>
+    <div class="card"><div class="card-icon">💼</div><h3>Branding 100% personnalisé</h3><p>Logos, couleurs, signatures — tout est configurable. Tes courriels portent ta marque, pas la nôtre.</p></div>
+  </div>
+</div>
+</section>
+
+<section id="workflow">
+<div class="container">
+  <div class="section-eyebrow">🔄 Comment ça marche</div>
+  <h2>Du lead à <em>la signature</em>, en 4 étapes.</h2>
+  <div class="workflow">
+    <div class="step"><div class="step-num">1</div><h3>Le prospect remplit Centris</h3><p>Tu reçois l'email comme d'habitude — Kira le voit en 30s.</p></div>
+    <div class="step"><div class="step-num">2</div><h3>Kira capture + match</h3><p>Extraction nom/email/tel/Centris#, match Dropbox par numéro de propriété.</p></div>
+    <div class="step"><div class="step-num">3</div><h3>Envoi automatique</h3><p>Tous les docs (photos PDF, fiche, certificats) partent au prospect, toi en Cc.</p></div>
+    <div class="step"><div class="step-num">4</div><h3>Tu reçois la notif</h3><p>Telegram t'alerte: deal créé, brouillon J+0 prêt. Tu fais le suivi humain.</p></div>
+  </div>
+</div>
+</section>
+
+<section id="pricing">
+<div class="container">
+  <div class="section-eyebrow">💰 Prix</div>
+  <h2>Choisis ton plan. <em>Annule en tout temps.</em></h2>
+  <div class="pricing">
+    <div class="price-card">
+      <h3>Trial</h3>
+      <div class="price-amount">0<span>$ / 14 jours</span></div>
+      <ul>
+        <li>10 leads/jour</li>
+        <li>10 auto-sent/jour</li>
+        <li>20 scrapes/mois</li>
+        <li class="no">Vocaux</li>
+        <li class="no">Multi-logement</li>
+        <li class="no">Registre foncier</li>
+      </ul>
+      <a href="#contact" class="cta-button" style="display:block">Essayer</a>
+    </div>
+    <div class="price-card">
+      <h3>Solo</h3>
+      <div class="price-amount">49<span>$ / mois</span></div>
+      <ul>
+        <li>30 leads/jour</li>
+        <li>30 auto-sent/jour</li>
+        <li>100 scrapes/mois</li>
+        <li>Vision photos/PDF</li>
+        <li>Email sequences</li>
+        <li class="no">Multi-logement</li>
+        <li class="no">Registre foncier</li>
+      </ul>
+      <a href="#contact" class="cta-button" style="display:block">Choisir Solo</a>
+    </div>
+    <div class="price-card featured">
+      <h3>Pro</h3>
+      <div class="price-amount">149<span>$ / mois</span></div>
+      <ul>
+        <li>100 leads/jour</li>
+        <li>100 auto-sent/jour</li>
+        <li>500 scrapes/mois</li>
+        <li>Tout Solo +</li>
+        <li>Vocaux Whisper</li>
+        <li>Multi-logement (plex)</li>
+        <li>Registre foncier (SIRF)</li>
+      </ul>
+      <a href="#contact" class="cta-button" style="display:block">Choisir Pro</a>
+    </div>
+    <div class="price-card">
+      <h3>Enterprise</h3>
+      <div class="price-amount">499<span>$ / mois</span></div>
+      <ul>
+        <li>Leads illimités</li>
+        <li>Auto-sent illimités</li>
+        <li>5000 scrapes/mois</li>
+        <li>Tout Pro +</li>
+        <li>SLA 99.9%</li>
+        <li>Multi-courtier (équipe)</li>
+        <li>Support prioritaire</li>
+      </ul>
+      <a href="#contact" class="cta-button" style="display:block">Nous contacter</a>
+    </div>
+  </div>
+</div>
+</section>
+
+<section class="cta-section" id="contact">
+<div class="container">
+  <h2>Prêt à <em>arrêter de manquer des leads</em>?</h2>
+  <p>14 jours gratuit. Setup en 30 minutes (on t'aide). Pas de carte de crédit pour l'essai.</p>
+  <a href="mailto:shawn@signaturesb.com?subject=Kira%20Bot%20—%20essai%20gratuit&body=Bonjour%2C%0A%0AJ'aimerais%20essayer%20Kira%20Bot.%0A%0ANom%3A%0AAgence%3A%0ATéléphone%3A%0ARégion%3A%0A%0AMerci%21" class="cta-button">📧 Demander un essai</a>
+</div>
+</section>
+
+<footer>
+<div class="container">
+  <p>© 2026 Kira Bot · Conçu par Signature SB · <a href="https://signaturesb.com">signatureSB.com</a></p>
+  <p style="margin-top:8px;">
+    <a href="ONBOARDING.md">Documentation</a>
+    <a href="mailto:shawn@signaturesb.com">Contact</a>
+    <a href="https://github.com/signaturesb/bot-assistant">GitHub</a>
+  </p>
+</div>
+</footer>
+
+</body>
+</html>
