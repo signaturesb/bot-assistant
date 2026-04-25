@@ -3848,6 +3848,179 @@ const CENTRIS_HEADERS = {
   'Pragma': 'no-cache',
 };
 
+// ─── Centris OAuth flow complet avec MFA SMS auto via bridge Mac ──────────
+// Coordonné avec sms-bridge.js LaunchAgent. Login Auth0 + MFA injection auto.
+async function centrisOAuthLoginWithMFA(opts = {}) {
+  const user = process.env.CENTRIS_USER;
+  const pass = process.env.CENTRIS_PASS;
+  if (!user || !pass) return { ok: false, error: 'CENTRIS_USER/CENTRIS_PASS manquants' };
+
+  const COOKIES = {};
+  const apply = (res) => {
+    const sc = res.headers.get('set-cookie') || '';
+    for (const part of sc.split(/, (?=[^=]+=[^;]+)/)) {
+      const m = part.match(/^([^=]+)=([^;]*)/);
+      if (m) COOKIES[m[1].trim()] = m[2];
+    }
+  };
+  const cookieStr = () => Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join('; ');
+  const decode = s => String(s || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x2f;/gi, '/').replace(/&#x3d;/gi, '=');
+  const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
+  const HD = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9', 'Accept-Language': 'fr-CA,fr;q=0.9' };
+  const fOpts = (extra = {}) => ({ headers: { ...HD, ...(extra.headers || {}), 'Cookie': cookieStr() }, ...extra });
+  const lg = (lvl, m) => log(lvl, 'CENTRIS-OAUTH', m);
+
+  try {
+    const r1 = await fetch('https://matrix.centris.ca/Matrix/Login.aspx', fOpts({ redirect: 'follow' }));
+    apply(r1);
+    const html1 = await r1.text();
+    const finalUrl = r1.url;
+    const formMatch = html1.match(/<form[^>]*action=["']([^"']+)["'][^>]*>([\s\S]*?)<\/form>/i);
+    if (!formMatch) return { ok: false, error: 'Login form introuvable' };
+    const inputs = {};
+    for (const m of formMatch[2].matchAll(/<input[^>]+name=["']([^"']+)["'](?:[^>]+value=["']([^"']*)["'])?/gi)) {
+      inputs[m[1]] = decode(m[2] || '');
+    }
+    inputs.UserCode = user;
+    inputs.Password = pass;
+    inputs.RememberMe = 'true';
+
+    const r2 = await fetch('https://accounts.centris.ca/account/login', {
+      method: 'POST', redirect: 'manual',
+      headers: { ...HD, 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieStr(), 'Referer': finalUrl, 'Origin': 'https://accounts.centris.ca' },
+      body: new URLSearchParams(inputs).toString(),
+    });
+    apply(r2);
+    if (r2.status !== 302) {
+      const errHtml = await r2.text();
+      return { ok: false, error: /incorrect|invalide|wrong/i.test(errHtml) ? 'Credentials Centris incorrects' : `Login HTTP ${r2.status}` };
+    }
+    let nextUrl = decode(r2.headers.get('location') || '');
+    if (!nextUrl.startsWith('http')) nextUrl = 'https://accounts.centris.ca' + nextUrl;
+
+    let mfaChallenge = null;
+    let formPostFinal = null;
+    for (let hop = 0; hop < 20; hop++) {
+      const r = await fetch(nextUrl, fOpts({ redirect: 'manual' }));
+      apply(r);
+      if (r.status >= 300 && r.status < 400) {
+        const loc = decode(r.headers.get('location') || '');
+        if (!loc) break;
+        nextUrl = loc.startsWith('http') ? loc : new URL(loc, nextUrl).href;
+        continue;
+      }
+      if (r.status !== 200) { lg('WARN', `hop ${hop} status ${r.status}`); break; }
+      const html = await r.text();
+      if (/mfa-sms-challenge|sms-challenge/i.test(html) || nextUrl.includes('mfa-sms-challenge')) {
+        const stateMatch = html.match(/name=["']state["'][^>]+value=["']([^"']+)["']/i);
+        const actionMatch = html.match(/<form[^>]+action=["']([^"']+\/u\/mfa-sms-challenge[^"']*)["']/i);
+        if (stateMatch && actionMatch) {
+          mfaChallenge = {
+            state: decode(stateMatch[1]),
+            actionUrl: decode(actionMatch[1]).startsWith('http') ? decode(actionMatch[1]) : `https://centris-prod.ca.auth0.com${decode(actionMatch[1])}`,
+            referer: nextUrl,
+          };
+          lg('INFO', 'MFA challenge détecté — wait for SMS code via bridge');
+          break;
+        }
+      }
+      const fpMatch = html.match(/<form[^>]+action=["'](https:\/\/matrix\.centris\.ca[^"']+)["'][^>]*method=["']post["']/i);
+      if (fpMatch) {
+        const allInputs = {};
+        for (const m of html.matchAll(/<input[^>]+name=["']([^"']+)["'][^>]+value=["']([^"']*)["']/gi)) {
+          allInputs[m[1]] = decode(m[2]);
+        }
+        formPostFinal = { url: fpMatch[1], inputs: allInputs };
+        break;
+      }
+      lg('WARN', `hop ${hop}: 200 sans MFA ni form_post — stuck`);
+      break;
+    }
+
+    if (mfaChallenge) {
+      let smsCode;
+      try {
+        smsCode = await awaitMFACode(opts.mfaTimeoutMs || 120000);
+      } catch (e) {
+        return { ok: false, error: `MFA timeout — bridge Mac n'a pas envoyé de code en 2min. Vérifie sms-bridge daemon.` };
+      }
+      const mfaRes = await fetch(mfaChallenge.actionUrl, {
+        method: 'POST', redirect: 'manual',
+        headers: { ...HD, 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieStr(), 'Referer': mfaChallenge.referer, 'Origin': 'https://centris-prod.ca.auth0.com' },
+        body: new URLSearchParams({ state: mfaChallenge.state, code: smsCode }).toString(),
+      });
+      apply(mfaRes);
+      lg('OK', `MFA submitted, status ${mfaRes.status}`);
+      if (mfaRes.status >= 300 && mfaRes.status < 400) {
+        nextUrl = decode(mfaRes.headers.get('location') || '');
+        if (!nextUrl.startsWith('http')) nextUrl = new URL(nextUrl, mfaChallenge.actionUrl).href;
+        for (let hop = 0; hop < 20; hop++) {
+          const r = await fetch(nextUrl, fOpts({ redirect: 'manual' }));
+          apply(r);
+          if (r.status >= 300 && r.status < 400) {
+            const loc = decode(r.headers.get('location') || '');
+            if (!loc) break;
+            nextUrl = loc.startsWith('http') ? loc : new URL(loc, nextUrl).href;
+            continue;
+          }
+          if (r.status === 200) {
+            const html = await r.text();
+            const fpMatch = html.match(/<form[^>]+action=["'](https:\/\/matrix\.centris\.ca[^"']+)["'][^>]*method=["']post["']/i);
+            if (fpMatch) {
+              const allInputs = {};
+              for (const m of html.matchAll(/<input[^>]+name=["']([^"']+)["'][^>]+value=["']([^"']*)["']/gi)) {
+                allInputs[m[1]] = decode(m[2]);
+              }
+              formPostFinal = { url: fpMatch[1], inputs: allInputs };
+              break;
+            }
+          }
+          break;
+        }
+      } else if (mfaRes.status === 200) {
+        const errHtml = await mfaRes.text();
+        if (/incorrect|invalide|expired/i.test(errHtml)) return { ok: false, error: 'Code MFA refusé' };
+      }
+    }
+
+    if (!formPostFinal) return { ok: false, error: 'Pas de form_post matrix après auth' };
+
+    const r5 = await fetch(formPostFinal.url, {
+      method: 'POST', redirect: 'manual',
+      headers: { ...HD, 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieStr(), 'Origin': 'https://accounts.centris.ca' },
+      body: new URLSearchParams(formPostFinal.inputs).toString(),
+    });
+    apply(r5);
+    if (r5.status >= 300 && r5.status < 400) {
+      let url = decode(r5.headers.get('location') || '');
+      if (!url.startsWith('http')) url = new URL(url, formPostFinal.url).href;
+      for (let hop = 0; hop < 5; hop++) {
+        const rr = await fetch(url, fOpts({ redirect: 'manual' }));
+        apply(rr);
+        if (rr.status >= 300 && rr.status < 400) {
+          url = decode(rr.headers.get('location') || '');
+          if (!url.startsWith('http')) url = new URL(url, 'https://matrix.centris.ca').href;
+          continue;
+        }
+        break;
+      }
+    }
+
+    const cookieFinal = cookieStr();
+    centrisSession = {
+      cookies: cookieFinal,
+      expiry: Date.now() + 24 * 3600 * 1000,
+      authenticated: true,
+      lastLoginAt: Date.now(),
+      via: 'oauth-mfa-bridge',
+    };
+    lg('OK', `🎉 Centris OAuth+MFA login réussi (${Object.keys(COOKIES).length} cookies)`);
+    return { ok: true, cookieCount: Object.keys(COOKIES).length };
+  } catch (e) {
+    return { ok: false, error: `Exception: ${e.message?.substring(0, 200)}` };
+  }
+}
+
 async function centrisLogin() {
   const user = process.env.CENTRIS_USER;
   const pass = process.env.CENTRIS_PASS;
@@ -6273,6 +6446,44 @@ function registerHandlers() {
       await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() =>
         bot.sendMessage(msg.chat.id, c.replace(/[*_`]/g, '')).catch(() => {})
       );
+    }
+  });
+
+  // /login_centris — déclenche login OAuth complet avec injection MFA auto
+  // Coordonné avec le bridge Mac sms-bridge.js qui forward le code SMS au bot.
+  bot.onText(/^\/login[-_]?centris\b/i, async msg => {
+    if (!isAllowed(msg)) return;
+    if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) {
+      return bot.sendMessage(msg.chat.id, '❌ CENTRIS_USER/CENTRIS_PASS manquants dans Render env vars');
+    }
+    const bridgeAlive = smsBridgeHealth.alive && (Date.now() - smsBridgeHealth.lastHeartbeat) < 10 * 60 * 1000;
+    await bot.sendMessage(msg.chat.id,
+      `🔐 *Login Centris OAuth + MFA*\n` +
+      `Bridge Mac SMS: ${bridgeAlive ? '🟢 actif' : '⚠️ pas de heartbeat <10min'}\n` +
+      `_Le bot va recevoir un SMS code → bridge forward → injection auto._\n` +
+      `_Patience ~30-60s, surtout pour le SMS_`,
+      { parse_mode: 'Markdown' }
+    );
+    bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    try {
+      const result = await centrisOAuthLoginWithMFA({ mfaTimeoutMs: 120000 });
+      clearInterval(typing);
+      if (result.ok) {
+        await bot.sendMessage(msg.chat.id,
+          `✅ *Login Centris OK*\n` +
+          `Cookies: ${result.cookieCount} · session valide 24h\n` +
+          `Tu peux maintenant utiliser \`/fiche <#> <email>\``,
+          { parse_mode: 'Markdown' }
+        );
+        auditLogEvent('centris', 'oauth-login-success', { cookies: result.cookieCount });
+      } else {
+        await bot.sendMessage(msg.chat.id, `❌ *Login échoué:* ${result.error}`, { parse_mode: 'Markdown' });
+        auditLogEvent('centris', 'oauth-login-failed', { error: result.error });
+      }
+    } catch (e) {
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, `❌ Exception: ${e.message?.substring(0, 200)}`);
     }
   });
 
