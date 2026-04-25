@@ -4146,7 +4146,11 @@ const TOOLS = [
   { name: 'scraper_site_municipal', description: 'Scraper le site d\'une municipalité québécoise pour obtenir règlements de zonage, marges latérales, permis, taxes. Cache 30j. Fallback téléphone auto si scrape échoue. Villes: sainte-julienne, rawdon, chertsey, saint-calixte, saint-jean-de-matha, saint-didace, matawinie, d-autray.', input_schema: { type: 'object', properties: { ville: { type: 'string', description: 'Nom ville slug (sainte-julienne, rawdon, chertsey, saint-calixte, saint-jean-de-matha, saint-didace, matawinie, d-autray)' }, sujet: { type: 'string', enum: ['zonage', 'urbanisme', 'permis', 'taxes', 'riveraine'], description: 'Type info (défaut zonage)' } }, required: ['ville'] } },
   { name: 'scraper_url', description: 'Scraper n\'importe quelle URL et extraire markdown (règlements, PDFs convertis, pages gouv). Utiliser mots_cles pour filtrer la section pertinente.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète https://...' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'Mots-clés pour filtrer la section (ex: ["marge","latérale","recul"])' } }, required: ['url'] } },
   // ── Recherche web temps réel (Perplexity Sonar) ───────────────────────────
-  { name: 'recherche_web', description: 'Recherche web temps réel avec sources citées. Pour stats marché immobilier QC, taux hypothécaires actuels, nouvelles règles OACIQ/AMF, comparables récents. Nécessite PERPLEXITY_API_KEY env var.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Question naturelle (ex: "tendance prix terrains Lanaudière 2026", "taux hypothécaire Desjardins aujourd\'hui")' } }, required: ['question'] }, cache_control: { type: 'ephemeral' } },
+  { name: 'recherche_web', description: 'Recherche web temps réel avec sources citées. Pour stats marché immobilier QC, taux hypothécaires actuels, nouvelles règles OACIQ/AMF, comparables récents. Nécessite PERPLEXITY_API_KEY env var.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Question naturelle (ex: "tendance prix terrains Lanaudière 2026", "taux hypothécaire Desjardins aujourd\'hui")' } }, required: ['question'] } },
+  // ── Téléchargement PDF + scraping avancé ──────────────────────────────────
+  { name: 'telecharger_pdf', description: 'Télécharge un PDF depuis n\'importe quelle URL et l\'envoie direct sur Telegram à Shawn. Utile pour récupérer rapports municipaux, règlements, fiches MLS, certificats de localisation, plans cadastraux. Max 25MB. Retourne URL + taille + envoi confirmé.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète vers PDF (ex: https://ville.qc.ca/.../zonage.pdf)' }, titre: { type: 'string', description: 'OPTIONNEL — titre/légende pour le PDF dans Telegram' } }, required: ['url'] } },
+  { name: 'scraper_avance', description: 'Scrape une URL + extrait automatiquement TOUS les liens PDF trouvés. Utile pour explorer un site municipal/gouvernemental où les docs sont en PDF (ex: page urbanisme avec liens vers règlements, plans, formulaires). Retourne contenu + liste PDFs avec option de les télécharger.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL à scraper' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'OPTIONNEL — filtrer le contenu par mots-clés' }, telecharger_pdfs: { type: 'boolean', description: 'OPTIONNEL — si true, download auto les PDFs trouvés (max 5)' } }, required: ['url'] } },
+  { name: 'recherche_documents', description: 'COMBINAISON puissante: cherche sur le web (Perplexity) + scrape les sources trouvées (Firecrawl) + extrait/télécharge les PDFs pertinents. Pour "trouve-moi le règlement de zonage X en PDF", "documents officiels MRC Lanaudière sur Y", "fiche technique propriété Z". Nécessite PERPLEXITY_API_KEY + FIRECRAWL_API_KEY.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Ce que tu cherches (ex: "règlement bande riveraine Saint-Calixte PDF")' }, max_resultats: { type: 'number', description: 'OPTIONNEL — combien de sources scraper (défaut 3, max 5)' } }, required: ['question'] } },
 ];
 
 // Cache les tools (statiques) — réduit coût API
@@ -4362,6 +4366,161 @@ async function executeTool(name, input, chatId) {
         } catch (e) {
           return `❌ Recherche web: ${e.message.substring(0, 200)}`;
         }
+      }
+
+      case 'telecharger_pdf': {
+        const { url, titre } = input || {};
+        if (!url || !/^https?:\/\//.test(url)) return `❌ URL invalide (doit commencer par http:// ou https://)`;
+        try {
+          const r = await fetch(url, {
+            redirect: 'follow',
+            signal: AbortSignal.timeout(60000),
+            headers: { 'User-Agent': 'Mozilla/5.0 KiraBot/1.0' },
+          });
+          if (!r.ok) return `❌ HTTP ${r.status} sur ${url}`;
+          const contentType = r.headers.get('content-type') || '';
+          const contentLength = parseInt(r.headers.get('content-length') || '0');
+          if (contentLength > 25 * 1024 * 1024) return `❌ PDF trop gros (${Math.round(contentLength/1024/1024)}MB > 25MB Telegram limit)`;
+          const buf = Buffer.from(await r.arrayBuffer());
+          if (buf.length === 0) return `❌ Réponse vide`;
+          if (buf.length > 25 * 1024 * 1024) return `❌ Téléchargé ${Math.round(buf.length/1024/1024)}MB > 25MB Telegram limit`;
+          // Détection format: PDF magic bytes "%PDF" ou content-type
+          const isPDF = buf.slice(0, 4).toString() === '%PDF' || /pdf/i.test(contentType);
+          // Nom de fichier: extrait de l'URL ou titre fourni
+          const urlName = decodeURIComponent(url.split('/').pop().split('?')[0] || 'document');
+          const filename = (titre ? titre.replace(/[^\w\sÀ-ÿ.\-]/g, '_').trim() + '.pdf'
+                                  : urlName.endsWith('.pdf') ? urlName : urlName + '.pdf');
+          // Envoie via Telegram
+          if (!ALLOWED_ID) return `⚠️ ${buf.length} bytes téléchargés mais ALLOWED_ID absent — pas envoyé Telegram`;
+          await bot.sendDocument(ALLOWED_ID, buf, {
+            caption: `📄 ${titre || filename}\n🔗 ${url.substring(0, 200)}\n📦 ${Math.round(buf.length/1024)} KB`,
+          }, { filename, contentType: 'application/pdf' });
+          auditLogEvent('download', 'pdf-sent', { url: url.substring(0, 200), bytes: buf.length, isPDF });
+          return `✅ PDF envoyé sur Telegram\n📄 ${filename}\n📦 ${Math.round(buf.length/1024)} KB${isPDF ? '' : ' (⚠️ content-type pas PDF, vérifie le contenu)'}`;
+        } catch (e) {
+          return `❌ Erreur téléchargement: ${e.message.substring(0, 200)}`;
+        }
+      }
+
+      case 'scraper_avance': {
+        const firecrawl = require('./firecrawl_scraper');
+        const { url, mots_cles = [], telecharger_pdfs = false } = input || {};
+        if (!url) return `❌ URL requise`;
+        const r = await firecrawl.scrapUrl(url, mots_cles);
+        if (!r.success) return `❌ ${r.error}`;
+        // Extraire tous les liens PDF du markdown (format markdown: [text](url.pdf))
+        const pdfRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+\.pdf[^\s)]*)\)/gi;
+        const pdfs = [];
+        let m;
+        while ((m = pdfRegex.exec(r.contenu)) !== null) {
+          pdfs.push({ text: m[1].substring(0, 80), url: m[2] });
+        }
+        // Aussi chercher liens PDF "nus" (sans markdown)
+        const nakedPdfRegex = /(?<!\]\()https?:\/\/[^\s<>"']+\.pdf\b/gi;
+        const nakedPdfs = (r.contenu.match(nakedPdfRegex) || []).filter(u => !pdfs.some(p => p.url === u));
+        for (const u of nakedPdfs.slice(0, 10)) pdfs.push({ text: '(lien direct)', url: u });
+
+        let pdfList = '';
+        let downloaded = 0;
+        if (pdfs.length) {
+          pdfList = `\n\n*📎 PDFs trouvés (${pdfs.length}):*\n${pdfs.slice(0, 15).map((p, i) => `${i+1}. ${p.text}\n   ${p.url}`).join('\n')}`;
+          if (telecharger_pdfs && ALLOWED_ID) {
+            for (const p of pdfs.slice(0, 5)) {
+              try {
+                const dl = await fetch(p.url, { redirect: 'follow', signal: AbortSignal.timeout(60000) });
+                if (!dl.ok) continue;
+                const buf = Buffer.from(await dl.arrayBuffer());
+                if (buf.length === 0 || buf.length > 25 * 1024 * 1024) continue;
+                const filename = decodeURIComponent(p.url.split('/').pop().split('?')[0] || 'doc.pdf');
+                await bot.sendDocument(ALLOWED_ID, buf, { caption: `📄 ${p.text}\n🔗 ${p.url.substring(0, 200)}` }, { filename, contentType: 'application/pdf' }).catch(() => {});
+                downloaded++;
+              } catch {}
+            }
+          }
+        }
+        return `✅ *Scrape réussi*${r.fromCache ? ' (cache)' : ''}\n📍 ${r.url}\n📊 Quota: ${r.quota}\n\n${r.contenu.substring(0, 2500)}${r.contenu.length > 2500 ? '\n\n...(tronqué)' : ''}${pdfList}${downloaded ? `\n\n✅ ${downloaded} PDF(s) envoyés sur Telegram` : ''}`;
+      }
+
+      case 'recherche_documents': {
+        if (!process.env.PERPLEXITY_API_KEY) return `❌ PERPLEXITY_API_KEY requis`;
+        if (!process.env.FIRECRAWL_API_KEY) return `❌ FIRECRAWL_API_KEY requis`;
+        const { question, max_resultats = 3 } = input || {};
+        if (!question) return `❌ Question requise`;
+        const limit = Math.min(parseInt(max_resultats) || 3, 5);
+        // Étape 1: Perplexity trouve les meilleures sources
+        const queryAugmented = `${question} (sources avec liens directs vers PDF officiels si possible)`;
+        let perplexityResp;
+        try {
+          const r = await fetch('https://api.perplexity.ai/chat/completions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${process.env.PERPLEXITY_API_KEY}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: 'sonar',
+              messages: [
+                { role: 'system', content: 'Tu cherches des documents officiels (PDF, règlements, fiches techniques) immobiliers québécois. Donne des liens DIRECTS vers les sources. Privilégie sites .qc.ca, .gouv.qc.ca, OACIQ, municipalités.' },
+                { role: 'user', content: queryAugmented },
+              ],
+              max_tokens: 600,
+            }),
+            signal: AbortSignal.timeout(30000),
+          });
+          if (!r.ok) return `❌ Perplexity ${r.status}`;
+          perplexityResp = await r.json();
+        } catch (e) { return `❌ Perplexity: ${e.message.substring(0, 200)}`; }
+
+        const answer = perplexityResp.choices?.[0]?.message?.content || '';
+        const citations = perplexityResp.citations || [];
+        if (!citations.length) return `🔍 *${question}*\n\n${answer}\n\n⚠️ Aucune source citée par Perplexity`;
+
+        // Étape 2: scrape top N sources via Firecrawl
+        const firecrawl = require('./firecrawl_scraper');
+        const scraped = [];
+        const allPdfs = [];
+        for (const url of citations.slice(0, limit)) {
+          // Si l'URL est déjà un PDF, on télécharge direct
+          if (/\.pdf(\?|$)/i.test(url)) { allPdfs.push({ text: 'Source PDF directe', url }); continue; }
+          try {
+            const sr = await firecrawl.scrapUrl(url, []);
+            if (sr.success) {
+              scraped.push({ url, contenu: sr.contenu.substring(0, 800) });
+              // Extract PDFs from this scrape
+              const pdfRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+\.pdf[^\s)]*)\)/gi;
+              let m; while ((m = pdfRegex.exec(sr.contenu)) !== null) allPdfs.push({ text: m[1].substring(0, 60), url: m[2] });
+              const nakedPdfs = (sr.contenu.match(/(?<!\]\()https?:\/\/[^\s<>"']+\.pdf\b/gi) || []).filter(u => !allPdfs.some(p => p.url === u));
+              for (const u of nakedPdfs.slice(0, 5)) allPdfs.push({ text: 'PDF', url: u });
+            }
+          } catch {}
+        }
+
+        // Étape 3: download PDFs trouvés (max 5)
+        let downloaded = 0;
+        const dlErrors = [];
+        for (const p of allPdfs.slice(0, 5)) {
+          try {
+            const dl = await fetch(p.url, { redirect: 'follow', signal: AbortSignal.timeout(60000), headers: { 'User-Agent': 'Mozilla/5.0 KiraBot/1.0' } });
+            if (!dl.ok) { dlErrors.push(`${p.url}: HTTP ${dl.status}`); continue; }
+            const buf = Buffer.from(await dl.arrayBuffer());
+            if (buf.length === 0 || buf.length > 25 * 1024 * 1024) { dlErrors.push(`${p.url}: ${buf.length === 0 ? 'vide' : 'trop gros'}`); continue; }
+            const filename = decodeURIComponent(p.url.split('/').pop().split('?')[0] || 'doc.pdf');
+            if (ALLOWED_ID) {
+              await bot.sendDocument(ALLOWED_ID, buf, { caption: `📄 ${p.text}\n🔗 ${p.url.substring(0, 200)}` }, { filename, contentType: 'application/pdf' }).catch(() => {});
+              downloaded++;
+            }
+          } catch (e) { dlErrors.push(`${p.url}: ${e.message.substring(0, 60)}`); }
+        }
+
+        const lines = [
+          `🔍 *${question}*`,
+          ``,
+          answer.substring(0, 1500),
+          ``,
+          `*📚 Sources scrapées:* ${scraped.length}/${citations.length}`,
+          ...citations.slice(0, limit).map((u, i) => `${i+1}. ${u}`),
+        ];
+        if (allPdfs.length) lines.push(`\n*📎 PDFs trouvés:* ${allPdfs.length}\n${allPdfs.slice(0, 10).map((p, i) => `${i+1}. ${p.text}\n   ${p.url}`).join('\n')}`);
+        if (downloaded) lines.push(`\n✅ ${downloaded} PDF(s) envoyés sur Telegram`);
+        if (dlErrors.length) lines.push(`\n⚠️ Échecs téléchargement:\n${dlErrors.slice(0, 3).map(e => '• ' + e).join('\n')}`);
+        return lines.join('\n');
       }
 
       default: return `Outil inconnu: ${name}`;
