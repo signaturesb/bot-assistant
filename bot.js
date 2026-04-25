@@ -5629,6 +5629,106 @@ function registerHandlers() {
     }
   });
 
+  // /recent [heures] — TOUT ce que le bot a fait dans les N dernières heures
+  // Audit log + email outbox + webhooks + erreurs, tout en 1 message.
+  // Pour: "qu'est-ce qui s'est passé pendant que j'étais sur le terrain?"
+  bot.onText(/^\/recent(?:\s+(\d+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const hours = Math.min(72, Math.max(1, parseInt(match[1] || '12')));
+    const cutoff = Date.now() - hours * 3600 * 1000;
+    await bot.sendMessage(msg.chat.id, `📜 *Activité bot — dernières ${hours}h*`, { parse_mode: 'Markdown' });
+
+    // 1. Audit log — leads, sends, alertes
+    const events = (auditLog || []).filter(e => new Date(e.at).getTime() > cutoff);
+    const byCategory = {};
+    for (const e of events) byCategory[e.category] = (byCategory[e.category] || 0) + 1;
+
+    // 2. Email outbox — envois courriels
+    const outboxRecent = (emailOutbox || []).filter(e => e.ts > cutoff);
+
+    // 3. Anomalies récentes
+    const anomalies = events.filter(e => e.category === 'anomaly');
+
+    const lines = [];
+
+    // Leads par décision
+    const leadEvents = events.filter(e => e.category === 'lead');
+    if (leadEvents.length) {
+      const byDecision = {};
+      for (const e of leadEvents) {
+        const d = e.details?.decision || 'unknown';
+        byDecision[d] = (byDecision[d] || 0) + 1;
+      }
+      lines.push(`*🎯 Leads (${leadEvents.length}):*`);
+      const decEmoji = {
+        auto_sent: '🚀', pending_preview_sent: '📦', pending_invalid_name: '⚠️',
+        dedup_skipped: '♻️', auto_failed: '❌', auto_skipped: '⏭',
+        no_dropbox_match: '🔍', blocked_suspect_name: '🛑',
+        skipped_no_email_or_deal: '📭', noSource_suspect: '🤔',
+      };
+      for (const [d, n] of Object.entries(byDecision).sort((a, b) => b[1] - a[1])) {
+        lines.push(`  ${decEmoji[d] || '•'} ${d}: ${n}`);
+      }
+      // Top 5 leads détaillés
+      lines.push('');
+      lines.push(`*Détails (5 plus récents):*`);
+      for (const e of leadEvents.slice(-5).reverse()) {
+        const d = e.details || {};
+        const ext = d.extracted || {};
+        const time = new Date(e.at).toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+        lines.push(`  ${time} · ${decEmoji[d.decision] || '•'} ${ext.email || ext.nom || '(?)'} ${ext.centris ? '#' + ext.centris : ''} → \`${d.decision}\``);
+      }
+      lines.push('');
+    }
+
+    // Envois email
+    if (outboxRecent.length) {
+      const sent = outboxRecent.filter(e => e.outcome === 'sent');
+      const failed = outboxRecent.filter(e => e.outcome !== 'sent');
+      lines.push(`*📤 Envois courriels (${outboxRecent.length}):*`);
+      lines.push(`  ✅ ${sent.length} envoyés · ❌ ${failed.length} échoués`);
+      for (const e of outboxRecent.slice(-5).reverse()) {
+        const time = new Date(e.ts).toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+        const ico = e.outcome === 'sent' ? '✅' : '❌';
+        const consent = e.shawnConsent ? '🔓' : '🔒';
+        lines.push(`  ${time} ${ico}${consent} → ${e.to} · ${(e.subject || '').substring(0, 50)}`);
+      }
+      lines.push('');
+    }
+
+    // Anomalies
+    if (anomalies.length) {
+      lines.push(`*🚨 Anomalies (${anomalies.length}):*`);
+      for (const a of anomalies.slice(-3).reverse()) {
+        const time = new Date(a.at).toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+        lines.push(`  ${time} · ${a.event}: ${(a.details?.msg || '').substring(0, 80)}`);
+      }
+      lines.push('');
+    }
+
+    // Autres catégories (notify, audit, auto-recovery, etc.)
+    const otherCats = Object.keys(byCategory).filter(c => !['lead', 'anomaly'].includes(c));
+    if (otherCats.length) {
+      lines.push(`*📋 Autres (${otherCats.length} catégories):*`);
+      for (const c of otherCats) lines.push(`  • ${c}: ${byCategory[c]}`);
+    }
+
+    if (!leadEvents.length && !outboxRecent.length && !anomalies.length) {
+      lines.push(`✅ Aucune activité significative dans les ${hours}h`);
+      lines.push(`_(audit total: ${(auditLog || []).length} events, outbox: ${(emailOutbox || []).length})_`);
+    }
+
+    const txt = lines.join('\n');
+    // Auto-split si >4000 chars
+    const chunks = [];
+    for (let i = 0; i < txt.length; i += 3800) chunks.push(txt.slice(i, i + 3800));
+    for (const c of chunks) {
+      await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() =>
+        bot.sendMessage(msg.chat.id, c.replace(/[*_`]/g, '')).catch(() => {})
+      );
+    }
+  });
+
   // /info <#Centris ou adresse> — DASHBOARD complet d'une propriété (terrain mode)
   // Pour Shawn sur le terrain avec un client: tout en 1 commande, parallel calls.
   // Retourne deal Pipedrive + dossier Dropbox + photos + info zonage + comparables.
