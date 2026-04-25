@@ -4016,6 +4016,154 @@ function parseCentrisHTML(html, ville, jours) {
 }
 
 // Chercher les VENDUS sur Centris (avec session agent)
+// ─── Centris fiche download — outil le plus robuste ─────────────────────
+// Télécharge la fiche détaillée PDF d'un listing Centris (peu importe le
+// courtier inscripteur) en utilisant les credentials de Shawn. Stratégies:
+// 1. Try patterns URL directs (MX/PrintSheet, fr/agent/...)
+// 2. Si rien → fetch page listing + extract liens PDF
+// 3. Send email avec PDF en pièce jointe (consent attesté par la commande)
+async function telechargerFicheCentris({ centris_num, email_destination, cc, message_perso }) {
+  const num = String(centris_num || '').replace(/\D/g, '').trim();
+  if (!num || num.length < 7 || num.length > 9) return `❌ Numéro Centris invalide (7-9 chiffres requis)`;
+  if (!email_destination || !/@/.test(email_destination)) return `❌ Email destination requis`;
+  if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) {
+    return `❌ CENTRIS_USER/PASS non configurés dans Render — impossible d'accéder au portail courtier`;
+  }
+  // Auto-login si pas connecté
+  if (!centrisSession.cookies || Date.now() > centrisSession.expiry) {
+    const ok = await centrisLogin();
+    if (!ok) return `❌ Login Centris échoué — vérifie CENTRIS_USER/CENTRIS_PASS`;
+  }
+
+  // STRATÉGIE 1 — patterns URL PDF directs (testés en ordre)
+  // Centris agent expose plusieurs endpoints selon version site
+  const pdfUrls = [
+    `${CENTRIS_BASE}/MX/PrintSheet/${num}`,
+    `${CENTRIS_BASE}/MX/PrintSheet?num=${num}`,
+    `${CENTRIS_BASE}/fr/agent/listings/${num}/sheet`,
+    `${CENTRIS_BASE}/fr/print/${num}`,
+  ];
+  let pdfBuffer = null;
+  let pdfSource = null;
+  for (const url of pdfUrls) {
+    try {
+      const res = await fetch(url, {
+        headers: { ...CENTRIS_HEADERS, 'Cookie': centrisSession.cookies, 'Referer': CENTRIS_BASE },
+        signal: AbortSignal.timeout(30000), redirect: 'follow',
+      });
+      if (!res.ok) continue;
+      const ct = res.headers.get('content-type') || '';
+      const buf = Buffer.from(await res.arrayBuffer());
+      // Vérifie magic bytes PDF "%PDF" + taille raisonnable (>5KB)
+      if (buf.length > 5000 && buf.slice(0, 4).toString() === '%PDF') {
+        pdfBuffer = buf;
+        pdfSource = url;
+        break;
+      }
+      // Si HTML retourné, peut contenir lien PDF — strat 2 va le chercher
+      if (/text\/html/i.test(ct)) continue;
+    } catch (e) { /* retry suivant */ }
+  }
+
+  // STRATÉGIE 2 — fallback: fetch page listing + extract liens PDF
+  if (!pdfBuffer) {
+    const listingUrls = [
+      `${CENTRIS_BASE}/fr/agent/listings/${num}`,
+      `${CENTRIS_BASE}/fr/listings/${num}`,
+      `${CENTRIS_BASE}/property?num=${num}`,
+    ];
+    for (const url of listingUrls) {
+      try {
+        const res = await fetch(url, {
+          headers: { ...CENTRIS_HEADERS, 'Cookie': centrisSession.cookies, 'Referer': CENTRIS_BASE },
+          signal: AbortSignal.timeout(20000), redirect: 'follow',
+        });
+        if (!res.ok) continue;
+        const html = await res.text();
+        // Cherche tous liens PDF dans la page
+        const pdfMatches = [...html.matchAll(/href=["']([^"']+\.pdf[^"']*)["']/gi)].map(m => m[1]);
+        const printMatches = [...html.matchAll(/href=["']([^"']*(?:PrintSheet|print)[^"']*)["']/gi)].map(m => m[1]);
+        const candidates = [...new Set([...pdfMatches, ...printMatches])]
+          .map(u => u.startsWith('http') ? u : `${CENTRIS_BASE}${u.startsWith('/') ? u : '/' + u}`);
+        for (const candUrl of candidates.slice(0, 5)) {
+          try {
+            const dl = await fetch(candUrl, {
+              headers: { ...CENTRIS_HEADERS, 'Cookie': centrisSession.cookies, 'Referer': url },
+              signal: AbortSignal.timeout(30000), redirect: 'follow',
+            });
+            if (!dl.ok) continue;
+            const buf = Buffer.from(await dl.arrayBuffer());
+            if (buf.length > 5000 && buf.slice(0, 4).toString() === '%PDF') {
+              pdfBuffer = buf;
+              pdfSource = candUrl;
+              break;
+            }
+          } catch {}
+        }
+        if (pdfBuffer) break;
+      } catch {}
+    }
+  }
+
+  if (!pdfBuffer) {
+    return `❌ Fiche PDF non trouvée pour Centris #${num}\n` +
+           `Stratégies tentées: 4 URLs PDF directs + 3 pages listing\n` +
+           `Possibles raisons: listing n'existe pas, accès courtier limité, format Centris a changé.\n` +
+           `Workaround: va sur agent.centris.ca → listing → "Imprimer fiche" → forward le PDF au bot avec /pdf <url>`;
+  }
+
+  // ENVOI EMAIL — via Gmail avec sendEmailLogged (audit + consent attesté)
+  const token = await getGmailToken();
+  if (!token) return `❌ PDF récupéré (${Math.round(pdfBuffer.length/1024)} KB) mais Gmail token absent`;
+  const filename = `Fiche_Centris_${num}.pdf`;
+  const subject = `Fiche Centris #${num}${message_perso ? ' — ' + message_perso.substring(0, 40) : ''}`;
+  const ccUserRaw = cc;
+  const ccUser = !ccUserRaw ? [] : (Array.isArray(ccUserRaw) ? ccUserRaw : String(ccUserRaw).split(',')).map(s => s.trim()).filter(Boolean);
+  const ccFinal = [...new Set([AGENT.email, ...ccUser].filter(e => e && e.toLowerCase() !== email_destination.toLowerCase()))];
+  const ccLine = ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : [];
+  const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+  const outer = `sbOut${Date.now()}`;
+  const intro = message_perso || `Bonjour,\n\nVoici la fiche détaillée du listing Centris #${num} tel que demandé.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
+  const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;margin:0;padding:20px;"><div style="max-width:600px;margin:auto;"><div style="border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;margin:0 0 8px;">${escapeHtml(AGENT.nom)}</h2><div style="color:#999;font-size:13px;font-style:italic;">${escapeHtml(AGENT.titre)} · ${escapeHtml(AGENT.compagnie)}</div></div><p style="color:#cccccc;line-height:1.7;white-space:pre-line;">${escapeHtml(intro)}</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:16px;margin:20px 0;"><div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">📎 Pièce jointe</div><div style="color:#f5f5f7;">📄 ${escapeHtml(filename)} (${Math.round(pdfBuffer.length/1024)} KB)</div></div><div style="border-top:1px solid #1a1a1a;padding-top:16px;color:#666;font-size:12px;">📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a></div></div></body></html>`;
+  const lines = [
+    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `To: ${email_destination}`,
+    ...ccLine,
+    `Reply-To: ${AGENT.email}`,
+    `Subject: ${enc(subject)}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/mixed; boundary="${outer}"`,
+    '',
+    `--${outer}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html, 'utf-8').toString('base64'),
+    `--${outer}`,
+    `Content-Type: application/pdf`,
+    `Content-Disposition: attachment; filename="${enc(filename)}"`,
+    'Content-Transfer-Encoding: base64',
+    '',
+    pdfBuffer.toString('base64'),
+    `--${outer}--`,
+  ];
+  const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+
+  const sent = await sendEmailLogged({
+    via: 'gmail', to: email_destination, cc: ccFinal, subject,
+    category: 'centris-fiche-download',
+    shawnConsent: true, // consent attesté par la commande explicite
+    sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw }),
+    }),
+  });
+  if (!sent.ok) return `❌ PDF récupéré (${Math.round(pdfBuffer.length/1024)} KB) mais envoi Gmail échoué: ${sent.error || sent.status}`;
+  auditLogEvent('centris', 'fiche-sent', { num, to: email_destination, bytes: pdfBuffer.length, source: pdfSource });
+  return `✅ Fiche Centris #${num} envoyée à *${email_destination}*\n   📄 ${Math.round(pdfBuffer.length/1024)} KB · toi en Cc${ccUser.length ? ' + ' + ccUser.join(', ') : ''}\n   🔗 Source: ${pdfSource}`;
+}
+
 async function centrisSearchVendus(type, ville, jours) {
   const ti  = slugType(type);
   const vs  = slugVille(ville);
@@ -4378,6 +4526,8 @@ const TOOLS = [
   { name: 'telecharger_pdf', description: 'Télécharge un PDF depuis n\'importe quelle URL et l\'envoie direct sur Telegram à Shawn. Utile pour récupérer rapports municipaux, règlements, fiches MLS, certificats de localisation, plans cadastraux. Max 25MB. Retourne URL + taille + envoi confirmé.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète vers PDF (ex: https://ville.qc.ca/.../zonage.pdf)' }, titre: { type: 'string', description: 'OPTIONNEL — titre/légende pour le PDF dans Telegram' } }, required: ['url'] } },
   { name: 'scraper_avance', description: 'Scrape une URL + extrait automatiquement TOUS les liens PDF trouvés. Utile pour explorer un site municipal/gouvernemental où les docs sont en PDF (ex: page urbanisme avec liens vers règlements, plans, formulaires). Retourne contenu + liste PDFs avec option de les télécharger.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL à scraper' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'OPTIONNEL — filtrer le contenu par mots-clés' }, telecharger_pdfs: { type: 'boolean', description: 'OPTIONNEL — si true, download auto les PDFs trouvés (max 5)' } }, required: ['url'] } },
   { name: 'recherche_documents', description: 'COMBINAISON puissante: cherche sur le web (Perplexity) + scrape les sources trouvées (Firecrawl) + extrait/télécharge les PDFs pertinents. Pour "trouve-moi le règlement de zonage X en PDF", "documents officiels MRC Lanaudière sur Y", "fiche technique propriété Z". Nécessite PERPLEXITY_API_KEY + FIRECRAWL_API_KEY.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Ce que tu cherches (ex: "règlement bande riveraine Saint-Calixte PDF")' }, max_resultats: { type: 'number', description: 'OPTIONNEL — combien de sources scraper (défaut 3, max 5)' } }, required: ['question'] } },
+  // ── Centris fiche download ──────────────────────────────────────────────
+  { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
 ];
 
 // Cache les tools (statiques) — réduit coût API
@@ -4666,6 +4816,10 @@ async function executeTool(name, input, chatId) {
           }
         }
         return `✅ *Scrape réussi*${r.fromCache ? ' (cache)' : ''}\n📍 ${r.url}\n📊 Quota: ${r.quota}\n\n${r.contenu.substring(0, 2500)}${r.contenu.length > 2500 ? '\n\n...(tronqué)' : ''}${pdfList}${downloaded ? `\n\n✅ ${downloaded} PDF(s) envoyés sur Telegram` : ''}`;
+      }
+
+      case 'telecharger_fiche_centris': {
+        return await telechargerFicheCentris(input || {});
       }
 
       case 'recherche_documents': {
@@ -6090,6 +6244,29 @@ function registerHandlers() {
       await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() =>
         bot.sendMessage(msg.chat.id, c.replace(/[*_`]/g, '')).catch(() => {})
       );
+    }
+  });
+
+  // /fiche <#centris> <email> [message_perso] — télécharge fiche Centris + envoie
+  // Cas usage: tu es sur le terrain, client demande info sur un autre listing pas
+  // à toi → /fiche 12345678 client@gmail.com → bot fetch + envoie en 10s.
+  bot.onText(/^\/fiche\s+(\d{7,9})\s+(\S+@\S+)(?:\s+(.+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const num = match[1];
+    const email = match[2];
+    const message_perso = match[3]?.trim() || null;
+    await bot.sendMessage(msg.chat.id, `📥 *Fiche Centris #${num}* → ${email}\n_Login Centris + download + envoi (10-30s)_`, { parse_mode: 'Markdown' });
+    bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    try {
+      const result = await telechargerFicheCentris({ centris_num: num, email_destination: email, message_perso });
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, String(result).substring(0, 4000), { parse_mode: 'Markdown' }).catch(() =>
+        bot.sendMessage(msg.chat.id, String(result).substring(0, 4000).replace(/[*_`]/g, '')).catch(() => {})
+      );
+    } catch (e) {
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, `❌ Erreur: ${e.message?.substring(0, 300)}`);
     }
   });
 
