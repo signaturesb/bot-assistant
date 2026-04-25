@@ -154,6 +154,7 @@ const GIST_ID_FILE    = path.join(DATA_DIR, 'gist_id.txt');
 const VISITES_FILE    = path.join(DATA_DIR, 'visites.json');
 const POLLER_FILE     = path.join(DATA_DIR, 'gmail_poller.json');
 const AUTOENVOI_FILE  = path.join(DATA_DIR, 'autoenvoi_state.json');
+const EMAIL_OUTBOX_FILE = path.join(DATA_DIR, 'email_outbox.json');
 const PENDING_LEADS_FILE = path.join(DATA_DIR, 'pending_leads.json');
 const PENDING_DOCS_FILE  = path.join(DATA_DIR, 'pending_docs.json');
 
@@ -271,6 +272,99 @@ try {
     const r = _pdsSet(k, v); savePendingDocs(); return r;
   };
   pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
+}
+
+// (rate limiting webhooks géré par webhookRateOK() défini plus bas — DRY)
+
+// ─── HTML escape helper — protection XSS ─────────────────────────────────
+// Toute valeur dérivée d'un lead (nom, adresse, email, etc.) qui est
+// injectée dans un template HTML DOIT passer par escapeHtml() pour éviter
+// qu'un input malicieux casse le template ou injecte du JS dans un client mail.
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMAIL OUTBOX — Source de vérité unique pour TOUS les envois email du bot.
+// Chaque envoi (Gmail OU Brevo) DOIT passer par sendEmailLogged() qui:
+//   1. Log "intent" AVANT envoi (si bot crash, on a la trace)
+//   2. Effectue l'envoi
+//   3. Log "outcome" APRÈS (sent/failed/blocked + duration)
+// Le cron auditSentMail (1h) compare l'outbox vs Gmail Sent réel —
+// si un email apparaît dans Sent mais PAS dans outbox = ENVOI HORS BOT
+// = alerte 🚨 immédiate (= la sécurité ultime contre les envois fantômes).
+// ═══════════════════════════════════════════════════════════════════════════
+let emailOutbox = [];
+try {
+  if (fs.existsSync(EMAIL_OUTBOX_FILE)) {
+    emailOutbox = JSON.parse(fs.readFileSync(EMAIL_OUTBOX_FILE, 'utf8')) || [];
+  }
+} catch { emailOutbox = []; }
+function saveEmailOutbox() {
+  try {
+    // Cap 1000 entrées (FIFO) pour éviter croissance illimitée
+    if (emailOutbox.length > 1000) emailOutbox = emailOutbox.slice(-1000);
+    fs.writeFileSync(EMAIL_OUTBOX_FILE, JSON.stringify(emailOutbox, null, 2));
+  } catch (e) { console.warn('saveEmailOutbox:', e.message); }
+}
+
+/**
+ * sendEmailLogged — wrapper centralisé pour TOUT envoi email du bot.
+ * @param {object} opts
+ *   - via: 'gmail' | 'brevo'
+ *   - to: string (destinataire)
+ *   - cc, bcc: array (optionnel)
+ *   - subject: string
+ *   - category: string ('envoyerDocsProspect', 'sendTelegramFallback', etc.)
+ *   - shawnConsent: boolean (si true = consent attesté par caller)
+ *   - sendFn: async () => Response — exécute l'envoi réel
+ * @returns {object} { ok, status, durationMs, entryId, error? }
+ */
+async function sendEmailLogged(opts) {
+  const entry = {
+    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    ts: Date.now(),
+    tsISO: new Date().toISOString(),
+    via: opts.via || 'gmail',
+    to: String(opts.to || '').toLowerCase(),
+    cc: opts.cc || [],
+    bcc: opts.bcc || [],
+    subject: String(opts.subject || '').substring(0, 200),
+    category: opts.category || 'unknown',
+    shawnConsent: !!opts.shawnConsent,
+    outcome: 'pending',
+  };
+  emailOutbox.push(entry);
+  saveEmailOutbox(); // log AVANT envoi — capture intent même si crash
+
+  const t0 = Date.now();
+  try {
+    const res = await opts.sendFn();
+    entry.durationMs = Date.now() - t0;
+    if (res && typeof res.ok === 'boolean') {
+      entry.outcome = res.ok ? 'sent' : 'failed';
+      entry.status = res.status;
+      if (!res.ok) {
+        try { entry.error = (await res.clone().text()).substring(0, 300); } catch {}
+      }
+    } else {
+      entry.outcome = 'sent'; // pas de Response standard mais pas d'exception → succès
+    }
+    saveEmailOutbox();
+    return { ok: entry.outcome === 'sent', status: entry.status, durationMs: entry.durationMs, entryId: entry.id, error: entry.error };
+  } catch (e) {
+    entry.outcome = 'exception';
+    entry.error = e.message?.substring(0, 300) || String(e);
+    entry.durationMs = Date.now() - t0;
+    saveEmailOutbox();
+    return { ok: false, error: entry.error, entryId: entry.id, durationMs: entry.durationMs };
+  }
 }
 
 // 🔒 RÈGLE ABSOLUE — Aucun courriel ne s'envoie sans consent explicite Shawn.
@@ -2497,6 +2591,7 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match, _shaw
         dealHint: deal,
         folderHint: match.folder,
         centrisHint: centris,
+        _shawnConsent: true, // arrivés ici = caller a déjà attesté consent
       });
       const ms = Date.now() - t0;
 
@@ -2756,20 +2851,23 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     return bits.join('');
   })() : '';
 
-  // Bandeau preview (injecté seulement en mode preview)
+  // Bandeau preview (injecté seulement en mode preview) — XSS-safe via escapeHtml
+  const safeClientName  = escapeHtml(clientName || '');
+  const safeClientEmail = escapeHtml(clientEmail || '');
   const previewBanner = previewMode ? `
 <div style="background:#1a0a0a;border:2px solid #aa0721;border-radius:8px;padding:18px 20px;margin:0 0 20px;">
 <div style="color:#aa0721;font-size:11px;font-weight:800;letter-spacing:3px;text-transform:uppercase;margin-bottom:10px;">🔍 Preview — pas encore envoyé</div>
-<div style="color:#f5f5f7;font-size:14px;line-height:1.6;margin-bottom:8px;">Voici <strong>exactement</strong> ce qui sera envoyé à <strong style="color:#aa0721;">${clientName || ''} &lt;${clientEmail}&gt;</strong>.</div>
-<div style="color:#cccccc;font-size:13px;line-height:1.6;">✅ Sur Telegram, réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#aa0721;">envoie les docs à ${clientEmail}</code> pour livrer au client.<br>❌ Réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#666;">annule ${clientEmail}</code> pour ignorer.</div>
+<div style="color:#f5f5f7;font-size:14px;line-height:1.6;margin-bottom:8px;">Voici <strong>exactement</strong> ce qui sera envoyé à <strong style="color:#aa0721;">${safeClientName} &lt;${safeClientEmail}&gt;</strong>.</div>
+<div style="color:#cccccc;font-size:13px;line-height:1.6;">✅ Sur Telegram, réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#aa0721;">envoie les docs à ${safeClientEmail}</code> pour livrer au client.<br>❌ Réponds <code style="background:#000;padding:2px 8px;border-radius:3px;color:#666;">annule ${safeClientEmail}</code> pour ignorer.</div>
 ${convInfo}
 </div>` : '';
 
   // Contenu métier — injecté dans le master template à la place d'INTRO_TEXTE
   // NOTE: le master template Dropbox a DÉJÀ un bloc "Programme référence" à la fin,
   // donc on ne le duplique PAS ici.
+  const safePropLabel = escapeHtml(propLabel);
   const contentHTML = `${previewBanner}
-<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Veuillez trouver ci-joint la documentation concernant la propriété <strong style="color:#f5f5f7;">${propLabel}</strong>.</p>
+<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Veuillez trouver ci-joint la documentation concernant la propriété <strong style="color:#f5f5f7;">${safePropLabel}</strong>.</p>
 
 <div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px 20px;margin:16px 0;">
 <div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">📎 Pièces jointes — ${ok.length} document${ok.length>1?'s':''}</div>
@@ -2949,20 +3047,28 @@ Au plaisir,<br>
 
   const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
-  const sendController = new AbortController();
-  const sendTimeout    = setTimeout(() => sendController.abort(), 30000);
-  let sendRes;
-  try {
-    sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-      method: 'POST', signal: sendController.signal,
-      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ raw })
-    });
-  } finally { clearTimeout(sendTimeout); }
-
-  if (!sendRes.ok) {
-    const errMsg = await sendRes.text().catch(() => String(sendRes.status));
-    return `❌ Gmail erreur ${sendRes.status}: ${errMsg.substring(0, 200)}`;
+  // Envoi via sendEmailLogged → traçabilité intent + outcome dans email_outbox.json
+  const logged = await sendEmailLogged({
+    via: 'gmail',
+    to: realToEmail,
+    cc: ccFinal,
+    subject: sujet,
+    category: previewMode ? 'envoyerDocsProspect-preview' : 'envoyerDocsProspect',
+    shawnConsent: !!opts._shawnConsent || previewMode, // preview va à shawn@ donc consent implicite
+    sendFn: async () => {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 30000);
+      try {
+        return await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+          method: 'POST', signal: ctrl.signal,
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ raw }),
+        });
+      } finally { clearTimeout(t); }
+    },
+  });
+  if (!logged.ok) {
+    return `❌ Gmail erreur ${logged.status || ''}: ${(logged.error || '').substring(0, 200)}`;
   }
 
   // 9. Note Pipedrive — skip en mode preview (c'est juste un preview, pas une vraie livraison)
@@ -4712,6 +4818,94 @@ async function handleEmailConfirmation(chatId, text) {
 // ─── Handlers Telegram ────────────────────────────────────────────────────────
 function registerHandlers() {
 
+  // ─── INLINE BUTTONS handler — clicks sous les notifs lead ─────────────────
+  // Format callback_data:
+  //   send:<email>    → exécute envoi docs (consent attesté par le click)
+  //   cancel:<email>  → supprime pending
+  //   audit:<query>   → affiche /lead-audit pour ce lead
+  bot.on('callback_query', async (cbq) => {
+    if (!cbq.from || String(cbq.from.id) !== String(ALLOWED_ID)) {
+      return bot.answerCallbackQuery(cbq.id, { text: '🚫 Non autorisé' }).catch(() => {});
+    }
+    const data = cbq.data || '';
+    const [action, ...rest] = data.split(':');
+    const arg = rest.join(':');
+    const chatId = cbq.message?.chat?.id;
+    const msgId = cbq.message?.message_id;
+
+    try {
+      if (action === 'send' && arg) {
+        const pending = pendingDocSends.get(arg);
+        if (!pending) {
+          await bot.answerCallbackQuery(cbq.id, { text: '⚠️ Pending introuvable (déjà traité?)' });
+          return;
+        }
+        await bot.answerCallbackQuery(cbq.id, { text: '📤 Envoi en cours...' });
+        pending._shawnConsent = true; // CLICK = consent attesté + tracé
+        savePendingDocs();
+        // Édite le message original pour montrer le statut
+        if (chatId && msgId) {
+          await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '⏳ Envoi en cours...', callback_data: 'noop' }]] },
+            { chat_id: chatId, message_id: msgId }).catch(() => {});
+        }
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
+        if (r.sent) {
+          pendingDocSends.delete(arg);
+          await bot.sendMessage(chatId, `✅ *Envoyé* à ${arg}\n${pending.match?.pdfs?.length || '?'} docs · ${Math.round((r.deliveryMs||0)/1000)}s`, { parse_mode: 'Markdown' });
+          auditLogEvent('inline-send', 'docs-sent', { email: arg, via: 'inline-button' });
+        } else {
+          await bot.sendMessage(chatId, `⚠️ Échec: ${r.error || r.reason || 'unknown'}`);
+        }
+      } else if (action === 'cancel' && arg) {
+        if (pendingDocSends.has(arg)) {
+          pendingDocSends.delete(arg);
+          await bot.answerCallbackQuery(cbq.id, { text: '🗑 Annulé' });
+          if (chatId && msgId) {
+            await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '🗑 Annulé', callback_data: 'noop' }]] },
+              { chat_id: chatId, message_id: msgId }).catch(() => {});
+          }
+          auditLogEvent('inline-cancel', 'pending_cancelled', { email: arg, via: 'inline-button' });
+        } else {
+          await bot.answerCallbackQuery(cbq.id, { text: '⚠️ Déjà annulé/envoyé' });
+        }
+      } else if (action === 'audit' && arg) {
+        await bot.answerCallbackQuery(cbq.id, { text: '🔍 Audit...' });
+        const events = (auditLog || []).filter(e =>
+          e.category === 'lead' && (
+            e.details?.msgId === arg ||
+            e.details?.extracted?.email?.toLowerCase() === arg.toLowerCase() ||
+            e.details?.extracted?.centris === arg
+          )
+        ).slice(-3).reverse();
+        if (!events.length) {
+          await bot.sendMessage(chatId, `❌ Aucun audit trouvé pour ${arg}`);
+        } else {
+          const ev = events[0];
+          const d = ev.details || {};
+          const ext = d.extracted || {};
+          const m = d.match || {};
+          const summary = [
+            `🔍 *Audit lead* — ${new Date(ev.at).toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}`,
+            `Décision: \`${d.decision}\``,
+            `Source: ${d.source} | Sujet: ${d.subject?.substring(0, 60)}`,
+            ``,
+            `*Extracté:* ${ext.nom || '?'} · ${ext.email || '?'} · ${ext.telephone || '?'} · #${ext.centris || '?'}`,
+            `*Match:* ${m.found ? '✅' : '❌'} score ${m.score}/100 · ${m.strategy} · ${m.pdfCount || 0} docs`,
+            d.dealId ? `*Deal:* ✅ #${d.dealId}` : '*Deal:* ❌',
+          ].join('\n');
+          await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
+        }
+      } else if (action === 'noop') {
+        await bot.answerCallbackQuery(cbq.id);
+      } else {
+        await bot.answerCallbackQuery(cbq.id, { text: '❓ Action inconnue' });
+      }
+    } catch (e) {
+      log('WARN', 'CALLBACK', `${data}: ${e.message.substring(0, 150)}`);
+      bot.answerCallbackQuery(cbq.id, { text: `❌ Erreur: ${e.message.substring(0, 60)}` }).catch(() => {});
+    }
+  });
+
   bot.onText(/\/start/, msg => {
     if (!isAllowed(msg)) return;
     bot.sendMessage(msg.chat.id,
@@ -6302,6 +6496,117 @@ function startDailyTasks() {
     }
   }, 30 * 60 * 1000); // toutes les 30min
 
+  // ─── BREVO AUTOMATION AUDIT (cron 6h) ────────────────────────────────────
+  // Liste les automations Brevo actives et alerte Shawn si un nouveau workflow
+  // est apparu (= peut envoyer des emails sans son contrôle direct via Telegram).
+  let _knownBrevoWorkflows = new Set();
+  setInterval(async () => {
+    if (!BREVO_KEY) return;
+    try {
+      // Brevo API: GET /automations/workflows
+      const r = await fetch('https://api.brevo.com/v3/automations/workflows?limit=50', {
+        headers: { 'api-key': BREVO_KEY, 'accept': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!r.ok) {
+        // Endpoint Automation peut nécessiter un plan payant — silencieux si pas dispo
+        return;
+      }
+      const data = await r.json().catch(() => null);
+      const workflows = (data?.workflows || []).filter(w => w.enabled);
+      const currentIds = new Set(workflows.map(w => String(w.id)));
+
+      // Nouveaux workflows (présents maintenant mais pas avant)
+      const newOnes = [...currentIds].filter(id => !_knownBrevoWorkflows.has(id));
+      if (newOnes.length > 0 && _knownBrevoWorkflows.size > 0) {
+        // Skip premier run (init list, pas de comparaison)
+        const newDetails = workflows.filter(w => newOnes.includes(String(w.id)));
+        const alertMsg = [
+          `🚨 *Nouvelle automation Brevo activée*`,
+          ``,
+          `${newOnes.length} nouvelle(s) automation(s) détectée(s) — peuvent envoyer des courriels au client:`,
+          ``,
+          ...newDetails.slice(0, 5).map(w => `• \`${w.name || w.id}\` — créée ${w.createdAt || '?'}`),
+          ``,
+          `Si tu n'as pas créé ces automations, va sur app.brevo.com → Automations → Pause immédiat.`,
+        ].join('\n');
+        await sendTelegramWithFallback(alertMsg, { category: 'brevo-new-automation', count: newOnes.length }).catch(()=>{});
+        auditLogEvent('audit', 'brevo_new_automation', { ids: newOnes, count: newOnes.length });
+      }
+      _knownBrevoWorkflows = currentIds;
+      log('OK', 'AUDIT', `Brevo: ${workflows.length} workflow(s) actif(s)`);
+    } catch (e) {
+      log('WARN', 'AUDIT', `Brevo audit: ${e.message.substring(0, 100)}`);
+    }
+  }, 6 * 60 * 60 * 1000);
+
+  // ─── AUDIT SENT FOLDER — détection envois non-autorisés (cron 1h) ─────────
+  // Compare Gmail Sent folder vs emailOutbox local. Tout email envoyé sans
+  // passer par sendEmailLogged() apparaîtra dans Sent mais PAS dans l'outbox
+  // = ENVOI HORS BOT = alerte 🚨 immédiate Shawn (sécurité ultime).
+  let _lastSentAuditAt = 0;
+  setInterval(async () => {
+    if (!process.env.GMAIL_CLIENT_ID) return;
+    try {
+      const sinceMs = Math.max(_lastSentAuditAt, Date.now() - 90 * 60 * 1000); // 90min ou depuis dernier check
+      const sinceQ = `after:${Math.floor(sinceMs / 1000)}`;
+      const list = await gmailAPI(`/messages?maxResults=50&q=in:sent ${encodeURIComponent(sinceQ)}`).catch(() => null);
+      const messages = list?.messages || [];
+      if (!messages.length) { _lastSentAuditAt = Date.now(); return; }
+
+      const suspects = [];
+      for (const m of messages) {
+        try {
+          const full = await gmailAPI(`/messages/${m.id}?format=metadata&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date`).catch(() => null);
+          if (!full) continue;
+          const hdrs = full.payload?.headers || [];
+          const get = n => hdrs.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
+          const to = get('To').toLowerCase();
+          const subject = get('Subject').substring(0, 200);
+          const dateMs = parseInt(full.internalDate || '0');
+
+          // Skip emails à shawn@ lui-même (sont des notifs internes/backups, légitimes)
+          if (to.includes(AGENT.email.toLowerCase()) && !to.includes(',')) continue;
+
+          // Cherche match dans outbox dans une fenêtre ±5min
+          const matched = emailOutbox.find(o =>
+            o.to === to.replace(/.*<([^>]+)>.*/, '$1').trim() &&
+            Math.abs(o.ts - dateMs) < 5 * 60 * 1000 &&
+            (o.subject?.substring(0, 60) === subject.substring(0, 60) ||
+             subject.includes(o.subject?.substring(0, 30) || ''))
+          );
+          if (!matched) {
+            suspects.push({ msgId: m.id, to, subject, dateMs, dateISO: new Date(dateMs).toISOString() });
+          }
+        } catch {}
+      }
+
+      if (suspects.length > 0) {
+        log('WARN', 'AUDIT', `🚨 ${suspects.length} email(s) dans Sent SANS trace dans outbox`);
+        const alertMsg = [
+          `🚨 *ALERTE SÉCURITÉ — Email(s) envoyé(s) HORS du bot*`,
+          ``,
+          `${suspects.length} email(s) trouvé(s) dans Gmail Sent sans trace dans email_outbox.`,
+          `Ça veut dire qu'un envoi est parti sans passer par le bot (autre app, web, mailing-masse?).`,
+          ``,
+          ...suspects.slice(0, 5).map((s, i) =>
+            `${i+1}. À: \`${s.to}\`\n   Sujet: ${s.subject}\n   Heure: ${s.dateISO}\n   MsgId: \`${s.msgId}\``
+          ),
+          ``,
+          suspects.length > 5 ? `+${suspects.length - 5} autres...` : '',
+          `*Investigue:* dossier Sent Gmail + check si quelqu'un a accès à shawn@`,
+        ].filter(Boolean).join('\n');
+        await sendTelegramWithFallback(alertMsg, { category: 'audit-sent-anomaly', count: suspects.length }).catch(()=>{});
+        auditLogEvent('audit', 'sent_folder_anomaly', { count: suspects.length, suspects: suspects.slice(0, 10) });
+      } else {
+        log('OK', 'AUDIT', `Sent folder: ${messages.length} email(s) tous tracés dans outbox`);
+      }
+      _lastSentAuditAt = Date.now();
+    } catch (e) {
+      log('WARN', 'AUDIT', `Sent audit: ${e.message.substring(0, 150)}`);
+    }
+  }, 60 * 60 * 1000); // toutes les heures
+
   // MEMORY MONITORING — alerte si heap >85% (préviens OOM avant crash Render)
   // Render starter plan = 512MB RSS. Node heapTotal s'ajuste dynamiquement mais
   // si heapUsed approche rss limit → pression GC + risque crash.
@@ -7052,10 +7357,15 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   // Sans ce header, n'importe qui peut injecter des commandes dans le bot.
   // Le secret est configuré côté Telegram via setWebhook(secret_token).
   if (req.method === 'POST' && url === '/webhook/telegram') {
+    // Rate limit: Telegram peut envoyer plusieurs updates/min en burst
+    if (!webhookRateOK(req.socket.remoteAddress, url, 120)) {
+      log('WARN', 'SECURITY', `Webhook Telegram rate-limited from ${req.socket.remoteAddress}`);
+      res.writeHead(429); res.end('too many requests'); return;
+    }
     const tgSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
     const provided = req.headers['x-telegram-bot-api-secret-token'];
     if (tgSecret && provided !== tgSecret) {
-      log('WARN', 'SECURITY', `Webhook Telegram — bad/missing secret-token from ${req.socket.remoteAddress}`);
+      log('WARN', 'SECURITY', `Webhook Telegram — bad/missing secret-token from ${ip}`);
       res.writeHead(401); res.end('unauthorized'); return;
     }
     let body = '';
@@ -7521,7 +7831,24 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     msg += `\n⚠️ Pas d'email — appelle directement: ${telephone || '(non fourni)'}`;
   }
 
-  const sent = await sendTelegramWithFallback(msg, { category: 'lead-notif', leadId: msgId, email, centris });
+  // INLINE BUTTONS — si le lead a un pending docs, attacher boutons 1-click
+  // ✅ Envoie · ❌ Annule · 📋 Audit. Plus rapide que de retaper la commande,
+  // élimine les fautes de frappe (mauvais email), trace explicite du consent.
+  let replyMarkup;
+  const hasPendingDocs = email && pendingDocSends?.has?.(email);
+  if (hasPendingDocs) {
+    replyMarkup = {
+      inline_keyboard: [[
+        { text: '✅ Envoie',  callback_data: `send:${email}` },
+        { text: '❌ Annule',  callback_data: `cancel:${email}` },
+        { text: '📋 Audit',   callback_data: `audit:${msgId || email}` },
+      ]],
+    };
+  }
+
+  const sent = await sendTelegramWithFallback(msg, {
+    category: 'lead-notif', leadId: msgId, email, centris, replyMarkup,
+  });
   return { decision: leadAudit.decision, dealId, notifySent: sent };
 }
 
@@ -7530,16 +7857,20 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
 // Garantit que Shawn est averti même si Telegram API est down ou le bot expulsé du chat.
 async function sendTelegramWithFallback(msg, ctx = {}) {
   if (!ALLOWED_ID) return false;
+  const replyMarkup = ctx.replyMarkup; // optionnel: inline buttons
+  const sendOpts = { parse_mode: 'Markdown' };
+  if (replyMarkup) sendOpts.reply_markup = replyMarkup;
   // 1. Markdown
   try {
-    await bot.sendMessage(ALLOWED_ID, msg, { parse_mode: 'Markdown' });
+    await bot.sendMessage(ALLOWED_ID, msg, sendOpts);
     return true;
   } catch (e1) {
     log('WARN', 'NOTIFY', `Telegram markdown failed (${ctx.category || '?'}): ${e1.message.substring(0, 140)}`);
-    // 2. Plain text
+    // 2. Plain text (avec replyMarkup si fourni)
     try {
       const plain = msg.replace(/\*/g, '').replace(/_/g, '').replace(/`/g, '');
-      await bot.sendMessage(ALLOWED_ID, plain);
+      const plainOpts = replyMarkup ? { reply_markup: replyMarkup } : {};
+      await bot.sendMessage(ALLOWED_ID, plain, plainOpts);
       return true;
     } catch (e2) {
       log('ERR', 'NOTIFY', `Telegram plain failed (${ctx.category || '?'}): ${e2.message.substring(0, 140)}`);
@@ -7566,10 +7897,16 @@ async function sendTelegramWithFallback(msg, ctx = {}) {
             body,
           ].join('\r\n');
           const raw = Buffer.from(mime).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-          await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ raw }),
+          // Sent via wrapper — outbox traçable. Destinataire shawn@ = consent implicite.
+          await sendEmailLogged({
+            via: 'gmail', to: AGENT.email, subject: subj,
+            category: 'sendTelegramFallback-' + (ctx.category || 'unknown'),
+            shawnConsent: true,
+            sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ raw }),
+            }),
           });
           log('OK', 'NOTIFY', `Fallback email → ${AGENT.email} (${ctx.category})`);
           auditLogEvent('notify', 'email_fallback_sent', { category: ctx.category });
