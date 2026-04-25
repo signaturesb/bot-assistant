@@ -2459,7 +2459,9 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
     return { sent: false, skipped: true, reason: 'déjà envoyé <24h', match };
   }
 
-  const AUTO_THRESHOLD = parseInt(process.env.AUTO_SEND_THRESHOLD || '75');
+  // Threshold: si caller a déjà filtré (traiterNouveauLead) le score est ok.
+  // Sinon (envoyer_docs_prospect tool direct) on applique 70 par défaut.
+  const AUTO_THRESHOLD = parseInt(process.env.AUTO_SEND_THRESHOLD || '70');
   if (!match.folder || match.score < AUTO_THRESHOLD || !match.pdfs?.length) {
     return { sent: false, skipped: true, reason: `score ${match.score} < ${AUTO_THRESHOLD} ou 0 PDF`, match };
   }
@@ -7298,8 +7300,19 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   if (dealId) {
     try { dealFullObj = (await pdGet(`/deals/${dealId}`))?.data; } catch {}
   }
-  // Seuil d'envoi auto configurable (défaut 75 au lieu de 90 — plus agressif)
-  const AUTO_THRESHOLD = parseInt(process.env.AUTO_SEND_THRESHOLD || '75');
+  // Seuil d'envoi auto DYNAMIQUE selon qualité d'extraction du lead.
+  // Logique: un lead bien formé (nom + email + tel + centris + adresse = quality 100)
+  // mérite un seuil plus permissif. Un lead pauvre (peu d'info) → seuil strict.
+  //   quality ≥80  → threshold 60   (très permissif, on connaît bien le client)
+  //   quality 60-79 → threshold 70  (modéré)
+  //   quality <60   → threshold 80  (strict, peu d'info = risque)
+  // Override possible via env var AUTO_SEND_THRESHOLD (force value statique).
+  const _envThreshold = parseInt(process.env.AUTO_SEND_THRESHOLD || '0');
+  const _quality = leadParser.leadQualityScore({ nom, telephone, email, centris, adresse });
+  const AUTO_THRESHOLD = _envThreshold > 0 ? _envThreshold
+    : _quality >= 80 ? 60
+    : _quality >= 60 ? 70
+    : 80;
 
   // hasMinInfo RELAXÉ: email + (Centris# OU tel) suffit — nom pas obligatoire.
   // Si pas de nom, on utilise "Madame/Monsieur" dans le template (vouvoiement pro).

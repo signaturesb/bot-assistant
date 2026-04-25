@@ -187,7 +187,11 @@ function parseLeadEmail(body, subject, from) {
   const centris = extract(
     /\(#\s*(\d{7,9})\)/,
     /#\s*(\d{7,9})\b/,
-    /(?:centris|mls|inscription|listing)[^\d]{0,60}(\d{7,9})\b/i,
+    /(?:centris|mls|inscription|listing|fiche|propri[ée]t[ée])[^\d]{0,80}(\d{7,9})\b/i,
+    // URL Centris: /fr/maison/12345678, /en/condo/87654321, ?id=12345678, mls=12345678
+    /centris\.ca\/[^\s"'<>]*?(\d{7,9})/i,
+    /[?&](?:id|mls|listing|nid)=(\d{7,9})/i,
+    /\bMLS\s*[:#]?\s*(\d{7,9})/i,
     /\b(\d{8})\b/,
   );
 
