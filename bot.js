@@ -5763,6 +5763,63 @@ function registerHandlers() {
           ].join('\n');
           await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
         }
+      } else if (action === 'cmp_send' || action === 'cmp_cancel' || action === 'cmp_preview') {
+        if (!BREVO_KEY) {
+          await bot.answerCallbackQuery(cbq.id, { text: '❌ BREVO_API_KEY manquant' });
+          return;
+        }
+        const campaignId = arg;
+        if (action === 'cmp_preview') {
+          await bot.answerCallbackQuery(cbq.id, { text: '👁 Récupération preview...' });
+          try {
+            const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+              headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
+            });
+            const c = await r.json();
+            const recipients = c.recipients || {};
+            const stats = c.statistics?.globalStats || {};
+            const txt = [
+              `*Campagne #${campaignId}*`,
+              `Sujet: ${c.subject?.substring(0, 100) || '?'}`,
+              `Listes: ${(recipients.listIds || []).join(', ') || '?'}`,
+              `Exclusions: ${(recipients.exclusionListIds || []).length} listes`,
+              `Type: ${c.type || '?'}`,
+              `Status: ${c.status}`,
+              `Scheduled: ${c.scheduledAt ? new Date(c.scheduledAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto' }) : '?'}`,
+              `Sender: ${c.sender?.email || '?'}`,
+              ``,
+              `*Aperçu HTML (premier 500 chars):*`,
+              `\`${(c.htmlContent || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').substring(0, 500)}\``,
+            ].join('\n');
+            await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(chatId, txt.replace(/[*_`]/g, '')).catch(() => {}));
+          } catch (e) {
+            await bot.sendMessage(chatId, `❌ Preview: ${e.message?.substring(0, 200)}`);
+          }
+        } else {
+          const newStatus = action === 'cmp_send' ? 'queued' : 'suspended';
+          const verb = action === 'cmp_send' ? '✅ Confirmé — partira à scheduledAt' : '🚫 Annulé — reste suspendu';
+          await bot.answerCallbackQuery(cbq.id, { text: verb });
+          try {
+            const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/status`, {
+              method: 'PUT',
+              headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status: newStatus }),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (r.ok || r.status === 204) {
+              if (chatId && msgId) {
+                const newMarkup = { inline_keyboard: [[{ text: action === 'cmp_send' ? '✅ Confirmé' : '🚫 Annulé', callback_data: 'noop' }]] };
+                await bot.editMessageReplyMarkup(newMarkup, { chat_id: chatId, message_id: msgId }).catch(() => {});
+              }
+              auditLogEvent('campaign', action === 'cmp_send' ? 'confirmed' : 'cancelled', { campaignId });
+            } else {
+              const err = await r.text().catch(() => '');
+              await bot.sendMessage(chatId, `❌ Brevo ${r.status}: ${err.substring(0, 200)}`);
+            }
+          } catch (e) {
+            await bot.sendMessage(chatId, `❌ ${e.message?.substring(0, 200)}`);
+          }
+        }
       } else if (action === 'noop') {
         await bot.answerCallbackQuery(cbq.id);
       } else {
@@ -6768,6 +6825,54 @@ function registerHandlers() {
     const chunks = [];
     for (let i = 0; i < txt.length; i += 3500) chunks.push(txt.slice(i, i + 3500));
     for (const c of chunks) await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(msg.chat.id, c).catch(() => {}));
+  });
+
+  // /campaigns — liste campagnes Brevo suspended + boutons inline confirm/cancel
+  // Remplace le système confirmserver Mac fragile (Cloudflare tunnel volatile).
+  // Bot appelle directement Brevo API → robuste, jamais down.
+  bot.onText(/^\/campaigns?\b|\/courriels?\b|\/envois?\b/i, async msg => {
+    if (!isAllowed(msg)) return;
+    if (!BREVO_KEY) return bot.sendMessage(msg.chat.id, '❌ BREVO_API_KEY requis');
+    await bot.sendMessage(msg.chat.id, `📧 *Recherche campagnes en attente...*`, { parse_mode: 'Markdown' });
+    try {
+      const r = await fetch('https://api.brevo.com/v3/emailCampaigns?status=suspended&limit=20', {
+        headers: { 'api-key': BREVO_KEY, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!r.ok) return bot.sendMessage(msg.chat.id, `❌ Brevo HTTP ${r.status}`);
+      const data = await r.json();
+      const campaigns = data.campaigns || [];
+      if (!campaigns.length) {
+        return bot.sendMessage(msg.chat.id, `✅ Aucune campagne en attente (suspended: 0)`);
+      }
+      // Trier par scheduledAt asc (plus proche en premier)
+      campaigns.sort((a, b) => new Date(a.scheduledAt || 0) - new Date(b.scheduledAt || 0));
+      // Header summary
+      await bot.sendMessage(msg.chat.id,
+        `📧 *${campaigns.length} campagne(s) en attente de confirmation*\n_Click ✅ pour activer · 🚫 pour annuler · 👁 pour preview_`,
+        { parse_mode: 'Markdown' }
+      );
+      // Une bulle par campagne avec inline buttons
+      for (const c of campaigns.slice(0, 10)) {
+        const sched = c.scheduledAt ? new Date(c.scheduledAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' }) : '?';
+        const txt = `*#${c.id}* · ${c.name?.substring(0, 60) || '?'}\n📅 ${sched}\n📋 ${c.subject?.substring(0, 80) || '?'}`;
+        const replyMarkup = {
+          inline_keyboard: [[
+            { text: '✅ Confirmer', callback_data: `cmp_send:${c.id}` },
+            { text: '🚫 Annuler', callback_data: `cmp_cancel:${c.id}` },
+            { text: '👁 Preview', callback_data: `cmp_preview:${c.id}` },
+          ]],
+        };
+        await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'Markdown', reply_markup: replyMarkup }).catch(() =>
+          bot.sendMessage(msg.chat.id, txt.replace(/[*_`]/g, ''), { reply_markup: replyMarkup }).catch(() => {})
+        );
+      }
+      if (campaigns.length > 10) {
+        await bot.sendMessage(msg.chat.id, `_+ ${campaigns.length - 10} autres — utilise dashboard Brevo pour gérer_`, { parse_mode: 'Markdown' });
+      }
+    } catch (e) {
+      bot.sendMessage(msg.chat.id, `❌ ${e.message?.substring(0, 200)}`);
+    }
   });
 
   // /firecrawl — statut quota + dernières villes scrapées
