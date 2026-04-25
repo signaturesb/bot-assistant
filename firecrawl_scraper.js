@@ -14,8 +14,12 @@ const crypto = require('crypto');
 
 const DATA_DIR = fs.existsSync('/data') ? '/data' : '/tmp';
 
+// Note: apiKey est résolu LAZY (à chaque scrape) via getApiKey() pour
+// supporter le secret-loader Dropbox qui injecte process.env APRÈS le
+// require de ce module au boot.
+function getApiKey() { return process.env.FIRECRAWL_API_KEY || ''; }
 const CONFIG = {
-  apiKey:       process.env.FIRECRAWL_API_KEY || '',
+  get apiKey() { return getApiKey(); },
   baseUrl:      'https://api.firecrawl.dev/v1',
   quotaMonthly: parseInt(process.env.FIRECRAWL_QUOTA_MONTHLY || '500'),
   cacheDir:     path.join(DATA_DIR, 'firecrawl_cache'),

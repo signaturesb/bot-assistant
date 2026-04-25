@@ -1405,6 +1405,44 @@ async function dropboxAPI(apiUrl, body, isDownload = false) {
   }
   return res;
 }
+// Self-service secret loader: bypasse Render env vars en stockant
+// les clés API dans Dropbox /bot-secrets/<KEY>.txt. Bot lit au boot
+// et injecte dans process.env. Permet d'ajouter des clés (Firecrawl,
+// Perplexity, etc.) sans accès à la console Render.
+async function loadDropboxSecrets() {
+  if (!dropboxToken) await refreshDropboxToken();
+  const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '/bot-secrets', recursive: false });
+  if (!res || !res.ok) {
+    if (res?.status === 409) log('INFO', 'SECRETS', 'Dossier /bot-secrets absent (normal si jamais utilisé)');
+    return 0;
+  }
+  const data = await res.json();
+  const files = (data.entries || []).filter(e => e['.tag'] === 'file' && e.name.endsWith('.txt'));
+  let loaded = 0;
+  for (const f of files) {
+    const key = f.name.replace(/\.txt$/, '');
+    if (process.env[key]) continue; // priorité aux env vars Render
+    const dl = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: f.path_lower }, true);
+    if (dl?.ok) {
+      const v = (await dl.text()).trim();
+      if (v) { process.env[key] = v; loaded++; log('OK', 'SECRETS', `${key} chargé depuis Dropbox`); }
+    }
+  }
+  return loaded;
+}
+async function uploadDropboxSecret(key, value) {
+  if (!dropboxToken) await refreshDropboxToken();
+  const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${dropboxToken}`,
+      'Content-Type': 'application/octet-stream',
+      'Dropbox-API-Arg': JSON.stringify({ path: `/bot-secrets/${key}.txt`, mode: 'overwrite', autorename: false, mute: true })
+    },
+    body: Buffer.from(String(value))
+  });
+  return res.ok;
+}
 async function listDropboxFolder(folderPath) {
   const p = folderPath === '' ? '' : ('/' + folderPath.replace(/^\//, ''));
   const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: p, recursive: false });
@@ -6837,6 +6875,40 @@ function registerHandlers() {
   // quel email reçu, même si pas détecté comme lead. Utile pour récupérer info même
   // si Pipedrive a échoué ou si le format est inhabituel.
   // Sans arg: dernier email Gmail. Avec arg "last 5": 5 derniers. Avec msgId: spécifique.
+  // /setsecret KEY VALUE — stocke un secret dans Dropbox /bot-secrets/<KEY>.txt
+  // ET injecte dans process.env immédiatement (sans redeploy Render).
+  // Permet d'ajouter FIRECRAWL_API_KEY, PERPLEXITY_API_KEY, etc. en 1 message.
+  bot.onText(/^\/setsecret\s+(\S+)\s+(.+)/i, async (msg, m) => {
+    if (!isAllowed(msg)) return;
+    const key = m[1].toUpperCase().trim();
+    const value = m[2].trim();
+    if (!/^[A-Z0-9_]+$/.test(key)) return bot.sendMessage(msg.chat.id, `❌ Clé invalide: ${key} (lettres+chiffres+underscore seulement)`);
+    if (value.length < 8) return bot.sendMessage(msg.chat.id, `❌ Valeur trop courte (min 8 chars)`);
+    try {
+      const ok = await uploadDropboxSecret(key, value);
+      if (!ok) return bot.sendMessage(msg.chat.id, `❌ Upload Dropbox échoué`);
+      process.env[key] = value;
+      const masked = value.length > 12 ? value.substring(0, 6) + '...' + value.substring(value.length - 4) : '***';
+      await bot.sendMessage(msg.chat.id, `✅ *${key}* sauvegardé\n\n• Dropbox: \`/bot-secrets/${key}.txt\`\n• process.env: actif live\n• Valeur: \`${masked}\`\n\n_Persiste à travers les redeploys Render._`, { parse_mode: 'Markdown' });
+      // Auto-delete le message original (contient la clé en clair)
+      try { await bot.deleteMessage(msg.chat.id, msg.message_id); } catch {}
+    } catch (e) { bot.sendMessage(msg.chat.id, `❌ Erreur: ${e.message}`); }
+  });
+
+  // /listsecrets — affiche les clés stockées dans Dropbox (sans valeurs)
+  bot.onText(/^\/listsecrets$/i, async (msg) => {
+    if (!isAllowed(msg)) return;
+    try {
+      const res = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: '/bot-secrets', recursive: false });
+      if (!res?.ok) return bot.sendMessage(msg.chat.id, `📭 Aucun secret stocké (dossier /bot-secrets vide ou absent)`);
+      const data = await res.json();
+      const keys = (data.entries || []).filter(e => e['.tag'] === 'file' && e.name.endsWith('.txt')).map(e => e.name.replace(/\.txt$/, ''));
+      if (!keys.length) return bot.sendMessage(msg.chat.id, `📭 Aucun secret stocké`);
+      const lines = keys.map(k => `• \`${k}\` ${process.env[k] ? '✅' : '⚠️ pas en process.env'}`).join('\n');
+      bot.sendMessage(msg.chat.id, `🔐 *Secrets Dropbox (${keys.length})*\n\n${lines}\n\n_Pour ajouter:_ \`/setsecret KEY VALUE\``, { parse_mode: 'Markdown' });
+    } catch (e) { bot.sendMessage(msg.chat.id, `❌ ${e.message}`); }
+  });
+
   bot.onText(/^\/extract(?:\s+(.+))?/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const arg = (match[1] || '').trim();
@@ -10321,6 +10393,12 @@ async function main() {
       if (!ok) log('WARN', 'BOOT', 'Dropbox refresh échoué au démarrage');
     } catch (e) { log('WARN', 'BOOT', `Dropbox refresh exception: ${e.message}`); }
   }
+
+  log('INFO', 'BOOT', 'Step 1b: load secrets from Dropbox');
+  try {
+    const n = await loadDropboxSecrets();
+    if (n > 0) log('OK', 'BOOT', `${n} secret(s) chargé(s) depuis Dropbox /bot-secrets/`);
+  } catch (e) { log('WARN', 'BOOT', `Dropbox secrets: ${e.message}`); }
 
   log('INFO', 'BOOT', 'Step 2: load Dropbox structure + index');
   try { await loadDropboxStructure(); } catch (e) { log('WARN', 'BOOT', `Dropbox struct: ${e.message}`); }
