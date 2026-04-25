@@ -5587,6 +5587,42 @@ function registerHandlers() {
     }
   });
 
+  // ─── RACCOURCIS WEB RESEARCH ─────────────────────────────────────────────
+  // /pdf <url>       — télécharge n'importe quel PDF + envoie sur Telegram
+  // /scrape <url>    — scrape page + extract liens PDF (+ download top 5)
+  // /cherche <query> — Perplexity + Firecrawl + auto-download PDFs trouvés
+  bot.onText(/^\/pdf\s+(\S+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const url = match[1].trim();
+    await bot.sendMessage(msg.chat.id, `📥 Téléchargement: ${url}...`);
+    const result = await executeToolSafe('telecharger_pdf', { url }, msg.chat.id).catch(e => `❌ ${e.message}`);
+    await bot.sendMessage(msg.chat.id, String(result).substring(0, 4000));
+  });
+
+  bot.onText(/^\/scrape\s+(\S+)(?:\s+(.*))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const url = match[1].trim();
+    const motsCles = match[2] ? match[2].split(/[,\s]+/).filter(Boolean) : [];
+    await bot.sendMessage(msg.chat.id, `🌐 Scrape ${url}${motsCles.length ? ' filtrant: ' + motsCles.join(',') : ''}...`);
+    const result = await executeToolSafe('scraper_avance', { url, mots_cles: motsCles, telecharger_pdfs: true }, msg.chat.id).catch(e => `❌ ${e.message}`);
+    // Split if too long for Telegram
+    const txt = String(result);
+    const chunks = [];
+    for (let i = 0; i < txt.length; i += 3500) chunks.push(txt.slice(i, i + 3500));
+    for (const c of chunks) await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(msg.chat.id, c).catch(() => {}));
+  });
+
+  bot.onText(/^\/cherche\s+(.+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const question = match[1].trim();
+    await bot.sendMessage(msg.chat.id, `🔍 Recherche: "${question}"\n_(Perplexity → Firecrawl → download auto)_`, { parse_mode: 'Markdown' });
+    const result = await executeToolSafe('recherche_documents', { question, max_resultats: 3 }, msg.chat.id).catch(e => `❌ ${e.message}`);
+    const txt = String(result);
+    const chunks = [];
+    for (let i = 0; i < txt.length; i += 3500) chunks.push(txt.slice(i, i + 3500));
+    for (const c of chunks) await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(msg.chat.id, c).catch(() => {}));
+  });
+
   // /firecrawl — statut quota + dernières villes scrapées
   bot.onText(/\/firecrawl\b/i, async msg => {
     if (!isAllowed(msg)) return;
