@@ -829,6 +829,35 @@ function logActivity(event) {
 // Partie dynamique (Dropbox + mémoire + session live) — change fréquemment, jamais cachée
 function getSystemDynamic() {
   const parts = [];
+
+  // ━━ DATE & HEURE — INJECTÉ À CHAQUE REQUÊTE (PAS CACHÉ) ━━
+  // Bug fix 2026-04-25: SYSTEM_BASE est caché par Anthropic prompt caching.
+  // Si on y mettait la date au boot, Claude verrait toujours la date du
+  // dernier reboot (potentiellement 2 jours en arrière). C'est pourquoi
+  // les dates dans Pipedrive étaient fausses — Claude devinait à partir
+  // de ses données training (2024) ou d'une date périmée du boot.
+  const TZ = 'America/Toronto';
+  const now = new Date();
+  const dateLong = now.toLocaleDateString('fr-CA', { timeZone: TZ, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const dateISO = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+  const timeShort = now.toLocaleTimeString('fr-CA', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false });
+  const dayName = now.toLocaleDateString('fr-CA', { timeZone: TZ, weekday: 'long' });
+  // Calculs jours relatifs prêts pour Claude
+  const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowISO = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(tomorrow);
+  parts.push(
+    `━━ DATE & HEURE ACTUELLES (impératif — pour outils Pipedrive) ━━\n` +
+    `📅 Aujourd'hui: ${dateLong} (ISO: ${dateISO})\n` +
+    `🕐 Heure: ${timeShort} ${TZ}\n` +
+    `📆 Demain: ${tomorrowISO}\n` +
+    `\n` +
+    `RÈGLE ABSOLUE: les outils planifier_visite / creer_activite EXIGENT format ISO:\n` +
+    `  • due_date: YYYY-MM-DD (ex: ${tomorrowISO})\n` +
+    `  • due_time: HH:MM (ex: 14:00)\n` +
+    `Calculer "demain", "vendredi prochain", "dans 3 jours" À PARTIR DE ${dateISO}.\n` +
+    `JAMAIS deviner l'année — utiliser ${dateISO.substring(0, 4)}.`
+  );
+
   if (dropboxStructure) parts.push(`━━ DROPBOX — Structure actuelle:\n${dropboxStructure}`);
   if (sessionLiveContext) {
     // Tronquer à 3000 chars pour rester raisonnable en tokens
@@ -2064,6 +2093,21 @@ async function modifierDeal(terme, { valeur, titre, dateClose, raison }) {
 
 async function creerActivite({ terme, type, sujet, date, heure }) {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  // VALIDATION DATE — empêche Claude d'envoyer une date périmée (bug récurrent)
+  if (date) {
+    const m = String(date).match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return `❌ Date invalide "${date}" — format attendu YYYY-MM-DD`;
+    const dateObj = new Date(`${m[1]}-${m[2]}-${m[3]}T12:00:00`);
+    if (isNaN(dateObj.getTime())) return `❌ Date invalide "${date}"`;
+    const ageMs = Date.now() - dateObj.getTime();
+    const futureMs = dateObj.getTime() - Date.now();
+    // Refuser dates >60 jours dans le passé OU >2 ans dans le futur (= probable hallucination Claude)
+    if (ageMs > 60 * 86400000) return `❌ Date "${date}" est ${Math.round(ageMs/86400000)} jours dans le passé. Vérifie la date courante (system prompt) et réessaie.`;
+    if (futureMs > 730 * 86400000) return `❌ Date "${date}" est >2 ans dans le futur. Vérifie l'année.`;
+  }
+  if (heure && !/^\d{2}:\d{2}$/.test(String(heure))) {
+    return `❌ Heure invalide "${heure}" — format attendu HH:MM (ex: 14:00)`;
+  }
   const TYPES = { appel:'call', call:'call', email:'email', réunion:'meeting', meeting:'meeting', tâche:'task', task:'task', visite:'meeting', texte:'task' };
   const actType = TYPES[type?.toLowerCase()?.trim()] || 'task';
   const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
@@ -2251,6 +2295,17 @@ async function planifierVisite({ prospect, date, adresse }) {
   }
   const dateStr = rdvISO.split('T')[0];
   const timeStr = rdvISO.includes('T') ? rdvISO.split('T')[1]?.substring(0, 5) : '14:00';
+
+  // VALIDATION DATE — empêche dates périmées/hallucinées (bug Claude récurrent)
+  const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return `❌ Date invalide "${dateStr}" — format YYYY-MM-DD requis`;
+  const dateObj = new Date(`${dateStr}T12:00:00`);
+  if (isNaN(dateObj.getTime())) return `❌ Date "${dateStr}" non parsable`;
+  const ageMs = Date.now() - dateObj.getTime();
+  const futureMs = dateObj.getTime() - Date.now();
+  if (ageMs > 60 * 86400000) return `❌ Date "${dateStr}" est ${Math.round(ageMs/86400000)} jours dans le passé. Vérifie la date courante.`;
+  if (futureMs > 730 * 86400000) return `❌ Date "${dateStr}" est >2 ans dans le futur — probable hallucination, vérifie l'année.`;
+  if (timeStr && !/^\d{2}:\d{2}/.test(timeStr)) return `❌ Heure invalide "${timeStr}"`;
 
   await Promise.all([
     pdPut(`/deals/${deal.id}`, { stage_id: 52 }),
@@ -4139,7 +4194,7 @@ const TOOLS = [
   { name: 'ajouter_note',       description: 'Ajouter une note sur un prospect dans Pipedrive.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, note: { type: 'string' } }, required: ['terme', 'note'] } },
   { name: 'stats_business',     description: 'Tableau de bord: pipeline par étape, performance du mois, taux de conversion.', input_schema: { type: 'object', properties: {} } },
   { name: 'creer_deal',         description: 'Créer un nouveau prospect/deal dans Pipedrive. Utiliser quand Shawn dit "nouveau prospect: [info]" ou reçoit un lead.', input_schema: { type: 'object', properties: { prenom: { type: 'string' }, nom: { type: 'string' }, telephone: { type: 'string' }, email: { type: 'string' }, type: { type: 'string', description: 'terrain, maison_usagee, maison_neuve, construction_neuve, auto_construction, plex' }, source: { type: 'string', description: 'centris, facebook, site_web, reference, appel' }, centris: { type: 'string', description: 'Numéro Centris si disponible' }, note: { type: 'string', description: 'Note initiale: besoin, secteur, budget, délai' } }, required: ['prenom'] } },
-  { name: 'planifier_visite',   description: 'Planifier une visite de propriété. Met à jour le deal → Visite prévue + crée activité Pipedrive + sauvegarde pour rappel matin.', input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Nom du prospect' }, date: { type: 'string', description: 'Date ISO (2024-05-10T14:00) ou approximation' }, adresse: { type: 'string', description: 'Adresse de la propriété (optionnel)' } }, required: ['prospect', 'date'] } },
+  { name: 'planifier_visite',   description: 'Planifier une visite de propriété. Met à jour le deal → Visite prévue + crée activité Pipedrive + sauvegarde pour rappel matin.', input_schema: { type: 'object', properties: { prospect: { type: 'string', description: 'Nom du prospect' }, date: { type: 'string', description: 'Date ISO format YYYY-MM-DDTHH:MM (ex: 2026-04-26T14:00). UTILISE LA DATE COURANTE DU SYSTEM PROMPT, JAMAIS DEVINER L\'ANNÉE.' }, adresse: { type: 'string', description: 'Adresse de la propriété (optionnel)' } }, required: ['prospect', 'date'] } },
   { name: 'voir_visites',      description: 'Voir les visites planifiées (aujourd\'hui + à venir). Pour "mes visites", "c\'est quoi aujourd\'hui".', input_schema: { type: 'object', properties: {} } },
   { name: 'changer_etape',          description: 'Changer l\'étape d\'un deal Pipedrive. Options: nouveau, contacté, discussion, visite prévue, visite faite, offre, gagné.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, etape: { type: 'string' } }, required: ['terme', 'etape'] } },
   { name: 'voir_activites',         description: 'Voir les activités et tâches planifiées pour un deal. "c\'est quoi le prochain step avec Jean?"', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
@@ -4148,7 +4203,7 @@ const TOOLS = [
   { name: 'historique_contact',     description: 'Timeline chronologique d\'un prospect: notes + activités triées. Compact pour mobile. Pour "c\'est quoi le background de Jean?", "show me the history for Marie".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
   { name: 'repondre_vite',          description: 'Réponse rapide mobile: trouve l\'email du prospect dans Pipedrive AUTOMATIQUEMENT, prépare le brouillon style Shawn. Shawn dit juste son message, le bot fait le reste. Ne pas appeler si email déjà connu — utiliser envoyer_email directement.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive' }, message: { type: 'string', description: 'Texte de la réponse tel que dicté par Shawn' } }, required: ['terme', 'message'] } },
   { name: 'modifier_deal',          description: 'Modifier la valeur, le titre ou la date de clôture d\'un deal.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction' }, titre: { type: 'string' }, dateClose: { type: 'string', description: 'Date ISO YYYY-MM-DD' } }, required: ['terme'] } },
-  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'YYYY-MM-DD' }, heure: { type: 'string', description: 'HH:MM' } }, required: ['terme', 'type'] } },
+  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite. UTILISE LA DATE COURANTE DU SYSTEM PROMPT (jamais deviner l\'année).', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'Format STRICT YYYY-MM-DD (ex: 2026-04-26). Calculer à partir de la date courante du system prompt.' }, heure: { type: 'string', description: 'Format STRICT HH:MM (ex: 14:00)' } }, required: ['terme', 'type'] } },
   // ── Gmail ──
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
