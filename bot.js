@@ -3543,6 +3543,120 @@ async function historiqueContact(terme) {
   return txt.trim();
 }
 
+// ─── CERVEAU STRATÉGIQUE — analyseStrategique() ───────────────────────────
+// Utilise Claude Opus 4.7 (le modèle le plus intelligent) pour analyser
+// pipeline Pipedrive + audit log leads + mémoire stratégique + ventes passées.
+// Génère un rapport d'insights + 3-5 actions concrètes priorisées.
+// Cron dimanche 7am + ad-hoc via /analyse [question].
+async function analyseStrategique(question) {
+  if (!API_KEY) return '❌ ANTHROPIC_API_KEY requis';
+  if (!PD_KEY)  return '❌ PIPEDRIVE_API_KEY requis';
+
+  // 1. Collecte data en parallèle
+  const [actifs, gagnes, perdus] = await Promise.all([
+    pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=open&limit=100`).catch(() => null),
+    pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=won&limit=50`).catch(() => null),
+    pdGet(`/deals?pipeline_id=${AGENT.pipeline_id}&status=lost&limit=50`).catch(() => null),
+  ]);
+  const dealsActifs = actifs?.data || [];
+  const dealsGagnes = gagnes?.data || [];
+  const dealsPerdus = perdus?.data || [];
+  const now = Date.now();
+
+  // 2. Préparer données condensées (max 40K tokens input pour Opus)
+  const summarize = d => ({
+    title: d.title?.substring(0, 60),
+    stage: d.stage_id,
+    value: d.value || 0,
+    add_ago_days: d.add_time ? Math.floor((now - new Date(d.add_time).getTime()) / 86400000) : null,
+    last_act_ago_days: d.last_activity_date ? Math.floor((now - new Date(d.last_activity_date).getTime()) / 86400000) : null,
+    notes_count: d.notes_count || 0,
+    activities_count: d.activities_count || 0,
+    centris: d[PD_FIELD_CENTRIS] || null,
+    type: d[PD_FIELD_TYPE] || null,
+  });
+  const data = {
+    dealsActifs: dealsActifs.map(summarize),
+    dealsGagnes30j: dealsGagnes.filter(d => {
+      const t = d.close_time || d.won_time;
+      return t && (now - new Date(t).getTime()) < 30 * 86400000;
+    }).map(summarize),
+    dealsGagnes90j: dealsGagnes.filter(d => {
+      const t = d.close_time || d.won_time;
+      return t && (now - new Date(t).getTime()) < 90 * 86400000;
+    }).map(summarize),
+    dealsPerdus30j: dealsPerdus.filter(d => {
+      const t = d.lost_time;
+      return t && (now - new Date(t).getTime()) < 30 * 86400000;
+    }).map(summarize),
+    leadsRecents: (auditLog || []).filter(e => e.category === 'lead').slice(-50).map(e => ({
+      decision: e.details?.decision,
+      source: e.details?.source,
+      at: e.at,
+      score: e.details?.match?.score,
+      auto_validated: !!e.details?.match?.found,
+    })),
+    memoryFacts: (kiramem?.facts || []).slice(-100), // 100 derniers facts catégorisés
+  };
+
+  const stages = '49=Nouveau · 50=Contacté · 51=En discussion · 52=Visite prévue · 53=Visite faite · 54=Offre déposée · 55=Gagné';
+  const promptUser = question
+    ? `Question stratégique du courtier: ${question}\n\nUtilise les données ci-dessous pour répondre de façon actionnable.`
+    : `Génère le rapport stratégique HEBDOMADAIRE pour ${AGENT.nom}, courtier ${AGENT.compagnie} en ${AGENT.region}.
+
+Format attendu (court, actionnable, en français québécois):
+
+🎯 BIG PICTURE (2 lignes)
+État global du pipeline et tendance.
+
+🔥 TOP 3 OPPORTUNITÉS (à pousser cette semaine)
+Pour chacune: nom deal + raison spécifique + action concrète.
+
+⚠️ TOP 3 RISQUES (à régler avant qu'on les perde)
+Pour chacune: nom deal + pourquoi à risque + action.
+
+📊 PATTERNS DÉTECTÉS (insights tirés des données)
+Ce que les chiffres révèlent (ex: meilleure source, type qui convertit, prix qui marchent...).
+
+⚡ 5 ACTIONS PRIORISÉES POUR LA SEMAINE
+Ordonnées par impact ventes immédiat. Spécifiques (qui/quoi/quand).
+
+Sois DIRECT et concis. Pas de blabla. Format Markdown.`;
+
+  const stageInfo = `Pipeline ID ${AGENT.pipeline_id}: ${stages}`;
+  const dataJson = JSON.stringify(data, null, 0).substring(0, 80000);
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 60000);
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-4-7', // INTELLIGENCE MAXIMALE pour analyse stratégique
+        max_tokens: 2000,
+        system: `Tu es l'analyste stratégique senior de ${AGENT.nom}, courtier RE/MAX en ${AGENT.region}. Tu connais le marché immobilier québécois (terrains, plexs, maisons usagées, construction neuve). Spécialités: ${AGENT.specialites}.\n\n${stageInfo}\n\nTu as accès à TOUTES les données du pipeline + leads récents + mémoire catégorisée. Ton job: identifier les patterns, prioriser les actions, augmenter les ventes. Sois direct, actionnable, précis. Tutoiement.`,
+        messages: [
+          { role: 'user', content: `${promptUser}\n\n━━ DONNÉES ━━\n${dataJson}` },
+        ],
+      }),
+    });
+    clearTimeout(t);
+    if (!res.ok) {
+      const err = await res.text().catch(() => '');
+      return `❌ Opus ${res.status}: ${err.substring(0, 200)}`;
+    }
+    const data2 = await res.json();
+    if (data2.usage) trackCost('claude-opus-4-7', data2.usage);
+    const reply = data2.content?.[0]?.text?.trim() || '(vide)';
+    auditLogEvent('strategic-analysis', question ? 'ad-hoc' : 'weekly', { tokens_in: data2.usage?.input_tokens, tokens_out: data2.usage?.output_tokens });
+    return reply;
+  } catch (e) {
+    clearTimeout(t);
+    return `❌ Analyse stratégique: ${e.message?.substring(0, 200)}`;
+  }
+}
+
 // ─── Whisper (voix → texte) ───────────────────────────────────────────────────
 // Prompt OPTIMISÉ pour reconnaissance vocabulaire Shawn: termes immobilier QC,
 // noms locaux, marques partenaires, expressions courantes courtier, commandes
@@ -5700,6 +5814,33 @@ function registerHandlers() {
     }
   });
 
+  // /analyse [question] — CERVEAU STRATÉGIQUE Opus 4.7 (analyse profonde + actions)
+  // Sans question → rapport hebdo complet. Avec question → réponse spécifique.
+  // Latence ~30-60s (analyse profonde de tout le pipeline + audit + mémoire).
+  bot.onText(/^\/analyse(?:\s+(.+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const question = match[1]?.trim() || null;
+    await bot.sendMessage(msg.chat.id, question
+      ? `🧠 *Analyse stratégique en cours...* (${question})\n_Opus 4.7 — 30-60s pour examiner pipeline + ventes + mémoire_`
+      : `🧠 *Rapport stratégique hebdo en cours...*\n_Opus 4.7 — analyse profonde de toutes tes données_`, { parse_mode: 'Markdown' });
+    bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    try {
+      const reply = await analyseStrategique(question);
+      clearInterval(typing);
+      const chunks = [];
+      for (let i = 0; i < reply.length; i += 3800) chunks.push(reply.slice(i, i + 3800));
+      for (const c of chunks) {
+        await bot.sendMessage(msg.chat.id, c, { parse_mode: 'Markdown' }).catch(() =>
+          bot.sendMessage(msg.chat.id, c.replace(/[*_`]/g, '')).catch(() => {})
+        );
+      }
+    } catch (e) {
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, `❌ Analyse: ${e.message?.substring(0, 300)}`);
+    }
+  });
+
   // /insights — DASHBOARD STRATÉGIQUE pour augmenter ventes
   // Connecte Pipedrive + audit log + mémoire pour identifier:
   //   • Leads chauds (haute probabilité conversion)
@@ -7524,6 +7665,16 @@ function startDailyTasks() {
     if (h === 6  && lastCron.trashCI !== todayStr)  { lastCron.trashCI = todayStr; autoTrashGitHubNoise(); }
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
+    // CERVEAU STRATÉGIQUE — rapport hebdo dimanche 7h (Opus 4.7 deep analysis)
+    if (now.getDay() === 0 && h === 7 && lastCron.strategic !== todayStr) {
+      lastCron.strategic = todayStr;
+      analyseStrategique(null).then(report => {
+        if (report && !report.startsWith('❌')) {
+          sendTelegramWithFallback(`🧠 *Rapport stratégique hebdo*\n\n${report.substring(0, 3500)}`,
+            { category: 'weekly-strategic-report' }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
     // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
   }, 60 * 1000);
