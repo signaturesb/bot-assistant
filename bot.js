@@ -3809,6 +3809,36 @@ const CENTRIS_BASE = 'https://www.centris.ca';
 // Session Centris (expire 2h)
 let centrisSession = { cookies: '', expiry: 0, authenticated: false };
 
+// ─── Centris session cookies (manual capture from Chrome) ─────────────────
+// Persistance: /data/centris_session.json + Gist backup. TTL 25j.
+// Approche bypass MFA: Shawn login dans Chrome (avec MFA), copie cookies
+// header, paste dans Telegram via /cookies <string>. Bot use ces cookies
+// pour toutes les opérations Centris (fiche, comparables, etc.).
+const CENTRIS_SESSION_FILE = path.join(DATA_DIR, 'centris_session.json');
+function loadCentrisSessionFromDisk() {
+  try {
+    if (fs.existsSync(CENTRIS_SESSION_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CENTRIS_SESSION_FILE, 'utf8'));
+      if (data && data.cookies && data.expiry > Date.now()) {
+        centrisSession = { ...data, authenticated: true };
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+function saveCentrisSessionToDisk() {
+  if (!centrisSession.cookies) return;
+  safeWriteJSON(CENTRIS_SESSION_FILE, {
+    cookies: centrisSession.cookies,
+    expiry: centrisSession.expiry,
+    via: centrisSession.via || 'manual-capture',
+    capturedAt: centrisSession.lastLoginAt || Date.now(),
+  });
+}
+// Charge au boot
+loadCentrisSessionFromDisk();
+
 // ─── MFA Bridge — coordination Mac SMS bridge ↔ Centris OAuth flow ────────
 let pendingMFACode = null;       // dernier code reçu non consommé
 let mfaWaiters = [];             // resolveurs Promise en attente d'un code
@@ -4101,10 +4131,14 @@ async function centrisLogin() {
 }
 
 async function centrisGet(path, options = {}) {
-  // Auto-relogin si session expirée
+  // Priorité: cookies manuel-capture (via /cookies command, valide 25j).
+  // Fallback: tentative login auto si CENTRIS_USER/PASS configurés.
   if (!centrisSession.cookies || Date.now() > centrisSession.expiry) {
+    if (centrisSession.via === 'manual-capture') {
+      throw new Error('🍪 Cookies Centris expirés. Re-capture: 1) Login matrix.centris.ca dans Chrome 2) DevTools → Cookies → copy 3) /cookies <string>');
+    }
     const ok = await centrisLogin();
-    if (!ok) throw new Error('Centris: impossible de se connecter — vérifier CENTRIS_USER/CENTRIS_PASS');
+    if (!ok) throw new Error('Centris: pas de cookies capturés. Tape /cookies dans Telegram pour setup (60 sec).');
   }
 
   const controller = new AbortController();
@@ -6449,6 +6483,104 @@ function registerHandlers() {
     }
   });
 
+  // /cookies <string> — capture cookies session Centris depuis Chrome (one-time setup)
+  // Procédure utilisateur: Chrome → matrix.centris.ca (login + MFA) → DevTools (Cmd+Opt+I)
+  // → Application → Cookies → matrix.centris.ca → copy tous les cookies
+  // (ou plus simple: Network tab → click une requête → headers → "Cookie:" copy value)
+  bot.onText(/^\/cookies\s+(.+)/is, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const raw = match[1].trim();
+    // Parse — accepte 2 formats:
+    //   1. Header style: "Cookie: name1=val1; name2=val2"
+    //   2. Plain: "name1=val1; name2=val2"
+    //   3. JSON array of {name, value} (DevTools export)
+    let cookieStr = '';
+    try {
+      if (raw.startsWith('[') || raw.startsWith('{')) {
+        const arr = JSON.parse(raw);
+        cookieStr = (Array.isArray(arr) ? arr : [arr])
+          .map(c => `${c.name}=${c.value}`).join('; ');
+      } else {
+        cookieStr = raw.replace(/^Cookie:\s*/i, '').trim();
+      }
+    } catch (e) {
+      return bot.sendMessage(msg.chat.id, `❌ Format cookies invalide. Attendu: string Cookie header OU JSON array de DevTools.\n\nExemple:\n\`/cookies _ga=GA1.2.123; .centris_auth=xyz; ...\``, { parse_mode: 'Markdown' });
+    }
+    if (!cookieStr || cookieStr.length < 50) {
+      return bot.sendMessage(msg.chat.id, `❌ Cookie string trop courte (${cookieStr.length} chars). Devrait faire 500-3000 chars.`);
+    }
+    // Validation rapide: doit contenir au moins quelques tokens centris-related
+    const tokens = ['centris', 'auth', 'session', '_ga', 'aspnet'];
+    const hasIndicator = tokens.some(t => cookieStr.toLowerCase().includes(t));
+    if (!hasIndicator) {
+      return bot.sendMessage(msg.chat.id, `⚠️ Ces cookies ne ressemblent pas à du Centris/Auth0. Continue quand même? Re-tape \`/cookies-force <string>\` si tu es sûr.`, { parse_mode: 'Markdown' });
+    }
+    // Test ces cookies contre matrix.centris.ca
+    await bot.sendMessage(msg.chat.id, `🔍 Test des cookies contre matrix.centris.ca...`);
+    try {
+      const testRes = await fetch('https://matrix.centris.ca/Matrix/Default.aspx', {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
+          'Cookie': cookieStr,
+        },
+        redirect: 'manual',
+      });
+      const isAuth = testRes.status === 200 || (testRes.status >= 300 && testRes.status < 400 && !(testRes.headers.get('location') || '').includes('Login'));
+      if (!isAuth) {
+        return bot.sendMessage(msg.chat.id, `❌ Cookies refusés par Centris (HTTP ${testRes.status}). Re-login dans Chrome + recopie les cookies.`);
+      }
+    } catch (e) {
+      return bot.sendMessage(msg.chat.id, `❌ Test cookies exception: ${e.message?.substring(0, 200)}`);
+    }
+    // Save 25j (typique session Centris longue durée)
+    centrisSession = {
+      cookies: cookieStr,
+      expiry: Date.now() + 25 * 24 * 3600 * 1000,
+      authenticated: true,
+      lastLoginAt: Date.now(),
+      via: 'manual-capture',
+    };
+    saveCentrisSessionToDisk();
+    auditLogEvent('centris', 'cookies-captured', { length: cookieStr.length });
+    await bot.sendMessage(msg.chat.id,
+      `✅ *Cookies Centris validés et sauvegardés*\n\n` +
+      `📦 ${cookieStr.length} chars · session valide ~25 jours\n` +
+      `🗄️ Persisté disque + backup Gist\n\n` +
+      `Tu peux maintenant utiliser:\n` +
+      `• \`/fiche <#> <email>\` — envoie fiche d'un listing\n` +
+      `• \`/info <#>\` — dashboard propriété\n` +
+      `• Outils \`telecharger_fiche_centris\`, \`chercher_comparables\` (langage naturel)\n\n` +
+      `Le bot te pingera quand les cookies vont expirer (~25j).`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // /centris-status — vérifie si cookies valides + expiry
+  bot.onText(/^\/centris[-_]?status/i, async msg => {
+    if (!isAllowed(msg)) return;
+    if (!centrisSession.cookies) {
+      return bot.sendMessage(msg.chat.id,
+        `⚠️ *Aucun cookies Centris*\n\nFais le setup une fois:\n` +
+        `1. Login matrix.centris.ca dans Chrome (avec MFA)\n` +
+        `2. DevTools (Cmd+Opt+I) → Network → click une requête → header "Cookie:" → copy\n` +
+        `3. Tape \`/cookies <le_string>\`\n\n` +
+        `Le bot test la validité, save 25j, et te ping quand expire.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+    const remainingMs = centrisSession.expiry - Date.now();
+    const remainingDays = Math.round(remainingMs / 86400000);
+    const lastLogin = centrisSession.lastLoginAt ? new Date(centrisSession.lastLoginAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto' }) : '?';
+    bot.sendMessage(msg.chat.id,
+      `🍪 *Centris session*\n` +
+      `Expire dans: ${remainingDays > 0 ? `*${remainingDays} jours*` : '🔴 EXPIRÉ — re-capture nécessaire'}\n` +
+      `Cookies: ${centrisSession.cookies.length} chars\n` +
+      `Capturé: ${lastLogin}\n` +
+      `Via: ${centrisSession.via || '?'}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
   // /login_centris — déclenche login OAuth complet avec injection MFA auto
   // Coordonné avec le bridge Mac sms-bridge.js qui forward le code SMS au bot.
   bot.onText(/^\/login[-_]?centris\b/i, async msg => {
@@ -7829,6 +7961,33 @@ function startDailyTasks() {
       .then(r => r.ok ? null : log('WARN', 'KEEPALIVE', `self-ping ${r.status}`))
       .catch(e => log('WARN', 'KEEPALIVE', `self-ping: ${e.message.substring(0, 60)}`));
   }, 10 * 60 * 1000);
+
+  // CENTRIS COOKIES EXPIRY ALERT — ping si <3j avant expiry (max 1×/jour)
+  let _lastCentrisExpiryAlert = 0;
+  setInterval(() => {
+    if (!centrisSession.cookies || centrisSession.via !== 'manual-capture') return;
+    const remaining = centrisSession.expiry - Date.now();
+    const days = remaining / 86400000;
+    const cooldown = 23 * 60 * 60 * 1000;
+    if (days < 3 && days > 0 && Date.now() - _lastCentrisExpiryAlert > cooldown) {
+      _lastCentrisExpiryAlert = Date.now();
+      sendTelegramWithFallback(
+        `🍪 *Cookies Centris expirent dans ${Math.round(days)} jour(s)*\n\n` +
+        `Pour éviter coupure du service /fiche:\n` +
+        `1. Login matrix.centris.ca dans Chrome (avec MFA si demandé)\n` +
+        `2. DevTools (Cmd+Opt+I) → Network → click une requête → "Cookie" header → copy\n` +
+        `3. \`/cookies <le_string>\` — bot test + save 25 jours de plus\n\n` +
+        `60 secondes total.`,
+        { category: 'centris-cookies-expiring', days }
+      ).catch(() => {});
+    } else if (days <= 0 && Date.now() - _lastCentrisExpiryAlert > cooldown) {
+      _lastCentrisExpiryAlert = Date.now();
+      sendTelegramWithFallback(
+        `🔴 *Cookies Centris EXPIRÉS*\n\nLes outils \`/fiche\`, comparables, etc. ne fonctionneront plus tant que tu n'auras pas re-capturé.\n\nProcédure (60 sec):\n1. matrix.centris.ca dans Chrome\n2. DevTools → Cookies → copy\n3. \`/cookies <string>\``,
+        { category: 'centris-cookies-expired' }
+      ).catch(() => {});
+    }
+  }, 6 * 60 * 60 * 1000); // check toutes les 6h
 
   // LEAD AGING ESCALATION — ping si pending >4h (max 1×/jour par lead)
   // Évite qu'un pending reste silencieusement oublié si Shawn n'a pas vu la notif.
