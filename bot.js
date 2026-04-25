@@ -273,9 +273,14 @@ try {
   pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
 }
 
-// NOTE: consent implicite via seuils score (≥75 auto, <75 preview+pending)
-// + blacklist nom + isValidProspectName. Aucun email/SMS ne part sans au moins
-// un de ces checks validés. Voir sendTelegramWithFallback pour notifs Shawn.
+// 🔒 RÈGLE ABSOLUE — Aucun courriel ne s'envoie sans consent explicite Shawn.
+// Cette flag est lue par envoyerDocsAuto et toute fonction qui pourrait envoyer
+// un courriel "automatique". Si true (toujours, par décision Shawn 2026-04-25):
+//   - Pas d'auto-send sur lead (tout passe par preview shawn@ + Telegram pending)
+//   - "envoie les docs à <email>" reste la seule porte d'entrée pour livrer
+// Référence demande Shawn: "souvent des clients me disent qu'il reçoivent
+//   des courriels de ma part, et je n'étais même pas au courant"
+const CONSENT_REQUIRED = true;
 const POLLER_ENABLED = process.env.POLLER_ENABLED !== 'false'; // kill switch via env
 let autoSendPaused = false; // toggle via /pauseauto command
 
@@ -2459,7 +2464,14 @@ async function convertDocsToPDF(docs, folderLabel) {
 // ═══════════════════════════════════════════════════════════════════════════
 let autoEnvoiState = loadJSON(AUTOENVOI_FILE, { sent: {}, log: [], totalAuto: 0, totalFails: 0 });
 
-async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match }) {
+async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match, _shawnConsent }) {
+  // 🔒 KILLSWITCH consent — si CONSENT_REQUIRED, refuse tout envoi sauf si
+  // l'appelant a explicitement attesté que Shawn a confirmé via Telegram
+  // (ex: handler "envoie les docs à X" passe _shawnConsent: true).
+  if (CONSENT_REQUIRED && !_shawnConsent) {
+    log('WARN', 'AUTOENVOI', `BLOQUÉ — envoi sans consent Shawn pour ${email}`);
+    return { sent: false, skipped: true, reason: 'CONSENT_REQUIRED — confirmation Shawn manquante', match };
+  }
   const dedupKey = `${email}|${centris || match?.folder?.centris || ''}`;
   const last = autoEnvoiState.sent[dedupKey];
   if (last && (Date.now() - last) < 24 * 3600 * 1000) {
@@ -4796,8 +4808,9 @@ function registerHandlers() {
       return bot.sendMessage(msg.chat.id, `❌ Aucun pending match pour "${target}". Utilise /pending pour voir la liste.`);
     }
     await bot.sendMessage(msg.chat.id, `📤 Envoi docs à ${pending.email}...`);
+    pending._shawnConsent = true; // attestation pour auto-recovery futur
     try {
-      const r = await envoyerDocsAuto(pending);
+      const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
       if (r.sent) {
         await bot.sendMessage(msg.chat.id, `✅ Envoyé · ${pending.match.pdfs.length} PDFs · ${Math.round(r.deliveryMs/1000)}s`);
         auditLogEvent('manual-send', 'docs-sent', { email: pending.email, confirmed: true });
@@ -5238,11 +5251,12 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     const n = pendingDocSends.size;
     if (n === 0) return bot.sendMessage(msg.chat.id, '✅ Aucun pending à flush.');
-    await bot.sendMessage(msg.chat.id, `⚡ Flush ${n} pending doc-sends (force retry)...`);
+    await bot.sendMessage(msg.chat.id, `⚡ Flush ${n} pending doc-sends (force retry — consent Shawn)...`);
     let sent = 0, failed = 0;
     for (const [email, pending] of [...pendingDocSends.entries()]) {
       try {
-        const r = await envoyerDocsAuto(pending);
+        // Shawn a tapé /flush-pending = consent explicit pour TOUS les pending
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
         if (r.sent) { pendingDocSends.delete(email); sent++; }
         else if (r.skipped) log('INFO', 'FLUSH', `${email}: ${r.reason}`);
         else failed++;
@@ -6333,7 +6347,18 @@ function startDailyTasks() {
     log('INFO', 'RECOVERY', `Auto-retry ${toRetry.length} pendingDocSends (>5min)`);
     for (const { email, pending } of toRetry) {
       try {
-        const r = await envoyerDocsAuto(pending);
+        // RÈGLE CONSENT: ne retry QUE si Shawn avait déjà confirmé l'envoi
+        // (envoyerDocsAuto a échoué après son "envoie"). Sinon, juste notifier.
+        if (!pending._shawnConsent) {
+          await sendTelegramWithFallback(
+            `⏰ *Lead pending sans consent* — ${email}\n` +
+            `Match score ${pending.match?.score || '?'} · ${pending.match?.pdfs?.length || '?'} PDFs prêts.\n` +
+            `Réponds \`envoie les docs à ${email}\` pour livrer OU \`annule ${email}\`.`,
+            { category: 'pending-awaiting-consent', email }
+          );
+          continue; // pas de retry sans accord explicite
+        }
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
         if (r.sent) {
           pendingDocSends.delete(email);
           await sendTelegramWithFallback(
@@ -6971,7 +6996,8 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     const results = [];
     for (const [email, pending] of [...pendingDocSends.entries()]) {
       try {
-        const r = await envoyerDocsAuto(pending);
+        // Admin token = Shawn's authorized tool → consent implicite
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
         if (r.sent) { pendingDocSends.delete(email); results.push({ email, sent: true }); }
         else results.push({ email, sent: false, reason: r.reason || r.error });
       } catch (e) { results.push({ email, sent: false, error: e.message.substring(0, 150) }); }
@@ -7428,34 +7454,14 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
-  } else if (hasMinInfo && hasMatch && dbxMatch.score >= AUTO_THRESHOLD && !autoSendPaused) {
-    // ✅ AUTO-ENVOI — on procède MÊME SI Pipedrive a failé (dealFullObj peut être null).
-    // Le match Dropbox + email + (tel ou Centris) sont suffisants pour un vrai lead.
-    try {
-      // Stub deal si Pipedrive down, permet à envoyerDocsAuto de travailler
-      const dealForSend = dealFullObj || { id: null, title: nom || email, [PD_FIELD_CENTRIS]: centris || '' };
-      const autoRes = await envoyerDocsAuto({
-        email, nom: nom || email.split('@')[0], centris, dealId: dealId || null, deal: dealForSend, match: dbxMatch,
-      });
-      if (autoRes.sent) {
-        leadAudit.decision = 'auto_sent'; leadAudit.deliveryMs = autoRes.deliveryMs; leadAudit.attempts = autoRes.attempt;
-        autoEnvoiMsg = `\n🚀 *Docs envoyés auto* à ${email}\n   ${dbxMatch.pdfs.length} docs · match "${dbxMatch.folder.adresse||dbxMatch.folder.name}" · score ${dbxMatch.score} · ${Math.round(autoRes.deliveryMs/1000)}s${autoRes.attempt > 1 ? ` (${autoRes.attempt} tentatives)` : ''}`;
-        auditLogEvent('auto-send', 'docs-sent', { email, centris, score: dbxMatch.score, docs: dbxMatch.pdfs.length, ms: autoRes.deliveryMs });
-      } else if (autoRes.skipped) {
-        leadAudit.decision = 'auto_skipped'; leadAudit.skipReason = autoRes.reason;
-        autoEnvoiMsg = `\n⏭ Auto-envoi skip: ${autoRes.reason}`;
-      } else {
-        leadAudit.decision = 'auto_failed'; leadAudit.error = String(autoRes.error).substring(0, 200); leadAudit.attempts = autoRes.attempts;
-        autoEnvoiMsg = `\n⚠️ *Auto-envoi ÉCHOUÉ* après ${autoRes.attempts} tentatives: ${String(autoRes.error).substring(0, 120)}\n   Envoie manuellement: \`envoie les docs à ${email}\``;
-        pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
-        auditLogEvent('auto-send', 'docs-failed', { email, error: String(autoRes.error).substring(0, 200) });
-      }
-    } catch (e) {
-      leadAudit.decision = 'auto_exception'; leadAudit.error = e.message.substring(0, 200);
-      autoEnvoiMsg = `\n⚠️ Auto-envoi exception: ${e.message.substring(0, 100)}`;
-      pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
-    }
-  } else if (email && hasMatch) {
+  // ─── RÈGLE ABSOLUE 2026-04-25 — CONSENT_REQUIRED ────────────────────────
+  // Zéro courriel ne s'envoie sans accord explicite de Shawn via Telegram.
+  // Tous les leads avec match → preview shawn@ + pending, JAMAIS auto-envoi.
+  // Shawn a dit: "souvent des clients me disent qu'il reçoivent des courriels
+  //  de ma part, et je n'étais même pas au courant"
+  // → branche auto-envoi à score ≥75 retirée. La logique pending preview
+  //   ci-dessous gère TOUS les cas. /pauseauto reste pour killswitch global.
+  } else if (false) { // legacy auto-send désactivé — laissé en place 1 cycle pour audit
     // Score < AUTO_THRESHOLD OU infos incomplètes → preview + pending
     leadAudit.decision = 'pending_preview_sent';
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
