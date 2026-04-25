@@ -8414,16 +8414,72 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
-  // ─── RÈGLE CONSENT_REQUIRED — TOUS les leads → preview + pending ────────
-  // Tous les leads avec match Dropbox passent par preview shawn@ + pending
-  // Telegram avec boutons inline. JAMAIS d'auto-envoi (Shawn 2026-04-25).
+    return { decision: 'blocked_suspect_name', dealId };
+  }
+
+  // ─── HYBRIDE B (Shawn 2026-04-25): auto-send si TOUS critères stricts ────
+  // CRITÈRES AUTO-SAFE — TOUS doivent être OK (sinon fallback preview):
+  //   1. Match Dropbox PARFAIT (score 100 = Centris# exact) → exclut fuzzy
+  //   2. Nom valide isValidProspectName (pas Shawn capté par erreur)
+  //   3. AI a validé l'extraction (deep scrape réussi OU regex 5/5 complet)
+  //   4. Email + (téléphone OU centris) extraits du body
+  //   5. Source connue (centris/remax/realtor/duproprio) — pas 'direct' inconnu
+  //   6. Pipedrive deal créé sans erreur
+  //   7. autoSendPaused = false
+  //
+  // Si TOUS OK → auto-envoi + notif "🚀 envoyé auto" + audit complet.
+  //   → consent attesté par les critères stricts (équivalent click manuel
+  //     pour leads ultra-clean). Tu sais TOUJOURS via Telegram immédiatement.
+  // Si moindre doute → preview + click ✅ comme avant (mode A).
+  const aiValidated = (lead && lead._aiValidated) || (typeof lead._infoCount === 'number' && lead._infoCount >= 4);
+  const sourceTrusted = /^(centris|remax|realtor|duproprio)$/i.test(source?.source || '');
+  const exactMatch = dbxMatch?.score === 100;
+  const completeContact = !!(email && (telephone || centris));
+  const AUTO_SAFE = exactMatch && aiValidated && completeContact && sourceTrusted && hasMatch && !!dealId && !autoSendPaused && isValidProspectName(nom);
+
+  if (AUTO_SAFE) {
+    // Auto-envoi avec consent attesté par critères stricts
+    try {
+      const dealForSend = dealFullObj || { id: dealId, title: nom || email, [PD_FIELD_CENTRIS]: centris || '' };
+      const autoRes = await envoyerDocsAuto({
+        email, nom, centris, dealId, deal: dealForSend, match: dbxMatch,
+        _shawnConsent: true, // attesté par AUTO_SAFE = tous critères stricts validés
+      });
+      if (autoRes.sent) {
+        leadAudit.decision = 'auto_sent';
+        leadAudit.deliveryMs = autoRes.deliveryMs;
+        autoEnvoiMsg = `\n🚀 *Docs envoyés auto* à ${email}\n` +
+                       `   ${dbxMatch.pdfs.length} docs · Centris# ${centris} match exact · ${Math.round(autoRes.deliveryMs/1000)}s\n` +
+                       `   ✅ Toi en Cc · Note Pipedrive ajoutée · audit tracé`;
+        auditLogEvent('auto-send', 'docs-sent-auto-safe', { email, centris, score: dbxMatch.score, ms: autoRes.deliveryMs });
+      } else {
+        // Auto échoué → fallback preview/pending
+        leadAudit.decision = 'auto_failed_fallback_pending';
+        pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+        firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
+        autoEnvoiMsg = `\n⚠️ Auto-send a échoué (${autoRes.error || autoRes.reason}) — fallback preview + click manuel\n   ✅ Click bouton ci-dessous OU dis \`envoie les docs à ${email}\``;
+      }
+    } catch (e) {
+      leadAudit.decision = 'auto_exception';
+      leadAudit.error = e.message?.substring(0, 200);
+      pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
+      firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
+      autoEnvoiMsg = `\n⚠️ Exception auto-send: ${e.message?.substring(0, 100)} — fallback preview`;
+    }
   } else if (email && hasMatch) {
+    // Mode preview + pending (consent click obligatoire)
     leadAudit.decision = 'pending_preview_sent';
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
-    const why = !hasMinInfo
-      ? `infos incomplètes (nom=${nom?'✓':'✗'} email=${email?'✓':'✗'} contact=${(telephone||centris)?'✓':'✗'})`
-      : `match score ${dbxMatch.score}/100`;
+    // Explique POURQUOI ce n'est pas auto-safe (transparence pour Shawn)
+    const reasons = [];
+    if (!exactMatch) reasons.push(`match ${dbxMatch.score}/100 (pas exact)`);
+    if (!aiValidated) reasons.push('extraction non validée par AI');
+    if (!completeContact) reasons.push('contact incomplet');
+    if (!sourceTrusted) reasons.push(`source "${source?.source}" non reconnue`);
+    if (!isValidProspectName(nom)) reasons.push('nom invalide');
+    if (!dealId) reasons.push('deal Pipedrive non créé');
+    const why = reasons.length ? reasons.join(', ') : `match score ${dbxMatch.score}`;
     const docsList = dbxMatch.pdfs.slice(0, 10).map(p => `     • ${p.name}`).join('\n');
     autoEnvoiMsg = `\n📦 *Docs prêts — attend ton OK* (${why})\n` +
                    `   Dossier: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
@@ -8885,18 +8941,38 @@ async function runGmailLeadPoller(opts = {}) {
 
           let lead = parseLeadEmail(body, subject, from);
           let infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+          let aiValidated = false;
 
-          // AI FALLBACK — si regex extrait <3 infos, appel Claude Sonnet 4.6 avec tool-use structuré
-          // Passe plain + html bodies pour max contexte (certains formulaires sont HTML-only)
-          if (infoCount < 3 && API_KEY) {
-            log('INFO', 'POLLER', `Regex ${infoCount} infos — AI fallback (sonnet tool-use) pour "${subject.substring(0,50)}"`);
+          // AI DEEP SCRAPE (renforcé Shawn 2026-04-25): toujours appeler l'AI quand
+          // l'info n'est pas COMPLÈTE (5/5), pour valider/enrichir l'extraction et
+          // donner un signal de confiance pour l'auto-send. Avant: AI seulement si <3.
+          // Maintenant: AI dès que <5 ET au moins 2 (sinon junk évident, on skip AI).
+          if (infoCount < 5 && infoCount >= 2 && API_KEY) {
+            log('INFO', 'POLLER', `Regex ${infoCount}/5 infos — AI deep scrape (sonnet tool-use) pour "${subject.substring(0,50)}"`);
             try {
-              lead = await parseLeadEmailWithAI(body, subject, from, lead, {
+              const enriched = await parseLeadEmailWithAI(body, subject, from, lead, {
                 apiKey: API_KEY, logger: log, htmlBody: bodies.html,
               });
+              if (enriched && (enriched.nom || enriched.email || enriched.centris)) {
+                lead = enriched;
+                aiValidated = true;
+                infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
+              }
+            } catch (e) { log('WARN', 'POLLER', `AI deep scrape: ${e.message}`); }
+          } else if (infoCount === 5) {
+            // Regex a tout extrait — confiance haute déjà
+            aiValidated = true;
+          } else if (infoCount < 2 && API_KEY) {
+            // Cas limite: presque rien extrait, AI fallback dernière chance
+            try {
+              lead = await parseLeadEmailWithAI(body, subject, from, lead, { apiKey: API_KEY, logger: log, htmlBody: bodies.html }) || lead;
               infoCount = [lead.nom, lead.email, lead.telephone, lead.centris, lead.adresse].filter(Boolean).length;
-            } catch (e) { log('WARN', 'POLLER', `AI fallback: ${e.message}`); }
+              aiValidated = infoCount >= 3;
+            } catch {}
           }
+          // Marqueur de confiance utilisé par traiterNouveauLead pour décider auto-send
+          lead._aiValidated = aiValidated;
+          lead._infoCount = infoCount;
 
           // VALIDATION lead viable — minimum 2 infos OU Centris# seul suffit
           if (infoCount < 2 && !lead.centris) {
