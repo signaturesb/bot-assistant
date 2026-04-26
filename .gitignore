@@ -33,3 +33,6 @@ build/
 *.bak
 *.backup
 *.orig
+
+# Personal index data — données clients confidentielles (iMessage/Gmail/phones), JAMAIS en git
+scripts/personal_index/data/
