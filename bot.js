@@ -8193,6 +8193,9 @@ function getProactive() {
 }
 
 async function runDigestJulie() {
+  // 🧊 SUR GLACE par défaut — Shawn ne veut pas d'emails auto sans accord.
+  // Pour réactiver: /setsecret DIGEST_JULIE_ENABLED true (effet immédiat).
+  if (process.env.DIGEST_JULIE_ENABLED !== 'true') return;
   if (!PD_KEY || !BREVO_KEY) return;
   try {
     const [nouveaux, enDiscussion, visitesAujourdhui] = await Promise.all([
