@@ -5263,11 +5263,29 @@ async function detectAnomalies() {
   // 2. Zero leads en 24h (alors qu'on s'y attend — check poller actif)
   // NB: ignorer l'alerte si totalsDedup > 0 (dedup fonctionne = c'est normal qu'aucun
   // nouveau lead ne soit processé si tout l'historique est déjà vu).
+  // NB2: les emails peuvent être classifiés en noSource/junk/lowInfo — c'est PAS forcément
+  // un bug. Seuil élevé + breakdown détaillé pour différencier "personne n'écrit" vs "parser cassé".
   const pollerStatsRef = pollerStats;
+  const totalActivityAll = (pollerStatsRef.totalsProcessed || 0) + (pollerStatsRef.totalsDedup || 0)
+                          + (pollerStatsRef.totalsNoSource || 0) + (pollerStatsRef.totalsJunk || 0)
+                          + (pollerStatsRef.totalsLowInfo || 0);
   const totalProcessingSignal = (pollerStatsRef.totalsProcessed || 0) + (pollerStatsRef.totalsDedup || 0);
-  if (pollerStatsRef.runs > 200 && totalProcessingSignal === 0 && (pollerStatsRef.totalsFound || 0) > 0) {
-    // 200 polls + des emails trouvés + mais 0 traité/dedup = parser vraiment cassé
-    anomalies.push({ key: 'no_leads_processed', msg: `${pollerStatsRef.runs} polls, ${pollerStatsRef.totalsFound} emails vus, mais 0 traité/dedup — source detection ou parser cassé`, severity: 'high' });
+  // Vrai bug = beaucoup d'emails classés "noSource" (pas reconnu) + 0 traité réel.
+  // Si tout va dans noSource sans aucun traité, le détecteur de source est probablement cassé.
+  // Mais seuil >1000 emails (au lieu de >0) pour réduire le bruit.
+  if (pollerStatsRef.runs > 200 && totalProcessingSignal === 0 && (pollerStatsRef.totalsNoSource || 0) > 1000) {
+    const breakdown = [
+      `${pollerStatsRef.totalsNoSource} noSource`,
+      `${pollerStatsRef.totalsJunk || 0} junk`,
+      `${pollerStatsRef.totalsLowInfo || 0} lowInfo`,
+      `${pollerStatsRef.totalsDedup || 0} dedup`,
+      `${pollerStatsRef.totalsProcessed || 0} processed`,
+    ].join(' · ');
+    anomalies.push({
+      key: 'no_leads_processed',
+      msg: `Source detector cassé? ${pollerStatsRef.totalsFound} emails vus / ${breakdown}`,
+      severity: 'high'
+    });
   }
 
   // 2b. Silence poller anormal en heures ouvrables.
