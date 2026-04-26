@@ -8166,7 +8166,31 @@ function registerHandlers() {
 }
 
 // ─── Tâches quotidiennes (sans node-cron) ─────────────────────────────────────
-const lastCron = { digest: null, suivi: null, visites: null, sync: null, trashCI: null };
+const lastCron = {
+  digest: null, suivi: null, visites: null, sync: null, trashCI: null,
+  // Pipedrive proactive (anti-perte-de-lead)
+  stagnant: null, morningProactive: null, j1NotCalled: null, hygiene: null, weeklyDigest: null
+};
+
+// Module proactive — 5 features anti-perte-de-lead, lazy require pour startup rapide
+let _proactive = null;
+function getProactive() {
+  if (_proactive) return _proactive;
+  try {
+    _proactive = require('./pipedrive_proactive');
+    _proactive.init({
+      pdGet,
+      sendTG: (msg, opts) => sendTelegramWithFallback(msg, { ...opts, category: 'pipedrive-proactive' }),
+      AGENT,
+      log
+    });
+    log('OK', 'PROACTIVE', 'Module pipedrive_proactive chargé');
+    return _proactive;
+  } catch (e) {
+    log('ERR', 'PROACTIVE', `Load failed: ${e.message}`);
+    return null;
+  }
+}
 
 async function runDigestJulie() {
   if (!PD_KEY || !BREVO_KEY) return;
@@ -8578,6 +8602,35 @@ function startDailyTasks() {
     if (h === 6  && lastCron.trashCI !== todayStr)  { lastCron.trashCI = todayStr; autoTrashGitHubNoise(); }
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
+
+    // ── Pipedrive Proactive — 5 features anti-perte-de-lead ──────────────────
+    const minute = now.toLocaleString('fr-CA', { minute: 'numeric', hour12: false, timeZone: 'America/Toronto' });
+    const m = parseInt(minute);
+    // 06h00 — stagnants J+3/J+7/J+30 (avant la journée)
+    if (h === 6 && m === 0 && lastCron.stagnant !== todayStr) {
+      lastCron.stagnant = todayStr;
+      getProactive()?.stagnantDeals?.().catch(e => log('WARN', 'PROACTIVE', `stagnant: ${e.message}`));
+    }
+    // 08h30 — rapport matinal
+    if (h === 8 && m === 30 && lastCron.morningProactive !== todayStr) {
+      lastCron.morningProactive = todayStr;
+      getProactive()?.morningReport?.().catch(e => log('WARN', 'PROACTIVE', `morning: ${e.message}`));
+    }
+    // 17h00 — alerte J+1 lead pas appelé
+    if (h === 17 && m === 0 && lastCron.j1NotCalled !== todayStr) {
+      lastCron.j1NotCalled = todayStr;
+      getProactive()?.alerteJ1NotCalled?.().catch(e => log('WARN', 'PROACTIVE', `j1: ${e.message}`));
+    }
+    // 23h00 — hygiène CRM
+    if (h === 23 && m === 0 && lastCron.hygiene !== todayStr) {
+      lastCron.hygiene = todayStr;
+      getProactive()?.crmHygiene?.().catch(e => log('WARN', 'PROACTIVE', `hygiene: ${e.message}`));
+    }
+    // Dimanche 18h00 — digest semaine
+    if (now.getDay() === 0 && h === 18 && m === 0 && lastCron.weeklyDigest !== todayStr) {
+      lastCron.weeklyDigest = todayStr;
+      getProactive()?.weeklyDigest?.().catch(e => log('WARN', 'PROACTIVE', `weekly: ${e.message}`));
+    }
     // CERVEAU STRATÉGIQUE — rapport hebdo dimanche 7h (Opus 4.7 deep analysis)
     if (now.getDay() === 0 && h === 7 && lastCron.strategic !== todayStr) {
       lastCron.strategic = todayStr;
