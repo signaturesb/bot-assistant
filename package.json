@@ -21,9 +21,9 @@
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.36.0",
+    "@anthropic-ai/sdk": "^0.91.1",
     "dotenv": "^16.0.0",
-    "node-telegram-bot-api": "^0.66.0",
+    "node-telegram-bot-api": "^0.67.0",
     "pdf-lib": "^1.17.1"
   },
   "overrides": {
