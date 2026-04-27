@@ -47,7 +47,7 @@ jobs:
 
       - name: Open issue if health fails
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const sha = context.sha.substring(0, 7);
