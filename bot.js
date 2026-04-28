@@ -2151,6 +2151,70 @@ async function modifierDeal(terme, { valeur, titre, dateClose, raison }) {
   return `✅ *${deal.title}* mis à jour\n${changes}`;
 }
 
+// ─── ANTI-DOUBLONS activités (3e demande Shawn — Lounes, Jeannot, Mathieu) ──
+// Règle: 1 activité par (type+date) par deal. Point. Quel que soit le nb d'emails entrants.
+
+/**
+ * Check si activité non-complétée du même type existe déjà à cette date pour ce deal.
+ * Retourne l'ID existant si trouvée, null sinon.
+ */
+async function activiteExisteDeja(dealId, type, date = null) {
+  if (!dealId || !type) return null;
+  const targetDate = date || new Date().toISOString().split('T')[0];
+  try {
+    const r = await pdGet(`/deals/${dealId}/activities?limit=50`);
+    const acts = r?.data || [];
+    const match = acts.find(a => a.type === type && !a.done && a.due_date === targetDate);
+    return match ? match.id : null;
+  } catch (e) {
+    log('WARN', 'DEDUP', `activiteExisteDeja deal ${dealId}: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Nettoie les doublons d'activités sur un deal.
+ * Garde la PLUS RÉCENTE de chaque (type+due_date) parmi les non-complétées, supprime le reste.
+ * Ne touche JAMAIS aux activités déjà complétées (done=true).
+ */
+async function nettoyerDoublonsActivites(dealId) {
+  if (!dealId) return { gardees: 0, supprimees: 0 };
+  try {
+    const r = await pdGet(`/deals/${dealId}/activities?limit=100`);
+    const acts = r?.data || [];
+
+    // Grouper par (type + due_date) — uniquement non-complétées
+    const groupes = new Map();
+    for (const a of acts) {
+      if (a.done) continue;
+      const key = `${a.type}_${a.due_date || 'no-date'}`;
+      if (!groupes.has(key)) groupes.set(key, []);
+      groupes.get(key).push(a);
+    }
+
+    let gardees = 0, supprimees = 0;
+    for (const [, group] of groupes) {
+      if (group.length <= 1) { gardees++; continue; }
+      // Trier par add_time DESC, garder le premier (plus récent)
+      group.sort((a, b) => new Date(b.add_time).getTime() - new Date(a.add_time).getTime());
+      gardees++;
+      for (let i = 1; i < group.length; i++) {
+        try {
+          const dr = await fetch(`https://api.pipedrive.com/v1/activities/${group[i].id}?api_token=${PD_KEY}`, { method: 'DELETE' });
+          if (dr.ok) {
+            supprimees++;
+            log('OK', 'DEDUP', `Activité #${group[i].id} (${group[i].type}/${group[i].due_date}) supprimée du deal ${dealId}`);
+          }
+        } catch (e) { log('WARN', 'DEDUP', `Delete err: ${e.message}`); }
+      }
+    }
+    return { gardees, supprimees };
+  } catch (e) {
+    log('ERR', 'DEDUP', `nettoyerDoublonsActivites deal ${dealId}: ${e.message}`);
+    return { gardees: 0, supprimees: 0, error: e.message };
+  }
+}
+
 async function creerActivite({ terme, type, sujet, date, heure }) {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   // VALIDATION DATE — empêche Claude d'envoyer une date périmée (bug récurrent)
@@ -2174,6 +2238,15 @@ async function creerActivite({ terme, type, sujet, date, heure }) {
   const deals = sr?.data?.items || [];
   if (!deals.length) return `Aucun deal: "${terme}"`;
   const deal = deals[0].item;
+
+  // 🛡️ ANTI-DOUBLON — check si activité même type+date existe déjà
+  const checkDate = date || new Date().toISOString().split('T')[0];
+  const existant = await activiteExisteDeja(deal.id, actType, checkDate);
+  if (existant) {
+    log('INFO', 'DEDUP', `Activité ${actType} existe déjà pour deal ${deal.id} le ${checkDate} (#${existant}) — skip création`);
+    return `⏭️ Activité *${actType}* existe déjà pour *${deal.title}* le ${checkDate} (#${existant}) — création skip`;
+  }
+
   const body = {
     deal_id: deal.id,
     subject: sujet || `${actType.charAt(0).toUpperCase() + actType.slice(1)} — ${deal.title}`,
@@ -7061,6 +7134,37 @@ function registerHandlers() {
     } catch (e) { bot.sendMessage(msg.chat.id, `❌ Erreur: ${e.message}`); }
   });
 
+  // /dedup — nettoie doublons activités sur tous les deals open (manuel)
+  // /dedup #DEAL_ID — nettoie un deal spécifique
+  bot.onText(/^\/dedup(?:\s+#?(\d+))?/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const dealArg = match?.[1] ? parseInt(match[1]) : null;
+    await bot.sendMessage(msg.chat.id, `🧹 *Dedup en cours...*${dealArg ? ` deal #${dealArg}` : ' tous deals open'}`, { parse_mode: 'Markdown' });
+
+    try {
+      if (dealArg) {
+        const res = await nettoyerDoublonsActivites(dealArg);
+        const dInfo = await pdGet(`/deals/${dealArg}`).then(r => r?.data).catch(() => null);
+        await bot.sendMessage(msg.chat.id,
+          `✅ *Deal #${dealArg}* ${dInfo ? `(${dInfo.title})` : ''}\n` +
+          `${res.gardees} groupe(s) gardé(s)\n` +
+          `${res.supprimees} doublon(s) supprimé(s)`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        const r = await runDedupHebdo();
+        await bot.sendMessage(msg.chat.id,
+          `✅ *Dedup terminé*\n\n` +
+          `${r?.totalDeals || 0} deals scannés\n` +
+          `${r?.totalSupprimees || 0} doublon(s) supprimé(s)`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ Erreur: ${e.message}`);
+    }
+  });
+
   // /listsecrets — affiche les clés stockées dans Dropbox (sans valeurs)
   bot.onText(/^\/listsecrets$/i, async (msg) => {
     if (!isAllowed(msg)) return;
@@ -8270,7 +8374,9 @@ function registerHandlers() {
 const lastCron = {
   digest: null, suivi: null, visites: null, sync: null, trashCI: null,
   // Pipedrive proactive (anti-perte-de-lead)
-  stagnant: null, morningProactive: null, j1NotCalled: null, hygiene: null, weeklyDigest: null
+  stagnant: null, morningProactive: null, j1NotCalled: null, hygiene: null, weeklyDigest: null,
+  // Veille J-1 backup + dedup hebdo activités
+  veilleCampaign: null, dedupHebdo: null
 };
 
 // Module proactive — 5 features anti-perte-de-lead, lazy require pour startup rapide
@@ -8291,6 +8397,33 @@ function getProactive() {
     log('ERR', 'PROACTIVE', `Load failed: ${e.message}`);
     return null;
   }
+}
+
+// ─── Dedup hebdo activités (dimanche 21h) ───────────────────────────────
+async function runDedupHebdo() {
+  if (!PD_KEY) return;
+  log('INFO', 'DEDUP', 'Dedup hebdo activités — scan deals open...');
+  let totalDeals = 0, totalSupprimees = 0;
+  try {
+    const r = await pdGet(`/deals?status=open&limit=500`);
+    const deals = r?.data || [];
+    totalDeals = deals.length;
+    for (const d of deals) {
+      const res = await nettoyerDoublonsActivites(d.id);
+      totalSupprimees += res.supprimees || 0;
+    }
+    log('OK', 'DEDUP', `Hebdo: ${totalSupprimees} doublon(s) supprimé(s) sur ${totalDeals} deals`);
+    if (totalSupprimees > 0) {
+      await sendTelegramWithFallback(
+        `🧹 *Dedup hebdo activités*\n\n` +
+        `${totalSupprimees} doublon(s) supprimé(s)\n` +
+        `Sur ${totalDeals} deals scannés\n\n` +
+        `_Pipeline propre — 1 activité par (type+date) par deal._`,
+        { category: 'dedup-hebdo' }
+      ).catch(() => {});
+    }
+  } catch (e) { log('ERR', 'DEDUP', `runDedupHebdo: ${e.message}`); }
+  return { totalDeals, totalSupprimees };
 }
 
 // ─── Veille J-1 backup côté Render (au cas où Mac dort) ─────────────────
@@ -8824,6 +8957,12 @@ function startDailyTasks() {
     }
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
     // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
+
+    // ── DEDUP HEBDO dimanche 21h — nettoie doublons activités sur tous les deals open ──
+    if (now.getDay() === 0 && h === 21 && m === 0 && lastCron.dedupHebdo !== todayStr) {
+      lastCron.dedupHebdo = todayStr;
+      runDedupHebdo().catch(e => log('WARN', 'DEDUP', `Hebdo: ${e.message}`));
+    }
 
     // ── VEILLE J-1 BACKUP — fail-safe si Mac scheduler.js ne tourne pas ──────
     // Tourne 19h Eastern: cherche les campagnes suspended schedulées DEMAIN.
@@ -9862,6 +10001,17 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
         }
       }
     } catch (e) { dealTxt = `⚠️ Deal: ${e.message.substring(0, 80)}`; }
+  }
+
+  // 1.5. ANTI-DOUBLONS — Nettoyer activités existantes AVANT toute nouvelle création
+  // Demande Shawn (3e fois): Lounes → 20 doublons, Jeannot → 20 doublons, Mathieu → 10+
+  if (dealId) {
+    try {
+      const cleanup = await nettoyerDoublonsActivites(dealId);
+      if (cleanup.supprimees > 0) {
+        log('OK', 'POLLER', `🧹 Anti-doublons deal ${dealId}: ${cleanup.supprimees} activité(s) doublon(s) supprimée(s) (${cleanup.gardees} gardées)`);
+      }
+    } catch (e) { log('WARN', 'POLLER', `Cleanup deal ${dealId}: ${e.message}`); }
   }
 
   // 2. Matching Dropbox AVANCÉ (4 stratégies) + auto-envoi si score ≥90
