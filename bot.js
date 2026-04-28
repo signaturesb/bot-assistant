@@ -2714,8 +2714,55 @@ async function changerEtape(terme, etape) {
   if (!deals.length) return `Aucun deal trouvé: "${terme}"`;
   const deal = deals[0].item;
   const avant = PD_STAGES[deal.stage_id] || deal.stage_id;
-  await pdPut(`/deals/${deal.id}`, { stage_id: stageId });
-  return `✅ *${deal.title || terme}*\n${avant} → ${PD_STAGES[stageId]}`;
+
+  // Stage 55 = gagné → DOIT aussi set status='won' sinon Pipedrive considère le deal open
+  const body = { stage_id: stageId };
+  if (stageId === 55) body.status = 'won';
+
+  // Verify post-action: GET et confirme que stage_id appliqué
+  await pdPut(`/deals/${deal.id}`, body);
+  const verify = await pdGet(`/deals/${deal.id}`);
+  const realStage = verify?.data?.stage_id;
+  const realStatus = verify?.data?.status;
+  if (realStage !== stageId) {
+    return `❌ ÉCHEC: stage demandé=${stageId} mais Pipedrive a stage=${realStage} status=${realStatus}\nDeal #${deal.id} — vérifie manuellement`;
+  }
+  if (stageId === 55 && realStatus !== 'won') {
+    return `❌ Stage OK (gagné) mais status reste "${realStatus}" — vérifie permissions Pipedrive`;
+  }
+  return `✅ *${deal.title || terme}* (#${deal.id})\n${avant} → ${PD_STAGES[stageId]}${stageId === 55 ? ' · status=won' : ''}`;
+}
+
+// ─── marquer_gagne — outil dédié pour fermer un deal gagné avec valeur ───
+async function marquerGagne({ terme, valeur, devise }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  if (!terme) return '❌ terme (nom prospect) requis';
+
+  const s = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+  const deals = s?.data?.items || [];
+  if (!deals.length) return `Aucun deal trouvé: "${terme}"`;
+  const deal = deals[0].item;
+
+  const body = { status: 'won', stage_id: 55 };
+  if (valeur != null && valeur !== '') body.value = parseFloat(valeur);
+  if (devise) body.currency = devise.toUpperCase();
+
+  await pdPut(`/deals/${deal.id}`, body);
+
+  // Verify — GET et check que tout est appliqué
+  const verify = await pdGet(`/deals/${deal.id}`);
+  const v = verify?.data;
+  if (!v) return `❌ Deal #${deal.id} introuvable après update`;
+
+  const issues = [];
+  if (v.status !== 'won') issues.push(`status="${v.status}" (attendu won)`);
+  if (v.stage_id !== 55) issues.push(`stage_id=${v.stage_id} (attendu 55)`);
+  if (body.value != null && Math.abs((v.value || 0) - body.value) > 0.01) issues.push(`value=${v.value} (attendu ${body.value})`);
+
+  if (issues.length) {
+    return `❌ ÉCHEC partiel #${deal.id} *${v.title}*:\n${issues.join('\n')}`;
+  }
+  return `✅ *${v.title}* (#${deal.id}) marqué GAGNÉ\nValeur: ${v.value} ${v.currency || 'CAD'}\nStatus: ${v.status} · Stage: gagné`;
 }
 
 async function voirActivitesDeal(terme) {
@@ -5087,6 +5134,7 @@ const TOOLS = [
   { name: 'supprimer_personne',     description: 'SUPPRIMER une personne de Pipedrive (irréversible). Utiliser pour fiches test/doublons non-fusionnables. Si la personne a des deals, fusionner d\'abord.', input_schema: { type: 'object', properties: { personne_id: { type: 'number', description: 'ID person à supprimer' } }, required: ['personne_id'] } },
   { name: 'supprimer_note',         description: 'SUPPRIMER une note Pipedrive (test, erreur). Affiche d\'abord la liste des notes d\'un deal pour choix si terme fourni.', input_schema: { type: 'object', properties: { note_id: { type: 'number', description: 'ID exact de la note' }, terme: { type: 'string', description: 'Nom prospect — affiche les notes du deal pour choix' } } } },
   { name: 'modifier_personne',      description: 'Modifier nom/email/téléphone d\'une personne Pipedrive.', input_schema: { type: 'object', properties: { personne_id: { type: 'number', description: 'ID person' }, nom: { type: 'string' }, email: { type: 'string' }, telephone: { type: 'string' } }, required: ['personne_id'] } },
+  { name: 'marquer_gagne',          description: 'Marquer un deal comme GAGNÉ dans Pipedrive avec valeur. Set status=won + stage=55 + value. Vérifie que c\'est bien appliqué après. Préfère cet outil à changer_etape pour les ventes closées.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction (ex: 2900)' }, devise: { type: 'string', description: 'Code devise (CAD défaut)' } }, required: ['terme', 'valeur'] } },
   // ── Gmail ──
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
@@ -5181,6 +5229,7 @@ async function executeTool(name, input, chatId) {
       case 'supprimer_personne':      return await supprimerPersonne(input.personne_id);
       case 'supprimer_note':          return await supprimerNote(input);
       case 'modifier_personne':       return await modifierPersonne(input);
+      case 'marquer_gagne':           return await marquerGagne(input);
       case 'chercher_comparables': {
         const res = await chercherComparablesVendus({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14 });
         if (typeof res === 'string') return res;
