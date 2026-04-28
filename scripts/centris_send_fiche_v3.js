@@ -69,8 +69,10 @@ async function waitOutOfAuth(page, maxMs = 30000) {
   });
   const page = ctx.pages()[0] || await ctx.newPage();
 
-  // PDF capture
+  // PDF capture avec dedup par hash de contenu
   const downloads = [];
+  const seenHashes = new Set();
+  const crypto = require('crypto');
   function attachPdfCapture(p) {
     p.on('response', async resp => {
       try {
@@ -80,6 +82,13 @@ async function waitOutOfAuth(page, maxMs = 30000) {
         const buf = await resp.body();
         if (buf.length < 5000 || buf.slice(0, 4).toString() !== '%PDF') return;
         if (/Matrix.?Stats.?Guide/i.test(url)) return;
+        // Dedup par hash MD5 du contenu
+        const hash = crypto.createHash('md5').update(buf).digest('hex');
+        if (seenHashes.has(hash)) {
+          console.log(`  ⏭ DUP skip: ${(buf.length/1024).toFixed(0)}KB ${url.substring(0, 60)}`);
+          return;
+        }
+        seenHashes.add(hash);
         const fname = `${Date.now()}_${(url.split('/').pop().split('?')[0] || 'pdf').replace(/[^a-zA-Z0-9_.-]/g, '_').substring(0, 60)}.pdf`;
         const dest = path.join(DOWNLOAD_DIR, fname);
         fs.writeFileSync(dest, buf);
@@ -214,47 +223,117 @@ async function waitOutOfAuth(page, maxMs = 30000) {
   }
   await page.screenshot({ path: '/tmp/matrix_detail_v3_' + MLS + '.png', fullPage: true });
 
-  // Step 6: Trouver TOUS les liens PDF / fiche descriptive / documents
-  console.log('📄 Chercher liens PDFs...');
+  // Step 6: Trouver les 2 BONS PDFs: Fiche descriptive + Déclaration vendeur
+  // (Règle Shawn: TOUJOURS ces 2-là, pas certificat ni plans)
+  console.log('📄 Chercher liens fiche descriptive + DV...');
   const pdfLinks = await page.evaluate(() => {
     const seen = new Set();
     const out = [];
     for (const a of document.querySelectorAll('a')) {
       const href = a.href || '';
       const txt = (a.innerText || a.textContent || '').trim();
-      const score =
-        (/\.pdf/i.test(href) ? 10 : 0) +
-        (/fiche\s*descriptive/i.test(txt) ? 20 : 0) +
-        (/fiche/i.test(txt) ? 5 : 0) +
-        (/document/i.test(txt) ? 3 : 0) +
-        (/certificat|plan|cadastre/i.test(txt) ? 3 : 0) +
-        (/Document|FichaDescrip|attache|plan/i.test(href) ? 5 : 0);
+      let score = 0;
+      let category = 'other';
+
+      // PRIORITÉ 1: Fiche descriptive (avec photos, doc complet client)
+      if (/fiche\s*descriptive|fiche\s*detail|description.*client/i.test(txt)) {
+        score += 100; category = 'fiche_descriptive';
+      }
+      // PRIORITÉ 1: Déclaration du vendeur (DV — formulaire OACIQ obligatoire)
+      if (/d[eé]claration\s*(du\s*)?vendeur|^DV$|DV\s*\(|formulaire\s*DV/i.test(txt)) {
+        score += 100; category = 'declaration_vendeur';
+      }
+      // CIGMRedirector avec Custom Action = export dynamique (probablement fiche)
+      if (/CIGMRedirector.*Action=Custom/i.test(href)) {
+        score += 50; if (category === 'other') category = 'cigm_custom';
+      }
+      // PDF direct
+      if (/\.pdf/i.test(href)) score += 20;
+
+      // EXCLUSIONS — Shawn ne veut PAS ces docs
+      if (/Matrix.?Stats.?Guide|certificat\s*localisation|plan\s*cadastr|cadastre/i.test(txt + ' ' + href)) {
+        score = 0; // skip
+      }
+      // Penalize generic doc/print buttons
+      if (/^Imprimer$|guide|aide|help/i.test(txt)) score -= 10;
+
       if (score > 0 && href && !seen.has(href)) {
         seen.add(href);
-        out.push({ href, text: txt.substring(0, 80), score });
+        out.push({ href, text: txt.substring(0, 80), score, category });
       }
     }
     return out.sort((a, b) => b.score - a.score);
   });
   console.log('  ' + pdfLinks.length + ' liens scorés:');
   for (const l of pdfLinks.slice(0, 10)) {
-    console.log('    [' + l.score + '] ' + l.text + ' → ' + l.href.substring(0, 80));
+    console.log('    [' + l.score + '] (' + l.category + ') ' + l.text + ' → ' + l.href.substring(0, 80));
   }
 
-  // Step 7: Click chaque PDF link (en priorité fiche descriptive)
-  for (const link of pdfLinks.slice(0, 8)) {
-    try {
-      const [popup] = await Promise.all([
-        ctx.waitForEvent('page', { timeout: 4000 }).catch(() => null),
-        page.evaluate(url => window.open(url, '_blank'), link.href),
-      ]);
-      if (popup) {
-        attachPdfCapture(popup);
-        await popup.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-        await popup.waitForTimeout(2500);
-        await popup.close().catch(() => {});
-      }
-    } catch {}
+  // Step 7: Click PDFs prioritaires (fiche descriptive + DV en premier)
+  // Tag chaque download avec sa catégorie pour nommage propre dans email
+  const linkByCategory = {};
+  for (const link of pdfLinks.slice(0, 10)) {
+    if (!linkByCategory[link.category]) linkByCategory[link.category] = link;
+  }
+  // Attache catégorie au capture pour tagging
+  let currentCategory = 'unknown';
+  const taggedDownloads = [];
+
+  // Override capture: tag chaque PDF avec sa catégorie au moment du click
+  const originalDownloads = downloads.slice(); // snapshot
+
+  // Dedupe par href (plusieurs CIGMRedirector identiques dans la page)
+  const uniqueLinks = [];
+  const seenHrefs = new Set();
+  for (const l of pdfLinks) {
+    if (!seenHrefs.has(l.href)) { seenHrefs.add(l.href); uniqueLinks.push(l); }
+  }
+  console.log('  → ' + uniqueLinks.length + ' liens uniques après dedup');
+
+  // Pour CIGMRedirector: faut click DOM direct (le token est généré par JS au click)
+  // Pour mediaserver direct: window.open OK
+  for (const link of uniqueLinks.slice(0, 5)) {
+    console.log('  ↻ Trigger ' + link.category + ': ' + link.href.substring(0, 80));
+    const before = downloads.length;
+
+    if (link.category === 'cigm_custom' || /CIGMRedirector/.test(link.href)) {
+      // Click le N-ième CIGMRedirector via JS (le token est généré au click).
+      // On trace l'index dans uniqueLinks car tous les hrefs sont identiques (T=tok placeholder).
+      try {
+        const idx = uniqueLinks.filter(l => /CIGMRedirector/.test(l.href)).indexOf(link);
+        const [popup] = await Promise.all([
+          ctx.waitForEvent('page', { timeout: 10000 }).catch(() => null),
+          page.evaluate((i) => {
+            const all = [...document.querySelectorAll('a')].filter(a => /CIGMRedirector/i.test(a.href || ''));
+            if (all[i]) all[i].click();
+          }, idx),
+        ]);
+        if (popup) {
+          attachPdfCapture(popup);
+          await popup.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+          // Le PDF peut prendre du temps à générer côté serveur
+          await popup.waitForTimeout(6000);
+          await popup.close().catch(() => {});
+        } else {
+          // Pas de popup — peut-être direct download
+          await page.waitForTimeout(5000);
+        }
+      } catch (e) { console.log('    err: ' + e.message?.substring(0, 100)); }
+    } else {
+      // mediaserver direct — window.open OK
+      try {
+        const newPage = await ctx.newPage();
+        attachPdfCapture(newPage);
+        await newPage.goto(link.href, { waitUntil: 'load', timeout: 20000 }).catch(() => null);
+        await newPage.waitForTimeout(3000);
+        await newPage.close().catch(() => {});
+      } catch {}
+    }
+
+    // Tag les nouveaux downloads
+    for (let i = before; i < downloads.length; i++) {
+      if (!downloads[i].category) downloads[i].category = link.category;
+    }
   }
   console.log('⏳ Wait 10s downloads...');
   await page.waitForTimeout(10000);
@@ -292,10 +371,29 @@ async function waitOutOfAuth(page, maxMs = 30000) {
     .replace(/\{CENTRIS_NUM\}/g, MLS)
     .replace(/\{DATE_ENVOI\}/g, dateStr);
 
-  const attachments = valid.map((f, i) => ({
-    name: valid.length === 1 ? `Fiche_Centris_${MLS}.pdf` : `Fiche_Centris_${MLS}_${i+1}.pdf`,
-    content: fs.readFileSync(path.join(DOWNLOAD_DIR, f)).toString('base64')
-  }));
+  // Nommage propre selon catégorie du download
+  const CATEGORY_NAMES = {
+    fiche_descriptive: `Fiche_Descriptive_${MLS}.pdf`,
+    declaration_vendeur: `Declaration_Vendeur_${MLS}.pdf`,
+    cigm_custom: `Fiche_${MLS}.pdf`,
+    other: `Document_${MLS}.pdf`,
+  };
+  const attachments = [];
+  const seenCats = {};
+  for (let i = 0; i < valid.length; i++) {
+    const f = valid[i];
+    // Trouve la catégorie via downloads array
+    const dlEntry = downloads.find(d => d.name === f);
+    const cat = dlEntry?.category || 'other';
+    let name = CATEGORY_NAMES[cat] || CATEGORY_NAMES.other;
+    if (seenCats[cat]) name = name.replace('.pdf', `_${seenCats[cat]+1}.pdf`);
+    seenCats[cat] = (seenCats[cat] || 0) + 1;
+    attachments.push({
+      name,
+      content: fs.readFileSync(path.join(DOWNLOAD_DIR, f)).toString('base64')
+    });
+    console.log('  📎 ' + name + ' (' + cat + ', ' + (fs.statSync(path.join(DOWNLOAD_DIR, f)).size/1024).toFixed(0) + 'KB)');
+  }
 
   const r = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
