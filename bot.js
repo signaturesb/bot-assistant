@@ -8293,6 +8293,84 @@ function getProactive() {
   }
 }
 
+// ─── Veille J-1 backup côté Render (au cas où Mac dort) ─────────────────
+async function checkVeilleCampagnesBackup() {
+  if (!BREVO_KEY) return;
+  log('INFO', 'VEILLE', 'Backup check campagnes suspended pour demain...');
+
+  // Demain en Eastern
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowKey = tomorrow.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
+
+  // Liste suspended
+  const r = await fetch('https://api.brevo.com/v3/emailCampaigns?status=suspended&limit=50', {
+    headers: { 'api-key': BREVO_KEY, 'accept': 'application/json' },
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!r.ok) { log('WARN', 'VEILLE', `Brevo HTTP ${r.status}`); return; }
+  const data = await r.json();
+  const camps = (data.campaigns || []).filter(c => /\[AUTO\]|\[REENG\]|\[TERRAINS\]/.test(c.name || ''));
+  const targets = camps.filter(c => {
+    const d = (c.scheduledAt || '').split('T')[0];
+    return d === tomorrowKey;
+  });
+
+  if (!targets.length) {
+    log('INFO', 'VEILLE', `Aucune campagne pour demain (${tomorrowKey})`);
+    return;
+  }
+
+  // État dédup persistant
+  const STATE_FILE = require('fs').existsSync('/data') ? '/data/veille_state.json' : '/tmp/veille_state.json';
+  let state = {};
+  try { state = JSON.parse(require('fs').readFileSync(STATE_FILE, 'utf8')); } catch {}
+
+  for (const camp of targets) {
+    const dedupKey = `veille_${camp.id}_${tomorrowKey}`;
+    if (state[dedupKey]) { log('INFO', 'VEILLE', `${dedupKey} déjà fait (Mac scheduler probablement)`); continue; }
+
+    // 1. Envoie test email Brevo
+    let testOK = false;
+    try {
+      const tr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}/sendTest`, {
+        method: 'POST',
+        headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ emailTo: [SHAWN_EMAIL] }),
+        signal: AbortSignal.timeout(15000)
+      });
+      testOK = tr.ok || tr.status === 204;
+    } catch (e) { log('WARN', 'VEILLE', `sendTest err: ${e.message}`); }
+
+    // 2. Notif Telegram
+    const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}`, {
+      headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(10000)
+    }).then(r => r.json()).catch(() => ({}));
+    const segMatch = (camp.name || '').match(/\[(?:AUTO|REENG|TERRAINS)\]\s*([^·\d][^·]*?)(?:\s*[·\d]|$)/);
+    const segment = segMatch ? segMatch[1].trim() : 'Campagne';
+    const lists = det.recipients?.lists || det.recipients?.listIds || [];
+    const dateStr = new Date(camp.scheduledAt).toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
+
+    const tgText = `📧 *Campagne demain à 10h* (backup veille)\n\n` +
+      `*${segment}* · #${camp.id}\n` +
+      `📅 ${dateStr}\n` +
+      `👥 listes [${lists.join(',')}]\n` +
+      `📝 ${(det.subject || camp.subject || '').substring(0, 80)}\n\n` +
+      (testOK ? `📬 *Email de prévisualisation envoyé* — vérifie ton inbox.\n\n` : `⚠️ Test email Brevo échoué — voir l'aperçu Brevo direct.\n\n`) +
+      `→ Tape \`/campaigns\` dans le bot pour confirmer/annuler\n\n` +
+      `_Ce notif est un backup côté cloud. Le Mac scheduler peut aussi en avoir envoyé._`;
+
+    await sendTelegramWithFallback(tgText, { category: 'veille-backup' }).catch(() => {});
+    state[dedupKey] = new Date().toISOString();
+    log('OK', 'VEILLE', `Notif backup #${camp.id} envoyée`);
+  }
+
+  try {
+    require('fs').mkdirSync(require('path').dirname(STATE_FILE), { recursive: true });
+    require('fs').writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch {}
+}
+
 async function runDigestJulie() {
   // 🧊 SUR GLACE par défaut — Shawn ne veut pas d'emails auto sans accord.
   // Pour réactiver: /setsecret DIGEST_JULIE_ENABLED true (effet immédiat).
@@ -8746,6 +8824,16 @@ function startDailyTasks() {
     }
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
     // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
+
+    // ── VEILLE J-1 BACKUP — fail-safe si Mac scheduler.js ne tourne pas ──────
+    // Tourne 19h Eastern: cherche les campagnes suspended schedulées DEMAIN.
+    // Pour chacune: envoie test email Brevo + notif Telegram + marque dédup.
+    // Le Mac scheduler.js peut faire la même chose avant — la dédup empêche
+    // les doublons (key: veille_campaign_<id>).
+    if (h === 19 && lastCron.veilleCampaign !== todayStr) {
+      lastCron.veilleCampaign = todayStr;
+      checkVeilleCampagnesBackup().catch(e => log('WARN', 'VEILLE', `${e.message}`));
+    }
   }, 60 * 1000);
   // MONITORING PROACTIF — vérifie santé système toutes les 10 min, alerte Telegram si problème
   let monitoringState = { pollerAlertSent: false, autoEnvoiStreak: 0, lastAutoEnvoiAlert: 0 };
