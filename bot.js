@@ -9919,6 +9919,59 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── POST /admin/centris-cookies — push cookies depuis Mac (>4KB) ───────
+  // Bypass Telegram 4096 char limit. Sécurité: bot teste les cookies contre
+  // Centris AVANT de save — si ça marche pas, on save pas. Donc inutile pour
+  // un attaquant d'envoyer du junk. Plus rate limit 5 req/h par IP.
+  if (req.method === 'POST' && url === '/admin/centris-cookies') {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) {
+      res.writeHead(429); res.end('rate limit'); return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 50000) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const cookieStr = body.trim();
+        if (!cookieStr || cookieStr.length < 100) {
+          res.writeHead(400); res.end('cookie string trop court'); return;
+        }
+        // Test cookies contre matrix.centris.ca
+        const testRes = await fetch('https://matrix.centris.ca/Matrix/Default.aspx', {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
+            'Cookie': cookieStr,
+          },
+          redirect: 'manual',
+        });
+        const isAuth = testRes.status === 200 || (testRes.status >= 300 && testRes.status < 400 && !(testRes.headers.get('location') || '').includes('Login'));
+        if (!isAuth) {
+          res.writeHead(401); res.end(`cookies refusés Centris HTTP ${testRes.status}`); return;
+        }
+        // Save 25j
+        centrisSession = {
+          cookies: cookieStr,
+          expiry: Date.now() + 25 * 24 * 3600 * 1000,
+          authenticated: true,
+          lastLoginAt: Date.now(),
+          via: 'http-push',
+        };
+        saveCentrisSessionToDisk();
+        auditLogEvent('centris', 'cookies-captured-http', { length: cookieStr.length });
+        if (ALLOWED_ID) {
+          sendTelegramWithFallback(
+            `✅ *Cookies Centris reçus via HTTP*\n\n📦 ${cookieStr.length} chars · session valide ~25 jours\n_Source: POST /admin/centris-cookies_`,
+            { category: 'centris-cookies' }
+          ).catch(() => {});
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, length: cookieStr.length, expiresInDays: 25 }));
+      } catch (e) {
+        res.writeHead(500); res.end(`error: ${e.message?.substring(0, 200)}`);
+      }
+    });
+    return;
+  }
+
   // ─── /webhook/sms-bridge — pont iMessage Mac → bot pour codes MFA Centris ──
   // Daemon Mac envoie ici les codes 6-digits captés depuis chat.db (Messages app).
   // Auth: HMAC SHA-256 du body avec SMS_BRIDGE_SECRET partagé.
