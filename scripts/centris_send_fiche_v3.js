@@ -6,43 +6,21 @@
 const { chromium } = require('/Users/signaturesb/Documents/github/mailing-masse/node_modules/playwright');
 const path = require('path');
 const fs = require('fs');
+const sendGuard = require('./lib/send_guard');
 
 const TYPE = (process.argv[2] || 'terrain').toLowerCase();
 const MLS = process.argv[3];
 const EMAIL = process.argv[4];
 const MESSAGE = process.argv[5] || '';
+const FORCE_RESEND = process.argv.includes('--force-resend');
 
 if (!MLS || !EMAIL) {
   console.error('Usage: node centris_send_fiche_v3.js <type> <mls> <email> [message]');
   process.exit(1);
 }
 
-// ─── PROTECTIONS ENVOI CLIENT ───────────────────────────────────────────
-// Règle Shawn: jamais envoyer sans accord explicite, jamais doubler.
-const TEST_EMAILS = ['shawnbarrette@icloud.com', 'shawn@signaturesb.com', 'shawnbarrette@gmail.com'];
-const isProductionSend = !TEST_EMAILS.includes(EMAIL.toLowerCase());
-const FORCE_RESEND = process.argv.includes('--force-resend');
-const AUDIT_LOG = '/tmp/centris_sends_audit.jsonl';
-
-if (isProductionSend && !FORCE_RESEND) {
-  // Check audit log pour dédup 24h
-  if (fs.existsSync(AUDIT_LOG)) {
-    const log = fs.readFileSync(AUDIT_LOG, 'utf8').split('\n').filter(Boolean);
-    const recent = log.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    const dup = recent.find(e => e.email === EMAIL.toLowerCase() && e.mls === MLS && (Date.now() - new Date(e.ts).getTime()) < 24 * 3600 * 1000);
-    if (dup) {
-      console.error(`❌ ENVOI BLOQUÉ — déjà envoyé à ${EMAIL} pour MLS ${MLS} il y a ${Math.round((Date.now() - new Date(dup.ts).getTime()) / 60000)} min.`);
-      console.error(`   Pour forcer un re-envoi: ajouter flag --force-resend`);
-      process.exit(1);
-    }
-  }
-}
-
 function auditSend(success) {
-  const entry = { ts: new Date().toISOString(), mls: MLS, email: EMAIL.toLowerCase(), success, type: TYPE };
-  try {
-    fs.appendFileSync(AUDIT_LOG, JSON.stringify(entry) + '\n');
-  } catch {}
+  sendGuard.recordSend({ email: EMAIL, mls: MLS, subject: `Fiche #${MLS}`, success });
 }
 
 const TYPE_TO_SECTION = {
@@ -68,6 +46,7 @@ function loadCreds() {
     user: text.match(/CENTRIS_USER\s*=\s*"?([^"\n]+)"?/)?.[1]?.trim(),
     pass: text.match(/CENTRIS_PASS\s*=\s*"?([^"\n]+)"?/)?.[1]?.trim(),
     brevoKey: text.match(/BREVO_API_KEY\s*=\s*"?([^"\n]+)"?/)?.[1]?.trim(),
+    tgToken: text.match(/TELEGRAM_BOT_TOKEN\s*=\s*"?([^"\n]+)"?/)?.[1]?.trim(),
   };
 }
 
@@ -458,7 +437,126 @@ async function waitOutOfAuth(page, maxMs = 30000) {
   }
 
   console.log();
-  console.log('📧 Envoi email à ' + EMAIL + '...');
+
+  // ─── CONFIRMATION OBLIGATOIRE AVANT ENVOI CLIENT (send_guard) ──────────
+  // Règle Shawn: "je veux confirmer l'aperçu de chaque envoi"
+  if (false) { // bloc legacy désactivé — on utilise send_guard.requestConsent à la place
+    console.log('═══ CONFIRMATION REQUISE — APERÇU ENVOI ═══');
+    console.log('  📨 Destinataire: ' + EMAIL);
+    console.log('  📋 Subject: Fiche propriété — Centris #' + MLS);
+    console.log('  📎 Pièces jointes:');
+    for (const f of valid) {
+      const size = (fs.statSync(path.join(DOWNLOAD_DIR, f)).size/1024).toFixed(0);
+      const dlEntry = downloads.find(d => d.name === f);
+      const cat = dlEntry?.category || 'other';
+      console.log('     • ' + f + ' (' + cat + ', ' + size + 'KB)');
+    }
+    console.log();
+
+    // 1. Envoie PREVIEW EMAIL à shawn@signaturesb.com avec TOUS les PDFs
+    console.log('📬 Envoi PREVIEW à shawn@signaturesb.com pour vérification visuelle...');
+    const tplPath = path.join(__dirname, 'centris_fiche_email_template.html');
+    let htmlPreview = fs.readFileSync(tplPath, 'utf8');
+    const messageHtml = (MESSAGE || `J'ai le plaisir de vous transmettre la fiche détaillée de la propriété <strong>Centris #${MLS}</strong>.`).replace(/\n/g, '<br/>');
+    const dateStr = new Date().toLocaleDateString('fr-CA', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'America/Toronto' });
+    htmlPreview = htmlPreview
+      .replace(/\{MESSAGE_HTML\}/g, '<strong style="color:#aa0721;">⚠️ APERÇU — destinataire FINAL: ' + EMAIL + '</strong><br/><br/>' + messageHtml)
+      .replace(/\{CENTRIS_NUM\}/g, MLS)
+      .replace(/\{DATE_ENVOI\}/g, dateStr);
+
+    const previewAttachments = valid.map((f, i) => ({
+      name: valid.length === 1 ? `Fiche_Centris_${MLS}.pdf` : `Fiche_Centris_${MLS}_${i+1}.pdf`,
+      content: fs.readFileSync(path.join(DOWNLOAD_DIR, f)).toString('base64')
+    }));
+    await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': creds.brevoKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sender: { name: 'Bot Preview', email: 'shawn@signaturesb.com' },
+        to: [{ email: 'shawn@signaturesb.com' }],
+        subject: `[APERÇU] Fiche #${MLS} → ${EMAIL}`,
+        htmlContent: htmlPreview,
+        attachment: previewAttachments,
+      })
+    }).catch(() => {});
+
+    // 2. Notif Telegram + poll pour "OK" / "envoie"
+    const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || creds.tgToken || '';
+    const TG_CHAT = process.env.TELEGRAM_ALLOWED_USER_ID || '5261213272';
+    if (!TG_TOKEN) {
+      console.log('⚠️ TELEGRAM_BOT_TOKEN manquant — confirmation skip, abort par sécurité');
+      auditSend(false);
+      await ctx.close();
+      process.exit(1);
+    }
+    const tgMsg = `📬 *Aperçu fiche prêt* — destinataire: \`${EMAIL}\`\n\n` +
+      `*MLS:* ${MLS}\n*Pièces:* ${valid.length} PDF · ${valid.map(f => Math.round(fs.statSync(path.join(DOWNLOAD_DIR, f)).size/1024)+'KB').join(' + ')}\n\n` +
+      `📨 Aperçu envoyé à ton inbox shawn@signaturesb.com\n\n` +
+      `→ Réponds "*envoie*" pour confirmer envoi au client\n` +
+      `→ Réponds "*annule*" pour annuler\n\n` +
+      `Timeout 10 min sans réponse = annulé`;
+    let lastUpdateId = 0;
+    try {
+      const upd = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?limit=1&offset=-1`).then(r => r.json());
+      lastUpdateId = upd.result?.[0]?.update_id || 0;
+    } catch {}
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT, text: tgMsg, parse_mode: 'Markdown' })
+    });
+
+    // Poll Telegram for confirmation (10 min)
+    console.log('⏳ Attente confirmation Telegram (10 min)...');
+    const startWait = Date.now();
+    let confirmed = false;
+    let cancelled = false;
+    while (Date.now() - startWait < 10 * 60 * 1000) {
+      try {
+        const upd = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=5`).then(r => r.json());
+        for (const u of (upd.result || [])) {
+          lastUpdateId = u.update_id;
+          const text = (u.message?.text || '').toLowerCase().trim();
+          if (/^(envoie|envoye|envoyer|ok|go|confirme?|oui|✅)/i.test(text)) {
+            confirmed = true;
+            break;
+          }
+          if (/^(annule|annuler|non|cancel|🚫|❌)/i.test(text)) {
+            cancelled = true;
+            break;
+          }
+        }
+        if (confirmed || cancelled) break;
+      } catch {}
+      await new Promise(r => setTimeout(r, 3000));
+    }
+
+    if (cancelled) {
+      console.log('🚫 ANNULÉ par Shawn');
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: TG_CHAT, text: `🚫 Envoi à ${EMAIL} ANNULÉ` })
+      });
+      auditSend(false);
+      await ctx.close();
+      process.exit(0);
+    }
+    if (!confirmed) {
+      console.log('⏰ TIMEOUT — pas de confirmation reçue dans 10 min, annulé');
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: TG_CHAT, text: `⏰ Pas de confirmation — envoi à ${EMAIL} annulé par sécurité` })
+      });
+      auditSend(false);
+      await ctx.close();
+      process.exit(0);
+    }
+    console.log('✅ CONFIRMÉ par Shawn — envoi en cours...');
+  }
+
+  // Build template + attachments AVANT consent guard
   const tplPath = path.join(__dirname, 'centris_fiche_email_template.html');
   let htmlBody = fs.readFileSync(tplPath, 'utf8');
   const messageHtml = (MESSAGE || `J'ai le plaisir de vous transmettre la fiche détaillée de la propriété <strong>Centris #${MLS}</strong>.`).replace(/\n/g, '<br/>');
@@ -468,7 +566,6 @@ async function waitOutOfAuth(page, maxMs = 30000) {
     .replace(/\{CENTRIS_NUM\}/g, MLS)
     .replace(/\{DATE_ENVOI\}/g, dateStr);
 
-  // Nommage propre selon catégorie du download
   const CATEGORY_NAMES = {
     fiche_descriptive: `Fiche_Descriptive_${MLS}.pdf`,
     declaration_vendeur: `Declaration_Vendeur_${MLS}.pdf`,
@@ -479,7 +576,6 @@ async function waitOutOfAuth(page, maxMs = 30000) {
   const seenCats = {};
   for (let i = 0; i < valid.length; i++) {
     const f = valid[i];
-    // Trouve la catégorie via downloads array
     const dlEntry = downloads.find(d => d.name === f);
     const cat = dlEntry?.category || 'other';
     let name = CATEGORY_NAMES[cat] || CATEGORY_NAMES.other;
@@ -491,6 +587,29 @@ async function waitOutOfAuth(page, maxMs = 30000) {
     });
     console.log('  📎 ' + name + ' (' + cat + ', ' + (fs.statSync(path.join(DOWNLOAD_DIR, f)).size/1024).toFixed(0) + 'KB)');
   }
+
+  // ─── GUARD: Demande consentement Shawn (whitelist OU code Telegram) ───
+  console.log();
+  const consentResult = await sendGuard.requestConsent({
+    email: EMAIL,
+    mls: MLS,
+    subject: `Fiche propriété — Centris #${MLS}`,
+    attachments,
+    htmlBody,
+    brevoKey: creds.brevoKey,
+    tgToken: creds.tgToken || process.env.TELEGRAM_BOT_TOKEN,
+    tgChat: process.env.TELEGRAM_ALLOWED_USER_ID || '5261213272',
+    flags: { forceResend: FORCE_RESEND },
+  });
+
+  if (!consentResult.approved) {
+    console.log(`🚫 ENVOI BLOQUÉ — ${consentResult.mode} (${consentResult.reason || 'pas autorisé'})`);
+    auditSend(false);
+    await ctx.close();
+    process.exit(0);
+  }
+  console.log(`✅ AUTORISÉ (${consentResult.mode}${consentResult.code ? ' code=' + consentResult.code : ''}) — envoi en cours...`);
+  console.log('📧 Envoi email à ' + EMAIL + '...');
 
   const r = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
