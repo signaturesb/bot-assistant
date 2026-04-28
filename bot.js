@@ -2155,6 +2155,49 @@ async function modifierDeal(terme, { valeur, titre, dateClose, raison }) {
 // Règle: 1 activité par (type+date) par deal. Point. Quel que soit le nb d'emails entrants.
 
 /**
+ * Marque comme complétées toutes les activités OUVERTES d'un deal.
+ * Règle Shawn: 'garde toujours juste un deal et une activité, toujours
+ * compléter l'ancien quand on fait un nouveau suivi'.
+ *
+ * Préserve: les activités déjà done + les activités schedulées >7j dans le futur
+ * (visites planifiées en avance restent actives).
+ */
+async function completerAnciennesActivites(dealId) {
+  if (!dealId) return 0;
+  try {
+    const r = await pdGet(`/deals/${dealId}/activities?limit=50`);
+    const acts = r?.data || [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const inSevenDays = today.getTime() + 7 * 24 * 3600 * 1000;
+    let completed = 0;
+    for (const a of acts) {
+      if (a.done) continue;
+      // Préserver activités schedulées >7j dans le futur (visites planifiées)
+      if (a.due_date) {
+        const due = new Date(a.due_date + 'T00:00:00').getTime();
+        if (due >= inSevenDays) continue;
+      }
+      try {
+        const r = await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${PD_KEY}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ done: 1 })
+        });
+        if (r.ok) {
+          completed++;
+          log('OK', 'DEDUP', `Activité #${a.id} (${a.type}/${a.due_date || 'now'}) marquée done — deal ${dealId}`);
+        }
+      } catch (e) { log('WARN', 'DEDUP', `Complete err: ${e.message}`); }
+    }
+    return completed;
+  } catch (e) {
+    log('WARN', 'DEDUP', `completerAnciennes deal ${dealId}: ${e.message}`);
+    return 0;
+  }
+}
+
+/**
  * Check si activité non-complétée du même type existe déjà à cette date pour ce deal.
  * Retourne l'ID existant si trouvée, null sinon.
  */
@@ -2246,6 +2289,11 @@ async function creerActivite({ terme, type, sujet, date, heure }) {
     log('INFO', 'DEDUP', `Activité ${actType} existe déjà pour deal ${deal.id} le ${checkDate} (#${existant}) — skip création`);
     return `⏭️ Activité *${actType}* existe déjà pour *${deal.title}* le ${checkDate} (#${existant}) — création skip`;
   }
+
+  // 🔄 AUTO-COMPLETE — marque les anciennes activités open comme done
+  // (Règle Shawn: 1 active à la fois, ancien complété au nouveau suivi)
+  const completed = await completerAnciennesActivites(deal.id);
+  if (completed > 0) log('OK', 'DEDUP', `${completed} ancienne(s) activité(s) complétée(s) auto sur deal ${deal.id}`);
 
   const body = {
     deal_id: deal.id,
@@ -10151,13 +10199,17 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     } catch (e) { dealTxt = `⚠️ Deal: ${e.message.substring(0, 80)}`; }
   }
 
-  // 1.5. ANTI-DOUBLONS — Nettoyer activités existantes AVANT toute nouvelle création
-  // Demande Shawn (3e fois): Lounes → 20 doublons, Jeannot → 20 doublons, Mathieu → 10+
+  // 1.5. ANTI-DOUBLONS — Cleanup + auto-complete ancien AVANT toute création
+  // Règle Shawn: 1 deal + 1 activité active. Ancien complété au nouveau suivi.
   if (dealId) {
     try {
       const cleanup = await nettoyerDoublonsActivites(dealId);
       if (cleanup.supprimees > 0) {
-        log('OK', 'POLLER', `🧹 Anti-doublons deal ${dealId}: ${cleanup.supprimees} activité(s) doublon(s) supprimée(s) (${cleanup.gardees} gardées)`);
+        log('OK', 'POLLER', `🧹 Anti-doublons deal ${dealId}: ${cleanup.supprimees} doublon(s) supprimé(s)`);
+      }
+      const completed = await completerAnciennesActivites(dealId);
+      if (completed > 0) {
+        log('OK', 'POLLER', `✅ ${completed} ancienne(s) activité(s) complétée(s) sur deal ${dealId}`);
       }
     } catch (e) { log('WARN', 'POLLER', `Cleanup deal ${dealId}: ${e.message}`); }
   }
