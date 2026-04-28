@@ -17,6 +17,34 @@ if (!MLS || !EMAIL) {
   process.exit(1);
 }
 
+// ─── PROTECTIONS ENVOI CLIENT ───────────────────────────────────────────
+// Règle Shawn: jamais envoyer sans accord explicite, jamais doubler.
+const TEST_EMAILS = ['shawnbarrette@icloud.com', 'shawn@signaturesb.com', 'shawnbarrette@gmail.com'];
+const isProductionSend = !TEST_EMAILS.includes(EMAIL.toLowerCase());
+const FORCE_RESEND = process.argv.includes('--force-resend');
+const AUDIT_LOG = '/tmp/centris_sends_audit.jsonl';
+
+if (isProductionSend && !FORCE_RESEND) {
+  // Check audit log pour dédup 24h
+  if (fs.existsSync(AUDIT_LOG)) {
+    const log = fs.readFileSync(AUDIT_LOG, 'utf8').split('\n').filter(Boolean);
+    const recent = log.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const dup = recent.find(e => e.email === EMAIL.toLowerCase() && e.mls === MLS && (Date.now() - new Date(e.ts).getTime()) < 24 * 3600 * 1000);
+    if (dup) {
+      console.error(`❌ ENVOI BLOQUÉ — déjà envoyé à ${EMAIL} pour MLS ${MLS} il y a ${Math.round((Date.now() - new Date(dup.ts).getTime()) / 60000)} min.`);
+      console.error(`   Pour forcer un re-envoi: ajouter flag --force-resend`);
+      process.exit(1);
+    }
+  }
+}
+
+function auditSend(success) {
+  const entry = { ts: new Date().toISOString(), mls: MLS, email: EMAIL.toLowerCase(), success, type: TYPE };
+  try {
+    fs.appendFileSync(AUDIT_LOG, JSON.stringify(entry) + '\n');
+  } catch {}
+}
+
 const TYPE_TO_SECTION = {
   terrain: 'https://matrix.centris.ca/Matrix/Search/Land',
   terre: 'https://matrix.centris.ca/Matrix/Search/Land',
@@ -215,11 +243,52 @@ async function waitOutOfAuth(page, maxMs = 30000) {
   await page.waitForTimeout(5000);
   console.log('  URL détail:', page.url());
 
+  // Si on arrive sur PrintOptions, c'est PARFAIT — le PDF est prêt à générer
+  if (/PrintOptions/i.test(page.url())) {
+    console.log('  🎯 Page PrintOptions! On va déclencher la fiche descriptive...');
+    await page.waitForTimeout(3000);
+    // Cherche le bouton Imprimer/Print qui va générer le PDF
+    try {
+      const printBtn = page.locator('input[value*="Imprim" i], button:has-text("Imprimer"), input[type="submit"][value*="Print" i]').first();
+      if (await printBtn.isVisible({ timeout: 5000 })) {
+        const [popup, dl] = await Promise.all([
+          ctx.waitForEvent('page', { timeout: 15000 }).catch(() => null),
+          page.waitForEvent('download', { timeout: 15000 }).catch(() => null),
+          printBtn.click({ timeout: 5000 }),
+        ]);
+        if (popup) {
+          attachPdfCapture(popup);
+          await popup.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
+          await popup.waitForTimeout(7000);
+          await popup.close().catch(() => {});
+        }
+        if (dl) {
+          const dest = path.join(DOWNLOAD_DIR, `${Date.now()}_print.pdf`);
+          await dl.saveAs(dest);
+          const buf = fs.readFileSync(dest);
+          if (buf.slice(0, 4).toString() === '%PDF') {
+            const hash = crypto.createHash('md5').update(buf).digest('hex');
+            if (!seenHashes.has(hash)) {
+              seenHashes.add(hash);
+              downloads.push({ name: path.basename(dest), path: dest, size: buf.length, url: 'PrintOptions', category: 'fiche_descriptive' });
+              console.log('    📥 PrintOptions PDF: ' + (buf.length/1024).toFixed(0) + 'KB');
+            }
+          }
+        }
+      }
+    } catch (e) { console.log('    PrintOptions err: ' + e.message?.substring(0, 100)); }
+  }
+
   // Step 5: SCROLL DOWN — fiche descriptive est en bas
   console.log('⬇️ Scroll fiche descriptive...');
-  for (let i = 0; i < 5; i++) {
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(1500);
+  try {
+    for (let i = 0; i < 5; i++) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1500);
+    }
+  } catch (e) {
+    console.log('  scroll err (page may have navigated): ' + e.message?.substring(0, 80));
+    await page.waitForTimeout(3000);
   }
   await page.screenshot({ path: '/tmp/matrix_detail_v3_' + MLS + '.png', fullPage: true });
 
@@ -335,13 +404,41 @@ async function waitOutOfAuth(page, maxMs = 30000) {
       if (!downloads[i].category) downloads[i].category = link.category;
     }
   }
-  console.log('⏳ Wait 10s downloads...');
-  await page.waitForTimeout(10000);
+  console.log('⏳ Wait 5s downloads auto...');
+  await page.waitForTimeout(5000);
 
-  // Manual fallback
-  if (downloads.length === 0) {
-    console.log('⚠️ Aucun PDF auto. 90 sec pour télécharger manuellement → ' + DOWNLOAD_DIR);
-    await page.waitForTimeout(90000);
+  // Vérification: a-t-on la fiche descriptive?
+  const hasFiche = downloads.some(d => d.category === 'fiche_descriptive' || d.category === 'cigm_custom');
+  const hasDV = downloads.some(d => d.category === 'declaration_vendeur');
+
+  if (!hasFiche) {
+    console.log();
+    console.log('⚠️  La fiche descriptive (CIGMRedirector) ne se télécharge pas auto.');
+    console.log('   Le bouton Print génère un PDF côté serveur via JS — Playwright limite.');
+    console.log();
+    console.log('═══ ACTION REQUISE — 10 secondes ═══');
+    console.log('   Dans la fenêtre Chrome ouverte:');
+    console.log('   1. Clique "Imprimer" (ou icône PDF) sur la fiche descriptive');
+    console.log('   2. Le PDF s\'ouvre / se télécharge');
+    console.log('   3. Le script détecte automatiquement et envoie l\'email');
+    console.log();
+    console.log('   (Si tu veux pas, attends 30 sec et email part avec DV seule)');
+    console.log();
+    // Wait up to 3 MINUTES (suffit pour click humain) — avance dès qu'un nouveau PDF arrive
+    const startWait = Date.now();
+    const baseCount = downloads.length;
+    while (Date.now() - startWait < 180000) {
+      if (downloads.length > baseCount) {
+        // Tag le nouveau download comme fiche_descriptive
+        for (let i = baseCount; i < downloads.length; i++) {
+          if (!downloads[i].category) downloads[i].category = 'fiche_descriptive';
+        }
+        console.log('  ✓ Nouveau PDF détecté! Continue...');
+        await page.waitForTimeout(3000); // Attend 3s additional pour autres PDFs si plusieurs
+        break;
+      }
+      await page.waitForTimeout(1000);
+    }
   }
 
   // Step 8: Send email avec template branded
@@ -412,8 +509,10 @@ async function waitOutOfAuth(page, maxMs = 30000) {
   if (r.ok || r.status === 201) {
     console.log('  ✅ Email envoyé!');
     console.log('  ', JSON.parse(txt).messageId);
+    auditSend(true);
   } else {
     console.log('  ❌ HTTP ' + r.status + ': ' + txt.substring(0, 200));
+    auditSend(false);
   }
 
   await ctx.close();
