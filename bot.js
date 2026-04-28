@@ -2476,6 +2476,43 @@ async function creerDeal({ prenom, nom, telephone, email, type, source, centris,
     personNote = '\n⚠️ Contact non lié — ajoute manuellement.';
   }
 
+  // 1.5. ANTI-DOUBLON DEAL — si la personne a déjà un deal OUVERT, utilise-le
+  // au lieu d'en créer un nouveau (Shawn: 'pas avoir deux deal pareil').
+  // Si plusieurs deals open existants → garde le + récent + alerte pour fusion manuelle.
+  if (personId) {
+    try {
+      const existingDeals = await pdGet(`/persons/${personId}/deals?status=open&limit=10`);
+      const open = existingDeals?.data || [];
+      if (open.length >= 1) {
+        // Trier par date de création desc — garder le plus récent
+        open.sort((a, b) => new Date(b.add_time).getTime() - new Date(a.add_time).getTime());
+        const existing = open[0];
+        log('OK', 'PD', `Deal existant #${existing.id} pour person #${personId} — réutilisé (skip création doublon)`);
+
+        // Si plusieurs open → notification Telegram pour fusion manuelle
+        if (open.length >= 2 && ALLOWED_ID) {
+          const dealList = open.map(d => `#${d.id} ${d.title}`).join(', ');
+          const tgMsg = `⚠️ *${open.length} deals open pour ${fullName || 'Person #' + personId}*\n\n${dealList}\n\n_Ce nouveau lead réutilise #${existing.id} (le + récent). Pour fusionner les autres: dis-moi "fusionne deal X dans Y"._`;
+          sendTelegramWithFallback(tgMsg, { category: 'duplicate-deals' }).catch(() => {});
+        }
+
+        // Ajout note avec contexte du nouvel email — préserve la trace
+        const newNote = [
+          `📧 Nouvelle entrée du ${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}`,
+          note,
+          telephone ? `Tel: ${telephone}` : '',
+          email ? `Email: ${email}` : '',
+          source ? `Source: ${source}` : '',
+        ].filter(Boolean).join('\n');
+        if (newNote) await pdPost('/notes', { deal_id: existing.id, content: newNote }).catch(() => {});
+
+        return `♻️ Deal existant réutilisé: *${existing.title}* (#${existing.id})${open.length >= 2 ? `\n⚠️ ${open.length} deals open pour cette personne — voir alerte Telegram` : ''}`;
+      }
+    } catch (e) {
+      log('WARN', 'PD', `Check deals existants person ${personId}: ${e.message}`);
+    }
+  }
+
   // 2. Créer le deal
   const typeOpt = PD_TYPE_MAP[type] || PD_TYPE_MAP.maison_usagee;
   const dealBody = {
@@ -8399,31 +8436,68 @@ function getProactive() {
   }
 }
 
-// ─── Dedup hebdo activités (dimanche 21h) ───────────────────────────────
+// ─── Détection doublons DEALS (mêmes person_id, plusieurs open) ─────────
+async function detecterDoublonsDeals() {
+  if (!PD_KEY) return [];
+  const r = await pdGet(`/deals?status=open&limit=500`);
+  const deals = r?.data || [];
+  const byPerson = new Map();
+  for (const d of deals) {
+    const pid = typeof d.person_id === 'object' ? d.person_id?.value : d.person_id;
+    if (!pid) continue;
+    if (!byPerson.has(pid)) byPerson.set(pid, []);
+    byPerson.get(pid).push(d);
+  }
+  const groupes = [];
+  for (const [pid, group] of byPerson) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => new Date(b.add_time).getTime() - new Date(a.add_time).getTime());
+    groupes.push({
+      personId: pid,
+      personName: group[0].person_name || `Person #${pid}`,
+      deals: group.map(d => ({ id: d.id, title: d.title, addTime: d.add_time, stageId: d.stage_id })),
+    });
+  }
+  return groupes;
+}
+
+// ─── Dedup hebdo activités + détection doublons deals (dimanche 21h) ─────
 async function runDedupHebdo() {
   if (!PD_KEY) return;
-  log('INFO', 'DEDUP', 'Dedup hebdo activités — scan deals open...');
+  log('INFO', 'DEDUP', 'Dedup hebdo — scan deals open...');
   let totalDeals = 0, totalSupprimees = 0;
+  let doublonsDeals = [];
   try {
     const r = await pdGet(`/deals?status=open&limit=500`);
     const deals = r?.data || [];
     totalDeals = deals.length;
+    // 1. Activités doublons par deal (auto-cleanup safe)
     for (const d of deals) {
       const res = await nettoyerDoublonsActivites(d.id);
       totalSupprimees += res.supprimees || 0;
     }
-    log('OK', 'DEDUP', `Hebdo: ${totalSupprimees} doublon(s) supprimé(s) sur ${totalDeals} deals`);
+    // 2. Détection doublons DEALS (alerte uniquement, pas auto-merge)
+    doublonsDeals = await detecterDoublonsDeals();
+    log('OK', 'DEDUP', `Hebdo: ${totalSupprimees} activité(s) doublon(s) sur ${totalDeals} deals · ${doublonsDeals.length} groupe(s) deals doublons`);
+
+    let msg = '';
     if (totalSupprimees > 0) {
-      await sendTelegramWithFallback(
-        `🧹 *Dedup hebdo activités*\n\n` +
-        `${totalSupprimees} doublon(s) supprimé(s)\n` +
-        `Sur ${totalDeals} deals scannés\n\n` +
-        `_Pipeline propre — 1 activité par (type+date) par deal._`,
-        { category: 'dedup-hebdo' }
-      ).catch(() => {});
+      msg += `🧹 *Dedup hebdo activités*\n${totalSupprimees} doublon(s) supprimé(s) sur ${totalDeals} deals\n\n`;
+    }
+    if (doublonsDeals.length > 0) {
+      msg += `⚠️ *${doublonsDeals.length} personne(s) avec deals dupliqués:*\n\n`;
+      for (const g of doublonsDeals.slice(0, 8)) {
+        msg += `*${g.personName}*\n`;
+        for (const d of g.deals) msg += `  • #${d.id} ${d.title.substring(0, 40)}\n`;
+        msg += `  → fusionner: "fusionne deal ${g.deals[1].id} dans ${g.deals[0].id}"\n\n`;
+      }
+      msg += `_Le bot utilise auto le + récent pour les nouveaux leads, mais les doublons existants restent jusqu'à fusion manuelle (sécurité)._`;
+    }
+    if (msg) {
+      await sendTelegramWithFallback(msg, { category: 'dedup-hebdo' }).catch(() => {});
     }
   } catch (e) { log('ERR', 'DEDUP', `runDedupHebdo: ${e.message}`); }
-  return { totalDeals, totalSupprimees };
+  return { totalDeals, totalSupprimees, doublonsDealsCount: doublonsDeals.length };
 }
 
 // ─── Veille J-1 backup côté Render (au cas où Mac dort) ─────────────────
