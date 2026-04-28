@@ -36,3 +36,8 @@ build/
 
 # Personal index data — données clients confidentielles (iMessage/Gmail/phones), JAMAIS en git
 scripts/personal_index/data/
+
+# Centris session — profile Playwright + cookies extraits = sensible
+.playwright-centris-profile/
+scripts/.playwright-*
+/tmp/centris_cookies*.txt
