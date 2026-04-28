@@ -2186,6 +2186,99 @@ async function creerActivite({ terme, type, sujet, date, heure }) {
   return `✅ Activité créée: *${body.subject}*\n${deal.title}${date ? ` — ${date}${heure ? ' ' + heure : ''}` : ''}`;
 }
 
+// ─── Anti-doublons Pipedrive ──────────────────────────────────────────────
+async function supprimerActivite({ activity_id, terme }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+
+  // Si activity_id direct → suppression immédiate
+  if (activity_id) {
+    try {
+      const r = await fetch(`https://api.pipedrive.com/v1/activities/${activity_id}?api_token=${PD_KEY}`, { method: 'DELETE' });
+      const j = await r.json();
+      if (j.success) return `✅ Activité #${activity_id} supprimée`;
+      return `❌ Échec suppression: ${j.error || 'inconnu'}`;
+    } catch (e) { return `❌ Erreur: ${e.message}`; }
+  }
+
+  // Sinon liste les activités du deal trouvé par terme
+  if (!terme) return '❌ Fournir activity_id OU terme (nom prospect)';
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+  const deals = sr?.data?.items || [];
+  if (!deals.length) return `Aucun deal: "${terme}"`;
+  const deal = deals[0].item;
+  const acts = await pdGet(`/deals/${deal.id}/activities?limit=20`);
+  if (!acts?.data?.length) return `Aucune activité sur deal #${deal.id} (${deal.title})`;
+  let msg = `📋 Activités du deal #${deal.id} *${deal.title}*\n\n`;
+  for (const a of acts.data) {
+    const status = a.done ? '✅' : '⏰';
+    const date = a.due_date ? ` · ${a.due_date}${a.due_time ? ' ' + a.due_time : ''}` : '';
+    msg += `${status} #${a.id} — *${a.type}* ${a.subject || ''}${date}\n`;
+  }
+  msg += `\n_Pour supprimer: dis "supprime activité #ID"_`;
+  return msg;
+}
+
+async function deplacerActivite({ activity_id, target_deal }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  if (!activity_id || !target_deal) return '❌ activity_id et target_deal requis';
+
+  const sr = await pdGet(`/deals/search?term=${encodeURIComponent(target_deal)}&limit=3`);
+  const deals = sr?.data?.items || [];
+  if (!deals.length) return `Aucun deal trouvé pour "${target_deal}"`;
+  const targetId = deals[0].item.id;
+  const targetTitle = deals[0].item.title;
+
+  try {
+    const r = await fetch(`https://api.pipedrive.com/v1/activities/${activity_id}?api_token=${PD_KEY}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deal_id: targetId })
+    });
+    const j = await r.json();
+    if (j.success) return `✅ Activité #${activity_id} déplacée vers deal #${targetId} *${targetTitle}*`;
+    return `❌ Échec: ${j.error || 'inconnu'}`;
+  } catch (e) { return `❌ Erreur: ${e.message}`; }
+}
+
+async function fusionnerDeals(dealKeep, dealRemove) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  if (!dealKeep || !dealRemove) return '❌ deal_garder et deal_supprimer requis';
+  if (dealKeep === dealRemove) return '❌ Les deux IDs sont identiques';
+
+  // Pipedrive a un endpoint dédié /deals/{id}/merge
+  try {
+    const r = await fetch(`https://api.pipedrive.com/v1/deals/${dealRemove}/merge?api_token=${PD_KEY}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ merge_with_id: dealKeep })
+    });
+    const j = await r.json();
+    if (j.success) {
+      return `✅ Deal #${dealRemove} fusionné dans #${dealKeep}\n_Activités, notes et historique transférés. Le deal source est supprimé._`;
+    }
+    return `❌ Fusion échouée: ${j.error || JSON.stringify(j).substring(0, 200)}`;
+  } catch (e) { return `❌ Erreur: ${e.message}`; }
+}
+
+async function fusionnerPersonnes(personKeep, personRemove) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  if (!personKeep || !personRemove) return '❌ personne_garder et personne_supprimer requis';
+  if (personKeep === personRemove) return '❌ Les deux IDs sont identiques';
+
+  try {
+    const r = await fetch(`https://api.pipedrive.com/v1/persons/${personRemove}/merge?api_token=${PD_KEY}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ merge_with_id: personKeep })
+    });
+    const j = await r.json();
+    if (j.success) {
+      return `✅ Person #${personRemove} fusionnée dans #${personKeep}\n_Deals, activités, notes transférés. La fiche source est supprimée._`;
+    }
+    return `❌ Fusion échouée: ${j.error || JSON.stringify(j).substring(0, 200)}`;
+  } catch (e) { return `❌ Erreur: ${e.message}`; }
+}
+
 async function statsBusiness() {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   const now = new Date();
@@ -4762,6 +4855,10 @@ const TOOLS = [
   { name: 'repondre_vite',          description: 'Réponse rapide mobile: trouve l\'email du prospect dans Pipedrive AUTOMATIQUEMENT, prépare le brouillon style Shawn. Shawn dit juste son message, le bot fait le reste. Ne pas appeler si email déjà connu — utiliser envoyer_email directement.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive' }, message: { type: 'string', description: 'Texte de la réponse tel que dicté par Shawn' } }, required: ['terme', 'message'] } },
   { name: 'modifier_deal',          description: 'Modifier la valeur, le titre ou la date de clôture d\'un deal.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction' }, titre: { type: 'string' }, dateClose: { type: 'string', description: 'Date ISO YYYY-MM-DD' } }, required: ['terme'] } },
   { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite. UTILISE LA DATE COURANTE DU SYSTEM PROMPT (jamais deviner l\'année).', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'Format STRICT YYYY-MM-DD (ex: 2026-04-26). Calculer à partir de la date courante du system prompt.' }, heure: { type: 'string', description: 'Format STRICT HH:MM (ex: 14:00)' } }, required: ['terme', 'type'] } },
+  { name: 'supprimer_activite',     description: 'SUPPRIMER une activité Pipedrive (doublon, erreur, plus pertinente). Affiche d\'abord les activités d\'un deal pour choisir, ou utilise activity_id direct.', input_schema: { type: 'object', properties: { activity_id: { type: 'number', description: 'ID exact de l\'activité à supprimer (priorité si fourni)' }, terme: { type: 'string', description: 'Nom prospect — le bot affiche les activités du deal et demande quelle supprimer' } } } },
+  { name: 'deplacer_activite',      description: 'DÉPLACER une activité d\'un deal vers un autre (utile pour consolider doublons). Source = activity_id, target = nom du deal de destination.', input_schema: { type: 'object', properties: { activity_id: { type: 'number', description: 'ID de l\'activité à déplacer' }, target_deal: { type: 'string', description: 'Nom du deal de destination' } }, required: ['activity_id', 'target_deal'] } },
+  { name: 'fusionner_deals',        description: 'FUSIONNER deux deals dupliqués pour un même prospect. Garde le plus récent, transfère activités+notes, supprime l\'autre. Demande confirmation avant.', input_schema: { type: 'object', properties: { deal_garder: { type: 'number', description: 'ID du deal à conserver' }, deal_supprimer: { type: 'number', description: 'ID du deal à fusionner+supprimer' } }, required: ['deal_garder', 'deal_supprimer'] } },
+  { name: 'fusionner_personnes',    description: 'FUSIONNER deux personnes dupliquées (même client, 2 fiches). Garde la principale, transfère deals+activités+notes.', input_schema: { type: 'object', properties: { personne_garder: { type: 'number', description: 'ID person à conserver' }, personne_supprimer: { type: 'number', description: 'ID person à fusionner+supprimer' } }, required: ['personne_garder', 'personne_supprimer'] } },
   // ── Gmail ──
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
@@ -4848,6 +4945,10 @@ async function executeTool(name, input, chatId) {
       case 'repondre_vite':           return await repondreVite(chatId, input.terme, input.message);
       case 'modifier_deal':           return await modifierDeal(input.terme, input);
       case 'creer_activite':          return await creerActivite(input);
+      case 'supprimer_activite':      return await supprimerActivite(input);
+      case 'deplacer_activite':       return await deplacerActivite(input);
+      case 'fusionner_deals':         return await fusionnerDeals(input.deal_garder, input.deal_supprimer);
+      case 'fusionner_personnes':     return await fusionnerPersonnes(input.personne_garder, input.personne_supprimer);
       case 'chercher_comparables': {
         const res = await chercherComparablesVendus({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14 });
         if (typeof res === 'string') return res;
