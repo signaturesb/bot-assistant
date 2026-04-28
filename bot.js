@@ -9919,6 +9919,24 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/env-check — diagnostic env vars (safe: pas de values) ──
+  if (req.method === 'GET' && url.startsWith('/admin/env-check')) {
+    const keys = ['CENTRIS_USER', 'CENTRIS_PASS', 'BREVO_API_KEY', 'PIPEDRIVE_API_KEY', 'GMAIL_CLIENT_ID', 'GMAIL_CLIENT_SECRET', 'GMAIL_REFRESH_TOKEN', 'DROPBOX_REFRESH_TOKEN', 'TELEGRAM_BOT_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'WEBHOOK_SECRET', 'RENDER_API_KEY', 'FIRECRAWL_API_KEY', 'PERPLEXITY_API_KEY'];
+    const status = {};
+    for (const k of keys) {
+      const v = process.env[k] || '';
+      status[k] = {
+        set: v.length > 0,
+        length: v.length,
+        // Affiche juste les 4 premiers + 4 derniers pour identification
+        preview: v.length > 12 ? `${v.substring(0, 4)}...${v.substring(v.length - 4)}` : (v ? '***' : ''),
+      };
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ checked: keys.length, status }, null, 2));
+    return;
+  }
+
   // ─── POST /admin/centris-cookies — push cookies depuis Mac (>4KB) ───────
   // Bypass Telegram 4096 char limit. Sécurité: bot teste les cookies contre
   // Centris AVANT de save — si ça marche pas, on save pas. Donc inutile pour
