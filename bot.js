@@ -911,9 +911,10 @@ function getSystemDynamic() {
     `\n` +
     `RÈGLE ABSOLUE: les outils planifier_visite / creer_activite EXIGENT format ISO:\n` +
     `  • due_date: YYYY-MM-DD (ex: ${tomorrowISO})\n` +
-    `  • due_time: HH:MM (ex: 14:00)\n` +
+    `  • due_time: HH:MM (ex: 14:00) — NE JAMAIS fournir sauf si Shawn demande explicitement une heure\n` +
     `Calculer "demain", "vendredi prochain", "dans 3 jours" À PARTIR DE ${dateISO}.\n` +
-    `JAMAIS deviner l'année — utiliser ${dateISO.substring(0, 4)}.`
+    `JAMAIS deviner l'année — utiliser ${dateISO.substring(0, 4)}.\n` +
+    `RÈGLE HEURE: Pas d'heure par défaut. Si Shawn ne mentionne pas une heure spécifique, NE PAS passer le param 'heure' aux outils.`
   );
 
   if (dropboxStructure) parts.push(`━━ DROPBOX — Structure actuelle:\n${dropboxStructure}`);
@@ -2823,7 +2824,8 @@ async function planifierVisite({ prospect, date, adresse }) {
     rdvISO = new Date(Date.now() + 86400000).toISOString();
   }
   const dateStr = rdvISO.split('T')[0];
-  const timeStr = rdvISO.includes('T') ? rdvISO.split('T')[1]?.substring(0, 5) : '14:00';
+  // RÈGLE Shawn: pas d'heure par défaut. Si pas explicite dans rdvISO → null.
+  const timeStr = rdvISO.includes('T') && !/T00:00/.test(rdvISO) ? rdvISO.split('T')[1]?.substring(0, 5) : null;
 
   // VALIDATION DATE — empêche dates périmées/hallucinées (bug Claude récurrent)
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -2841,9 +2843,19 @@ async function planifierVisite({ prospect, date, adresse }) {
   const completed = await completerAnciennesActivites(deal.id);
   if (completed > 0) log('OK', 'PD', `${completed} ancienne(s) activité(s) complétée(s) sur deal ${deal.id} avant visite`);
 
+  // Build activity body — n'inclut due_time que si timeStr fourni explicitement
+  const activityBody = {
+    deal_id: deal.id,
+    subject: `Visite — ${deal.title}${adresse ? ' @ ' + adresse : ''}`,
+    type: 'meeting',
+    due_date: dateStr,
+    done: 0,
+  };
+  if (timeStr) { activityBody.due_time = timeStr; activityBody.duration = '01:00'; }
+
   await Promise.all([
     pdPut(`/deals/${deal.id}`, { stage_id: 52 }),
-    pdPost('/activities', { deal_id: deal.id, subject: `Visite — ${deal.title}${adresse ? ' @ ' + adresse : ''}`, type: 'meeting', due_date: dateStr, due_time: timeStr, duration: '01:00', done: 0 })
+    pdPost('/activities', activityBody),
   ]);
 
   // Sauvegarder dans visites.json pour rappel matin
@@ -2851,8 +2863,8 @@ async function planifierVisite({ prospect, date, adresse }) {
   visites.push({ dealId: deal.id, nom: deal.title, date: rdvISO, adresse: adresse || '' });
   saveJSON(VISITES_FILE, visites);
 
-  logActivity(`Visite planifiée: ${deal.title} — ${dateStr} ${timeStr}${adresse?' @ '+adresse:''}`);
-  return `✅ Visite planifiée: *${deal.title}*\n📅 ${dateStr} à ${timeStr}${adresse ? '\n📍 ' + adresse : ''}\nDeal → Visite prévue ✓${completed > 0 ? `\n${completed} ancienne(s) activité(s) auto-complétée(s)` : ''}`;
+  logActivity(`Visite planifiée: ${deal.title} — ${dateStr}${timeStr ? ' ' + timeStr : ''}${adresse?' @ '+adresse:''}`);
+  return `✅ Visite planifiée: *${deal.title}*\n📅 ${dateStr}${timeStr ? ' à ' + timeStr : ' (pas d\'heure)'}${adresse ? '\n📍 ' + adresse : ''}\nDeal → Visite prévue ✓${completed > 0 ? `\n${completed} ancienne(s) activité(s) auto-complétée(s)` : ''}`;
 }
 
 async function changerEtape(terme, etape) {
@@ -5282,7 +5294,7 @@ const TOOLS = [
   { name: 'historique_contact',     description: 'Timeline chronologique d\'un prospect: notes + activités triées. Compact pour mobile. Pour "c\'est quoi le background de Jean?", "show me the history for Marie".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
   { name: 'repondre_vite',          description: 'Réponse rapide mobile: trouve l\'email du prospect dans Pipedrive AUTOMATIQUEMENT, prépare le brouillon style Shawn. Shawn dit juste son message, le bot fait le reste. Ne pas appeler si email déjà connu — utiliser envoyer_email directement.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive' }, message: { type: 'string', description: 'Texte de la réponse tel que dicté par Shawn' } }, required: ['terme', 'message'] } },
   { name: 'modifier_deal',          description: 'Modifier la valeur, le titre ou la date de clôture d\'un deal.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction' }, titre: { type: 'string' }, dateClose: { type: 'string', description: 'Date ISO YYYY-MM-DD' } }, required: ['terme'] } },
-  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite. UTILISE LA DATE COURANTE DU SYSTEM PROMPT (jamais deviner l\'année).', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'Format STRICT YYYY-MM-DD (ex: 2026-04-26). Calculer à partir de la date courante du system prompt.' }, heure: { type: 'string', description: 'Format STRICT HH:MM (ex: 14:00)' } }, required: ['terme', 'type'] } },
+  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite. UTILISE LA DATE COURANTE DU SYSTEM PROMPT (jamais deviner l\'année). RÈGLE: ne JAMAIS passer le param "heure" sauf si Shawn demande explicitement une heure spécifique.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'Format STRICT YYYY-MM-DD (ex: 2026-04-26). Calculer à partir de la date courante du system prompt.' }, heure: { type: 'string', description: 'OPTIONNEL — Format HH:MM (ex: 14:00). NE PAS PASSER sauf si Shawn demande explicitement une heure.' } }, required: ['terme', 'type'] } },
   { name: 'supprimer_activite',     description: 'SUPPRIMER une activité Pipedrive (doublon, erreur, plus pertinente). Affiche d\'abord les activités d\'un deal pour choisir, ou utilise activity_id direct.', input_schema: { type: 'object', properties: { activity_id: { type: 'number', description: 'ID exact de l\'activité à supprimer (priorité si fourni)' }, terme: { type: 'string', description: 'Nom prospect — le bot affiche les activités du deal et demande quelle supprimer' } } } },
   { name: 'deplacer_activite',      description: 'DÉPLACER une activité d\'un deal vers un autre (utile pour consolider doublons). Source = activity_id, target = nom du deal de destination.', input_schema: { type: 'object', properties: { activity_id: { type: 'number', description: 'ID de l\'activité à déplacer' }, target_deal: { type: 'string', description: 'Nom du deal de destination' } }, required: ['activity_id', 'target_deal'] } },
   { name: 'fusionner_deals',        description: 'FUSIONNER deux deals dupliqués pour un même prospect. Garde le plus récent, transfère activités+notes, supprime l\'autre. Demande confirmation avant.', input_schema: { type: 'object', properties: { deal_garder: { type: 'number', description: 'ID du deal à conserver' }, deal_supprimer: { type: 'number', description: 'ID du deal à fusionner+supprimer' } }, required: ['deal_garder', 'deal_supprimer'] } },
