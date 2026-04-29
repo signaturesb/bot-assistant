@@ -2251,22 +2251,32 @@ async function completerAnciennesActivites(dealId) {
 
 /**
  * Règle Shawn 2026-04-29: "1 activité par client à la fois. C'est un cheminement."
+ * + check niveau PERSONNE (pas juste deal) — anti Kim Fradette 23 activités.
  *
- * Retourne l'ID de TOUTE activité non-complétée existante sur le deal,
- * peu importe le type/date. Si client a déjà 1 activité open → REFUSE création.
- *
- * Pour passer à la prochaine activité: il faut d'abord marquer la courante DONE.
+ * Si person a une activité open SUR N'IMPORTE QUEL deal → REFUSE création.
+ * Évite: multiple deals dupliqués pour même person × multiple activités each.
  */
 async function activiteExisteDeja(dealId, type, date = null) {
   if (!dealId) return null;
   try {
-    const r = await pdGet(`/deals/${dealId}/activities?limit=50`);
-    const acts = r?.data || [];
-    // ANY open activity blocks new creation (cheminement séquentiel)
-    const anyOpen = acts.find(a => !a.done);
-    return anyOpen ? anyOpen.id : null;
+    // 1. Check level deal: any open activity on this deal
+    const dealActs = await pdGet(`/deals/${dealId}/activities?limit=50`);
+    const anyOpenInDeal = (dealActs?.data || []).find(a => !a.done);
+    if (anyOpenInDeal) return anyOpenInDeal.id;
+
+    // 2. Check level PERSON: any open activity on any deal of this person
+    const dealRes = await pdGet(`/deals/${dealId}`);
+    const personId = typeof dealRes?.data?.person_id === 'object' ? dealRes.data.person_id?.value : dealRes?.data?.person_id;
+    if (!personId) return null;
+    const personActs = await pdGet(`/persons/${personId}/activities?done=0&limit=20`);
+    const anyOpenForPerson = (personActs?.data || []).find(a => !a.done);
+    if (anyOpenForPerson) {
+      log('INFO', 'DEDUP', `Person #${personId} a déjà activité open #${anyOpenForPerson.id} sur deal #${anyOpenForPerson.deal_id}`);
+      return anyOpenForPerson.id;
+    }
+    return null;
   } catch (e) {
-    log('WARN', 'DEDUP', `activiteExisteDeja deal ${dealId}: ${e.message}`);
+    log('WARN', 'DEDUP', `activiteExisteDeja: ${e.message}`);
     return null;
   }
 }
@@ -7493,6 +7503,32 @@ function registerHandlers() {
     } catch (e) { bot.sendMessage(msg.chat.id, `❌ Erreur: ${e.message}`); }
   });
 
+  // /menage — audit Pipedrive ULTRA (deals doublons + activités + orphans + génériques)
+  bot.onText(/^\/menage|\/m[ée]nage|\/audit|\/clean/i, async msg => {
+    if (!isAllowed(msg)) return;
+    await bot.sendMessage(msg.chat.id, `🧹 *Audit ultra-perfectionné en cours...*\n_Scanne tous deals/activités, fusionne doublons, supprime orphans._`, { parse_mode: 'Markdown' });
+    try {
+      const stats = await auditPipedriveUltra();
+      if (!stats || stats.error) {
+        await bot.sendMessage(msg.chat.id, `❌ ${stats?.error || 'erreur'}`);
+        return;
+      }
+      const total = stats.dealsFusionnes + stats.activitesDoublons + stats.activitesOrphans + stats.activitesSansContact;
+      await bot.sendMessage(msg.chat.id,
+        `✅ *Audit terminé*\n\n` +
+        `• ${stats.dealsFusionnes} deals doublons fusionnés\n` +
+        `• ${stats.activitesDoublons} activités doublons → done\n` +
+        `• ${stats.activitesOrphans} orphans supprimées\n` +
+        `• ${stats.activitesSansContact} sans contact supprimées\n\n` +
+        `*Total: ${total} entrées nettoyées.*\n\n` +
+        (total === 0 ? `_Pipeline déjà propre._` : `_1 deal + 1 activité max par personne maintenant._`),
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      await bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+    }
+  });
+
   // /dedup — nettoie doublons activités sur tous les deals open (manuel)
   // /dedup #DEAL_ID — nettoie un deal spécifique
   bot.onText(/^\/dedup(?:\s+#?(\d+))?/i, async (msg, match) => {
@@ -8734,8 +8770,8 @@ const lastCron = {
   digest: null, suivi: null, visites: null, sync: null, trashCI: null,
   // Pipedrive proactive (anti-perte-de-lead)
   stagnant: null, morningProactive: null, j1NotCalled: null, hygiene: null, weeklyDigest: null,
-  // Veille J-1 backup + dedup hebdo activités
-  veilleCampaign: null, dedupHebdo: null
+  // Veille J-1 backup + dedup hebdo activités + audit ultra quotidien
+  veilleCampaign: null, dedupHebdo: null, auditUltra: null
 };
 
 // Module proactive — 5 features anti-perte-de-lead, lazy require pour startup rapide
@@ -8781,6 +8817,104 @@ async function detecterDoublonsDeals() {
     });
   }
   return groupes;
+}
+
+// ─── Audit Pipedrive ULTRA — auto-cleanup tout (sécurité maximale) ────────
+async function auditPipedriveUltra() {
+  if (!PD_KEY) return null;
+  log('INFO', 'AUDIT', 'Audit ultra-perfectionné démarré...');
+  const stats = { dealsFusionnes: 0, activitesDoublons: 0, activitesOrphans: 0, activitesSansContact: 0 };
+
+  try {
+    // 1. PERSONS avec ≥2 deals open → fusion auto (garde + récent)
+    const allDealsRes = await pdGet('/deals?status=open&limit=500');
+    const allDeals = allDealsRes?.data || [];
+    const dealsByPerson = new Map();
+    for (const d of allDeals) {
+      const pid = typeof d.person_id === 'object' ? d.person_id?.value : d.person_id;
+      if (!pid) continue;
+      if (!dealsByPerson.has(pid)) dealsByPerson.set(pid, []);
+      dealsByPerson.get(pid).push(d);
+    }
+    for (const [, deals] of dealsByPerson) {
+      if (deals.length < 2) continue;
+      deals.sort((a, b) => new Date(b.add_time).getTime() - new Date(a.add_time).getTime());
+      const keep = deals[0];
+      for (let i = 1; i < deals.length; i++) {
+        try {
+          const r = await fetch(`https://api.pipedrive.com/v1/deals/${deals[i].id}/merge?api_token=${PD_KEY}`, {
+            method: 'PUT', headers: {'content-type':'application/json'},
+            body: JSON.stringify({ merge_with_id: keep.id })
+          });
+          if ((await r.json()).success) stats.dealsFusionnes++;
+        } catch {}
+      }
+    }
+
+    // 2. ACTIVITÉS doublons par deal — 1 par deal max
+    const allActsRes = await pdGet('/activities?done=0&limit=500');
+    const allActs = (allActsRes?.data || []).filter(a => a.deal_id);
+    const actsByDeal = new Map();
+    for (const a of allActs) {
+      if (!actsByDeal.has(a.deal_id)) actsByDeal.set(a.deal_id, []);
+      actsByDeal.get(a.deal_id).push(a);
+    }
+    for (const [, list] of actsByDeal) {
+      if (list.length < 2) continue;
+      list.sort((a, b) => new Date(b.add_time).getTime() - new Date(a.add_time).getTime());
+      for (let i = 1; i < list.length; i++) {
+        try {
+          await fetch(`https://api.pipedrive.com/v1/activities/${list[i].id}?api_token=${PD_KEY}`, {
+            method: 'PUT', headers: {'content-type':'application/json'}, body: JSON.stringify({ done: 1 })
+          });
+          stats.activitesDoublons++;
+        } catch {}
+      }
+    }
+
+    // 3. ORPHANS — activité sans deal_id OU deal supprimé → DELETE
+    const refreshRes = await pdGet('/activities?done=0&limit=500');
+    for (const a of (refreshRes?.data || [])) {
+      if (!a.deal_id) {
+        try {
+          await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${PD_KEY}`, { method: 'DELETE' });
+          stats.activitesOrphans++;
+        } catch {}
+        continue;
+      }
+      const d = await pdGet(`/deals/${a.deal_id}`).catch(() => null);
+      if (!d?.success || d?.data?.status === 'deleted') {
+        try {
+          await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${PD_KEY}`, { method: 'DELETE' });
+          stats.activitesOrphans++;
+        } catch {}
+      }
+    }
+
+    // 4. ACTIVITÉS génériques sans info contact → DELETE
+    const finalRes = await pdGet('/activities?done=0&limit=500');
+    for (const a of (finalRes?.data || [])) {
+      const isGeneric = /^📞?\s*Appeler\s*(Contact|Nouveau prospect|Prospect)?$/i.test(a.subject || '') ||
+                         /^Appel(er)?\s*$/i.test(a.subject || '');
+      if (!isGeneric) continue;
+      let person = null;
+      if (a.person_id) { try { person = (await pdGet(`/persons/${a.person_id}`))?.data; } catch {} }
+      const hasInfo = (person?.name && person.name.length > 2 && !/^(nouveau prospect|prospect|contact)$/i.test(person.name)) ||
+                       person?.email?.[0]?.value || person?.phone?.[0]?.value;
+      if (!hasInfo) {
+        try {
+          await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${PD_KEY}`, { method: 'DELETE' });
+          stats.activitesSansContact++;
+        } catch {}
+      }
+    }
+
+    log('OK', 'AUDIT', `Cleanup ultra: ${JSON.stringify(stats)}`);
+    return stats;
+  } catch (e) {
+    log('ERR', 'AUDIT', `auditPipedriveUltra: ${e.message}`);
+    return { error: e.message };
+  }
 }
 
 // ─── Dedup hebdo activités + détection doublons deals (dimanche 21h) ─────
@@ -9354,7 +9488,25 @@ function startDailyTasks() {
     // J+1/J+3/J+7 sur glace — réactiver avec: lastCron.suivi check + runSuiviQuotidien()
     // if (h === 9  && lastCron.suivi   !== todayStr)  { lastCron.suivi   = todayStr; runSuiviQuotidien(); }
 
-    // ── DEDUP HEBDO dimanche 21h — nettoie doublons activités sur tous les deals open ──
+    // ── AUDIT ULTRA QUOTIDIEN 5h matin — auto-cleanup tout (deals/activités/orphans) ──
+    if (h === 5 && m === 0 && lastCron.auditUltra !== todayStr) {
+      lastCron.auditUltra = todayStr;
+      auditPipedriveUltra().then(stats => {
+        if (stats && (stats.dealsFusionnes + stats.activitesDoublons + stats.activitesOrphans + stats.activitesSansContact) > 0) {
+          sendTelegramWithFallback(
+            `🧹 *Audit Pipedrive nocturne*\n\n` +
+            `• ${stats.dealsFusionnes} deals doublons fusionnés\n` +
+            `• ${stats.activitesDoublons} activités doublons → done\n` +
+            `• ${stats.activitesOrphans} orphans supprimées\n` +
+            `• ${stats.activitesSansContact} sans contact supprimées\n\n` +
+            `_Pipeline propre. 1 deal + 1 activité max par personne._`,
+            { category: 'audit-ultra' }
+          ).catch(() => {});
+        }
+      }).catch(e => log('WARN', 'AUDIT', `${e.message}`));
+    }
+
+    // ── DEDUP HEBDO dimanche 21h — backup du daily ──
     if (now.getDay() === 0 && h === 21 && m === 0 && lastCron.dedupHebdo !== todayStr) {
       lastCron.dedupHebdo = todayStr;
       runDedupHebdo().catch(e => log('WARN', 'DEDUP', `Hebdo: ${e.message}`));
