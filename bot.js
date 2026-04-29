@@ -829,6 +829,52 @@ const SYSTEM_BASE = buildSystemBase();
 
 let dropboxStructure = '';
 let dropboxTerrains  = []; // cache des dossiers terrain — pour lookup rapide
+let mailingPlanCache = null; // cache du calendrier campagnes Brevo (refresh 1h)
+
+// ─── Mailing plan — fetch Brevo + format pour system prompt ─────────────
+async function refreshMailingPlan() {
+  if (!BREVO_KEY) return;
+  try {
+    const [susp, queued, sent] = await Promise.all([
+      fetch('https://api.brevo.com/v3/emailCampaigns?status=suspended&limit=50', { headers: { 'api-key': BREVO_KEY }}).then(r => r.json()).catch(() => ({})),
+      fetch('https://api.brevo.com/v3/emailCampaigns?status=queued&limit=50', { headers: { 'api-key': BREVO_KEY }}).then(r => r.json()).catch(() => ({})),
+      fetch('https://api.brevo.com/v3/emailCampaigns?status=sent&limit=10', { headers: { 'api-key': BREVO_KEY }}).then(r => r.json()).catch(() => ({})),
+    ]);
+    const suspended = (susp.campaigns || []).filter(c => /\[AUTO\]|\[REENG\]|\[TERRAINS\]/.test(c.name || ''));
+    const queue = (queued.campaigns || []).filter(c => /\[AUTO\]|\[REENG\]|\[TERRAINS\]/.test(c.name || ''));
+    const recent = (sent.campaigns || []).filter(c => /\[AUTO\]|\[REENG\]|\[TERRAINS\]/.test(c.name || ''));
+    const all = [...suspended.map(c => ({ ...c, _state: 'suspended' })), ...queue.map(c => ({ ...c, _state: 'queued' }))];
+    all.sort((a, b) => new Date(a.scheduledAt || 0) - new Date(b.scheduledAt || 0));
+
+    let text = '━━ MAILING PLAN — calendrier campagnes Brevo (live) ━━\n';
+    text += `Système: 8 campagnes mai-juin 2026 · Liste protection #10 (auto-excl bounces/désabos/quota 2 emails/30j)\n`;
+    text += `Confirmation: chaque veille 18-23h → notif Telegram + email APERÇU à shawn@\n`;
+    text += `Tu confirmes via /campaigns Telegram (boutons inline) → bot fait PUT scheduledAt → Brevo respecte la date 10h le lendemain.\n\n`;
+    if (all.length === 0) {
+      text += '⚠️ Pipeline VIDE — toutes les campagnes envoyées. Temps de planifier le prochain cycle (monthly_review 1er du mois).\n';
+    } else {
+      text += `📋 ${all.length} campagne(s) à venir:\n`;
+      for (const c of all.slice(0, 12)) {
+        const date = c.scheduledAt ? new Date(c.scheduledAt).toLocaleDateString('fr-CA', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'America/Toronto' }) : '?';
+        const seg = (c.name || '').match(/\[(?:AUTO|REENG|TERRAINS)\]\s*([^·\d][^·]*)/i)?.[1]?.trim() || '?';
+        const state = c._state === 'queued' ? '✅ confirmée' : '⏸ à confirmer';
+        text += `  • #${c.id} ${seg} · ${date} 10h · ${state}\n    ${(c.subject || '').substring(0, 70)}\n`;
+      }
+    }
+    if (recent.length > 0) {
+      text += `\n📤 Récentes envoyées (réf):\n`;
+      for (const c of recent.slice(0, 3)) {
+        const date = c.scheduledAt ? new Date(c.scheduledAt).toLocaleDateString('fr-CA', { day: 'numeric', month: 'short' }) : '?';
+        text += `  ✓ #${c.id} ${(c.name || '').replace(/\[AUTO\]\s*/, '').substring(0, 50)} (${date})\n`;
+      }
+    }
+    text += `\nQuand Shawn demande "où on est rendu" / "prochaine campagne" / "qu'est-ce qui s'en vient" — utiliser cette info, pas hallucinations.`;
+    mailingPlanCache = { text, refreshedAt: Date.now() };
+    log('OK', 'MAILING', `Plan refreshed: ${all.length} pending · ${recent.length} récentes`);
+  } catch (e) {
+    log('WARN', 'MAILING', `refreshMailingPlan: ${e.message}`);
+  }
+}
 let sessionLiveContext = ''; // SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot)
 
 // Log d'activité du bot — écrit dans BOT_ACTIVITY.md toutes les 10 min
@@ -871,6 +917,12 @@ function getSystemDynamic() {
   );
 
   if (dropboxStructure) parts.push(`━━ DROPBOX — Structure actuelle:\n${dropboxStructure}`);
+
+  // ━━ MAILING PLAN — campagnes en queue (refresh 1h) ━━━━━━━━━━━━━━━━━━━━━
+  if (mailingPlanCache?.text) {
+    parts.push(mailingPlanCache.text);
+  }
+
   if (sessionLiveContext) {
     // Tronquer à 3000 chars pour rester raisonnable en tokens
     const trunc = sessionLiveContext.length > 3000 ? sessionLiveContext.substring(0, 3000) + '\n...[tronqué]' : sessionLiveContext;
@@ -11183,6 +11235,11 @@ async function main() {
   try { await loadDropboxStructure(); } catch (e) { log('WARN', 'BOOT', `Dropbox struct: ${e.message}`); }
   // Build index complet en background (non bloquant — lookup rapide dès que prêt)
   buildDropboxIndex().catch(e => log('WARN', 'BOOT', `Dropbox index build: ${e.message}`));
+
+  log('INFO', 'BOOT', 'Step 2b: refresh mailing plan (Brevo)');
+  refreshMailingPlan().catch(e => log('WARN', 'BOOT', `Mailing plan: ${e.message}`));
+  // Refresh toutes les heures pour rester à jour
+  setInterval(() => refreshMailingPlan().catch(() => {}), 60 * 60 * 1000);
 
   log('INFO', 'BOOT', 'Step 3: init Gist');
   try { await initGistId(); } catch (e) { log('WARN', 'BOOT', `Gist init: ${e.message}`); }
