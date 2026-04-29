@@ -10252,6 +10252,52 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── POST /admin/setenv-firecrawl — push Firecrawl key + test live ───────
+  // Sécurité: teste la clé contre Firecrawl API avant save. Si invalide → reject.
+  if (req.method === 'POST' && url === '/admin/setenv-firecrawl') {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) {
+      res.writeHead(429); res.end('rate limit'); return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 1000) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const key = body.trim();
+        if (!/^fc-[a-f0-9]{20,}$/i.test(key)) {
+          res.writeHead(400); res.end('format clé invalide (attendu fc-xxxxxx)'); return;
+        }
+        // Test contre Firecrawl
+        const test = await fetch('https://api.firecrawl.dev/v1/scrape', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: 'https://example.com', formats: ['markdown'] }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (test.status === 401 || test.status === 403) {
+          res.writeHead(401); res.end('clé refusée par Firecrawl'); return;
+        }
+        // OK — save dans process.env + Dropbox
+        process.env.FIRECRAWL_API_KEY = key;
+        try {
+          if (typeof uploadDropboxSecret === 'function') {
+            await uploadDropboxSecret('FIRECRAWL_API_KEY', key);
+          }
+        } catch {}
+        if (ALLOWED_ID) {
+          sendTelegramWithFallback(
+            `🔥 *FIRECRAWL_API_KEY activée*\n\n${key.length} chars · testée live ✅\nSauvegardée Dropbox /bot-secrets/ + process.env\n\n_Scraping web actif maintenant._`,
+            { category: 'firecrawl-set' }
+          ).catch(() => {});
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, length: key.length, tested: 'firecrawl ok' }));
+      } catch (e) {
+        res.writeHead(500); res.end(`error: ${e.message?.substring(0, 200)}`);
+      }
+    });
+    return;
+  }
+
   // ─── POST /admin/centris-cookies — push cookies depuis Mac (>4KB) ───────
   // Bypass Telegram 4096 char limit. Sécurité: bot teste les cookies contre
   // Centris AVANT de save — si ça marche pas, on save pas. Donc inutile pour
