@@ -2250,17 +2250,21 @@ async function completerAnciennesActivites(dealId) {
 }
 
 /**
- * Check si activité non-complétée du même type existe déjà à cette date pour ce deal.
- * Retourne l'ID existant si trouvée, null sinon.
+ * Règle Shawn 2026-04-29: "1 activité par client à la fois. C'est un cheminement."
+ *
+ * Retourne l'ID de TOUTE activité non-complétée existante sur le deal,
+ * peu importe le type/date. Si client a déjà 1 activité open → REFUSE création.
+ *
+ * Pour passer à la prochaine activité: il faut d'abord marquer la courante DONE.
  */
 async function activiteExisteDeja(dealId, type, date = null) {
-  if (!dealId || !type) return null;
-  const targetDate = date || new Date().toISOString().split('T')[0];
+  if (!dealId) return null;
   try {
     const r = await pdGet(`/deals/${dealId}/activities?limit=50`);
     const acts = r?.data || [];
-    const match = acts.find(a => a.type === type && !a.done && a.due_date === targetDate);
-    return match ? match.id : null;
+    // ANY open activity blocks new creation (cheminement séquentiel)
+    const anyOpen = acts.find(a => !a.done);
+    return anyOpen ? anyOpen.id : null;
   } catch (e) {
     log('WARN', 'DEDUP', `activiteExisteDeja deal ${dealId}: ${e.message}`);
     return null;
@@ -2334,12 +2338,11 @@ async function creerActivite({ terme, type, sujet, date, heure }) {
   if (!deals.length) return `Aucun deal: "${terme}"`;
   const deal = deals[0].item;
 
-  // 🛡️ ANTI-DOUBLON — check si activité même type+date existe déjà
-  const checkDate = date || new Date().toISOString().split('T')[0];
-  const existant = await activiteExisteDeja(deal.id, actType, checkDate);
+  // 🛡️ RÈGLE SHAWN: 1 activité OPEN par deal max (cheminement séquentiel)
+  const existant = await activiteExisteDeja(deal.id);
   if (existant) {
-    log('INFO', 'DEDUP', `Activité ${actType} existe déjà pour deal ${deal.id} le ${checkDate} (#${existant}) — skip création`);
-    return `⏭️ Activité *${actType}* existe déjà pour *${deal.title}* le ${checkDate} (#${existant}) — création skip`;
+    log('INFO', 'DEDUP', `Deal ${deal.id} a déjà une activité open #${existant} — création skip`);
+    return `⏭️ *${deal.title}* a déjà une activité en cours (#${existant}). Marque-la "fait" avant d'en créer une nouvelle.\n_Règle: 1 activité par client à la fois — cheminement séquentiel._`;
   }
 
   // 🔄 AUTO-COMPLETE — marque les anciennes activités open comme done
