@@ -2521,6 +2521,93 @@ async function modifierPersonne({ personne_id, nom, email, telephone }) {
   } catch (e) { return `❌ Erreur: ${e.message}`; }
 }
 
+// ─── classer_deal — set type + stage avec verify post-action ────────────
+async function classerDeal({ terme, type_propriete, etape }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  if (!terme) return '❌ terme requis';
+
+  // Parse terme: ID direct ou search
+  let deal;
+  if (/^\d+$/.test(terme)) {
+    deal = (await pdGet(`/deals/${terme}`))?.data;
+    if (!deal) return `❌ Deal #${terme} introuvable`;
+  } else {
+    const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
+    const items = sr?.data?.items || [];
+    if (!items.length) return `Aucun deal: "${terme}"`;
+    deal = items[0].item;
+  }
+
+  const STAGE_MAP = {
+    'nouveau': 49, 'contacté': 50, 'contact': 50, 'discussion': 51, 'en discussion': 51,
+    'visite prévue': 52, 'visite planifiée': 52, 'visite faite': 53, 'visite': 53,
+    'offre': 54, 'offre déposée': 54, 'gagné': 55, 'won': 55,
+  };
+
+  const updates = {};
+  if (type_propriete) {
+    const typeId = PD_TYPE_MAP[type_propriete.toLowerCase().trim()];
+    if (!typeId) return `❌ Type inconnu: "${type_propriete}". Options: ${Object.keys(PD_TYPE_MAP).join(', ')}`;
+    updates[PD_FIELD_TYPE] = typeId;
+  }
+  if (etape) {
+    const stageId = STAGE_MAP[etape.toLowerCase().trim()];
+    if (!stageId) return `❌ Étape inconnue: "${etape}". Options: ${Object.keys(STAGE_MAP).join(', ')}`;
+    updates.stage_id = stageId;
+  }
+  if (Object.keys(updates).length === 0) return '❌ Rien à modifier (fournir type_propriete OU etape)';
+
+  await pdPut(`/deals/${deal.id}`, updates);
+  // Verify
+  const after = (await pdGet(`/deals/${deal.id}`))?.data;
+  const issues = [];
+  if (updates.stage_id && after.stage_id !== updates.stage_id) issues.push(`stage=${after.stage_id} attendu ${updates.stage_id}`);
+  if (updates[PD_FIELD_TYPE] && after[PD_FIELD_TYPE] != updates[PD_FIELD_TYPE]) issues.push(`type=${after[PD_FIELD_TYPE]} attendu ${updates[PD_FIELD_TYPE]}`);
+  if (issues.length) return `❌ ÉCHEC: ${issues.join(' · ')}`;
+
+  const TYPE_LABELS = { 37: 'Terrain', 38: 'Construction neuve', 39: 'Maison neuve', 40: 'Maison usagée', 41: 'Plex' };
+  const parts = [];
+  if (type_propriete) parts.push(`type → *${TYPE_LABELS[updates[PD_FIELD_TYPE]] || type_propriete}*`);
+  if (etape) parts.push(`étape → *${PD_STAGES[updates.stage_id]}*`);
+  return `✅ *${after.title}* (#${deal.id})\n${parts.join('\n')}`;
+}
+
+async function classerActivite({ activity_id, type, sujet, date, heure }) {
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  if (!activity_id) return '❌ activity_id requis';
+
+  const TYPES = { appel:'call', call:'call', email:'email', réunion:'meeting', meeting:'meeting', tâche:'task', task:'task', visite:'meeting' };
+  const updates = {};
+  if (type) {
+    const t = TYPES[type.toLowerCase().trim()];
+    if (!t) return `❌ Type inconnu: ${type}`;
+    updates.type = t;
+  }
+  if (sujet) updates.subject = sujet;
+  if (date) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return '❌ Date format YYYY-MM-DD';
+    updates.due_date = date;
+  }
+  if (heure) {
+    if (!/^\d{2}:\d{2}$/.test(heure)) return '❌ Heure format HH:MM';
+    updates.due_time = heure;
+  }
+  if (Object.keys(updates).length === 0) return '❌ Rien à modifier';
+
+  try {
+    const r = await fetch(`https://api.pipedrive.com/v1/activities/${activity_id}?api_token=${PD_KEY}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(updates)
+    });
+    const j = await r.json();
+    if (!j.success) return `❌ ${j.error || 'inconnu'}`;
+    // Verify
+    const after = await pdGet(`/activities/${activity_id}`);
+    const got = after?.data;
+    if (!got) return `❌ Activité #${activity_id} disparue après update`;
+    return `✅ Activité #${activity_id} mise à jour\n${type ? '• type: ' + type + '\n' : ''}${sujet ? '• sujet: ' + sujet + '\n' : ''}${date ? '• date: ' + date + '\n' : ''}${heure ? '• heure: ' + heure : ''}`;
+  } catch (e) { return `❌ Erreur: ${e.message}`; }
+}
+
 async function statsBusiness() {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   const now = new Date();
@@ -5195,6 +5282,8 @@ const TOOLS = [
   { name: 'supprimer_note',         description: 'SUPPRIMER une note Pipedrive (test, erreur). Affiche d\'abord la liste des notes d\'un deal pour choix si terme fourni.', input_schema: { type: 'object', properties: { note_id: { type: 'number', description: 'ID exact de la note' }, terme: { type: 'string', description: 'Nom prospect — affiche les notes du deal pour choix' } } } },
   { name: 'modifier_personne',      description: 'Modifier nom/email/téléphone d\'une personne Pipedrive.', input_schema: { type: 'object', properties: { personne_id: { type: 'number', description: 'ID person' }, nom: { type: 'string' }, email: { type: 'string' }, telephone: { type: 'string' } }, required: ['personne_id'] } },
   { name: 'marquer_gagne',          description: 'Marquer un deal comme GAGNÉ dans Pipedrive avec valeur. Set status=won + stage=55 + value. Vérifie que c\'est bien appliqué après. Préfère cet outil à changer_etape pour les ventes closées.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction (ex: 2900)' }, devise: { type: 'string', description: 'Code devise (CAD défaut)' } }, required: ['terme', 'valeur'] } },
+  { name: 'classer_deal',           description: 'Classer un deal dans la bonne catégorie: type de propriété (terrain/maison_usagee/maison_neuve/plex/etc) ET étape (NOUVEAU→CONTACTÉ→DISCUSSION→VISITE→OFFRE→GAGNÉ). Utilise quand le deal a un type/stage manquant ou faux. Vérifie post-action.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect ou ID deal' }, type_propriete: { type: 'string', description: 'terrain | maison_usagee | maison_neuve | plex | auto_construction | construction_neuve' }, etape: { type: 'string', description: 'nouveau | contacté | discussion | visite prévue | visite faite | offre | gagné' } }, required: ['terme'] } },
+  { name: 'classer_activite',       description: 'Modifier le type/sujet/date d\'une activité existante. Ex: convertir "Appeler Contact" générique en "Appel Marie Dupuis - terrain Rawdon" avec bonne date.', input_schema: { type: 'object', properties: { activity_id: { type: 'number' }, type: { type: 'string', description: 'call | email | meeting | task | visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'YYYY-MM-DD' }, heure: { type: 'string', description: 'HH:MM' } }, required: ['activity_id'] } },
   // ── Gmail ──
   { name: 'voir_emails_recents', description: 'Voir les emails récents de prospects dans Gmail inbox. Pour "qui a répondu", "nouveaux emails", "mes emails". Exclut les notifications automatiques.', input_schema: { type: 'object', properties: { depuis: { type: 'string', description: 'Période: "1d", "3d", "7d" (défaut: 1d)' } } } },
   { name: 'voir_conversation',   description: 'Voir la conversation Gmail complète avec un prospect (reçus + envoyés, 30 jours). Utiliser AVANT de rédiger un suivi pour avoir tout le contexte.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou email du prospect' } }, required: ['terme'] } },
@@ -5290,6 +5379,8 @@ async function executeTool(name, input, chatId) {
       case 'supprimer_note':          return await supprimerNote(input);
       case 'modifier_personne':       return await modifierPersonne(input);
       case 'marquer_gagne':           return await marquerGagne(input);
+      case 'classer_deal':            return await classerDeal(input);
+      case 'classer_activite':        return await classerActivite(input);
       case 'chercher_comparables': {
         const res = await chercherComparablesVendus({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14 });
         if (typeof res === 'string') return res;
