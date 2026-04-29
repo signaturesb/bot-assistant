@@ -2739,6 +2739,11 @@ async function planifierVisite({ prospect, date, adresse }) {
   if (futureMs > 730 * 86400000) return `❌ Date "${dateStr}" est >2 ans dans le futur — probable hallucination, vérifie l'année.`;
   if (timeStr && !/^\d{2}:\d{2}/.test(timeStr)) return `❌ Heure invalide "${timeStr}"`;
 
+  // 🛡️ RÈGLE 1-activité-par-deal: complète les anciennes AVANT de créer la visite
+  // (planifier une visite = nouvelle étape du cheminement, l'ancienne devient done auto)
+  const completed = await completerAnciennesActivites(deal.id);
+  if (completed > 0) log('OK', 'PD', `${completed} ancienne(s) activité(s) complétée(s) sur deal ${deal.id} avant visite`);
+
   await Promise.all([
     pdPut(`/deals/${deal.id}`, { stage_id: 52 }),
     pdPost('/activities', { deal_id: deal.id, subject: `Visite — ${deal.title}${adresse ? ' @ ' + adresse : ''}`, type: 'meeting', due_date: dateStr, due_time: timeStr, duration: '01:00', done: 0 })
@@ -2750,7 +2755,7 @@ async function planifierVisite({ prospect, date, adresse }) {
   saveJSON(VISITES_FILE, visites);
 
   logActivity(`Visite planifiée: ${deal.title} — ${dateStr} ${timeStr}${adresse?' @ '+adresse:''}`);
-  return `✅ Visite planifiée: *${deal.title}*\n📅 ${dateStr} à ${timeStr}${adresse ? '\n📍 ' + adresse : ''}\nDeal → Visite prévue ✓`;
+  return `✅ Visite planifiée: *${deal.title}*\n📅 ${dateStr} à ${timeStr}${adresse ? '\n📍 ' + adresse : ''}\nDeal → Visite prévue ✓${completed > 0 ? `\n${completed} ancienne(s) activité(s) auto-complétée(s)` : ''}`;
 }
 
 async function changerEtape(terme, etape) {
