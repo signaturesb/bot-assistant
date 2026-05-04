@@ -1811,13 +1811,19 @@ function fastDropboxMatch({ centris, adresse, rue }) {
 }
 
 async function loadDropboxStructure() {
+  // Sections ALIMENTANT dropboxTerrains: /Terrain en ligne/ ET /Inscription/
+  // Bug fix Shawn 2026-05-04: bot trouvait pas les Centris# du dossier /Inscription/
+  // car dropboxTerrains était overwrite avec seulement /Terrain en ligne/.
   const sections = [
-    { path: '',                     label: 'Racine' },
-    { path: AGENT.dbx_terrains,    label: 'Terrain en ligne' },
-    { path: AGENT.dbx_templates,   label: 'Templates email' },
-    { path: AGENT.dbx_contacts,    label: 'Contacts' },
+    { path: '',                     label: 'Racine',           feedListings: false },
+    { path: AGENT.dbx_terrains,    label: 'Terrain en ligne', feedListings: true  },
+    { path: '/Inscription',         label: 'Inscription',      feedListings: true  },
+    { path: AGENT.dbx_templates,   label: 'Templates email',  feedListings: false },
+    { path: AGENT.dbx_contacts,    label: 'Contacts',         feedListings: false },
   ];
   const parts = [];
+  // Accumulateur cross-source pour dropboxTerrains (merge de toutes les sections feedListings:true)
+  const allListings = [];
   try {
     for (const sec of sections) {
       const p   = sec.path === '' ? '' : ('/' + sec.path.replace(/^\//, ''));
@@ -1826,15 +1832,15 @@ async function loadDropboxStructure() {
       const data    = await res.json();
       const entries = data.entries || [];
 
-      // Mettre à jour le cache terrain
+      // Mettre à jour le cache cross-source si c'est un dossier de listings
       // Parser flexible: Centris# peut être au début, au milieu ou à la fin du nom
       // Formats supportés:
       //   "12582379_456_rue_Principale_Rawdon"        ← # au début (recommandé)
       //   "456_rue_Principale_Rawdon_12582379"        ← # à la fin
       //   "Terrain_NoCentris_12582379_456_Principale" ← ancien format
       //   "456_rue_Principale_Rawdon"                 ← sans #
-      if (sec.label === 'Terrain en ligne') {
-        dropboxTerrains = entries.filter(e => e['.tag'] === 'folder').map(e => {
+      if (sec.feedListings) {
+        const listings = entries.filter(e => e['.tag'] === 'folder').map(e => {
           const m = e.name.match(/(?:_NoCentris_|(?:^|_))(\d{7,9})(?=_|$)/);
           const centris = m ? m[1] : '';
           const adresse = e.name
@@ -1844,15 +1850,25 @@ async function loadDropboxStructure() {
             .replace(/_/g, ' ')
             .replace(/\s+/g, ' ')
             .trim();
-          return { name: e.name, path: e.path_lower, centris, adresse };
+          return { name: e.name, path: e.path_lower, centris, adresse, source: sec.label };
         });
+        allListings.push(...listings);
       }
 
       const lines = entries.map(e => `  ${e['.tag'] === 'folder' ? '📁' : '📄'} ${e.name}`).join('\n');
       parts.push(`📂 ${sec.label} (${p || '/'}):\n${lines || '  (vide)'}`);
     }
+    // Merge cross-source — dédup par path_lower (au cas où même dossier dans 2 sections)
+    const seen = new Set();
+    dropboxTerrains = allListings.filter(l => {
+      if (seen.has(l.path)) return false;
+      seen.add(l.path);
+      return true;
+    });
     dropboxStructure = parts.join('\n\n');
-    log('OK', 'DROPBOX', `Structure: ${dropboxTerrains.length} terrains, ${sections.length} sections chargées`);
+    const bySource = dropboxTerrains.reduce((acc, l) => { acc[l.source] = (acc[l.source] || 0) + 1; return acc; }, {});
+    const breakdown = Object.entries(bySource).map(([s, n]) => `${s}: ${n}`).join(', ');
+    log('OK', 'DROPBOX', `Structure: ${dropboxTerrains.length} listings (${breakdown}), ${sections.length} sections`);
   } catch (e) { log('WARN', 'DROPBOX', `loadStructure: ${e.message}`); }
 }
 
@@ -3001,7 +3017,7 @@ async function chercherListingDropbox(terme) {
     const files = r?.ok ? (await r.json()).entries : [];
     const pdfs  = files.filter(x => x.name.toLowerCase().endsWith('.pdf')).map(x => x.name);
     const imgs  = files.filter(x => /\.(jpg|jpeg|png)$/i.test(x.name)).length;
-    let txt = `📁 *${f.adresse || f.name}*${f.centris ? ` (Centris #${f.centris})` : ''}\n`;
+    let txt = `📁 *${f.adresse || f.name}*${f.centris ? ` (Centris #${f.centris})` : ''}${f.source ? ` _[${f.source}]_` : ''}\n`;
     if (pdfs.length)  txt += `  📄 ${pdfs.join(' · ')}\n`;
     if (imgs > 0)     txt += `  🖼 ${imgs} photo(s)\n`;
     if (!files.length) txt += `  _(vide)_\n`;
@@ -5679,7 +5695,7 @@ const TOOLS = [
   { name: 'read_bot_file',   description: 'Lit un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' } }, required: ['filename'] } },
   { name: 'write_bot_file',  description: 'Modifie ou crée un fichier de configuration dans /data/botfiles/', input_schema: { type: 'object', properties: { filename: { type: 'string' }, content: { type: 'string' } }, required: ['filename', 'content'] } },
   // ── Listings Dropbox + envoi docs ──
-  { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox (/Terrain en ligne/) par ville, adresse ou numéro Centris. Utilise le cache — résultat instantané. Liste PDFs + photos de chaque dossier trouvé.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
+  { name: 'chercher_listing_dropbox', description: 'Chercher un dossier listing dans Dropbox — fouille AUTOMATIQUEMENT les 2 sources: /Terrain en ligne/ ET /Inscription/. Match par ville, adresse ou numéro Centris. Utilise le cache cross-source — résultat instantané. Liste PDFs + photos de chaque dossier trouvé. Source affichée dans la réponse pour traçabilité.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Ville (ex: "Rawdon"), adresse partielle ou numéro Centris (7-9 chiffres)' } }, required: ['terme'] } },
   { name: 'envoyer_docs_prospect',   description: 'Envoie TOUS les docs Dropbox du terrain au client par Gmail (multi-PJ). PDFs passthrough + photos combinées en 1 PDF auto. Template Signature SB + RE/MAX avec logos base64. Match par Centris# ou adresse via index cross-source /Inscription + /Terrain en ligne fusionnés. shawn@signaturesb.com est TOUJOURS AUTOMATIQUEMENT en Cc visible par le client (pas besoin de le spécifier). CCs additionnels (julie@, autres) via le param cc. Note Pipedrive automatique. Utiliser quand Shawn dit "envoie les docs à [nom/email]". Le tool supporte tout — multi-PDF par défaut, CC, envoi même sans deal Pipedrive si email fourni.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive, OU email du client directement si pas encore dans Pipedrive' }, email: { type: 'string', description: 'Email destination (override si Pipedrive email différent)' }, cc: { type: 'string', description: 'CCs ADDITIONNELS en plus de shawn@ qui est auto (ex: "julie@signaturesb.com"). Séparer par virgules si plusieurs.' }, fichier: { type: 'string', description: 'OPTIONNEL — filtrer UN seul PDF (nom partiel). Par défaut: TOUS les docs envoyés.' }, centris: { type: 'string', description: 'OPTIONNEL — # Centris pour forcer match Dropbox (si absent de Pipedrive)' } }, required: ['terme'] } },
   // ── Sync Claude Code ↔ Bot ──
   { name: 'refresh_contexte_session', description: 'Recharger SESSION_LIVE.md depuis GitHub (sync Claude Code ↔ bot). Utiliser quand Shawn mentionne "tu sais pas ça" ou après qu\'il a travaillé dans Claude Code sur son Mac.', input_schema: { type: 'object', properties: {} } },
