@@ -6311,6 +6311,157 @@ const PRICING = {
 };
 const COST_FILE = path.join(DATA_DIR, 'cost_tracker.json');
 let costTracker = loadJSON(COST_FILE, { daily: {}, monthly: {}, total: 0, byModel: {}, alertsSent: {} });
+
+// ─── OpenAI Whisper cost tracking ────────────────────────────────────────────
+// Whisper: $0.006 per minute audio (2026 pricing)
+const OPENAI_COST_FILE = path.join(DATA_DIR, 'openai_cost.json');
+let openaiCost = loadJSON(OPENAI_COST_FILE, { daily: {}, monthly: {}, total: 0, totalMinutes: 0 });
+function trackWhisperCost(durationSec) {
+  if (!durationSec || durationSec <= 0) return;
+  const minutes = durationSec / 60;
+  const cost = minutes * 0.006;
+  const d = today(), m = thisMonth();
+  openaiCost.daily[d]   = (openaiCost.daily[d]   || 0) + cost;
+  openaiCost.monthly[m] = (openaiCost.monthly[m] || 0) + cost;
+  openaiCost.total += cost;
+  openaiCost.totalMinutes = (openaiCost.totalMinutes || 0) + minutes;
+  // Purge daily >30j
+  const cutoffDay = new Date(Date.now() - 30*86400000).toISOString().slice(0,10);
+  Object.keys(openaiCost.daily).forEach(k => { if (k < cutoffDay) delete openaiCost.daily[k]; });
+  saveJSON(OPENAI_COST_FILE, openaiCost);
+}
+
+// ─── Abonnements business (fixes + variables) ────────────────────────────────
+// Source de vérité pour le coût total mensuel de la business.
+// Shawn met à jour les prix via /sub_set <id> <prix_USD> ou /sub_set <id> <prix_CAD> CAD
+const SUBS_FILE = path.join(DATA_DIR, 'subscriptions.json');
+const DEFAULT_SUBS = [
+  // ── INFRA & DEV ───────────────────────────────────────────────────────────
+  { id: 'render',       name: 'Render Hosting',        category: 'Infra',   price_usd: 7,     est: true,  notes: 'Web service Starter ~$7/mo (à confirmer)' },
+  { id: 'github',       name: 'GitHub',                category: 'Dev',     price_usd: 0,     est: false, notes: 'Free tier (repos privés OK)' },
+  { id: 'claude_code',  name: 'Claude Code (toi)',     category: 'Dev',     price_usd: 100,   est: true,  notes: 'Estimation Max 5x — confirme ton plan exact (Pro $20, Max 5x $100, Max 20x $200, ou API key direct)' },
+  { id: 'domain',       name: 'Domaine signaturesb.com', category: 'Infra', price_usd: 1.25,  est: true,  notes: 'Annuel ~$15 ÷ 12' },
+  // ── CRM & OUTILS PRO ──────────────────────────────────────────────────────
+  { id: 'pipedrive',    name: 'Pipedrive',             category: 'CRM',     price_usd: 34.90, est: true,  notes: 'Estimation Advanced — confirme ton tier exact' },
+  { id: 'dropbox',      name: 'Dropbox',               category: 'Storage', price_usd: 11.99, est: true,  notes: 'Estimation Plus — confirme (Family $20, Business $24)' },
+  { id: 'brevo',        name: 'Brevo (mass email)',    category: 'Email',   price_usd: 0,     est: true,  notes: 'Free tier 300/jour — confirme si payant' },
+  // ── APIs PAY-PER-USE (variables) ──────────────────────────────────────────
+  { id: 'anthropic_api', name: 'Anthropic API (bot)',   category: 'API',    variable: true,   notes: 'Pay-as-you-go — voir costTracker /cout' },
+  { id: 'openai',        name: 'OpenAI Whisper',        category: 'API',    variable: true,   notes: 'Pay-as-you-go $0.006/min audio' },
+  { id: 'firecrawl',    name: 'Firecrawl',             category: 'Scraping', price_usd: 0,    est: true,  notes: 'Free tier (500 scrapes/mo)' },
+  { id: 'perplexity',   name: 'Perplexity Sonar',      category: 'Search',  price_usd: 0,     est: true,  notes: 'Pas activé actuellement' },
+  // ── COMMUNICATION ─────────────────────────────────────────────────────────
+  { id: 'telegram',     name: 'Telegram Bot',          category: 'Comm',    price_usd: 0,     est: false, notes: 'Gratuit' },
+  // ── À VENIR (planifiés) ───────────────────────────────────────────────────
+  { id: 'tapeacall',    name: 'TapeACall (planifié)',  category: 'Phone',   price_usd: 11.99, est: true,  pending: true, notes: 'Pas encore actif — pour enregistrement appels' },
+  { id: 'zapier',       name: 'Zapier (planifié)',     category: 'Automation', price_usd: 19.99, est: true, pending: true, notes: 'Pas encore actif — pour TapeACall→Bot' },
+  // ── BUSINESS RE (à confirmer) ─────────────────────────────────────────────
+  { id: 'centris',      name: 'Centris courtier',      category: 'RE',      price_cad: null,  est: true,  notes: 'Frais courtier — à confirmer' },
+  { id: 'oaciq',        name: 'OACIQ licence',         category: 'RE',      price_cad: 54,    est: true,  notes: '~$650/an ÷ 12 — à confirmer' },
+  { id: 'remax',        name: 'RE/MAX franchise',      category: 'RE',      price_cad: null,  est: true,  notes: '% commission ou flat fee — à confirmer' },
+  { id: 'assurance',    name: 'Assurance pro',         category: 'RE',      price_cad: 40,    est: true,  notes: 'Estimation — à confirmer' },
+  { id: 'phone',        name: 'Téléphone iPhone',      category: 'RE',      price_cad: 90,    est: true,  notes: 'Estimation Bell/Telus — à confirmer' },
+];
+let subscriptions = loadJSON(SUBS_FILE, { items: DEFAULT_SUBS, lastUpdate: new Date().toISOString(), usd_to_cad: 1.36 });
+// Migration: si fichier existant manque des nouveaux items du DEFAULT_SUBS, les ajouter
+{
+  const existingIds = new Set((subscriptions.items || []).map(s => s.id));
+  for (const def of DEFAULT_SUBS) {
+    if (!existingIds.has(def.id)) {
+      subscriptions.items.push(def);
+    }
+  }
+  saveJSON(SUBS_FILE, subscriptions);
+}
+
+function getMonthlyVariableCosts() {
+  const m = thisMonth();
+  // Anthropic API (bot — pas Claude Code)
+  const anthro = costTracker.monthly[m] || 0;
+  // OpenAI Whisper
+  const openai = openaiCost.monthly[m] || 0;
+  // Projection: extrapoler sur jour-mois
+  const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
+  const daysElapsed = Math.max(1, new Date().getDate());
+  return {
+    anthropic_actual: anthro,
+    anthropic_projected: anthro / daysElapsed * daysInMonth,
+    openai_actual: openai,
+    openai_projected: openai / daysElapsed * daysInMonth,
+    openai_minutes: openaiCost.totalMinutes || 0,
+  };
+}
+
+function formatBusinessReport() {
+  const rate = subscriptions.usd_to_cad || 1.36;
+  const v = getMonthlyVariableCosts();
+  // Grouper par catégorie
+  const byCategory = {};
+  let totalUsdFixed = 0, totalCadFixed = 0;
+  const pending = [];
+  for (const s of subscriptions.items) {
+    if (s.pending) { pending.push(s); continue; }
+    if (s.variable) continue;
+    const cat = s.category || 'Autre';
+    if (!byCategory[cat]) byCategory[cat] = [];
+    let usdEq = 0, cadEq = 0;
+    if (s.price_usd != null) { usdEq = s.price_usd; cadEq = s.price_usd * rate; }
+    else if (s.price_cad != null) { cadEq = s.price_cad; usdEq = s.price_cad / rate; }
+    totalUsdFixed += usdEq; totalCadFixed += cadEq;
+    byCategory[cat].push({ ...s, usdEq, cadEq });
+  }
+  const lines = [];
+  lines.push(`💰 *RAPPORT COÛT BUSINESS — ${new Date().toLocaleDateString('fr-CA', { month: 'long', year: 'numeric' })}*`);
+  lines.push(`_Taux USD→CAD: ${rate}_\n`);
+
+  // Section: abonnements fixes par catégorie
+  for (const cat of Object.keys(byCategory).sort()) {
+    lines.push(`*${cat}*`);
+    for (const s of byCategory[cat]) {
+      const priceLine = s.price_usd != null
+        ? `$${s.price_usd.toFixed(2)} USD ≈ $${(s.price_usd * rate).toFixed(2)} CAD`
+        : s.price_cad != null
+          ? `$${s.price_cad.toFixed(2)} CAD ≈ $${(s.price_cad / rate).toFixed(2)} USD`
+          : '*?*';
+      const flag = s.est ? ' 🔸' : ''; // 🔸 = estimation
+      lines.push(`  • ${s.name}: ${priceLine}${flag}`);
+    }
+    lines.push('');
+  }
+
+  // Section: APIs variables
+  lines.push(`*API Pay-As-You-Go (ce mois)*`);
+  lines.push(`  • Anthropic (bot): $${v.anthropic_actual.toFixed(2)} actuel · proj. $${v.anthropic_projected.toFixed(2)}`);
+  lines.push(`  • OpenAI Whisper: $${v.openai_actual.toFixed(2)} actuel · proj. $${v.openai_projected.toFixed(2)} (${v.openai_minutes.toFixed(0)} min audio)`);
+  const anthroProjCad = v.anthropic_projected * rate;
+  const openaiProjCad = v.openai_projected * rate;
+  const totalVarUsd = v.anthropic_projected + v.openai_projected;
+  const totalVarCad = anthroProjCad + openaiProjCad;
+  lines.push('');
+
+  // GRAND TOTAL
+  const grandTotalUsd = totalUsdFixed + totalVarUsd;
+  const grandTotalCad = totalCadFixed + totalVarCad;
+  lines.push(`━━━━━━━━━━━━━━━━━━━━━━━`);
+  lines.push(`*🏆 TOTAL MENSUEL PROJETÉ*`);
+  lines.push(`USD: *$${grandTotalUsd.toFixed(2)}*  ·  CAD: *$${grandTotalCad.toFixed(2)}*`);
+  lines.push(`  Fixes: $${totalUsdFixed.toFixed(2)} USD ($${totalCadFixed.toFixed(2)} CAD)`);
+  lines.push(`  Variables: $${totalVarUsd.toFixed(2)} USD ($${totalVarCad.toFixed(2)} CAD)`);
+  lines.push('');
+
+  if (pending.length) {
+    lines.push(`*🆕 Planifiés (pas encore actifs)*`);
+    for (const s of pending) {
+      const usd = s.price_usd || 0;
+      lines.push(`  • ${s.name}: $${usd.toFixed(2)} USD → impact +$${(usd * rate).toFixed(2)} CAD/mo`);
+    }
+    lines.push('');
+  }
+
+  lines.push(`🔸 = estimation à confirmer · 📝 ajuste avec \`/sub_set <id> <prix>\` (ex: \`/sub_set pipedrive 49.90\`)`);
+  lines.push(`📋 IDs: ${subscriptions.items.filter(s => !s.variable && !s.pending).map(s => s.id).join(', ')}`);
+  return lines.join('\n');
+}
 function today() { return new Date().toISOString().slice(0, 10); }
 function thisMonth() { return new Date().toISOString().slice(0, 7); }
 function trackCost(model, usage) {
@@ -8268,6 +8419,67 @@ function registerHandlers() {
     }
   });
 
+  // ─── /business — coût total de la business (fixes + variables) ──────────
+  bot.onText(/\/business|\/abonnements|\/couts_business/, msg => {
+    if (!isAllowed(msg)) return;
+    bot.sendMessage(msg.chat.id, formatBusinessReport(), { parse_mode: 'Markdown', disable_web_page_preview: true });
+  });
+
+  // ─── /sub_set <id> <prix> [USD|CAD] — ajuster prix abonnement
+  bot.onText(/\/sub[_-]?set\s+(\S+)\s+(\d+(?:\.\d+)?)\s*(USD|CAD|usd|cad)?/i, (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const id = match[1].toLowerCase();
+    const price = parseFloat(match[2]);
+    const currency = (match[3] || 'USD').toUpperCase();
+    const sub = subscriptions.items.find(s => s.id === id);
+    if (!sub) {
+      bot.sendMessage(msg.chat.id, `❌ ID "${id}" inconnu.\n\nIDs valides: ${subscriptions.items.filter(s => !s.variable).map(s => s.id).join(', ')}`);
+      return;
+    }
+    if (sub.variable) {
+      bot.sendMessage(msg.chat.id, `❌ ${sub.name} est variable (pay-as-you-go) — pas de prix fixe à set.`);
+      return;
+    }
+    if (currency === 'CAD') { sub.price_cad = price; sub.price_usd = null; }
+    else                    { sub.price_usd = price; sub.price_cad = null; }
+    sub.est = false;
+    sub.confirmedAt = new Date().toISOString();
+    subscriptions.lastUpdate = new Date().toISOString();
+    saveJSON(SUBS_FILE, subscriptions);
+    bot.sendMessage(msg.chat.id, `✅ ${sub.name}: $${price.toFixed(2)} ${currency} confirmé.\n_Voir le total: /business_`, { parse_mode: 'Markdown' });
+  });
+
+  // ─── /sub_add <name> <prix> [category] — nouvel abonnement
+  bot.onText(/\/sub[_-]?add\s+"([^"]+)"\s+(\d+(?:\.\d+)?)\s*(\S+)?/i, (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const name = match[1];
+    const price = parseFloat(match[2]);
+    const category = match[3] || 'Autre';
+    const id = name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').substring(0, 30);
+    if (subscriptions.items.find(s => s.id === id)) {
+      bot.sendMessage(msg.chat.id, `❌ Existe déjà: ${id}. Utilise /sub_set pour modifier.`);
+      return;
+    }
+    subscriptions.items.push({ id, name, category, price_usd: price, est: false, confirmedAt: new Date().toISOString() });
+    subscriptions.lastUpdate = new Date().toISOString();
+    saveJSON(SUBS_FILE, subscriptions);
+    bot.sendMessage(msg.chat.id, `✅ Ajouté: ${name} ($${price.toFixed(2)} USD, ${category})\nID: \`${id}\``, { parse_mode: 'Markdown' });
+  });
+
+  // ─── /sub_remove <id> — retirer un abonnement
+  bot.onText(/\/sub[_-]?remove\s+(\S+)/i, (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const id = match[1].toLowerCase();
+    const before = subscriptions.items.length;
+    subscriptions.items = subscriptions.items.filter(s => s.id !== id);
+    if (subscriptions.items.length === before) {
+      bot.sendMessage(msg.chat.id, `❌ ID "${id}" introuvable.`);
+      return;
+    }
+    saveJSON(SUBS_FILE, subscriptions);
+    bot.sendMessage(msg.chat.id, `🗑 Retiré: ${id}`);
+  });
+
   bot.onText(/\/cout|\/cost/, msg => {
     if (!isAllowed(msg)) return;
     const d = today(), m = thisMonth();
@@ -9060,6 +9272,9 @@ function registerHandlers() {
       const recentContext = recentNames || '';
 
       const texte = await transcrire(buffer, { recentContext });
+
+      // Track Whisper cost ($0.006/min)
+      if (msg.voice?.duration) trackWhisperCost(msg.voice.duration);
 
       if (!texte) { await bot.sendMessage(chatId, '❌ Impossible de transcrire ce message vocal.'); return; }
 
