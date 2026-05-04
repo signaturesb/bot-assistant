@@ -8931,6 +8931,74 @@ function registerHandlers() {
     await send(msg.chat.id, reply);
   });
 
+  // ─── /dernier_appel — re-affiche le dernier résumé d'appel + lien Pipedrive
+  bot.onText(/\/dernier[_-]?appel/, async msg => {
+    if (!isAllowed(msg)) return;
+    const recents = (auditLog || []).filter(e => e.category === 'appel').slice(-1);
+    if (!recents.length) {
+      await bot.sendMessage(msg.chat.id, '📞 Aucun résumé d\'appel enregistré encore.');
+      return;
+    }
+    const last = recents[0];
+    const d = last.details || {};
+    const when = new Date(last.timestamp).toLocaleString('fr-CA', { timeZone: 'America/Toronto', day:'numeric', month:'long', hour:'2-digit', minute:'2-digit' });
+    const dealUrl = d.deal_id ? `https://signaturesb.pipedrive.com/deal/${d.deal_id}` : null;
+    const lines = [
+      `📞 *Dernier résumé d'appel — ${when}*`,
+      '',
+      `${last.event}`,
+      `🌡️ Engagement: ${(d.engagement || '—').toUpperCase()}`,
+      d.is_new ? '✨ Nouveau deal créé' : '♻️ Deal existant enrichi',
+      d.noteOk ? '✅ Note Pipedrive OK' : '⚠️ Note: échec',
+      d.activityOk ? '✅ Activité créée' : (d.is_new ? '⚠️ Activité: échec' : '⏭️ Pas d\'activité (deal existant)'),
+      d.analyseErr ? `\n⚠️ Haiku partiel: ${d.analyseErr.substring(0, 80)}` : '',
+      dealUrl ? `\n🔗 ${dealUrl}` : '',
+    ].filter(Boolean);
+    await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown', disable_web_page_preview: true });
+  });
+
+  // ─── /test_appel <texte> — preview analyse Haiku SANS écrire dans Pipedrive
+  bot.onText(/\/test[_-]?appel\s+([\s\S]+)/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const transcription = match[1].trim();
+    if (transcription.length < 20) {
+      await bot.sendMessage(msg.chat.id, '❌ Texte trop court (min 20 chars).');
+      return;
+    }
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    try {
+      const json = await analyserAppelHaiku(transcription);
+      const matched = json.nom_complet || json.telephone || json.centris_number || json.prenom
+        ? await _matcherProspectFuzzy(json) : null;
+      const lines = [
+        `🧪 *TEST analyse Haiku (DRY-RUN)*`,
+        `_Aucune écriture Pipedrive — preview seulement._\n`,
+        `👤 Nom: ${json.nom_complet || '—'}`,
+        `📱 Tel: ${json.telephone || '—'}`,
+        `📧 Email: ${json.email || '—'}`,
+        `🔢 Centris: ${json.centris_number || '—'}`,
+        `🏠 Type: ${json.type_propriete || '—'}`,
+        `💰 Budget: ${json.budget ? Number(json.budget).toLocaleString('fr-CA') + ' $' : '—'}`,
+        `🌡️ Engagement: ${(json.engagement_client || '—').toUpperCase()}`,
+        `🎯 ${json.objectif_appel || '—'}`,
+        '',
+        `🔑 Points clés:`,
+        ...(json.points_cles || []).map(p => `• ${p}`),
+        json.objections?.length ? `\n⚠️ Objections:\n${json.objections.map(o => `• ${o}`).join('\n')}` : '',
+        `\n➡️ Prochaine étape: ${json.prochaine_etape || '—'}`,
+        json.suivi_date ? `📅 Suivi suggéré: ${json.suivi_date}${json.suivi_heure ? ' ' + json.suivi_heure : ''}` : '',
+        json.alerte ? `\n🚨 ${json.alerte}` : '',
+        '',
+        matched?.deal ? `✅ *Match Pipedrive:* ${matched.deal.title} (#${matched.deal.id})${matched.ambiguous ? ` — ⚠️ ${matched.ambiguous} matchs` : ''}` : '⚠️ *Aucun match Pipedrive* — créerait un nouveau deal en mode auto',
+      ].filter(Boolean);
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+    } catch (e) {
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, `❌ Test échec: ${e.message}`);
+    }
+  });
+
   // ─── Messages texte ──────────────────────────────────────────────────────────
   bot.on('message', async (msg) => {
     if (!isAllowed(msg)) return;
