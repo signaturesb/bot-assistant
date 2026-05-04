@@ -917,6 +917,26 @@ function getSystemDynamic() {
     `RÈGLE HEURE: Pas d'heure par défaut. Si Shawn ne mentionne pas une heure spécifique, NE PAS passer le param 'heure' aux outils.`
   );
 
+  // ━━ DÉTECTION AUTO RÉSUMÉ D'APPEL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  parts.push(
+    `━━ DÉTECTION RÉSUMÉ D'APPEL (impératif — vocal Telegram) ━━\n` +
+    `Si le message utilisateur (transcription vocale OU texte) ressemble à un compte-rendu d'appel téléphonique avec un client, tu DOIS appeler l'outil enregistrer_resume_appel({transcription: "<texte complet>"}) AUTOMATIQUEMENT, sans demander confirmation.\n\n` +
+    `Patterns déclencheurs:\n` +
+    `• "j'ai parlé avec [Nom]" / "viens de parler à [Nom]"\n` +
+    `• "[Nom] vient d'appeler" / "[Nom] m'a appelé"\n` +
+    `• "rappel de [Nom]" / "discussion avec [Nom]"\n` +
+    `• "[Nom] est intéressé par X" / "[Nom] veut visiter"\n` +
+    `• "résumé d'appel" / "compte-rendu"\n` +
+    `• Tout vocal décrivant les détails d'une conversation client (engagement, budget, prochaine étape, objections)\n\n` +
+    `Passe la transcription COMPLÈTE telle quelle dans le param transcription. L'outil:\n` +
+    `1. Extrait infos via Haiku (nom, tel, budget, engagement, etc)\n` +
+    `2. Cherche client existant Pipedrive (nom→tel→Centris→prénom)\n` +
+    `3. NOUVEAU client → crée deal + note + activité (date du jour)\n` +
+    `4. CLIENT EXISTANT → ajoute note seulement (règle 1-activité-par-deal)\n` +
+    `5. Pas de nom extrait → renvoie résumé sur Telegram pour attribution manuelle\n\n` +
+    `NE PAS appeler chercher_prospect ou creer_deal manuellement — l'outil gère tout.`
+  );
+
   if (dropboxStructure) parts.push(`━━ DROPBOX — Structure actuelle:\n${dropboxStructure}`);
 
   // ━━ MAILING PLAN — campagnes en queue (refresh 1h) ━━━━━━━━━━━━━━━━━━━━━
@@ -4299,6 +4319,332 @@ async function transcrire(audioBuffer, opts = {}) {
   } finally { clearTimeout(t); }
 }
 
+// ─── Résumé d'appel téléphonique (Haiku → JSON structuré) ───────────────────
+// Shawn raccroche avec un client → vocal Telegram → Whisper → CE FLOW.
+// Auto-détection par Claude (system prompt). Crée note + deal + activité Pipedrive.
+// Règle Shawn 2026-05-03: "il faut toujours une activité avec le deal en date de
+// la création deal apres je gere". 1ère convo = écriture parallèle deal+note+activité.
+
+function _extractJsonFromText(txt) {
+  if (!txt) return null;
+  // 1. Direct parse
+  try { return JSON.parse(txt.trim()); } catch {}
+  // 2. Extract first {...} block
+  const m = txt.match(/\{[\s\S]*\}/);
+  if (m) {
+    try { return JSON.parse(m[0]); } catch {}
+    // 3. Tentative repair: enlever trailing commas
+    try { return JSON.parse(m[0].replace(/,(\s*[\]}])/g, '$1')); } catch {}
+  }
+  return null;
+}
+
+async function analyserAppelHaiku(transcription) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error('ANTHROPIC_API_KEY absent — analyse impossible');
+
+  const TZ = 'America/Toronto';
+  const now = new Date();
+  const dateLong = now.toLocaleDateString('fr-CA', { timeZone: TZ, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const dateISO  = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+
+  const sys = `Tu analyses la transcription d'un appel téléphonique d'un courtier immobilier québécois (Shawn Barrette, RE/MAX PRESTIGE Rawdon, secteur Lanaudière).
+
+Aujourd'hui: ${dateLong} (ISO ${dateISO}). Timezone: America/Toronto.
+
+Extrait UNIQUEMENT un JSON valide (aucun texte avant/après) avec ces champs:
+{
+  "nom_complet": "Prénom Nom client (string ou null si pas mentionné)",
+  "prenom": "Prénom seul (string ou null)",
+  "nom": "Nom de famille seul (string ou null)",
+  "telephone": "10 chiffres normalisés ou null",
+  "email": "email valide ou null",
+  "centris_number": "7-9 chiffres si mentionné ou null",
+  "type_propriete": "terrain|maison_usagee|maison_neuve|construction_neuve|auto_construction|plex (ou null)",
+  "budget": "Montant numérique en dollars (ex 80000) ou null",
+  "adresse_propriete": "Adresse mentionnée ou null",
+  "ville": "Ville mentionnée ou null",
+  "objectif_appel": "1 phrase claire — pourquoi cet appel a eu lieu",
+  "points_cles": ["3-6 points factuels importants extraits"],
+  "objections": ["objection 1", "objection 2"],
+  "engagement_client": "chaud|tiede|froid",
+  "prochaine_etape": "1 phrase actionnable — ce que Shawn doit faire ensuite",
+  "suivi_type": "call|meeting|task|email (défaut: call)",
+  "suivi_date": "YYYY-MM-DD à partir de ${dateISO} — JAMAIS deviner l'année",
+  "suivi_heure": "HH:MM SEULEMENT si l'appelant mentionne une heure précise, sinon null",
+  "suivi_sujet": "Court sujet (max 60 chars) pour la prochaine activité",
+  "alerte": "string si urgence/risque détecté (ex: client urgent, autre courtier, désengagé) ou null"
+}
+
+Règles strictes:
+- Si pas mentionné → null (jamais inventer)
+- Si "samedi" sans date précise → calculer prochain samedi à partir de ${dateISO}
+- engagement_client: chaud=acheter/visiter bientôt, tiede=intéressé mais hésite, froid=poli mais distant
+- objections: vide [] si aucune
+- JAMAIS d'heure par défaut — null si pas explicite (règle Shawn absolue)
+- nom_complet doit être complet ET précis pour matching Pipedrive`;
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        max_tokens: 1500,
+        system: sys,
+        messages: [{ role: 'user', content: `Transcription appel:\n\n${transcription}` }],
+      }),
+    });
+    if (!res.ok) {
+      const errTxt = await res.text();
+      throw new Error(`Haiku HTTP ${res.status}: ${errTxt.substring(0, 120)}`);
+    }
+    const data = await res.json();
+    const txt = data.content?.[0]?.text?.trim() || '';
+    trackCost('claude-haiku-4-5', data.usage || {});
+    const parsed = _extractJsonFromText(txt);
+    if (!parsed) {
+      log('WARN', 'APPEL', `JSON parse fail: ${txt.substring(0, 100)}`);
+      throw new Error('Haiku a retourné du contenu non-JSON');
+    }
+    return parsed;
+  } finally { clearTimeout(t); }
+}
+
+async function _matcherProspectFuzzy(json) {
+  // Cascade: nom complet → tel → centris → prénom seul
+  const tries = [
+    json.nom_complet,
+    json.telephone,
+    json.centris_number,
+    json.prenom,
+  ].filter(Boolean);
+
+  for (const terme of tries) {
+    try {
+      const r = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&status=open&limit=3`);
+      const items = r?.data?.items || [];
+      if (items.length === 1) return { deal: items[0].item, matchedBy: terme };
+      if (items.length > 1) return { deal: items[0].item, matchedBy: terme, ambiguous: items.length };
+    } catch (e) { log('WARN', 'APPEL', `Search "${terme}": ${e.message}`); }
+  }
+  return null;
+}
+
+function _formatNoteAppel(json, transcription) {
+  const dateFR = new Date().toLocaleDateString('fr-CA', { timeZone: 'America/Toronto', day: 'numeric', month: 'long', year: 'numeric' });
+  const heureFR = new Date().toLocaleTimeString('fr-CA', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit', hour12: false });
+  const lines = [];
+  lines.push(`📞 RÉSUMÉ D'APPEL — ${dateFR} ${heureFR}`);
+  lines.push('');
+  lines.push(`🎯 Objectif: ${json.objectif_appel || '—'}`);
+  lines.push('');
+  if (json.points_cles?.length) {
+    lines.push('🔑 Points clés:');
+    json.points_cles.forEach(p => lines.push(`• ${p}`));
+    lines.push('');
+  }
+  if (json.objections?.length) {
+    lines.push('⚠️ Objections:');
+    json.objections.forEach(o => lines.push(`• ${o}`));
+    lines.push('');
+  }
+  lines.push(`🌡️ Engagement: ${(json.engagement_client || 'tiede').toUpperCase()}`);
+  if (json.budget)             lines.push(`💰 Budget: ${Number(json.budget).toLocaleString('fr-CA')} $`);
+  if (json.type_propriete)     lines.push(`🏠 Type: ${json.type_propriete}`);
+  if (json.adresse_propriete)  lines.push(`📍 Adresse: ${json.adresse_propriete}`);
+  if (json.centris_number)     lines.push(`🔢 Centris: #${json.centris_number}`);
+  lines.push('');
+  lines.push(`➡️ Prochaine étape: ${json.prochaine_etape || '—'}`);
+  if (json.alerte) lines.push(`\n🚨 ALERTE: ${json.alerte}`);
+  lines.push('');
+  lines.push('---');
+  lines.push('📝 TRANSCRIPTION COMPLÈTE:');
+  lines.push(transcription);
+  return lines.join('\n');
+}
+
+function _formatActivityNote(json, transcription) {
+  // Note Pipedrive activité — HTML léger pour scan rapide
+  const parts = [];
+  parts.push(`<b>🎯 ${json.objectif_appel || 'Suivi appel'}</b>`);
+  parts.push(`<b>🌡️ Engagement:</b> ${(json.engagement_client || 'tiede').toUpperCase()}`);
+  if (json.budget)         parts.push(`<b>💰 Budget:</b> ${Number(json.budget).toLocaleString('fr-CA')} $`);
+  if (json.type_propriete) parts.push(`<b>🏠 Type:</b> ${json.type_propriete}`);
+  if (json.adresse_propriete) parts.push(`<b>📍</b> ${json.adresse_propriete}`);
+  if (json.points_cles?.length) {
+    parts.push('<b>🔑 Points clés:</b>');
+    parts.push(json.points_cles.map(p => `• ${p}`).join('<br>'));
+  }
+  if (json.objections?.length) {
+    parts.push('<b>⚠️ Objections:</b>');
+    parts.push(json.objections.map(o => `• ${o}`).join('<br>'));
+  }
+  parts.push(`<b>➡️ Prochaine étape:</b> ${json.prochaine_etape || '—'}`);
+  if (json.alerte) parts.push(`<b>🚨 ${json.alerte}</b>`);
+  parts.push(`<br><i>Transcription:</i> ${transcription.substring(0, 400)}${transcription.length > 400 ? '...' : ''}`);
+  return parts.join('<br>');
+}
+
+async function enregistrerResumeAppel({ transcription }) {
+  if (!transcription || transcription.length < 20) {
+    return '❌ Transcription trop courte pour analyse (min 20 chars).';
+  }
+  if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+
+  // 1. Analyse Haiku (ou fallback brut si fail)
+  let json = null, analyseErr = null;
+  try {
+    json = await analyserAppelHaiku(transcription);
+  } catch (e) {
+    analyseErr = e.message;
+    log('WARN', 'APPEL', `Haiku fail: ${e.message} — fallback brut`);
+    // Fallback minimal pour ne JAMAIS perdre la donnée
+    json = {
+      nom_complet: null, prenom: null, nom: null,
+      objectif_appel: 'Résumé d\'appel — analyse auto échouée, voir transcription',
+      points_cles: [], objections: [],
+      engagement_client: 'tiede',
+      prochaine_etape: 'Classer manuellement',
+      suivi_type: 'call',
+      suivi_date: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date()),
+      suivi_sujet: 'Résumé d\'appel à classer',
+      alerte: `Analyse Haiku échouée: ${e.message.substring(0, 80)}`,
+    };
+  }
+
+  const dateISO = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date());
+
+  // 2. Match prospect existant
+  const match = json.nom_complet || json.telephone || json.centris_number || json.prenom
+    ? await _matcherProspectFuzzy(json)
+    : null;
+
+  let dealId = null, dealTitle = null, isNewDeal = false, ambiguousNote = '';
+
+  if (match?.deal) {
+    dealId = match.deal.id;
+    dealTitle = match.deal.title;
+    if (match.ambiguous) {
+      ambiguousNote = `\n⚠️ ${match.ambiguous} matchs trouvés pour "${match.matchedBy}" — utilisé le plus pertinent.`;
+    }
+    log('OK', 'APPEL', `Deal existant #${dealId} (${dealTitle}) matché par "${match.matchedBy}"`);
+  } else {
+    // 3a. Premier appel — créer person + deal
+    if (!json.prenom && !json.nom_complet) {
+      // Pas de nom extrait — résumé sur Telegram pour attribution manuelle (règle Shawn)
+      const lines = [];
+      lines.push(`⚠️ *Résumé d'appel — nom non identifié*`);
+      lines.push(`_Tu attaches manuellement au deal après._\n`);
+      if (json.objectif_appel) lines.push(`🎯 ${json.objectif_appel}`);
+      lines.push(`🌡️ Engagement: ${(json.engagement_client || 'tiede').toUpperCase()}`);
+      if (json.points_cles?.length) {
+        lines.push(`\n🔑 Points clés:`);
+        json.points_cles.forEach(p => lines.push(`• ${p}`));
+      }
+      if (json.objections?.length) {
+        lines.push(`\n⚠️ Objections:`);
+        json.objections.forEach(o => lines.push(`• ${o}`));
+      }
+      if (json.budget) lines.push(`\n💰 Budget: ${Number(json.budget).toLocaleString('fr-CA')} $`);
+      if (json.type_propriete) lines.push(`🏠 Type: ${json.type_propriete}`);
+      if (json.adresse_propriete) lines.push(`📍 ${json.adresse_propriete}`);
+      lines.push(`\n➡️ ${json.prochaine_etape || '—'}`);
+      lines.push(`\n📝 *Transcription:*\n_${transcription}_`);
+      return lines.join('\n');
+    }
+    const prenom = json.prenom || (json.nom_complet || '').split(' ')[0];
+    const nom = json.nom || (json.nom_complet || '').split(' ').slice(1).join(' ') || null;
+    const dealRes = await creerDeal({
+      prenom, nom,
+      telephone: json.telephone,
+      email: json.email,
+      type: json.type_propriete,
+      source: 'appel',
+      centris: json.centris_number,
+      note: `Source: appel téléphonique (${dateISO})\n${json.objectif_appel || ''}`,
+    });
+    // Extraire deal_id depuis le retour markdown (creerDeal retourne string avec "ID: 1234")
+    const idMatch = String(dealRes).match(/ID:\s*(\d+)|#(\d+)/);
+    if (idMatch) {
+      dealId = parseInt(idMatch[1] || idMatch[2], 10);
+      // Re-fetch pour avoir le titre exact
+      const verif = await pdGet(`/deals/${dealId}`).catch(() => null);
+      dealTitle = verif?.data?.title || `${prenom}${nom?' '+nom:''}`;
+      isNewDeal = true;
+      log('OK', 'APPEL', `Deal créé #${dealId} (${dealTitle}) depuis appel`);
+    } else {
+      // creerDeal a échoué ou réutilisé un deal existant — chercher le deal de cette personne
+      log('WARN', 'APPEL', `creerDeal output ambigu: ${dealRes.substring(0, 100)}`);
+      const fallback = await pdGet(`/deals/search?term=${encodeURIComponent(prenom + (nom?' '+nom:''))}&status=open&limit=1`);
+      const fbItem = fallback?.data?.items?.[0]?.item;
+      if (fbItem) { dealId = fbItem.id; dealTitle = fbItem.title; }
+      else return `⚠️ Création deal incertaine.\n\nRetour Pipedrive: ${dealRes}\n\n📝 Transcription:\n_${transcription.substring(0, 300)}..._`;
+    }
+  }
+
+  // 4. Note Pipedrive complète (résumé + transcription brute)
+  const noteContent = _formatNoteAppel(json, transcription);
+  let noteOk = false, noteId = null;
+  try {
+    const noteRes = await pdPost('/notes', { deal_id: dealId, content: noteContent });
+    noteId = noteRes?.data?.id || null;
+    noteOk = !!noteId;
+  } catch (e) { log('WARN', 'APPEL', `Note creation fail: ${e.message}`); }
+
+  // 5. Activité — UNIQUEMENT pour deal nouveau (règle Shawn 2026-05-03)
+  // Date = aujourd'hui (pas Haiku-extracted). Existant = note seulement.
+  let activityOk = false, activityNote = '';
+  if (isNewDeal) {
+    const TYPES_MAP = { call:'call', meeting:'meeting', task:'task', email:'email' };
+    const actType = TYPES_MAP[json.suivi_type] || 'call';
+    const sujet = json.suivi_sujet || `Suivi appel — ${dealTitle}`;
+    const body = {
+      deal_id: dealId,
+      subject: sujet.substring(0, 100),
+      type: actType,
+      done: 0,
+      due_date: dateISO, // toujours aujourd'hui (date création deal)
+      note: _formatActivityNote(json, transcription),
+    };
+    // Heure: jamais par défaut — règle absolue Shawn
+    try {
+      const aRes = await pdPost('/activities', body);
+      activityOk = !!aRes?.data?.id;
+    } catch (e) { log('WARN', 'APPEL', `Activity fail: ${e.message}`); }
+  } else {
+    activityNote = `\n📝 Note ajoutée seulement (deal existant — règle 1-activité-par-deal).`;
+  }
+
+  // 6. Audit log (pour /lead-audit)
+  try {
+    auditLogEvent('appel', `Résumé enregistré: ${dealTitle}`, {
+      deal_id: dealId, is_new: isNewDeal, engagement: json.engagement_client,
+      analyseErr, noteOk, activityOk,
+    });
+  } catch {}
+
+  // 7. Confirmation Telegram structurée
+  const lines = [];
+  lines.push(isNewDeal ? `✅ *Nouveau deal créé + résumé d'appel*` : `✅ *Résumé d'appel ajouté au deal existant*`);
+  lines.push('');
+  lines.push(`👤 *${dealTitle}* ${isNewDeal ? '(nouveau)' : `(deal #${dealId})`}`);
+  lines.push(`🌡️ Engagement: ${(json.engagement_client || 'tiede').toUpperCase()}`);
+  if (json.objectif_appel) lines.push(`🎯 ${json.objectif_appel}`);
+  if (json.budget) lines.push(`💰 Budget: ${Number(json.budget).toLocaleString('fr-CA')} $`);
+  lines.push('');
+  lines.push(`➡️ ${json.prochaine_etape || 'Suivi à classer'}`);
+  if (activityOk) lines.push(`📅 Activité: ${json.suivi_sujet || 'Suivi appel'} (${json.suivi_date || dateISO}${json.suivi_heure ? ' ' + json.suivi_heure : ''})`);
+  if (json.alerte) lines.push(`\n🚨 ${json.alerte}`);
+  if (analyseErr) lines.push(`\n⚠️ Analyse Haiku partielle (${analyseErr.substring(0, 60)}) — vérifie la note Pipedrive`);
+  if (ambiguousNote) lines.push(ambiguousNote);
+  if (activityNote) lines.push(activityNote);
+  if (!noteOk) lines.push(`\n⚠️ Note Pipedrive: échec écriture`);
+  return lines.join('\n');
+}
+
 // ─── Contacts iPhone (Dropbox /Contacts/contacts.vcf) ────────────────────────
 async function chercherContact(terme) {
   const paths = ['/Contacts/contacts.vcf', '/Contacts/contacts.csv', '/contacts.vcf', '/contacts.csv'];
@@ -5350,6 +5696,8 @@ const TOOLS = [
   { name: 'telecharger_pdf', description: 'Télécharge un PDF depuis n\'importe quelle URL et l\'envoie direct sur Telegram à Shawn. Utile pour récupérer rapports municipaux, règlements, fiches MLS, certificats de localisation, plans cadastraux. Max 25MB. Retourne URL + taille + envoi confirmé.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète vers PDF (ex: https://ville.qc.ca/.../zonage.pdf)' }, titre: { type: 'string', description: 'OPTIONNEL — titre/légende pour le PDF dans Telegram' } }, required: ['url'] } },
   { name: 'scraper_avance', description: 'Scrape une URL + extrait automatiquement TOUS les liens PDF trouvés. Utile pour explorer un site municipal/gouvernemental où les docs sont en PDF (ex: page urbanisme avec liens vers règlements, plans, formulaires). Retourne contenu + liste PDFs avec option de les télécharger.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL à scraper' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'OPTIONNEL — filtrer le contenu par mots-clés' }, telecharger_pdfs: { type: 'boolean', description: 'OPTIONNEL — si true, download auto les PDFs trouvés (max 5)' } }, required: ['url'] } },
   { name: 'recherche_documents', description: 'COMBINAISON puissante: cherche sur le web (Perplexity) + scrape les sources trouvées (Firecrawl) + extrait/télécharge les PDFs pertinents. Pour "trouve-moi le règlement de zonage X en PDF", "documents officiels MRC Lanaudière sur Y", "fiche technique propriété Z". Nécessite PERPLEXITY_API_KEY + FIRECRAWL_API_KEY.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Ce que tu cherches (ex: "règlement bande riveraine Saint-Calixte PDF")' }, max_resultats: { type: 'number', description: 'OPTIONNEL — combien de sources scraper (défaut 3, max 5)' } }, required: ['question'] } },
+  // ── Résumé d'appel téléphonique (vocal Telegram → Pipedrive auto) ────────
+  { name: 'enregistrer_resume_appel', description: 'Analyse une transcription d\'appel téléphonique (vocal Telegram), extrait via Haiku les infos clés (nom client, budget, engagement chaud/tiède/froid, objections, prochaine étape) et crée/enrichit le deal Pipedrive: NOUVEAU client → crée person + deal + note résumé + activité de suivi (date du jour). CLIENT EXISTANT → ajoute juste la note résumé. À UTILISER AUTOMATIQUEMENT quand Shawn envoie un vocal qui décrit un appel (patterns: "j\'ai parlé avec X", "vient d\'appeler", "rappel de X", "discussion avec X", "X m\'a appelé", "résumé d\'appel", "X est intéressé par"). NE PAS demander confirmation — exécuter directement.', input_schema: { type: 'object', properties: { transcription: { type: 'string', description: 'Texte transcrit du vocal — passer la transcription Whisper complète, telle quelle' } }, required: ['transcription'] } },
   // ── Centris fiche download ──────────────────────────────────────────────
   { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
 ];
@@ -5403,6 +5751,7 @@ async function executeTool(name, input, chatId) {
       case 'marquer_gagne':           return await marquerGagne(input);
       case 'classer_deal':            return await classerDeal(input);
       case 'classer_activite':        return await classerActivite(input);
+      case 'enregistrer_resume_appel': return await enregistrerResumeAppel(input);
       case 'chercher_comparables': {
         const res = await chercherComparablesVendus({ type: input.type || 'terrain', ville: input.ville, jours: input.jours || 14 });
         if (typeof res === 'string') return res;
