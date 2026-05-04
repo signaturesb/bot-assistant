@@ -10884,6 +10884,74 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/check-plans — fetch real plan info Brevo + Dropbox ───────
+  if (req.method === 'GET' && url.startsWith('/admin/check-plans')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
+    const out = { brevo: null, dropbox: null, errors: [] };
+    // Brevo /v3/account
+    try {
+      if (process.env.BREVO_API_KEY) {
+        const r = await fetch('https://api.brevo.com/v3/account', { headers: { 'api-key': process.env.BREVO_API_KEY, 'accept': 'application/json' } });
+        if (r.ok) {
+          const data = await r.json();
+          out.brevo = {
+            email: data.email,
+            companyName: data.companyName,
+            plan: data.plan,  // array de plans actifs
+            firstName: data.firstName,
+            lastName: data.lastName,
+          };
+        } else { out.errors.push(`Brevo HTTP ${r.status}`); }
+      } else { out.errors.push('BREVO_API_KEY absent'); }
+    } catch (e) { out.errors.push(`Brevo: ${e.message}`); }
+    // Dropbox /2/users/get_current_account
+    try {
+      if (process.env.DROPBOX_REFRESH_TOKEN) {
+        // Refresh token first
+        const refreshRes = await fetch('https://api.dropboxapi.com/oauth2/token', {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: process.env.DROPBOX_REFRESH_TOKEN,
+            client_id: process.env.DROPBOX_APP_KEY,
+            client_secret: process.env.DROPBOX_APP_SECRET,
+          }),
+        });
+        const tokenData = await refreshRes.json();
+        if (tokenData.access_token) {
+          const r = await fetch('https://api.dropboxapi.com/2/users/get_current_account', {
+            method: 'POST', headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+          });
+          if (r.ok) {
+            const data = await r.json();
+            out.dropbox = {
+              email: data.email,
+              account_type: data.account_type,  // {".tag": "basic"|"pro"|"business"}
+              name: data.name?.display_name,
+              country: data.country,
+            };
+            // Aussi space usage
+            const sr = await fetch('https://api.dropboxapi.com/2/users/get_space_usage', {
+              method: 'POST', headers: { 'Authorization': `Bearer ${tokenData.access_token}` }
+            });
+            if (sr.ok) {
+              const su = await sr.json();
+              out.dropbox.space = {
+                used_gb: (su.used / 1e9).toFixed(2),
+                allocated_gb: (su.allocation?.allocated / 1e9 || 0).toFixed(2),
+                type: su.allocation?.['.tag'],
+              };
+            }
+          } else { out.errors.push(`Dropbox HTTP ${r.status}`); }
+        } else { out.errors.push('Dropbox token refresh failed'); }
+      } else { out.errors.push('DROPBOX_REFRESH_TOKEN absent'); }
+    } catch (e) { out.errors.push(`Dropbox: ${e.message}`); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── POST /admin/setenv-firecrawl — push Firecrawl key + test live ───────
   // Sécurité: teste la clé contre Firecrawl API avant save. Si invalide → reject.
   if (req.method === 'POST' && url === '/admin/setenv-firecrawl') {
