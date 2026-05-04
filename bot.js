@@ -6335,43 +6335,51 @@ function trackWhisperCost(durationSec) {
 // Source de vérité pour le coût total mensuel de la business.
 // Shawn met à jour les prix via /sub_set <id> <prix_USD> ou /sub_set <id> <prix_CAD> CAD
 const SUBS_FILE = path.join(DATA_DIR, 'subscriptions.json');
+const DEFAULTS_VERSION = 2; // bump pour forcer re-seed sur prochain boot
 const DEFAULT_SUBS = [
   // ── INFRA & DEV ───────────────────────────────────────────────────────────
-  { id: 'render',       name: 'Render Hosting',        category: 'Infra',   price_usd: 7,     est: true,  notes: 'Web service Starter ~$7/mo (à confirmer)' },
-  { id: 'github',       name: 'GitHub',                category: 'Dev',     price_usd: 0,     est: false, notes: 'Free tier (repos privés OK)' },
-  { id: 'claude_code',  name: 'Claude Code (toi)',     category: 'Dev',     price_usd: 100,   est: true,  notes: 'Estimation Max 5x — confirme ton plan exact (Pro $20, Max 5x $100, Max 20x $200, ou API key direct)' },
+  { id: 'render',       name: 'Render Hosting',        category: 'Infra',   price_usd: 7,     est: true,  notes: 'Web service Starter ~$7/mo (à confirmer dashboard)' },
+  { id: 'github',       name: 'GitHub',                category: 'Dev',     price_usd: 0,     est: false, notes: 'Free tier' },
+  { id: 'claude_code',  name: 'Claude Code (Shawn)',   category: 'Dev',     price_usd: 158,   est: false, notes: 'Confirmé Shawn 2026-05-03: $158/mois' },
   { id: 'domain',       name: 'Domaine signaturesb.com', category: 'Infra', price_usd: 1.25,  est: true,  notes: 'Annuel ~$15 ÷ 12' },
-  // ── CRM & OUTILS PRO ──────────────────────────────────────────────────────
-  { id: 'pipedrive',    name: 'Pipedrive',             category: 'CRM',     price_usd: 34.90, est: true,  notes: 'Estimation Advanced — confirme ton tier exact' },
-  { id: 'dropbox',      name: 'Dropbox',               category: 'Storage', price_usd: 11.99, est: true,  notes: 'Estimation Plus — confirme (Family $20, Business $24)' },
-  { id: 'brevo',        name: 'Brevo (mass email)',    category: 'Email',   price_usd: 0,     est: true,  notes: 'Free tier 300/jour — confirme si payant' },
+  // ── PIPEDRIVE — payé annuel, exclu du mensuel (Shawn 2026-05-03) ─────────
+  // Pas dans la liste mensuelle. Recalculer si plan change.
+  // ── STORAGE ───────────────────────────────────────────────────────────────
+  // Confirmé via API Dropbox: account_type=pro, 3.3 TB → Dropbox Essentials/Professional
+  { id: 'dropbox',      name: 'Dropbox Essentials (3 TB)', category: 'Storage', price_usd: 19.99, est: false, notes: 'Confirmé via API: account_type=pro, 3300 GB allocated. Tier Essentials 3 TB.' },
+  // ── EMAIL ─────────────────────────────────────────────────────────────────
+  // Confirmé via API Brevo: subscription active, 17,995 sendLimit credits/mo → Starter tier
+  { id: 'brevo',        name: 'Brevo Starter (~20K emails)', category: 'Email', price_usd: 29, est: true, notes: 'Confirmé via API: subscription active, 17,995 send credits/mo. Tier Starter (~$29/mo). Confirmer prix exact dans dashboard Brevo.' },
   // ── APIs PAY-PER-USE (variables) ──────────────────────────────────────────
-  { id: 'anthropic_api', name: 'Anthropic API (bot)',   category: 'API',    variable: true,   notes: 'Pay-as-you-go — voir costTracker /cout' },
-  { id: 'openai',        name: 'OpenAI Whisper',        category: 'API',    variable: true,   notes: 'Pay-as-you-go $0.006/min audio' },
-  { id: 'firecrawl',    name: 'Firecrawl',             category: 'Scraping', price_usd: 0,    est: true,  notes: 'Free tier (500 scrapes/mo)' },
-  { id: 'perplexity',   name: 'Perplexity Sonar',      category: 'Search',  price_usd: 0,     est: true,  notes: 'Pas activé actuellement' },
+  { id: 'anthropic_api', name: 'Anthropic API (bot)',   category: 'API',    variable: true,   notes: 'Pay-as-you-go — voir /cout pour détails' },
+  { id: 'openai',        name: 'OpenAI Whisper',        category: 'API',    variable: true,   notes: 'Pay-as-you-go $0.006/min audio — auto-tracké' },
+  { id: 'firecrawl',    name: 'Firecrawl',             category: 'API', price_usd: 0,    est: false, notes: 'Free tier (500 scrapes/mo) — actif' },
   // ── COMMUNICATION ─────────────────────────────────────────────────────────
   { id: 'telegram',     name: 'Telegram Bot',          category: 'Comm',    price_usd: 0,     est: false, notes: 'Gratuit' },
   // ── À VENIR (planifiés) ───────────────────────────────────────────────────
   { id: 'tapeacall',    name: 'TapeACall (planifié)',  category: 'Phone',   price_usd: 11.99, est: true,  pending: true, notes: 'Pas encore actif — pour enregistrement appels' },
   { id: 'zapier',       name: 'Zapier (planifié)',     category: 'Automation', price_usd: 19.99, est: true, pending: true, notes: 'Pas encore actif — pour TapeACall→Bot' },
-  // ── BUSINESS RE (à confirmer) ─────────────────────────────────────────────
-  { id: 'centris',      name: 'Centris courtier',      category: 'RE',      price_cad: null,  est: true,  notes: 'Frais courtier — à confirmer' },
-  { id: 'oaciq',        name: 'OACIQ licence',         category: 'RE',      price_cad: 54,    est: true,  notes: '~$650/an ÷ 12 — à confirmer' },
-  { id: 'remax',        name: 'RE/MAX franchise',      category: 'RE',      price_cad: null,  est: true,  notes: '% commission ou flat fee — à confirmer' },
-  { id: 'assurance',    name: 'Assurance pro',         category: 'RE',      price_cad: 40,    est: true,  notes: 'Estimation — à confirmer' },
-  { id: 'phone',        name: 'Téléphone iPhone',      category: 'RE',      price_cad: 90,    est: true,  notes: 'Estimation Bell/Telus — à confirmer' },
 ];
-let subscriptions = loadJSON(SUBS_FILE, { items: DEFAULT_SUBS, lastUpdate: new Date().toISOString(), usd_to_cad: 1.36 });
-// Migration: si fichier existant manque des nouveaux items du DEFAULT_SUBS, les ajouter
+let subscriptions = loadJSON(SUBS_FILE, { items: DEFAULT_SUBS, lastUpdate: new Date().toISOString(), usd_to_cad: 1.36, defaultsVersion: DEFAULTS_VERSION });
+// Migration: si DEFAULTS_VERSION changé, on RESET les items (préserve user-set prices via merge intelligent)
 {
-  const existingIds = new Set((subscriptions.items || []).map(s => s.id));
-  for (const def of DEFAULT_SUBS) {
-    if (!existingIds.has(def.id)) {
-      subscriptions.items.push(def);
+  const oldVersion = subscriptions.defaultsVersion || 0;
+  if (oldVersion < DEFAULTS_VERSION) {
+    // Nouvelle version — reset items mais préserve les prix confirmés (est:false) déjà set par Shawn
+    const userConfirmed = (subscriptions.items || []).filter(s => s.confirmedAt && !s.est).reduce((acc, s) => { acc[s.id] = s; return acc; }, {});
+    subscriptions.items = DEFAULT_SUBS.map(def => userConfirmed[def.id] || { ...def });
+    subscriptions.defaultsVersion = DEFAULTS_VERSION;
+    subscriptions.migratedAt = new Date().toISOString();
+    saveJSON(SUBS_FILE, subscriptions);
+    log('OK', 'SUBS', `Migration v${oldVersion}→v${DEFAULTS_VERSION}: ${subscriptions.items.length} items, ${Object.keys(userConfirmed).length} prix Shawn préservés`);
+  } else {
+    // Même version — juste ajouter les nouveaux items qui n'existent pas
+    const existingIds = new Set((subscriptions.items || []).map(s => s.id));
+    for (const def of DEFAULT_SUBS) {
+      if (!existingIds.has(def.id)) subscriptions.items.push(def);
     }
+    saveJSON(SUBS_FILE, subscriptions);
   }
-  saveJSON(SUBS_FILE, subscriptions);
 }
 
 function getMonthlyVariableCosts() {
