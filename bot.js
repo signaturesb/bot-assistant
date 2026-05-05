@@ -11327,6 +11327,55 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── POST /admin/setsecret-universal — set n'importe quelle clé via WEBHOOK_SECRET
+  // Body: { key: 'OPENAI_API_KEY', value: 'sk-...', test_url?: 'https://api.openai.com/v1/models' }
+  // Si test_url fourni, valide la clé contre le service avant d'enregistrer.
+  if (req.method === 'POST' && url.startsWith('/admin/setsecret-universal')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', async () => {
+      try {
+        const provided = req.headers['x-webhook-secret'];
+        if (!process.env.WEBHOOK_SECRET || provided !== process.env.WEBHOOK_SECRET) {
+          res.writeHead(401); res.end(JSON.stringify({ error: 'unauthorized — X-Webhook-Secret header requis' })); return;
+        }
+        const data = JSON.parse(body || '{}');
+        const { key, value, test_url, test_auth_header } = data;
+        if (!key || !value) { res.writeHead(400); res.end(JSON.stringify({error:'key et value requis'})); return; }
+        if (!/^[A-Z0-9_]+$/.test(key)) { res.writeHead(400); res.end(JSON.stringify({error:'key invalide (A-Z0-9_)'})); return; }
+        if (value.length < 8) { res.writeHead(400); res.end(JSON.stringify({error:'value trop courte'})); return; }
+        // Test optionnel
+        let tested = null;
+        if (test_url) {
+          const headers = test_auth_header
+            ? { [test_auth_header]: value }
+            : { 'Authorization': `Bearer ${value}` };
+          try {
+            const tr = await fetch(test_url, { headers, signal: AbortSignal.timeout(10000) });
+            tested = { status: tr.status, ok: tr.ok };
+            if (!tr.ok) {
+              res.writeHead(400); res.end(JSON.stringify({ error: `Test URL fail: HTTP ${tr.status}`, tested })); return;
+            }
+          } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: `Test URL exception: ${e.message}` })); return; }
+        }
+        // Save Dropbox + env (réutilise existant)
+        const ok = await uploadDropboxSecret(key, value);
+        if (ok) {
+          process.env[key] = value;
+          auditLogEvent('secret', 'set', { key, via: 'admin-universal', tested: !!tested });
+          res.writeHead(200, {'content-type':'application/json'});
+          res.end(JSON.stringify({ ok: true, key, persisted: true, tested }, null, 2));
+          // Notif Telegram
+          if (ALLOWED_ID) sendTelegramWithFallback(`🔑 *${key}* configurée\n_via /admin/setsecret-universal_${tested ? `\nTest: HTTP ${tested.status} ✅` : ''}`, { category: 'secret-set' }).catch(()=>{});
+        } else {
+          res.writeHead(500); res.end(JSON.stringify({ error: 'Dropbox upload failed' }));
+        }
+      } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    });
+    return;
+  }
+
   // ─── GET /admin/state — DUMP COMPLET pour Claude Code (sync temps réel)
   // Une seule requête → toute la state du bot. Curl this au début de chaque
   // session Claude Code pour avoir le contexte parfait sans questions.
