@@ -11028,6 +11028,39 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/brevo-send-preview?id=N — force preview test à shawn@
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-send-preview')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    const to = u.searchParams.get('to') || SHAWN_EMAIL;
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    const out = { id, to, sent: false, status: null, campaign: null };
+    try {
+      // Get campaign details
+      const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (det.ok) {
+        const data = await det.json();
+        out.campaign = { name: data.name, subject: data.subject, status: data.status, scheduledAt: data.scheduledAt, recipients: data.recipients };
+      }
+      // Send test
+      const tr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/sendTest`, {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type':'application/json' },
+        body: JSON.stringify({ emailTo: [to] }),
+      });
+      out.status = tr.status;
+      out.sent = tr.ok || tr.status === 204;
+      if (!out.sent) {
+        const errBody = await tr.text().catch(() => '');
+        out.error = errBody.substring(0, 300);
+      }
+    } catch (e) { out.error = e.message; }
+    res.writeHead(200, { 'content-type':'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /admin/safety-check — déclenche safety check campagnes immédiatement
   if (req.method === 'GET' && url.startsWith('/admin/safety-check')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
