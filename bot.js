@@ -6961,6 +6961,8 @@ function registerHandlers() {
                   await bot.editMessageReplyMarkup(newMarkup, { chat_id: chatId, message_id: msgId }).catch(() => {});
                 }
                 await bot.sendMessage(chatId, label);
+                // Approval registry — empêche safetyCheckCampagnes de re-suspend
+                approveCampaign(campaignId);
                 auditLogEvent('campaign', 'confirmed', { campaignId, scheduledAt: sched, mode: isFuture ? 'scheduled' : 'sendNow' });
               } else {
                 const err = await r.text().catch(() => '');
@@ -9609,6 +9611,79 @@ async function runDedupHebdo() {
   return { totalDeals, totalSupprimees, doublonsDealsCount: doublonsDeals.length };
 }
 
+// ─── REGISTRE D'APPROBATION CAMPAGNES (Shawn 2026-05-05) ────────────────────
+// Shawn doit EXPLICITEMENT approuver chaque campagne via /campaigns avant envoi.
+// Toute campagne scheduledAt sans approval entry → suspendue auto + alerte.
+const CAMPAIGN_APPROVALS_FILE = path.join(DATA_DIR, 'campaigns_approved.json');
+let campaignApprovals = loadJSON(CAMPAIGN_APPROVALS_FILE, { approved: {} });
+function approveCampaign(id) {
+  campaignApprovals.approved[String(id)] = { approvedAt: new Date().toISOString() };
+  saveJSON(CAMPAIGN_APPROVALS_FILE, campaignApprovals);
+}
+function isCampaignApproved(id) {
+  return !!campaignApprovals.approved[String(id)];
+}
+
+// ─── SAFETY CHECK CAMPAGNES — cron horaire (Shawn 2026-05-05) ────────────────
+// Scanne TOUTES les campagnes Brevo schedulées dans les 48h prochaines.
+// Si campagne NON approuvée par Shawn → SUSPEND auto + alerte Telegram.
+// + envoie preview email pour ré-approbation.
+async function safetyCheckCampagnes() {
+  if (!BREVO_KEY) return;
+  try {
+    const now = Date.now();
+    const limit48h = now + 48 * 3600 * 1000;
+    // Scanner TOUS les statuts (queued, in_process, scheduled, suspended)
+    const statuses = ['queued', 'in_process'];
+    const campaigns = [];
+    for (const st of statuses) {
+      const r = await fetch(`https://api.brevo.com/v3/emailCampaigns?status=${st}&limit=100`, {
+        headers: { 'api-key': BREVO_KEY, 'accept': 'application/json' },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        campaigns.push(...(d.campaigns || []).map(c => ({ ...c, _scanStatus: st })));
+      }
+    }
+    const upcoming = campaigns.filter(c => {
+      if (!c.scheduledAt) return false;
+      const t = new Date(c.scheduledAt).getTime();
+      return t > now && t <= limit48h;
+    });
+    let suspended = 0, alerts = [];
+    for (const c of upcoming) {
+      if (isCampaignApproved(c.id)) continue;
+      // Non approuvée → suspend immédiatement
+      try {
+        const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${c.id}/status`, {
+          method: 'PUT',
+          headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
+          body: JSON.stringify({ status: 'suspended' }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (sr.ok || sr.status === 204) {
+          suspended++;
+          // Envoie preview test
+          await fetch(`https://api.brevo.com/v3/emailCampaigns/${c.id}/sendTest`, {
+            method: 'POST',
+            headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
+            body: JSON.stringify({ emailTo: [SHAWN_EMAIL] }),
+            signal: AbortSignal.timeout(10000),
+          }).catch(() => {});
+          const sched = new Date(c.scheduledAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' });
+          alerts.push(`🚨 *${c.name}* (#${c.id})\n   Schedulée ${sched} sans approbation → SUSPENDUE\n   Subject: ${(c.subject||'').substring(0,80)}`);
+        }
+      } catch (e) { log('WARN', 'SAFETY', `Suspend ${c.id}: ${e.message}`); }
+    }
+    if (alerts.length) {
+      const tgMsg = `🛡️ *SAFETY CHECK CAMPAGNES*\n_Cron horaire — ${alerts.length} campagne(s) non approuvée(s) suspendue(s)_\n\n` + alerts.join('\n\n') + `\n\n→ Tape \`/campaigns\` pour reviewer + approuver`;
+      await sendTelegramWithFallback(tgMsg, { category: 'safety-campaigns' }).catch(() => {});
+    }
+    if (suspended > 0) log('OK', 'SAFETY', `${suspended} campagne(s) suspendue(s) auto (non approuvées)`);
+  } catch (e) { log('WARN', 'SAFETY', `safetyCheck: ${e.message}`); }
+}
+
 // ─── Veille J-1 backup côté Render (au cas où Mac dort) ─────────────────
 async function checkVeilleCampagnesBackup() {
   if (!BREVO_KEY) return;
@@ -9626,7 +9701,10 @@ async function checkVeilleCampagnesBackup() {
   });
   if (!r.ok) { log('WARN', 'VEILLE', `Brevo HTTP ${r.status}`); return; }
   const data = await r.json();
-  const camps = (data.campaigns || []).filter(c => /\[AUTO\]|\[REENG\]|\[TERRAINS\]/.test(c.name || ''));
+  // BUG FIX 2026-05-05: ne plus filtrer par tag — préviewer TOUTES les campagnes
+  // suspended schedulées demain. La campagne "Vendeurs" sans tag [AUTO]/[REENG]
+  // était ignorée et partait sans preview/confirmation.
+  const camps = (data.campaigns || []);
   const targets = camps.filter(c => {
     const d = (c.scheduledAt || '').split('T')[0];
     return d === tomorrowKey;
@@ -10173,6 +10251,16 @@ function startDailyTasks() {
     if (h === 19 && lastCron.veilleCampaign !== todayStr) {
       lastCron.veilleCampaign = todayStr;
       checkVeilleCampagnesBackup().catch(e => log('WARN', 'VEILLE', `${e.message}`));
+    }
+
+    // ── SAFETY CHECK CAMPAGNES — TOUTES les heures (Shawn 2026-05-05) ────────
+    // Bug réel: campagne #34 [AUTO] Vendeurs scheduled sans approval.
+    // Filet de sécurité: scan toutes les campagnes queued/in_process schedulées
+    // dans les 48h. Sans approval explicite → suspend + alerte Telegram.
+    const minute = now.getMinutes();
+    if (minute < 5 && lastCron.safetyHourly !== `${todayStr}-${h}`) {
+      lastCron.safetyHourly = `${todayStr}-${h}`;
+      safetyCheckCampagnes().catch(e => log('WARN', 'SAFETY', `${e.message}`));
     }
   }, 60 * 1000);
   // MONITORING PROACTIF — vérifie santé système toutes les 10 min, alerte Telegram si problème
