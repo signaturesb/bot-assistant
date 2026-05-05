@@ -11474,6 +11474,80 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── POST /admin/brevo-send-now?id=N — ENVOI IMMÉDIAT avec triple-safety
+  // 1. Refuse si status === 'sent' OR sentDate set
+  // 2. Refuse si registre dédup contient déjà id+date
+  // 3. Pré-écrit registre AVANT envoi (anti-double-call)
+  // 4. Vérifie status post-envoi
+  if ((req.method === 'POST' || req.method === 'GET') && url.startsWith('/admin/brevo-send-now')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 3)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    const out = { id, sent: false, before: null, after: null, dedup_blocked: false, errors: [] };
+    try {
+      // 1. Get current state
+      const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (!det.ok) {
+        out.errors.push(`Brevo GET HTTP ${det.status}`);
+        res.writeHead(200, { 'content-type':'application/json' }); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      const beforeData = await det.json();
+      out.before = { status: beforeData.status, sentDate: beforeData.sentDate, name: beforeData.name, scheduledAt: beforeData.scheduledAt };
+      // 2. Refuse si déjà envoyée
+      if (beforeData.status === 'sent' || beforeData.sentDate) {
+        out.dedup_blocked = true;
+        out.errors.push(`Déjà envoyée le ${beforeData.sentDate || '?'}`);
+        res.writeHead(200, { 'content-type':'application/json' }); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      if (beforeData.status === 'in_process' || beforeData.status === 'queued') {
+        out.dedup_blocked = true;
+        out.errors.push(`En cours d'envoi (status=${beforeData.status})`);
+        res.writeHead(200, { 'content-type':'application/json' }); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      // 3. Vérifier registre dédup local (data/brevo_sent_registry.json)
+      const SEND_REGISTRY = path.join(DATA_DIR, 'brevo_sent_registry.json');
+      const reg = loadJSON(SEND_REGISTRY, {});
+      const today = new Date().toISOString().slice(0, 10);
+      const dedupKey = `${id}_${today}`;
+      if (reg[dedupKey]) {
+        out.dedup_blocked = true;
+        out.errors.push(`Registre local: déjà envoyé ${reg[dedupKey].sentAt}`);
+        res.writeHead(200, { 'content-type':'application/json' }); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      // 4. Pré-écrire registre AVANT envoi (anti-double-call atomic)
+      reg[dedupKey] = { sentAt: new Date().toISOString(), name: beforeData.name, by: 'admin-endpoint' };
+      saveJSON(SEND_REGISTRY, reg);
+      // 5. Send NOW
+      const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/sendNow`, {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY }
+      });
+      out.sendStatus = sr.status;
+      out.sent = sr.ok || sr.status === 204;
+      if (!out.sent) {
+        // Annule le registre si l'envoi a échoué
+        delete reg[dedupKey];
+        saveJSON(SEND_REGISTRY, reg);
+        const errBody = await sr.text().catch(() => '');
+        out.errors.push(`sendNow HTTP ${sr.status}: ${errBody.substring(0, 200)}`);
+      } else {
+        // Aussi marquer dans le registre d'approbation
+        approveCampaign(id);
+        auditLogEvent('campaign', 'sent-now', { id, name: beforeData.name, by: 'admin-endpoint' });
+      }
+      // 6. Vérifier état après
+      const after = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (after.ok) {
+        const afterData = await after.json();
+        out.after = { status: afterData.status, sentDate: afterData.sentDate };
+      }
+    } catch (e) { out.errors.push(`Top: ${e.message}`); }
+    res.writeHead(200, { 'content-type':'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /admin/brevo-list?status=X — liste campagnes Brevo
   if (req.method === 'GET' && url.startsWith('/admin/brevo-list')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
