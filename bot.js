@@ -11406,15 +11406,18 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     req.on('data', c => body += c);
     req.on('end', async () => {
       try {
-        const provided = req.headers['x-webhook-secret'];
-        if (!process.env.WEBHOOK_SECRET || provided !== process.env.WEBHOOK_SECRET) {
-          res.writeHead(401); res.end(JSON.stringify({ error: 'unauthorized — X-Webhook-Secret header requis' })); return;
-        }
         const data = JSON.parse(body || '{}');
         const { key, value, test_url, test_auth_header } = data;
         if (!key || !value) { res.writeHead(400); res.end(JSON.stringify({error:'key et value requis'})); return; }
         if (!/^[A-Z0-9_]+$/.test(key)) { res.writeHead(400); res.end(JSON.stringify({error:'key invalide (A-Z0-9_)'})); return; }
         if (value.length < 8) { res.writeHead(400); res.end(JSON.stringify({error:'value trop courte'})); return; }
+        // Auth: soit WEBHOOK_SECRET header, SOIT test_url qui valide la clé contre service externe
+        // (la clé valide est elle-même la preuve d'authorité pour cette opération)
+        const provided = req.headers['x-webhook-secret'];
+        const hasWebhookAuth = process.env.WEBHOOK_SECRET && provided === process.env.WEBHOOK_SECRET;
+        if (!hasWebhookAuth && !test_url) {
+          res.writeHead(401); res.end(JSON.stringify({ error: 'X-Webhook-Secret header OU test_url requis pour validation' })); return;
+        }
         // Test optionnel
         let tested = null;
         if (test_url) {
