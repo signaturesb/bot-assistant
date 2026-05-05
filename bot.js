@@ -5703,8 +5703,12 @@ const TOOLS = [
   { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
 ];
 
-// Cache les tools (statiques) — réduit coût API
-const TOOLS_WITH_CACHE = TOOLS;
+// Cache les tools (statiques) — Anthropic prompt caching sur le dernier tool
+// = cache la totalité de la liste TOOLS (envoyée à chaque call). Économise ~90%
+// du coût input_tokens des tools. Cache TTL: 5 min (renouvelé à chaque appel).
+const TOOLS_WITH_CACHE = TOOLS.map((t, i, arr) => i === arr.length - 1
+  ? { ...t, cache_control: { type: 'ephemeral' } }
+  : t);
 
 async function executeTool(name, input, chatId) {
   try {
@@ -6632,6 +6636,20 @@ function trackCost(model, usage) {
     costTracker.alertsSent[`d${d}-10`] = true;
     saveJSON(COST_FILE, costTracker);
     sendTelegramWithFallback(`💰 *Coût Anthropic aujourd'hui: $${todayCost.toFixed(2)}*\nSeuil 10$/jour atteint. Mois: $${monthCost.toFixed(2)}.`, { category: 'cost-daily-threshold' }).catch(() => {});
+  }
+  // Spike alert — coût aujourd'hui > 3× moyenne 7 derniers jours
+  const last7 = Object.entries(costTracker.daily || {})
+    .filter(([k]) => k < d)
+    .sort((a,b) => b[0].localeCompare(a[0]))
+    .slice(0, 7)
+    .map(([,v]) => v);
+  if (last7.length >= 3) {
+    const avg = last7.reduce((s,v) => s+v, 0) / last7.length;
+    if (todayCost > 3 * avg && todayCost > 1 && !costTracker.alertsSent[`spike${d}`]) {
+      costTracker.alertsSent[`spike${d}`] = true;
+      saveJSON(COST_FILE, costTracker);
+      sendTelegramWithFallback(`📈 *Spike Anthropic*\nAujourd'hui: $${todayCost.toFixed(2)} (${(todayCost/avg).toFixed(1)}× moyenne 7j: $${avg.toFixed(2)})\n\n_Vérifie /cout pour breakdown par modèle._`, { category: 'cost-spike' }).catch(() => {});
+    }
   }
   if (monthCost > 100 && !costTracker.alertsSent[`m${m}-100`]) {
     costTracker.alertsSent[`m${m}-100`] = true;
