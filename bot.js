@@ -2109,7 +2109,7 @@ async function voirProspectComplet(terme) {
   const [fullDeal, notes, activities, personData] = await Promise.all([
     pdGet(`/deals/${deal.id}`),
     pdGet(`/notes?deal_id=${deal.id}&limit=10`),
-    pdGet(`/activities?deal_id=${deal.id}&limit=10&done=0`),
+    pdGet(`/deals/${deal.id}/activities?limit=10&done=0`),
     deal.person_id ? pdGet(`/persons/${deal.person_id}`) : Promise.resolve(null),
   ]);
 
@@ -2976,7 +2976,7 @@ async function voirActivitesDeal(terme) {
   const deals = s?.data?.items || [];
   if (!deals.length) return `Aucun deal: "${terme}"`;
   const deal = deals[0].item;
-  const acts = await pdGet(`/activities?deal_id=${deal.id}&limit=100&done=0`);
+  const acts = await pdGet(`/deals/${deal.id}/activities?limit=100&done=0`);
   const list = acts?.data || [];
   if (!list.length) return `*${deal.title}* — aucune activité à venir.`;
   const now = Date.now();
@@ -4119,7 +4119,7 @@ async function historiqueContact(terme) {
 
   const [notes, activities, person] = await Promise.all([
     pdGet(`/notes?deal_id=${deal.id}&limit=20`),
-    pdGet(`/activities?deal_id=${deal.id}&limit=20`),
+    pdGet(`/deals/${deal.id}/activities?limit=20`),
     deal.person_id ? pdGet(`/persons/${deal.person_id}`) : Promise.resolve(null),
   ]);
 
@@ -11102,9 +11102,9 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       if (!dry) {
         for (const d of allDeals) {
           try {
-            // ALSO delete all open activities first to avoid orphans
-            const acts = await pdGet(`/activities?deal_id=${d.id}&done=0&limit=200`);
-            for (const a of (acts?.data || [])) {
+            // ALSO delete all open activities first to avoid orphans (proper API)
+            const acts = await pdGet(`/deals/${d.id}/activities?done=0&limit=200`);
+            for (const a of (acts?.data || []).filter(a => a.deal_id === d.id || a.deal_id == null)) {
               await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' }).catch(() => {});
             }
             // Delete deal
