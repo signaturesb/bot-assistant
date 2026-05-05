@@ -4613,29 +4613,11 @@ async function enregistrerResumeAppel({ transcription }) {
     noteOk = !!noteId;
   } catch (e) { log('WARN', 'APPEL', `Note creation fail: ${e.message}`); }
 
-  // 5. Activité — UNIQUEMENT pour deal nouveau (règle Shawn 2026-05-03)
-  // Date = aujourd'hui (pas Haiku-extracted). Existant = note seulement.
-  let activityOk = false, activityNote = '';
-  if (isNewDeal) {
-    const TYPES_MAP = { call:'call', meeting:'meeting', task:'task', email:'email' };
-    const actType = TYPES_MAP[json.suivi_type] || 'call';
-    const sujet = json.suivi_sujet || `Suivi appel — ${dealTitle}`;
-    const body = {
-      deal_id: dealId,
-      subject: sujet.substring(0, 100),
-      type: actType,
-      done: 0,
-      due_date: dateISO, // toujours aujourd'hui (date création deal)
-      note: _formatActivityNote(json, transcription),
-    };
-    // Heure: jamais par défaut — règle absolue Shawn
-    try {
-      const aRes = await pdPost('/activities', body);
-      activityOk = !!aRes?.data?.id;
-    } catch (e) { log('WARN', 'APPEL', `Activity fail: ${e.message}`); }
-  } else {
-    activityNote = `\n📝 Note ajoutée seulement (deal existant — règle 1-activité-par-deal).`;
-  }
+  // 5. Activité — DÉSACTIVÉE (Shawn 2026-05-05)
+  // "le suivi automatique soit enlevé aussi ça me fait trop de suivi pas rapport"
+  // Le résumé est dans la note Pipedrive. Shawn crée manuellement les suivis qu'il veut.
+  let activityOk = false;
+  const activityNote = `\n📝 Note ajoutée — pas d'activité auto-créée (suivi auto désactivé)`;
 
   // 6. Audit log (pour /lead-audit)
   try {
@@ -9189,7 +9171,7 @@ function registerHandlers() {
       `🌡️ Engagement: ${(d.engagement || '—').toUpperCase()}`,
       d.is_new ? '✨ Nouveau deal créé' : '♻️ Deal existant enrichi',
       d.noteOk ? '✅ Note Pipedrive OK' : '⚠️ Note: échec',
-      d.activityOk ? '✅ Activité créée' : (d.is_new ? '⚠️ Activité: échec' : '⏭️ Pas d\'activité (deal existant)'),
+      '⏭️ Pas d\'activité auto (suivi auto désactivé — règle Shawn 2026-05-05)',
       d.analyseErr ? `\n⚠️ Haiku partiel: ${d.analyseErr.substring(0, 80)}` : '',
       dealUrl ? `\n🔗 ${dealUrl}` : '',
     ].filter(Boolean);
@@ -10908,6 +10890,60 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ checked: keys.length, status }, null, 2));
+    return;
+  }
+
+  // ─── GET /admin/delete-deals-stage — supprime tous les deals d'une étape ─
+  // Query params: ?stage=48 (multi via virgules) ?dry=1 (preview)
+  // ATTENTION DESTRUCTIF: par défaut DRY-RUN, faut explicitement ?dry=0 pour exécuter
+  if (req.method === 'GET' && url.startsWith('/admin/delete-deals-stage')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 3)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const stages = (u.searchParams.get('stage') || '').split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean);
+    const dry = u.searchParams.get('dry') !== '0';
+    const out = { dry, stages, deals_found: 0, deals_deleted: 0, sample: [], errors: [] };
+    if (!stages.length) {
+      out.errors.push('?stage=N requis (ex: ?stage=48 ou ?stage=48,49)');
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(out, null, 2)); return;
+    }
+    try {
+      const allDeals = [];
+      for (const stage of stages) {
+        let start = 0;
+        while (true) {
+          const r = await pdGet(`/deals?stage_id=${stage}&status=all_not_deleted&start=${start}&limit=500`);
+          const items = r?.data || [];
+          allDeals.push(...items);
+          if (!r?.additional_data?.pagination?.more_items_in_collection) break;
+          start = r.additional_data.pagination.next_start;
+          if (start === undefined || start === null) break;
+        }
+      }
+      out.deals_found = allDeals.length;
+      // Sample preview
+      out.sample = allDeals.slice(0, 10).map(d => ({ id: d.id, title: d.title, stage_id: d.stage_id, person: d.person_name, value: d.value, add_time: d.add_time }));
+      if (!dry) {
+        for (const d of allDeals) {
+          try {
+            // ALSO delete all open activities first to avoid orphans
+            const acts = await pdGet(`/activities?deal_id=${d.id}&done=0&limit=200`);
+            for (const a of (acts?.data || [])) {
+              await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' }).catch(() => {});
+            }
+            // Delete deal
+            const dr = await fetch(`https://api.pipedrive.com/v1/deals/${d.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' });
+            if (dr.ok) out.deals_deleted++;
+            else out.errors.push(`Deal ${d.id}: HTTP ${dr.status}`);
+          } catch (e) { out.errors.push(`Deal ${d.id}: ${e.message}`); }
+        }
+      }
+      out.summary = dry
+        ? `DRY-RUN: ${out.deals_found} deals à supprimer (étapes ${stages.join(',')})`
+        : `EXÉCUTÉ: ${out.deals_deleted}/${out.deals_found} deals supprimés (+ leurs activités open)`;
+    } catch (e) { out.errors.push(`Top: ${e.message}`); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
     return;
   }
 
