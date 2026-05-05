@@ -11432,18 +11432,16 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
             }
           } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: `Test URL exception: ${e.message}` })); return; }
         }
-        // Save Dropbox + env (réutilise existant)
-        const ok = await uploadDropboxSecret(key, value);
-        if (ok) {
-          process.env[key] = value;
-          auditLogEvent('secret', 'set', { key, via: 'admin-universal', tested: !!tested });
-          res.writeHead(200, {'content-type':'application/json'});
-          res.end(JSON.stringify({ ok: true, key, persisted: true, tested }, null, 2));
-          // Notif Telegram
-          if (ALLOWED_ID) sendTelegramWithFallback(`🔑 *${key}* configurée\n_via /admin/setsecret-universal_${tested ? `\nTest: HTTP ${tested.status} ✅` : ''}`, { category: 'secret-set' }).catch(()=>{});
-        } else {
-          res.writeHead(500); res.end(JSON.stringify({ error: 'Dropbox upload failed' }));
-        }
+        // Set process.env IMMÉDIATEMENT (même si Dropbox fail)
+        process.env[key] = value;
+        // Try Dropbox persist (best effort)
+        let persisted = false;
+        try { persisted = await uploadDropboxSecret(key, value); } catch {}
+        auditLogEvent('secret', 'set', { key, via: 'admin-universal', tested: !!tested, persisted });
+        res.writeHead(200, {'content-type':'application/json'});
+        res.end(JSON.stringify({ ok: true, key, persisted, env_set: true, tested, warning: persisted ? null : 'Dropbox persist failed — clé active en mémoire seulement (perdue au prochain redeploy). Tape /setsecret pour réessayer.' }, null, 2));
+        // Notif Telegram
+        if (ALLOWED_ID) sendTelegramWithFallback(`🔑 *${key}* configurée\n${persisted ? '✅ Persisté Dropbox + env' : '⚠️ Env seulement (Dropbox fail — perdu au redeploy)'}${tested ? `\nTest: HTTP ${tested.status} ✅` : ''}`, { category: 'secret-set' }).catch(()=>{});
       } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
     });
     return;
