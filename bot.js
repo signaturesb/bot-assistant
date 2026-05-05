@@ -11474,6 +11474,27 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/brevo-list?status=X — liste campagnes Brevo
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-list')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const status = u.searchParams.get('status') || '';
+    const limit = u.searchParams.get('limit') || '50';
+    try {
+      const qs = new URLSearchParams({ limit });
+      if (status) qs.set('status', status);
+      const r = await fetch(`https://api.brevo.com/v3/emailCampaigns?${qs}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const data = await r.json();
+      const summary = (data.campaigns || []).map(c => ({
+        id: c.id, name: c.name, subject: c.subject, status: c.status,
+        scheduledAt: c.scheduledAt, sentDate: c.sentDate, modifiedAt: c.modifiedAt,
+      }));
+      res.writeHead(200, { 'content-type':'application/json' });
+      res.end(JSON.stringify({ count: summary.length, campaigns: summary }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+
   // ─── GET /admin/brevo-campaign?id=N — info campagne Brevo
   if (req.method === 'GET' && url.startsWith('/admin/brevo-campaign')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
