@@ -11123,11 +11123,14 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         }
       }
       out.deals_scanned = allDeals.length;
-      // 2. Pour chaque deal: lister activités open, sort par add_time desc (+récent en 1er)
+      // 2. Pour chaque deal: lister activités open via endpoint /deals/{id}/flow ou /deals/{id}/activities
+      // BUG FIX 2026-05-05: l'endpoint /activities?deal_id=X ne filtrait PAS correctement —
+      // il retournait toutes les activités du compte (30k+), pas celles du deal seul.
+      // L'endpoint /deals/{id}/activities est l'API correcte pour filtrer.
       for (const deal of allDeals) {
         try {
-          const acts = await pdGet(`/activities?deal_id=${deal.id}&done=0&limit=200`);
-          const list = acts?.data || [];
+          const acts = await pdGet(`/deals/${deal.id}/activities?done=0&limit=200`);
+          const list = (acts?.data || []).filter(a => a && a.id && (a.deal_id === deal.id || a.deal_id == null));
           if (list.length <= 1) continue; // 0 ou 1 activité = OK
           out.deals_with_dups++;
           out.total_activities_found += list.length;
