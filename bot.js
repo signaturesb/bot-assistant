@@ -1505,10 +1505,34 @@ async function loadDropboxSecrets() {
 }
 // Last error for debugging via /admin endpoints
 let _lastSecretError = null;
+// Local fallback: data/local_secrets.json — persiste sur disque Render (si paid plan)
+const LOCAL_SECRETS_FILE = path.join(DATA_DIR, 'local_secrets.json');
+function saveLocalSecret(key, value) {
+  try {
+    const cur = loadJSON(LOCAL_SECRETS_FILE, {});
+    cur[key] = value;
+    saveJSON(LOCAL_SECRETS_FILE, cur);
+    try { require('fs').chmodSync(LOCAL_SECRETS_FILE, 0o600); } catch {}
+    return true;
+  } catch (e) { _lastSecretError = `local save: ${e.message}`; return false; }
+}
+function loadLocalSecrets() {
+  try {
+    const cur = loadJSON(LOCAL_SECRETS_FILE, {});
+    let loaded = 0;
+    for (const [k, v] of Object.entries(cur)) {
+      if (!process.env[k] && v) { process.env[k] = v; loaded++; }
+    }
+    if (loaded) log('OK', 'SECRETS', `${loaded} clé(s) chargée(s) depuis ${LOCAL_SECRETS_FILE}`);
+    return loaded;
+  } catch { return 0; }
+}
 async function uploadDropboxSecret(key, value) {
   _lastSecretError = null;
+  // Toujours save local en premier (rapide, fiable)
+  const localOk = saveLocalSecret(key, value);
   if (!dropboxToken) await refreshDropboxToken();
-  if (!dropboxToken) { _lastSecretError = 'no dropboxToken after refresh'; return false; }
+  if (!dropboxToken) { _lastSecretError = 'no dropboxToken — local save only'; return localOk; }
   // Ensure folder exists first (idempotent — 409 si existe = OK)
   try {
     const fr = await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
@@ -1533,14 +1557,14 @@ async function uploadDropboxSecret(key, value) {
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
-      _lastSecretError = `HTTP ${res.status}: ${errBody.substring(0, 200)}`;
+      _lastSecretError = `Dropbox HTTP ${res.status}: ${errBody.substring(0, 200)} (local saved: ${localOk})`;
       log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: ${_lastSecretError}`);
     }
-    return res.ok;
+    return res.ok || localOk; // OK si Dropbox OU local marche
   } catch (e) {
-    _lastSecretError = `exception: ${e.message}`;
+    _lastSecretError = `Dropbox exception: ${e.message} (local saved: ${localOk})`;
     log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: ${e.message}`);
-    return false;
+    return localOk;
   }
 }
 async function listDropboxFolder(folderPath) {
@@ -13374,7 +13398,11 @@ async function main() {
     } catch (e) { log('WARN', 'BOOT', `Dropbox refresh exception: ${e.message}`); }
   }
 
-  log('INFO', 'BOOT', 'Step 1b: load secrets from Dropbox');
+  log('INFO', 'BOOT', 'Step 1b: load secrets (local persistent disk + Dropbox)');
+  try {
+    const local = loadLocalSecrets();
+    if (local > 0) log('OK', 'BOOT', `${local} secret(s) chargé(s) depuis ${LOCAL_SECRETS_FILE}`);
+  } catch (e) { log('WARN', 'BOOT', `Local secrets: ${e.message}`); }
   try {
     const n = await loadDropboxSecrets();
     if (n > 0) log('OK', 'BOOT', `${n} secret(s) chargé(s) depuis Dropbox /bot-secrets/`);
