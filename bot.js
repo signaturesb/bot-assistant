@@ -9301,6 +9301,32 @@ function registerHandlers() {
     await send(msg.chat.id, reply);
   });
 
+  // ─── /configure_openai — flow self-service login + auto-detect clé
+  // Tap = ouvre OpenAI dans Telegram inline browser. Shawn login + crée
+  // la clé + paste dans Telegram. Le bot auto-détecte sk-* et l'installe.
+  bot.onText(/\/configure[_-]?openai/, msg => {
+    if (!isAllowed(msg)) return;
+    const text =
+      `🔑 *Configuration OpenAI — flow auto-détection*\n\n` +
+      `**Étape 1**: Tape le lien ci-dessous (s'ouvre dans ton navigateur):\n` +
+      `https://platform.openai.com/api-keys\n\n` +
+      `**Étape 2**: Login (Google le + rapide), puis click "Create new secret key" → nom: \`Kira Bot\` → Create.\n\n` +
+      `**Étape 3**: Copie la valeur (sk-proj-...) et colle-la simplement dans CE chat.\n\n` +
+      `Le bot détecte automatiquement les valeurs commençant par \`sk-\` et les installe via /setsecret. ` +
+      `Pas besoin de taper la commande /setsecret toi-même.\n\n` +
+      `🛡 Auto-test contre l'API OpenAI avant save.\n` +
+      `🔒 Ton message est auto-supprimé après save (la clé reste pas visible dans le chat).`;
+    bot.sendMessage(msg.chat.id, text, {
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🔗 Ouvrir OpenAI API Keys', url: 'https://platform.openai.com/api-keys' }
+        ]],
+      },
+    });
+  });
+
   // ─── /keys — récap clés API (status visible, sans value)
   bot.onText(/\/keys|\/cles/, msg => {
     if (!isAllowed(msg)) return;
@@ -9505,6 +9531,50 @@ function registerHandlers() {
     if (isDuplicate(msg.message_id)) return;
 
     log('IN', 'MSG', text.substring(0, 80));
+
+    // ─── AUTO-DÉTECTION CLÉS API (sk-, fc-, pplx-, rnd_) ──────────────────
+    // Si Shawn paste une clé API valide, auto-install via setsecret pattern.
+    // Permet de configurer sans taper /setsecret manuellement.
+    const keyPatterns = [
+      { regex: /\b(sk-proj-[A-Za-z0-9_-]{30,})\b/, env: 'OPENAI_API_KEY', test_url: 'https://api.openai.com/v1/models', service: 'OpenAI Whisper' },
+      { regex: /\b(sk-[A-Za-z0-9_-]{40,})\b/,       env: 'OPENAI_API_KEY', test_url: 'https://api.openai.com/v1/models', service: 'OpenAI Whisper' },
+      { regex: /\b(sk-ant-[A-Za-z0-9_-]{40,})\b/,   env: 'ANTHROPIC_API_KEY', service: 'Anthropic Claude' },
+      { regex: /\b(fc-[a-f0-9]{30,})\b/,            env: 'FIRECRAWL_API_KEY', test_url: 'https://api.firecrawl.dev/v1/scrape', service: 'Firecrawl' },
+      { regex: /\b(pplx-[a-zA-Z0-9]{30,})\b/,       env: 'PERPLEXITY_API_KEY', service: 'Perplexity' },
+      { regex: /\b(rnd_[A-Za-z0-9]{20,})\b/,        env: 'RENDER_API_KEY', service: 'Render' },
+    ];
+    for (const p of keyPatterns) {
+      const m = text.match(p.regex);
+      if (!m) continue;
+      const value = m[1];
+      try {
+        // Auto-supprimer le message original (sécurité)
+        bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+        bot.sendMessage(chatId, `🔑 Clé ${p.service} détectée — installation...`).catch(() => {});
+        // Test optionnel
+        if (p.test_url) {
+          const tr = await fetch(p.test_url, {
+            headers: { 'Authorization': `Bearer ${value}` },
+            signal: AbortSignal.timeout(10000),
+          }).catch(() => null);
+          if (!tr || !tr.ok) {
+            await bot.sendMessage(chatId, `❌ Test API ${p.service} échoué (HTTP ${tr?.status || '?'}). Clé invalide ou expirée — pas installée.`);
+            continue;
+          }
+        }
+        const ok = await uploadDropboxSecret(p.env, value);
+        if (ok) {
+          process.env[p.env] = value;
+          auditLogEvent('secret', 'auto-detected', { env: p.env, service: p.service });
+          await bot.sendMessage(chatId, `✅ *${p.service}* configuré avec succès\n\nEnv: \`${p.env}\`\nPersisté: Dropbox /bot-secrets/\nActif: live (sans redeploy)`, { parse_mode: 'Markdown' });
+          // Run health check pour confirmer
+          setTimeout(() => testApisHealth().catch(() => {}), 500);
+        } else {
+          await bot.sendMessage(chatId, `⚠️ Clé valide mais Dropbox upload fail. Réessaie ou tape \`/setsecret ${p.env} ${value.substring(0,6)}...\``);
+        }
+      } catch (e) { await bot.sendMessage(chatId, `❌ ${e.message}`); }
+      return; // Sort du handler après auto-install
+    }
 
     // Vérifier si c'est une confirmation d'envoi d'email
     if (await handleEmailConfirmation(chatId, text)) return;
