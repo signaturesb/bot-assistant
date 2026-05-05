@@ -11934,6 +11934,87 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── POST /admin/brevo-fix-logos — remplace base64 logos par URLs hostées
+  // ?id=N (single) OR ?all=1 (toutes les suspended/queued)
+  // ?dry=1 pour preview, ?dry=0 pour exécuter
+  if ((req.method === 'POST' || req.method === 'GET') && url.startsWith('/admin/brevo-fix-logos')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    const all = u.searchParams.get('all') === '1';
+    const dry = u.searchParams.get('dry') !== '0';
+    const out = { dry, mode: id ? `single id=${id}` : (all ? 'all suspended+queued' : 'none'), processed: [], errors: [] };
+    const SB_URL = 'https://signaturesb-bot-s272.onrender.com/logo/sb';
+    const REMAX_URL = 'https://signaturesb-bot-s272.onrender.com/logo/remax';
+    try {
+      let campaignIds = [];
+      if (id) campaignIds = [id];
+      else if (all) {
+        for (const st of ['suspended', 'queued']) {
+          const r = await fetch(`https://api.brevo.com/v3/emailCampaigns?status=${st}&limit=100`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+          if (r.ok) {
+            const d = await r.json();
+            campaignIds.push(...(d.campaigns || []).map(c => c.id));
+          }
+        }
+      } else {
+        res.writeHead(400); res.end(JSON.stringify({error:'?id=N ou ?all=1 requis'})); return;
+      }
+      for (const cid of campaignIds) {
+        try {
+          const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${cid}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+          if (!det.ok) { out.errors.push(`#${cid}: GET HTTP ${det.status}`); continue; }
+          const data = await det.json();
+          const html = data.htmlContent || '';
+          // Replace base64 logos with URLs (alt-based detection)
+          let newHtml = html;
+          let replaced = 0;
+          // Logo Signature SB (alt="Signature SB")
+          newHtml = newHtml.replace(/<img([^>]*alt=["'][^"']*[Ss]ignature[^"']*["'][^>]*?)src=["']data:image\/png;base64,[A-Za-z0-9+/=]+["']/g, (m, before) => {
+            replaced++;
+            return `<img${before}src="${SB_URL}"`;
+          });
+          newHtml = newHtml.replace(/<img([^>]*?)src=["']data:image\/png;base64,[A-Za-z0-9+/=]+["']([^>]*alt=["'][^"']*[Ss]ignature[^"']*["'])/g, (m, before, after) => {
+            replaced++;
+            return `<img${before}src="${SB_URL}"${after}`;
+          });
+          // Logo RE/MAX (alt="RE/MAX")
+          newHtml = newHtml.replace(/<img([^>]*alt=["'][^"']*[Rr][Ee].?[Mm][Aa][Xx][^"']*["'][^>]*?)src=["']data:image\/png;base64,[A-Za-z0-9+/=]+["']/g, (m, before) => {
+            replaced++;
+            return `<img${before}src="${REMAX_URL}"`;
+          });
+          newHtml = newHtml.replace(/<img([^>]*?)src=["']data:image\/png;base64,[A-Za-z0-9+/=]+["']([^>]*alt=["'][^"']*[Rr][Ee].?[Mm][Aa][Xx][^"']*["'])/g, (m, before, after) => {
+            replaced++;
+            return `<img${before}src="${REMAX_URL}"${after}`;
+          });
+          const item = { id: cid, name: data.name, status: data.status, replaced, html_before_kb: Math.round(html.length/1024), html_after_kb: Math.round(newHtml.length/1024) };
+          if (replaced === 0) { item.skipped = 'no base64 logos found'; out.processed.push(item); continue; }
+          if (!dry) {
+            // PUT update HTML (Brevo API)
+            const pr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${cid}`, {
+              method: 'PUT',
+              headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
+              body: JSON.stringify({ htmlContent: newHtml }),
+            });
+            item.put_status = pr.status;
+            item.put_ok = pr.ok || pr.status === 204;
+            if (!item.put_ok) {
+              const errBody = await pr.text().catch(() => '');
+              item.put_error = errBody.substring(0, 200);
+            }
+          }
+          out.processed.push(item);
+        } catch (e) { out.errors.push(`#${cid}: ${e.message}`); }
+      }
+      out.summary = dry
+        ? `DRY: ${out.processed.filter(p => p.replaced > 0).length}/${out.processed.length} campagnes auraient des replacements`
+        : `EXÉCUTÉ: ${out.processed.filter(p => p.put_ok).length}/${out.processed.filter(p => p.replaced > 0).length} campagnes mises à jour`;
+    } catch (e) { out.errors.push(`Top: ${e.message}`); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /admin/brevo-list?status=X — liste campagnes Brevo
   if (req.method === 'GET' && url.startsWith('/admin/brevo-list')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
