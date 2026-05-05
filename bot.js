@@ -10893,6 +10893,70 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/brevo-campaign?id=N — info campagne Brevo
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-campaign')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    try {
+      const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY, 'accept':'application/json' } });
+      const data = await r.json();
+      res.writeHead(r.status, { 'content-type':'application/json' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+
+  // ─── POST /admin/brevo-cancel?id=N — ANNULE une campagne Brevo schedulée
+  // Brevo: PUT /v3/emailCampaigns/{id}/status body {status:"suspended"} pour pause
+  // OU DELETE /v3/emailCampaigns/{id} pour suppression définitive
+  if ((req.method === 'POST' || req.method === 'GET') && url.startsWith('/admin/brevo-cancel')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    const action = u.searchParams.get('action') || 'suspend'; // suspend | delete
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    const out = { id, action, before: null, after: null, errors: [] };
+    try {
+      // Get current state
+      const before = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const beforeData = await before.json();
+      out.before = { status: beforeData.status, scheduledAt: beforeData.scheduledAt, name: beforeData.name, subject: beforeData.subject };
+      // Cancel
+      if (action === 'delete') {
+        const dr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { method: 'DELETE', headers: { 'api-key': process.env.BREVO_API_KEY } });
+        out.deletedHttp = dr.status;
+      } else {
+        // Suspend = set status to "draft" via Brevo API (annule schedule)
+        const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/status`, {
+          method: 'PUT',
+          headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type':'application/json' },
+          body: JSON.stringify({ status: 'suspended' })
+        });
+        if (!sr.ok) {
+          // Fallback: try setting back to draft
+          const dr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/status`, {
+            method: 'PUT',
+            headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type':'application/json' },
+            body: JSON.stringify({ status: 'draft' })
+          });
+          out.fallbackDraftHttp = dr.status;
+          if (!dr.ok) out.errors.push(`suspend HTTP ${sr.status}, draft HTTP ${dr.status}`);
+        } else { out.suspendedHttp = sr.status; }
+      }
+      // Verify after
+      const after = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (after.ok) {
+        const afterData = await after.json();
+        out.after = { status: afterData.status, scheduledAt: afterData.scheduledAt };
+      }
+    } catch (e) { out.errors.push(e.message); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /admin/delete-deals-stage — supprime tous les deals d'une étape ─
   // Query params: ?stage=48 (multi via virgules) ?dry=1 (preview)
   // ATTENTION DESTRUCTIF: par défaut DRY-RUN, faut explicitement ?dry=0 pour exécuter
