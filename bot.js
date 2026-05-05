@@ -11327,6 +11327,81 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/state — DUMP COMPLET pour Claude Code (sync temps réel)
+  // Une seule requête → toute la state du bot. Curl this au début de chaque
+  // session Claude Code pour avoir le contexte parfait sans questions.
+  if (req.method === 'GET' && url.startsWith('/admin/state')) {
+    const v = getMonthlyVariableCosts();
+    const upcoming = (auditLog || []).slice(-30).reverse();
+    const lastCampaignSent = (auditLog || []).filter(e => e.category === 'campaign' && e.event === 'sent-now').slice(-1)[0];
+    const lastAppel = (auditLog || []).filter(e => e.category === 'appel').slice(-1)[0];
+    const subFixed = (subscriptions.items || []).filter(s => !s.variable && !s.pending);
+    const totalUsd = subFixed.reduce((sum, s) => {
+      if (s.price_usd != null) return sum + s.price_usd;
+      if (s.price_cad != null) return sum + s.price_cad / (subscriptions.usd_to_cad || 1.36);
+      return sum;
+    }, 0);
+    const state = {
+      now: new Date().toISOString(),
+      commit: (process.env.RENDER_GIT_COMMIT || 'unknown').substring(0, 7),
+      uptime_sec: Math.floor((Date.now() - metrics.startedAt) / 1000),
+      bot: {
+        model: currentModel,
+        tools_count: TOOLS.length,
+        thinking_mode: thinkingMode,
+      },
+      health: healthState.checks || {},
+      health_last_run: healthState.lastRun,
+      health_failures: healthState.lastFailures || [],
+      keys_set: {
+        anthropic: !!process.env.ANTHROPIC_API_KEY,
+        openai: !!process.env.OPENAI_API_KEY,
+        pipedrive: !!process.env.PIPEDRIVE_API_KEY,
+        brevo: !!process.env.BREVO_API_KEY,
+        telegram: !!process.env.TELEGRAM_BOT_TOKEN,
+        gmail: !!(process.env.GMAIL_CLIENT_ID && process.env.GMAIL_REFRESH_TOKEN),
+        dropbox: !!process.env.DROPBOX_REFRESH_TOKEN,
+        centris: !!(process.env.CENTRIS_USER && process.env.CENTRIS_PASS),
+        firecrawl: !!process.env.FIRECRAWL_API_KEY,
+        perplexity: !!process.env.PERPLEXITY_API_KEY,
+      },
+      costs: {
+        anthropic_today: costTracker.daily?.[today()] || 0,
+        anthropic_month: costTracker.monthly?.[thisMonth()] || 0,
+        anthropic_projected: v.anthropic_projected,
+        openai_month: openaiCost.monthly?.[thisMonth()] || 0,
+        openai_minutes_total: openaiCost.totalMinutes || 0,
+        subs_fixed_usd: totalUsd,
+        cache_hits: costTracker.cacheStats?.hits || 0,
+        cache_writes: costTracker.cacheStats?.writes || 0,
+      },
+      campaigns: {
+        approved_registry: Object.keys(campaignApprovals.approved || {}),
+        last_sent: lastCampaignSent ? { at: lastCampaignSent.at, ...lastCampaignSent.details } : null,
+      },
+      appels: {
+        last: lastAppel ? { at: lastAppel.at, ...lastAppel.details } : null,
+        total_audit: (auditLog || []).filter(e => e.category === 'appel').length,
+      },
+      pipedrive: {
+        deals_cache: dropboxTerrains.length,
+      },
+      audit_log_count: (auditLog || []).length,
+      audit_log_recent: upcoming.slice(0, 15).map(e => ({ at: e.at, cat: e.category, event: e.event })),
+      memory_facts: (kiramem?.facts || []).length,
+      preview_dedup: (() => { try { return loadJSON(path.join(DATA_DIR, 'preview_dedup.json'), {}); } catch { return {}; } })(),
+      sent_registry: (() => { try { return loadJSON(path.join(DATA_DIR, 'brevo_sent_registry.json'), {}); } catch { return {}; } })(),
+      pending_actions: {
+        openai_key_missing: !process.env.OPENAI_API_KEY,
+        firecrawl_key_missing: !process.env.FIRECRAWL_API_KEY,
+        perplexity_key_missing: !process.env.PERPLEXITY_API_KEY,
+      },
+    };
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(state, null, 2));
+    return;
+  }
+
   // ─── GET /admin/dashboard — page HTML agrégée (tous les indicateurs) ────
   if (req.method === 'GET' && url.startsWith('/admin/dashboard')) {
     const v = getMonthlyVariableCosts();
