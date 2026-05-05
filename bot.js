@@ -11451,43 +11451,26 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   // ─── GET /logo/sb et /logo/remax — sert les logos pour campagnes Brevo
   // Solution au problème "logos pas visibles chez destinataires" causé par
   // Gmail/Outlook qui bloquent les images base64 inline. URL stable = visible.
-  if (req.method === 'GET' && (url === '/logo/sb' || url === '/logo/remax' || url === '/logo/sb.png' || url === '/logo/remax.png')) {
+  // Source: data/logos_embedded.json (committé dans le repo).
+  if (req.method === 'GET' && /^\/logo\/(sb|remax)(\.png)?$/.test(url)) {
     const isRemax = url.includes('remax');
-    // Cache mémoire 1h
     global._logoCache = global._logoCache || {};
     const cacheKey = isRemax ? 'remax' : 'sb';
-    const cached = global._logoCache[cacheKey];
-    if (cached && Date.now() - cached.at < 3600 * 1000) {
-      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
-      res.end(cached.buf); return;
-    }
-    // Source: Dropbox /Logos/<file>.png
-    const dbxPath = isRemax ? '/Logos/remax-balloon.png' : '/Logos/signature-sb.png';
-    try {
-      const dr = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: dbxPath }, true);
-      if (dr?.ok) {
-        const buf = Buffer.from(await dr.arrayBuffer());
-        global._logoCache[cacheKey] = { at: Date.now(), buf };
-        res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
-        res.end(buf); return;
-      }
-    } catch {}
-    // Fallback: fetch depuis le HTML d'une campagne précédente (extract base64)
-    try {
-      const camp = await fetch(`https://api.brevo.com/v3/emailCampaigns/34`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
-      if (camp.ok) {
-        const data = await camp.json();
-        const html = data.htmlContent || '';
-        const imgs = [...html.matchAll(/<img[^>]+alt=["']([^"']*)["'][^>]+src=["']data:image\/png;base64,([^"']+)["']/g)];
-        const target = isRemax ? imgs.find(m => /re.?max/i.test(m[1])) : imgs.find(m => /signature/i.test(m[1]));
-        if (target) {
-          const buf = Buffer.from(target[2], 'base64');
-          global._logoCache[cacheKey] = { at: Date.now(), buf };
-          res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
-          res.end(buf); return;
+    let buf = global._logoCache[cacheKey];
+    if (!buf) {
+      try {
+        const embedded = loadJSON(path.join(__dirname, 'data', 'logos_embedded.json'), null);
+        if (embedded) {
+          const b64 = isRemax ? embedded.remax_b64 : embedded.sb_b64;
+          buf = Buffer.from(b64, 'base64');
+          global._logoCache[cacheKey] = buf;
         }
-      }
-    } catch {}
+      } catch (e) { log('WARN', 'LOGO', `${cacheKey}: ${e.message}`); }
+    }
+    if (buf) {
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
+      res.end(buf); return;
+    }
     res.writeHead(404); res.end('logo not found');
     return;
   }
