@@ -2976,17 +2976,20 @@ async function voirActivitesDeal(terme) {
   const deals = s?.data?.items || [];
   if (!deals.length) return `Aucun deal: "${terme}"`;
   const deal = deals[0].item;
-  const acts = await pdGet(`/activities?deal_id=${deal.id}&limit=20&done=0`);
+  const acts = await pdGet(`/activities?deal_id=${deal.id}&limit=100&done=0`);
   const list = acts?.data || [];
   if (!list.length) return `*${deal.title}* — aucune activité à venir.`;
   const now = Date.now();
-  let txt = `📋 *Activités — ${deal.title}*\n\n`;
+  // Header avec count + warning si doublons détectés
+  let txt = `📋 *Activités — ${deal.title}* (${list.length})\n`;
+  if (list.length > 1) txt += `⚠️ ${list.length} activités open — règle: 1 par deal max. /cleanup_doublons pour nettoyer.\n`;
+  txt += '\n';
   const sorted = list.sort((a, b) => new Date(`${a.due_date}T${a.due_time||'23:59'}`) - new Date(`${b.due_date}T${b.due_time||'23:59'}`));
   for (const a of sorted) {
     const dt   = new Date(`${a.due_date}T${a.due_time || '23:59'}`).getTime();
     const late = dt < now ? '⚠️ ' : '🔲 ';
     const time = a.due_time ? ` ${a.due_time.substring(0,5)}` : '';
-    txt += `${late}*${a.subject || a.type}* — ${a.due_date}${time}\n`;
+    txt += `${late}*${a.subject || a.type}* — ${a.due_date}${time} \`#${a.id}\`\n`;
   }
   return txt.trim();
 }
@@ -10905,6 +10908,79 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ checked: keys.length, status }, null, 2));
+    return;
+  }
+
+  // ─── GET /admin/cleanup-activity-dups — nettoie doublons activités ───────
+  // Query params: ?stage=48 (filtre étape, multi via virgules) ?dry=1 (preview)
+  // Pour chaque deal de l'étape: garde la +récente activité open, delete reste.
+  if (req.method === 'GET' && url.startsWith('/admin/cleanup-activity-dups')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const stages = (u.searchParams.get('stage') || '48').split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean);
+    const dry = u.searchParams.get('dry') !== '0'; // défaut DRY-RUN
+    const out = { dry, stages, deals_scanned: 0, deals_with_dups: 0, total_activities_found: 0, total_to_delete: 0, total_deleted: 0, sample: [], errors: [] };
+    try {
+      // 1. Fetch deals des étapes ciblées (paginé)
+      const allDeals = [];
+      for (const stage of stages) {
+        let start = 0;
+        while (true) {
+          const r = await pdGet(`/deals?stage_id=${stage}&status=all_not_deleted&start=${start}&limit=500`);
+          const items = r?.data || [];
+          allDeals.push(...items);
+          if (!r?.additional_data?.pagination?.more_items_in_collection) break;
+          start = r.additional_data.pagination.next_start;
+          if (start === undefined || start === null) break;
+        }
+      }
+      out.deals_scanned = allDeals.length;
+      // 2. Pour chaque deal: lister activités open, sort par add_time desc (+récent en 1er)
+      for (const deal of allDeals) {
+        try {
+          const acts = await pdGet(`/activities?deal_id=${deal.id}&done=0&limit=200`);
+          const list = acts?.data || [];
+          if (list.length <= 1) continue; // 0 ou 1 activité = OK
+          out.deals_with_dups++;
+          out.total_activities_found += list.length;
+          // Garder la +récente — sort par add_time desc (fallback id desc)
+          list.sort((a, b) => {
+            const ta = a.add_time ? new Date(a.add_time).getTime() : 0;
+            const tb = b.add_time ? new Date(b.add_time).getTime() : 0;
+            if (ta !== tb) return tb - ta;
+            return b.id - a.id;
+          });
+          const keep = list[0];
+          const toDelete = list.slice(1);
+          out.total_to_delete += toDelete.length;
+          if (out.sample.length < 5) {
+            out.sample.push({
+              deal_id: deal.id,
+              deal_title: deal.title,
+              total_open: list.length,
+              keep_id: keep.id,
+              keep_subject: keep.subject,
+              delete_count: toDelete.length,
+            });
+          }
+          // 3. Delete (sauf si dry)
+          if (!dry) {
+            for (const a of toDelete) {
+              try {
+                const dr = await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' });
+                if (dr.ok) out.total_deleted++;
+                else out.errors.push(`Delete activity ${a.id}: HTTP ${dr.status}`);
+              } catch (e) { out.errors.push(`Delete activity ${a.id}: ${e.message}`); }
+            }
+          }
+        } catch (e) { out.errors.push(`Deal ${deal.id}: ${e.message}`); }
+      }
+      out.summary = dry
+        ? `DRY-RUN: ${out.total_to_delete} activités à supprimer sur ${out.deals_with_dups} deals (${out.deals_scanned} deals scannés, étapes ${stages.join(',')})`
+        : `EXÉCUTÉ: ${out.total_deleted}/${out.total_to_delete} activités supprimées sur ${out.deals_with_dups} deals`;
+    } catch (e) { out.errors.push(`Top: ${e.message}`); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
     return;
   }
 
