@@ -11448,6 +11448,83 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── POST /webhook/appel — Zapier call recording → Whisper → Résumé Pipedrive
+  // Body JSON attendu (Zapier configurable):
+  //   { audio_url: "https://...", caller_name?: "Marie", caller_phone?: "5145551234",
+  //     duration_sec?: 300, source?: "tapeacall|aircall|twilio|other" }
+  // Auth: header X-Webhook-Secret: <WEBHOOK_SECRET>
+  if (req.method === 'POST' && url === '/webhook/appel') {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 30)) { res.writeHead(429); res.end('rate limit'); return; }
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 50000) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const provided = req.headers['x-webhook-secret'];
+        if (!process.env.WEBHOOK_SECRET || provided !== process.env.WEBHOOK_SECRET) {
+          res.writeHead(401); res.end(JSON.stringify({error:'unauthorized'})); return;
+        }
+        const payload = JSON.parse(body || '{}');
+        const { audio_url, caller_name, caller_phone, duration_sec, source } = payload;
+        if (!audio_url || !/^https?:\/\//.test(audio_url)) {
+          res.writeHead(400); res.end(JSON.stringify({error:'audio_url (https) requis'})); return;
+        }
+        // Audit avant traitement
+        const audit_id = `appel_${Date.now()}`;
+        auditLogEvent('appel_webhook', 'received', { source, caller_name, caller_phone, duration_sec, audio_url: audio_url.substring(0, 80) });
+        // Download audio
+        let buffer;
+        try {
+          const r = await fetch(audio_url, { signal: AbortSignal.timeout(60000) });
+          if (!r.ok) throw new Error(`Download HTTP ${r.status}`);
+          buffer = Buffer.from(await r.arrayBuffer());
+          if (buffer.length > 25 * 1024 * 1024) throw new Error(`Audio trop gros: ${(buffer.length/1024/1024).toFixed(1)} MB (max 25)`);
+        } catch (e) {
+          res.writeHead(502); res.end(JSON.stringify({error:`Audio download: ${e.message}`})); return;
+        }
+        // Transcribe
+        let transcription = null;
+        try {
+          const recentNames = (auditLog || []).filter(e => e.category === 'lead' && e.details?.extracted).slice(-10).flatMap(e => [e.details.extracted.nom]).filter(Boolean).join(', ');
+          transcription = await transcrire(buffer, { recentContext: recentNames });
+          if (duration_sec) trackWhisperCost(duration_sec);
+        } catch (e) {
+          // Sauve audio Dropbox pour ne pas perdre
+          const ts = new Date().toISOString().replace(/[:.]/g, '-');
+          const dbxPath = `/Audio/zapier_${ts}.ogg`;
+          await fetch('https://content.dropboxapi.com/2/files/upload', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${dropboxToken}`, 'Dropbox-API-Arg': JSON.stringify({ path: dbxPath, mode: 'add', autorename: true, mute: true }), 'Content-Type': 'application/octet-stream' },
+            body: buffer,
+          }).catch(() => {});
+          if (ALLOWED_ID) sendTelegramWithFallback(`🎙 Appel Zapier reçu mais Whisper échoué: ${e.message}\nAudio sauvé: ${dbxPath}`, { category: 'appel-fail' }).catch(() => {});
+          res.writeHead(500); res.end(JSON.stringify({error:`Transcription: ${e.message}`, audio_saved: dbxPath})); return;
+        }
+        // Pré-tag transcription avec metadata Zapier (aide Haiku à matcher prospect)
+        const taggedTranscription = [
+          caller_name ? `Appelant: ${caller_name}` : '',
+          caller_phone ? `Numéro: ${caller_phone}` : '',
+          duration_sec ? `Durée: ${duration_sec}s` : '',
+          source ? `Source: ${source}` : '',
+          '',
+          transcription,
+        ].filter(Boolean).join('\n');
+        // Process via enregistrerResumeAppel (réutilise tout le pipeline)
+        let resumeResult = null;
+        try {
+          resumeResult = await enregistrerResumeAppel({ transcription: taggedTranscription });
+        } catch (e) { resumeResult = `Erreur résumé: ${e.message}\n\nTranscription brute:\n${transcription}`; }
+        // Notif Telegram à Shawn (résumé court + lien)
+        if (ALLOWED_ID) {
+          const tgText = `📞 *Appel Zapier traité*${caller_name ? ` — ${caller_name}` : ''}${duration_sec ? ` (${Math.round(duration_sec/60)}min)` : ''}\n\n${resumeResult}`.substring(0, 3500);
+          sendTelegramWithFallback(tgText, { category: 'appel-zapier' }).catch(() => {});
+        }
+        res.writeHead(200, {'content-type':'application/json'});
+        res.end(JSON.stringify({ ok: true, transcription_length: transcription.length, resume: resumeResult.substring(0, 500), audit_id }, null, 2));
+      } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    });
+    return;
+  }
+
   // ─── POST /admin/setsecret-universal — set n'importe quelle clé via WEBHOOK_SECRET
   // Body: { key: 'OPENAI_API_KEY', value: 'sk-...', test_url?: 'https://api.openai.com/v1/models' }
   // Si test_url fourni, valide la clé contre le service avant d'enregistrer.
