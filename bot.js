@@ -10981,6 +10981,30 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/safety-check — déclenche safety check campagnes immédiatement
+  if (req.method === 'GET' && url.startsWith('/admin/safety-check')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    try {
+      await safetyCheckCampagnes();
+      res.writeHead(200, { 'content-type':'application/json' });
+      res.end(JSON.stringify({ ok: true, approved_registry: campaignApprovals.approved, ranAt: new Date().toISOString() }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+
+  // ─── GET /admin/inspect-activity?id=N — info activité Pipedrive
+  if (req.method === 'GET' && url.startsWith('/admin/inspect-activity')) {
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    try {
+      const r = await pdGet(`/activities/${id}`);
+      res.writeHead(200, { 'content-type':'application/json' });
+      res.end(JSON.stringify(r, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+
   // ─── GET /admin/brevo-campaign?id=N — info campagne Brevo
   if (req.method === 'GET' && url.startsWith('/admin/brevo-campaign')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
