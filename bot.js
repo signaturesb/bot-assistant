@@ -6298,9 +6298,138 @@ const AUDIT_FILE = path.join(DATA_DIR, 'audit.json');
 let auditLog = loadJSON(AUDIT_FILE, []);
 function auditLogEvent(category, event, details = {}) {
   auditLog.push({ at: new Date().toISOString(), category, event, details });
-  if (auditLog.length > 200) auditLog = auditLog.slice(-200);
+  if (auditLog.length > 1000) auditLog = auditLog.slice(-1000);
   saveJSON(AUDIT_FILE, auditLog);
   log('INFO', 'AUDIT', `${category}/${event} ${JSON.stringify(details).substring(0, 100)}`);
+}
+
+// ─── HEALTH CHECK APIs (boot + cron horaire) ─────────────────────────────────
+// Détecte tôt les bugs API critiques (ex: Pipedrive filter qui bypass).
+// Stocké data/health.json + endpoint /admin/health + alerte Telegram si dégradation.
+const HEALTH_FILE = path.join(DATA_DIR, 'health.json');
+let healthState = loadJSON(HEALTH_FILE, { lastRun: null, checks: {}, history: [] });
+
+async function testApisHealth() {
+  const results = {};
+  const fail = [];
+  // 1. Pipedrive — vérifie que /deals/{id}/activities filtre correctement
+  try {
+    if (PD_KEY) {
+      const r = await pdGet('/deals?limit=1');
+      const oneDeal = r?.data?.[0];
+      if (oneDeal) {
+        const acts = await pdGet(`/deals/${oneDeal.id}/activities?limit=20`);
+        const list = acts?.data || [];
+        const allBelongToDeal = list.every(a => a.deal_id === oneDeal.id || a.deal_id == null);
+        results.pipedrive = { ok: allBelongToDeal, sample_deal: oneDeal.id, returned: list.length, all_filtered: allBelongToDeal };
+        if (!allBelongToDeal) fail.push('Pipedrive: /deals/{id}/activities returns wrong deals');
+      } else { results.pipedrive = { ok: true, note: 'no deals' }; }
+    } else { results.pipedrive = { ok: false, error: 'PIPEDRIVE_API_KEY missing' }; fail.push('Pipedrive key missing'); }
+  } catch (e) { results.pipedrive = { ok: false, error: e.message }; fail.push(`Pipedrive: ${e.message}`); }
+  // 2. Brevo
+  try {
+    if (process.env.BREVO_API_KEY) {
+      const r = await fetch('https://api.brevo.com/v3/account', { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (r.ok) {
+        const d = await r.json();
+        results.brevo = { ok: true, email: d.email, plan: d.plan?.[0]?.type, credits: d.plan?.[0]?.credits };
+      } else { results.brevo = { ok: false, status: r.status }; fail.push(`Brevo HTTP ${r.status}`); }
+    } else { results.brevo = { ok: false, error: 'key missing' }; fail.push('Brevo key missing'); }
+  } catch (e) { results.brevo = { ok: false, error: e.message }; fail.push(`Brevo: ${e.message}`); }
+  // 3. Dropbox
+  try {
+    if (dropboxToken) {
+      const r = await dropboxAPI('https://api.dropboxapi.com/2/users/get_current_account', null);
+      if (r?.ok) { const d = await r.json(); results.dropbox = { ok: true, account_type: d.account_type?.['.tag'], email: d.email }; }
+      else { results.dropbox = { ok: false, status: r?.status }; fail.push('Dropbox check failed'); }
+    } else { results.dropbox = { ok: false, error: 'no token' }; fail.push('Dropbox not connected'); }
+  } catch (e) { results.dropbox = { ok: false, error: e.message }; fail.push(`Dropbox: ${e.message}`); }
+  // 4. Anthropic
+  try {
+    if (process.env.ANTHROPIC_API_KEY) {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-haiku-4-5', max_tokens: 5, messages: [{ role: 'user', content: 'ping' }] }),
+        signal: AbortSignal.timeout(8000)
+      });
+      results.anthropic = { ok: r.ok, status: r.status };
+      if (!r.ok) fail.push(`Anthropic HTTP ${r.status}`);
+    } else { results.anthropic = { ok: false, error: 'key missing' }; fail.push('Anthropic key missing'); }
+  } catch (e) { results.anthropic = { ok: false, error: e.message }; fail.push(`Anthropic: ${e.message}`); }
+  // 5. OpenAI (Whisper key valid)
+  try {
+    if (process.env.OPENAI_API_KEY) {
+      const r = await fetch('https://api.openai.com/v1/models', {
+        headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+        signal: AbortSignal.timeout(8000)
+      });
+      results.openai = { ok: r.ok, status: r.status };
+      if (!r.ok) fail.push(`OpenAI HTTP ${r.status}`);
+    } else { results.openai = { ok: false, error: 'key missing' }; fail.push('OpenAI key missing'); }
+  } catch (e) { results.openai = { ok: false, error: e.message }; fail.push(`OpenAI: ${e.message}`); }
+
+  const allOk = fail.length === 0;
+  healthState.lastRun = new Date().toISOString();
+  healthState.checks = results;
+  healthState.lastFailures = fail;
+  // Garde 30 derniers runs
+  healthState.history = healthState.history || [];
+  healthState.history.push({ at: healthState.lastRun, ok: allOk, fails: fail });
+  if (healthState.history.length > 30) healthState.history = healthState.history.slice(-30);
+  saveJSON(HEALTH_FILE, healthState);
+
+  // Alerte Telegram si nouveau fail (pas de spam si même fail récurrent)
+  const lastAlertKey = `lastHealthAlert_${fail.sort().join('|')}`;
+  if (!allOk && !healthState[lastAlertKey] && ALLOWED_ID) {
+    healthState[lastAlertKey] = healthState.lastRun;
+    saveJSON(HEALTH_FILE, healthState);
+    const msg = `🩺 *HEALTH CHECK FAILED*\n\n${fail.map(f => `❌ ${f}`).join('\n')}\n\n_Tape /health pour détails_`;
+    sendTelegramWithFallback(msg, { category: 'health-fail' }).catch(() => {});
+  }
+  if (allOk) {
+    // Reset alert flags si tout OK
+    Object.keys(healthState).filter(k => k.startsWith('lastHealthAlert_')).forEach(k => delete healthState[k]);
+    saveJSON(HEALTH_FILE, healthState);
+  }
+  log(allOk ? 'OK' : 'WARN', 'HEALTH', `${allOk ? 'all green' : `${fail.length} fail`}: ${Object.keys(results).map(k => `${k}=${results[k].ok?'✅':'❌'}`).join(' ')}`);
+  return { allOk, results, failures: fail };
+}
+
+// ─── BACKUP HELPER (snapshot avant action destructive) ────────────────────────
+async function backupBeforeAction(label, items) {
+  if (!items || !items.length) return { backed_up: 0, dropbox_path: null };
+  if (!dropboxToken) {
+    log('WARN', 'BACKUP', `Pas de Dropbox token — skip backup ${label}`);
+    return { backed_up: 0, dropbox_path: null, error: 'no dropbox' };
+  }
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const path = `/Backups/${label}_${ts}.json`;
+    const content = JSON.stringify({ at: new Date().toISOString(), label, count: items.length, items }, null, 2);
+    const buffer = Buffer.from(content, 'utf-8');
+    const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${dropboxToken}`,
+        'Dropbox-API-Arg': JSON.stringify({ path, mode: 'add', autorename: true, mute: true }),
+        'Content-Type': 'application/octet-stream',
+      },
+      body: buffer,
+    });
+    if (res.ok) {
+      const data = await res.json();
+      log('OK', 'BACKUP', `${label}: ${items.length} items → ${data.path_lower}`);
+      return { backed_up: items.length, dropbox_path: data.path_lower };
+    } else {
+      const err = await res.text();
+      log('WARN', 'BACKUP', `${label} fail: ${res.status} ${err.substring(0, 100)}`);
+      return { backed_up: 0, dropbox_path: null, error: `HTTP ${res.status}` };
+    }
+  } catch (e) {
+    log('WARN', 'BACKUP', `${label} exception: ${e.message}`);
+    return { backed_up: 0, dropbox_path: null, error: e.message };
+  }
 }
 
 // ─── Cost tracking Anthropic ─────────────────────────────────────────────────
@@ -9154,6 +9283,97 @@ function registerHandlers() {
     await send(msg.chat.id, reply);
   });
 
+  // ─── /health — health check live + détails ──────────────────────────────
+  bot.onText(/\/health/, async msg => {
+    if (!isAllowed(msg)) return;
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    try {
+      const r = await testApisHealth();
+      clearInterval(typing);
+      const lines = [`🩺 *Health Check — ${r.allOk ? '✅ Tout vert' : '❌ Dégradation'}*`, ''];
+      for (const [k, c] of Object.entries(r.results)) {
+        lines.push(`${c.ok ? '✅' : '❌'} *${k}*: ${c.ok ? 'OK' : (c.error || `HTTP ${c.status}`)}`);
+      }
+      if (r.failures.length) lines.push('', '⚠️ ' + r.failures.join(' · '));
+      await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+    } catch (e) {
+      clearInterval(typing);
+      await bot.sendMessage(msg.chat.id, `❌ Health check err: ${e.message}`);
+    }
+  });
+
+  // ─── /audit — derniers 15 events audit log ──────────────────────────────
+  bot.onText(/\/audit(?:\s+(\S+))?/, (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const cat = match[1];
+    const filtered = cat ? auditLog.filter(e => e.category === cat) : auditLog;
+    const recent = filtered.slice(-15).reverse();
+    if (!recent.length) { bot.sendMessage(msg.chat.id, `📋 Audit log vide${cat ? ` pour catégorie "${cat}"` : ''}.`); return; }
+    const lines = [`📋 *Audit log — ${recent.length} derniers ${cat ? `(catégorie ${cat})` : ''}*`, ''];
+    for (const e of recent) {
+      const t = new Date(e.at).toLocaleString('fr-CA', { timeZone: 'America/Toronto', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      lines.push(`\`${t}\` _${e.category}_ · ${e.event}`);
+    }
+    bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+  });
+
+  // ─── /safetycheck — déclenche manuellement le safety check campagnes ────
+  bot.onText(/\/safety[_-]?check/, async msg => {
+    if (!isAllowed(msg)) return;
+    const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
+    try {
+      await safetyCheckCampagnes();
+      clearInterval(typing);
+      const approved = Object.keys(campaignApprovals.approved || {}).length;
+      bot.sendMessage(msg.chat.id, `🛡️ Safety check exécuté.\n${approved} campagne(s) dans le registre d'approbation.\n\n_Si campagnes non-approuvées détectées, alerte Telegram séparée envoyée._`);
+    } catch (e) {
+      clearInterval(typing);
+      bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
+    }
+  });
+
+  // ─── /cancelcampagne <id> — annule une campagne Brevo ───────────────────
+  bot.onText(/\/cancel[_-]?campagne\s+(\d+)/, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const id = match[1];
+    try {
+      const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/status`, {
+        method: 'PUT',
+        headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'suspended' }),
+      });
+      if (r.ok || r.status === 204) {
+        auditLogEvent('campaign', 'cancelled-via-telegram', { id });
+        bot.sendMessage(msg.chat.id, `🚫 Campagne #${id} suspended.`);
+      } else { bot.sendMessage(msg.chat.id, `❌ Brevo HTTP ${r.status}`); }
+    } catch (e) { bot.sendMessage(msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /preview <id> — envoie preview campagne à shawn@ (dédup 1/jour) ────
+  bot.onText(/\/preview(?:_force)?\s+(\d+)/, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const id = match[1];
+    const force = /preview_force/.test(msg.text);
+    try {
+      const url = `https://signaturesb-bot-s272.onrender.com/admin/brevo-send-preview?id=${id}${force ? '&force=1' : ''}`;
+      const r = await fetch(url);
+      const data = await r.json();
+      if (data.dedup_skipped) {
+        bot.sendMessage(msg.chat.id, `⏭️ Preview #${id} déjà envoyé aujourd'hui.\n_${data.note}_\n\nUtilise /preview_force ${id} pour forcer.`, { parse_mode: 'Markdown' });
+      } else if (data.sent) {
+        bot.sendMessage(msg.chat.id, `📧 Preview campagne *${data.campaign?.name || id}* envoyé à ${data.to}\nSubject: _${data.campaign?.subject || ''}_`, { parse_mode: 'Markdown' });
+      } else {
+        bot.sendMessage(msg.chat.id, `❌ Brevo: ${data.error || 'unknown'}`);
+      }
+    } catch (e) { bot.sendMessage(msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /dashboard — URL signée vers /admin/dashboard ──────────────────────
+  bot.onText(/\/dashboard/, msg => {
+    if (!isAllowed(msg)) return;
+    bot.sendMessage(msg.chat.id, `📊 *Dashboard admin*\n\nhttps://signaturesb-bot-s272.onrender.com/admin/dashboard\n\n_Tout en un coup d'œil: health, coûts, campagnes, audit, abonnements._`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+  });
+
   // ─── /dernier_appel — re-affiche le dernier résumé d'appel + lien Pipedrive
   bot.onText(/\/dernier[_-]?appel/, async msg => {
     if (!isAllowed(msg)) return;
@@ -11011,6 +11231,9 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       out.matched = matched.length;
       out.sample = matched.slice(0, 10).map(a => ({ id: a.id, subject: a.subject, deal_id: a.deal_id, due_date: a.due_date, done: a.done, type: a.type }));
       if (!dry) {
+        // BACKUP avant suppression
+        const backup = await backupBeforeAction(`cleanup_activities_subject_${pattern.replace(/[^a-z0-9]/gi, '_')}`, matched);
+        out.backup = backup;
         for (const a of matched) {
           try {
             const dr = await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' });
@@ -11028,15 +11251,128 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/dashboard — page HTML agrégée (tous les indicateurs) ────
+  if (req.method === 'GET' && url.startsWith('/admin/dashboard')) {
+    const v = getMonthlyVariableCosts();
+    const rate = subscriptions.usd_to_cad || 1.36;
+    const allOk = (Object.values(healthState.checks || {})).every(c => c?.ok);
+    const upcomingApprovals = Object.keys(campaignApprovals.approved || {}).length;
+    const lastAuditEvents = (auditLog || []).slice(-15).reverse();
+    const subTable = (subscriptions.items || []).filter(s => !s.variable && !s.pending).map(s => {
+      const usd = s.price_usd != null ? s.price_usd : (s.price_cad != null ? s.price_cad / rate : null);
+      const cad = s.price_usd != null ? s.price_usd * rate : (s.price_cad || null);
+      return `<tr><td>${s.name}</td><td>${s.category}</td><td>${usd != null ? '$' + usd.toFixed(2) : '?'}</td><td>${cad != null ? '$' + cad.toFixed(2) : '?'}</td><td>${s.est ? '🔸' : '✅'}</td></tr>`;
+    }).join('');
+    const totalUsd = (subscriptions.items || []).filter(s => !s.variable && !s.pending).reduce((sum, s) => {
+      if (s.price_usd != null) return sum + s.price_usd;
+      if (s.price_cad != null) return sum + s.price_cad / rate;
+      return sum;
+    }, 0);
+    const grandUsd = totalUsd + v.anthropic_projected + v.openai_projected;
+    const grandCad = grandUsd * rate;
+    const healthRows = Object.entries(healthState.checks || {}).map(([k, c]) => `<tr><td>${k}</td><td>${c.ok ? '✅ OK' : '❌ FAIL'}</td><td><code>${JSON.stringify(c).substring(0, 200)}</code></td></tr>`).join('');
+    const auditRows = lastAuditEvents.map(e => `<tr><td>${new Date(e.at).toLocaleString('fr-CA',{timeZone:'America/Toronto'})}</td><td>${e.category}</td><td>${e.event}</td><td><code>${JSON.stringify(e.details).substring(0,150)}</code></td></tr>`).join('');
+    const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Kira Admin Dashboard</title>
+<style>
+body{font-family:-apple-system,sans-serif;background:#060606;color:#eee;margin:0;padding:20px;max-width:1400px}
+h1{color:#aa0721;border-bottom:2px solid #aa0721;padding-bottom:8px}
+h2{margin-top:32px;color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin:16px 0}
+.card{background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:16px}
+.card .label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+.card .value{font-size:32px;font-weight:bold;margin:4px 0}
+.card .sub{color:#aaa;font-size:13px}
+.green{color:#4ade80} .red{color:#ef4444} .yellow{color:#fbbf24}
+table{width:100%;border-collapse:collapse;margin:8px 0;background:#1a1a1a;font-size:13px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #2a2a2a}
+th{background:#aa0721;color:#fff;font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:1px}
+code{background:#0a0a0a;padding:2px 6px;border-radius:3px;color:#93c5fd;font-size:11px}
+.btn{display:inline-block;background:#aa0721;color:#fff;padding:8px 16px;border-radius:4px;text-decoration:none;margin:4px;font-size:13px}
+.btn:hover{background:#cc0a2c}
+.muted{color:#666}
+</style></head>
+<body>
+<h1>🤖 Kira — Admin Dashboard</h1>
+<p class="muted">Auto-refresh suggéré F5 · Bot: ${currentModel} · Tools: ${TOOLS.length} · Lignes: ${require('fs').statSync('bot.js').size > 0 ? 'live' : '?'} · ${new Date().toLocaleString('fr-CA',{timeZone:'America/Toronto'})}</p>
+
+<div class="grid">
+<div class="card"><div class="label">Health APIs</div><div class="value ${allOk ? 'green' : 'red'}">${allOk ? '✅' : '❌'}</div><div class="sub">${healthState.lastRun ? new Date(healthState.lastRun).toLocaleTimeString('fr-CA',{timeZone:'America/Toronto'}) : 'never'}</div></div>
+<div class="card"><div class="label">Coût mensuel projeté</div><div class="value">$${grandUsd.toFixed(0)}</div><div class="sub">USD · $${grandCad.toFixed(0)} CAD</div></div>
+<div class="card"><div class="label">Anthropic ce mois</div><div class="value">$${v.anthropic_actual.toFixed(2)}</div><div class="sub">proj. $${v.anthropic_projected.toFixed(2)}</div></div>
+<div class="card"><div class="label">OpenAI Whisper</div><div class="value">$${v.openai_actual.toFixed(2)}</div><div class="sub">${v.openai_minutes.toFixed(0)} min audio</div></div>
+<div class="card"><div class="label">Campagnes approuvées</div><div class="value">${upcomingApprovals}</div><div class="sub">registre actif</div></div>
+<div class="card"><div class="label">Audit log</div><div class="value">${auditLog.length}</div><div class="sub">events trackés (cap 1000)</div></div>
+</div>
+
+<h2>🎬 Actions rapides</h2>
+<a class="btn" href="/admin/health?refresh=1">🩺 Health check (refresh)</a>
+<a class="btn" href="/admin/safety-check">🛡️ Safety check campagnes</a>
+<a class="btn" href="/admin/check-plans">📊 Plans Brevo+Dropbox</a>
+<a class="btn" href="/admin/audit-log?limit=100">📋 Audit log full</a>
+<a class="btn" href="/admin/cleanup-activities-by-subject?dry=1">🧹 Dry-run cleanup</a>
+
+<h2>🩺 Health Check Détails</h2>
+<table><tr><th>Service</th><th>Status</th><th>Détails</th></tr>${healthRows || '<tr><td colspan=3 class=muted>Pas encore exécuté</td></tr>'}</table>
+
+<h2>💰 Abonnements (fixe seulement)</h2>
+<table><tr><th>Service</th><th>Catégorie</th><th>USD/mo</th><th>CAD/mo</th><th>Confirmé</th></tr>${subTable}</table>
+<p class="muted">Total fixe: $${totalUsd.toFixed(2)} USD · $${(totalUsd * rate).toFixed(2)} CAD</p>
+
+<h2>📋 Audit Log (15 derniers events)</h2>
+<table><tr><th>Quand</th><th>Catégorie</th><th>Event</th><th>Détails</th></tr>${auditRows || '<tr><td colspan=4 class=muted>Aucun event</td></tr>'}</table>
+
+</body></html>`;
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(html);
+    return;
+  }
+
+  // ─── GET /admin/health — état santé APIs (boot + cron horaire) ──────────
+  if (req.method === 'GET' && url.startsWith('/admin/health')) {
+    const u = new URL(req.url, 'http://x');
+    const refresh = u.searchParams.get('refresh') === '1';
+    if (refresh) await testApisHealth();
+    res.writeHead(200, { 'content-type':'application/json' });
+    res.end(JSON.stringify(healthState, null, 2));
+    return;
+  }
+
+  // ─── GET /admin/audit-log — derniers events (filtrable) ──────────────────
+  if (req.method === 'GET' && url.startsWith('/admin/audit-log')) {
+    const u = new URL(req.url, 'http://x');
+    const cat = u.searchParams.get('category');
+    const limit = Math.min(parseInt(u.searchParams.get('limit') || '50', 10), 500);
+    const filtered = cat ? auditLog.filter(e => e.category === cat) : auditLog;
+    res.writeHead(200, { 'content-type':'application/json' });
+    res.end(JSON.stringify({ count: filtered.length, total: auditLog.length, items: filtered.slice(-limit).reverse() }, null, 2));
+    return;
+  }
+
   // ─── GET /admin/brevo-send-preview?id=N — force preview test à shawn@
+  // DÉDUP 2026-05-05: 1 preview/jour/campagne max. ?force=1 override.
   if (req.method === 'GET' && url.startsWith('/admin/brevo-send-preview')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
     const id = u.searchParams.get('id');
     const to = u.searchParams.get('to') || SHAWN_EMAIL;
+    const force = u.searchParams.get('force') === '1';
     if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
-    const out = { id, to, sent: false, status: null, campaign: null };
+    const out = { id, to, sent: false, status: null, campaign: null, dedup_skipped: false };
     try {
+      // Dédup check
+      const PREVIEW_DEDUP_FILE = path.join(DATA_DIR, 'preview_dedup.json');
+      const dedup = loadJSON(PREVIEW_DEDUP_FILE, {});
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const dedupKey = `${id}_${todayKey}`;
+      if (!force && dedup[dedupKey]) {
+        out.dedup_skipped = true;
+        out.last_sent_at = dedup[dedupKey];
+        out.note = `Preview déjà envoyé aujourd'hui à ${dedup[dedupKey]}. Utilise ?force=1 pour re-envoyer.`;
+        res.writeHead(200, { 'content-type':'application/json' });
+        res.end(JSON.stringify(out, null, 2));
+        return;
+      }
       // Get campaign details
       const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (det.ok) {
@@ -11051,6 +11387,16 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       });
       out.status = tr.status;
       out.sent = tr.ok || tr.status === 204;
+      if (out.sent) {
+        dedup[dedupKey] = new Date().toISOString();
+        // Purge >7j
+        Object.keys(dedup).forEach(k => {
+          const d = k.split('_').slice(-1)[0];
+          if (d < new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10)) delete dedup[k];
+        });
+        saveJSON(PREVIEW_DEDUP_FILE, dedup);
+        auditLogEvent('preview', 'sent', { campaignId: id, to, forced: force });
+      }
       if (!out.sent) {
         const errBody = await tr.text().catch(() => '');
         out.error = errBody.substring(0, 300);
@@ -11180,6 +11526,9 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       // Sample preview
       out.sample = allDeals.slice(0, 10).map(d => ({ id: d.id, title: d.title, stage_id: d.stage_id, person: d.person_name, value: d.value, add_time: d.add_time }));
       if (!dry) {
+        // BACKUP avant suppression — recovery garantie
+        const backup = await backupBeforeAction(`delete_deals_stage_${stages.join('_')}`, allDeals);
+        out.backup = backup;
         for (const d of allDeals) {
           try {
             // ALSO delete all open activities first to avoid orphans (proper API)
@@ -12874,6 +13223,9 @@ async function main() {
   setTimeout(() => detectAnomalies().catch(()=>{}), 2 * 60 * 1000);
   // Backup Gist toutes les 6h (survit aux redeploys + disaster recovery)
   setInterval(() => savePollerStateToGist().catch(()=>{}), 6 * 60 * 60 * 1000);
+  // Health check APIs: 30s après boot puis toutes les heures
+  setTimeout(() => testApisHealth().catch(e => log('WARN','HEALTH',e.message)), 30 * 1000);
+  setInterval(() => testApisHealth().catch(e => log('WARN','HEALTH',e.message)), 60 * 60 * 1000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
