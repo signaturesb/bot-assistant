@@ -1505,6 +1505,12 @@ async function loadDropboxSecrets() {
 }
 async function uploadDropboxSecret(key, value) {
   if (!dropboxToken) await refreshDropboxToken();
+  // Ensure folder exists first (idempotent — 409 si existe = OK)
+  await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${dropboxToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: '/bot-secrets', autorename: false }),
+  }).catch(() => {});
   const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
     method: 'POST',
     headers: {
@@ -1514,6 +1520,10 @@ async function uploadDropboxSecret(key, value) {
     },
     body: Buffer.from(String(value))
   });
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: HTTP ${res.status} ${errBody.substring(0, 200)}`);
+  }
   return res.ok;
 }
 async function listDropboxFolder(folderPath) {
