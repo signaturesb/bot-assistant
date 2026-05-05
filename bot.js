@@ -10921,7 +10921,9 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   // /admin/audit?token=X → dump complet pour diagnostic à distance (leads,
   // pending, poller stats, audit log, dernières erreurs). Utilisé par Claude
   // Code pour investiguer sans roundtrip Telegram.
-  if (req.method === 'GET' && url.startsWith('/admin/audit')) {
+  // EXACT match /admin/audit (legacy with token) — pas startsWith pour ne pas
+  // capturer /admin/auditlog (nouveau, sans token).
+  if (req.method === 'GET' && url === '/admin/audit') {
     const token = (req.url || '').split('token=')[1]?.split('&')[0];
     if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
       res.writeHead(401); res.end('unauthorized'); return;
