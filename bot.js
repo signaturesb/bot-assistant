@@ -10981,6 +10981,53 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/cleanup-activities-by-subject — supprime activités avec subject matching
+  // Query: ?pattern=appeler contact|appeler prospect (regex, case insensitive)
+  //        ?dry=1 (défaut DRY-RUN)
+  if (req.method === 'GET' && url.startsWith('/admin/cleanup-activities-by-subject')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const pattern = u.searchParams.get('pattern') || 'appeler contact|appeler prospect';
+    const dry = u.searchParams.get('dry') !== '0';
+    const out = { dry, pattern, total_scanned: 0, matched: 0, deleted: 0, sample: [], errors: [] };
+    let regex;
+    try { regex = new RegExp(pattern, 'i'); }
+    catch (e) { res.writeHead(400); res.end(JSON.stringify({error:`pattern invalide: ${e.message}`})); return; }
+    try {
+      // Paginer toutes les activités du compte
+      let start = 0;
+      const allActs = [];
+      while (true) {
+        const r = await pdGet(`/activities?start=${start}&limit=500`);
+        const items = r?.data || [];
+        allActs.push(...items);
+        if (!r?.additional_data?.pagination?.more_items_in_collection) break;
+        start = r.additional_data.pagination.next_start;
+        if (start === undefined || start === null) break;
+        if (allActs.length > 50000) break; // safety
+      }
+      out.total_scanned = allActs.length;
+      const matched = allActs.filter(a => a.subject && regex.test(a.subject));
+      out.matched = matched.length;
+      out.sample = matched.slice(0, 10).map(a => ({ id: a.id, subject: a.subject, deal_id: a.deal_id, due_date: a.due_date, done: a.done, type: a.type }));
+      if (!dry) {
+        for (const a of matched) {
+          try {
+            const dr = await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' });
+            if (dr.ok) out.deleted++;
+            else out.errors.push(`${a.id}: HTTP ${dr.status}`);
+          } catch (e) { out.errors.push(`${a.id}: ${e.message}`); }
+        }
+      }
+      out.summary = dry
+        ? `DRY-RUN: ${out.matched} activités matchent /${pattern}/ sur ${out.total_scanned} total`
+        : `EXÉCUTÉ: ${out.deleted}/${out.matched} activités supprimées`;
+    } catch (e) { out.errors.push(`Top: ${e.message}`); }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /admin/safety-check — déclenche safety check campagnes immédiatement
   if (req.method === 'GET' && url.startsWith('/admin/safety-check')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
