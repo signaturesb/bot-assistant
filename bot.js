@@ -9301,6 +9301,42 @@ function registerHandlers() {
     await send(msg.chat.id, reply);
   });
 
+  // ─── /keys — récap clés API (status visible, sans value)
+  bot.onText(/\/keys|\/cles/, msg => {
+    if (!isAllowed(msg)) return;
+    const services = {
+      'Anthropic (Claude)':       !!process.env.ANTHROPIC_API_KEY,
+      'OpenAI (Whisper)':          !!process.env.OPENAI_API_KEY,
+      'Pipedrive (CRM)':          !!process.env.PIPEDRIVE_API_KEY,
+      'Brevo (mailing)':          !!process.env.BREVO_API_KEY,
+      'Telegram Bot':             !!process.env.TELEGRAM_BOT_TOKEN,
+      'Gmail (read+send)':        !!(process.env.GMAIL_CLIENT_ID && process.env.GMAIL_REFRESH_TOKEN),
+      'Dropbox':                   !!process.env.DROPBOX_REFRESH_TOKEN,
+      'Centris (courtier)':       !!(process.env.CENTRIS_USER && process.env.CENTRIS_PASS),
+      'Firecrawl (scraping)':     !!process.env.FIRECRAWL_API_KEY,
+      'Perplexity (recherche)':   !!process.env.PERPLEXITY_API_KEY,
+      'GitHub (write status)':    !!process.env.GITHUB_TOKEN,
+      'Render API (env push)':    !!process.env.RENDER_API_KEY,
+    };
+    const lines = ['🔑 *Clés API — Status*', ''];
+    const critical = ['Anthropic (Claude)', 'Telegram Bot', 'Pipedrive (CRM)'];
+    const optional = ['Render API (env push)', 'GitHub (write status)'];
+    for (const [name, ok] of Object.entries(services)) {
+      const icon = ok ? '✅' : (critical.includes(name) ? '🔴' : (optional.includes(name) ? '⚪' : '⚠️'));
+      const note = !ok && critical.includes(name) ? ' *(CRITIQUE)*' : '';
+      lines.push(`${icon} ${name}${note}`);
+    }
+    const missing = Object.entries(services).filter(([,ok]) => !ok).map(([n]) => n);
+    if (missing.length) {
+      lines.push('');
+      lines.push(`_${missing.length} clé(s) manquante(s) — pour ajouter:_`);
+      lines.push('`/setsecret KEY_NAME valeur` (persiste via Dropbox)');
+    } else {
+      lines.push('\n✨ Toutes les clés configurées.');
+    }
+    bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown' });
+  });
+
   // ─── /health — health check live + détails ──────────────────────────────
   bot.onText(/\/health/, async msg => {
     if (!isAllowed(msg)) return;
