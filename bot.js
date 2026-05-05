@@ -11295,6 +11295,7 @@ code{background:#0a0a0a;padding:2px 6px;border-radius:3px;color:#93c5fd;font-siz
 <body>
 <h1>🤖 Kira — Admin Dashboard</h1>
 <p class="muted">Auto-refresh suggéré F5 · Bot: ${currentModel} · Tools: ${TOOLS.length} · Lignes: ${require('fs').statSync('bot.js').size > 0 ? 'live' : '?'} · ${new Date().toLocaleString('fr-CA',{timeZone:'America/Toronto'})}</p>
+${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid #aa0721;padding:16px;border-radius:8px;margin:16px 0"><strong>⚠️ OPENAI_API_KEY manquante</strong> — Whisper désactivé, vocaux Telegram et résumés d'appels ne fonctionnent pas.<br>Fix immédiat: tape dans Telegram <code>/setsecret OPENAI_API_KEY sk-...</code> — persiste à travers les redeploys.</div>` : ''}
 
 <div class="grid">
 <div class="card"><div class="label">Health APIs</div><div class="value ${allOk ? 'green' : 'red'}">${allOk ? '✅' : '❌'}</div><div class="sub">${healthState.lastRun ? new Date(healthState.lastRun).toLocaleTimeString('fr-CA',{timeZone:'America/Toronto'}) : 'never'}</div></div>
@@ -11309,7 +11310,7 @@ code{background:#0a0a0a;padding:2px 6px;border-radius:3px;color:#93c5fd;font-siz
 <a class="btn" href="/admin/health?refresh=1">🩺 Health check (refresh)</a>
 <a class="btn" href="/admin/safety-check">🛡️ Safety check campagnes</a>
 <a class="btn" href="/admin/check-plans">📊 Plans Brevo+Dropbox</a>
-<a class="btn" href="/admin/audit-log?limit=100">📋 Audit log full</a>
+<a class="btn" href="/admin/auditlog?limit=100">📋 Audit log full</a>
 <a class="btn" href="/admin/cleanup-activities-by-subject?dry=1">🧹 Dry-run cleanup</a>
 
 <h2>🩺 Health Check Détails</h2>
@@ -11338,8 +11339,10 @@ code{background:#0a0a0a;padding:2px 6px;border-radius:3px;color:#93c5fd;font-siz
     return;
   }
 
-  // ─── GET /admin/audit-log — derniers events (filtrable) ──────────────────
-  if (req.method === 'GET' && url.startsWith('/admin/audit-log')) {
+  // ─── GET /admin/auditlog — derniers events (filtrable, sans token requis)
+  // Renommé /admin/audit-log → /admin/auditlog pour éviter conflit avec
+  // /admin/audit (token-required) qui interceptait avant.
+  if (req.method === 'GET' && url.startsWith('/admin/auditlog')) {
     const u = new URL(req.url, 'http://x');
     const cat = u.searchParams.get('category');
     const limit = Math.min(parseInt(u.searchParams.get('limit') || '50', 10), 500);
@@ -13226,6 +13229,15 @@ async function main() {
   // Health check APIs: 30s après boot puis toutes les heures
   setTimeout(() => testApisHealth().catch(e => log('WARN','HEALTH',e.message)), 30 * 1000);
   setInterval(() => testApisHealth().catch(e => log('WARN','HEALTH',e.message)), 60 * 60 * 1000);
+  // KEEP-WARM Render free tier (anti-cold-start) — self-ping toutes les 14min
+  // Render dort après 15min d'idle. Le ping suffit à le garder éveillé.
+  setInterval(() => {
+    fetch(`https://signaturesb-bot-s272.onrender.com/`, { signal: AbortSignal.timeout(8000) })
+      .catch(() => {});
+  }, 14 * 60 * 1000);
+  // Reload Dropbox secrets toutes les 6h — capture nouveaux secrets ajoutés
+  // sans redeploy + récupère OPENAI_API_KEY si Shawn fait /setsecret
+  setInterval(() => loadDropboxSecrets().catch(e => log('WARN','SECRETS',e.message)), 6 * 60 * 60 * 1000);
 
   log('OK', 'BOOT', `✅ Kira démarrée [${currentModel}] — ${DATA_DIR} — mémos:${kiramem.facts.length} — tools:${TOOLS.length} — port:${PORT}`);
 
