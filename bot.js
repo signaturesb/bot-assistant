@@ -9496,7 +9496,27 @@ function registerHandlers() {
     if (isDuplicate(msg.message_id)) return;
 
     if (!process.env.OPENAI_API_KEY) {
-      await bot.sendMessage(chatId, '⚠️ Whisper non configuré. Ajoute `OPENAI_API_KEY` dans Render.');
+      // Dégradation gracieuse: sauve le vocal dans Dropbox /Audio/<timestamp>.ogg
+      // pour que Shawn ne perde pas l'info même sans Whisper
+      try {
+        const fileInfo = await bot.getFile(msg.voice.file_id);
+        const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+        const r = await fetch(fileUrl);
+        const buffer = Buffer.from(await r.arrayBuffer());
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const dbxPath = `/Audio/voicememo_${ts}.ogg`;
+        const up = await fetch('https://content.dropboxapi.com/2/files/upload', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${dropboxToken}`,
+            'Dropbox-API-Arg': JSON.stringify({ path: dbxPath, mode: 'add', autorename: true, mute: true }),
+            'Content-Type': 'application/octet-stream',
+          },
+          body: buffer,
+        });
+        const saved = up.ok;
+        await bot.sendMessage(chatId, `🎙 Vocal reçu (${msg.voice.duration}s) — Whisper KO\n\n${saved ? `✅ Audio sauvé Dropbox: \`${dbxPath}\`` : '❌ Backup Dropbox aussi échoué'}\n\n*Pour activer transcription auto:*\nVa sur https://platform.openai.com/api-keys → crée une clé → tape \`/setsecret OPENAI_API_KEY sk-proj-...\`\n_~$1/mois pour 30 appels × 5min._`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+      } catch (e) { await bot.sendMessage(chatId, `⚠️ Whisper KO + sauvegarde échoué: ${e.message.substring(0,100)}`); }
       return;
     }
 
