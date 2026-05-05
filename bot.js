@@ -1503,28 +1503,45 @@ async function loadDropboxSecrets() {
   }
   return loaded;
 }
+// Last error for debugging via /admin endpoints
+let _lastSecretError = null;
 async function uploadDropboxSecret(key, value) {
+  _lastSecretError = null;
   if (!dropboxToken) await refreshDropboxToken();
+  if (!dropboxToken) { _lastSecretError = 'no dropboxToken after refresh'; return false; }
   // Ensure folder exists first (idempotent — 409 si existe = OK)
-  await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${dropboxToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: '/bot-secrets', autorename: false }),
-  }).catch(() => {});
-  const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${dropboxToken}`,
-      'Content-Type': 'application/octet-stream',
-      'Dropbox-API-Arg': JSON.stringify({ path: `/bot-secrets/${key}.txt`, mode: 'overwrite', autorename: false, mute: true })
-    },
-    body: Buffer.from(String(value))
-  });
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: HTTP ${res.status} ${errBody.substring(0, 200)}`);
+  try {
+    const fr = await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${dropboxToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/bot-secrets', autorename: false }),
+    });
+    if (!fr.ok && fr.status !== 409) {
+      const fb = await fr.text().catch(() => '');
+      log('WARN', 'SECRETS', `create_folder ${fr.status}: ${fb.substring(0, 150)}`);
+    }
+  } catch (e) { log('WARN', 'SECRETS', `create_folder exception: ${e.message}`); }
+  try {
+    const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${dropboxToken}`,
+        'Content-Type': 'application/octet-stream',
+        'Dropbox-API-Arg': JSON.stringify({ path: `/bot-secrets/${key}.txt`, mode: 'overwrite', autorename: false, mute: true })
+      },
+      body: Buffer.from(String(value))
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      _lastSecretError = `HTTP ${res.status}: ${errBody.substring(0, 200)}`;
+      log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: ${_lastSecretError}`);
+    }
+    return res.ok;
+  } catch (e) {
+    _lastSecretError = `exception: ${e.message}`;
+    log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: ${e.message}`);
+    return false;
   }
-  return res.ok;
 }
 async function listDropboxFolder(folderPath) {
   const p = folderPath === '' ? '' : ('/' + folderPath.replace(/^\//, ''));
@@ -11447,9 +11464,9 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         // Try Dropbox persist (best effort)
         let persisted = false;
         try { persisted = await uploadDropboxSecret(key, value); } catch {}
-        auditLogEvent('secret', 'set', { key, via: 'admin-universal', tested: !!tested, persisted });
+        auditLogEvent('secret', 'set', { key, via: 'admin-universal', tested: !!tested, persisted, dbxErr: _lastSecretError });
         res.writeHead(200, {'content-type':'application/json'});
-        res.end(JSON.stringify({ ok: true, key, persisted, env_set: true, tested, warning: persisted ? null : 'Dropbox persist failed — clé active en mémoire seulement (perdue au prochain redeploy). Tape /setsecret pour réessayer.' }, null, 2));
+        res.end(JSON.stringify({ ok: true, key, persisted, env_set: true, tested, dropbox_error: persisted ? null : _lastSecretError, warning: persisted ? null : 'Dropbox persist failed — clé active en mémoire seulement (perdue au prochain redeploy).' }, null, 2));
         // Notif Telegram
         if (ALLOWED_ID) sendTelegramWithFallback(`🔑 *${key}* configurée\n${persisted ? '✅ Persisté Dropbox + env' : '⚠️ Env seulement (Dropbox fail — perdu au redeploy)'}${tested ? `\nTest: HTTP ${tested.status} ✅` : ''}`, { category: 'secret-set' }).catch(()=>{});
       } catch (e) { res.writeHead(500); res.end(JSON.stringify({error:e.message})); }
