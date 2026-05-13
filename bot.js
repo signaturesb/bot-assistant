@@ -7165,6 +7165,13 @@ function registerHandlers() {
                 label = `✅ Envoyée maintenant`;
               }
               if (r.ok || r.status === 204) {
+                // 🚀 Cc Shawn auto (règle 2026-05-13): sendTest parallèle pour copie identique
+                const shawnCc = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
+                fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/sendTest`, {
+                  method: 'POST',
+                  headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ emailTo: [shawnCc] }),
+                }).catch(e => log('WARN', 'BREVO', `sendTest Cc fail #${campaignId}: ${e.message}`));
                 if (chatId && msgId) {
                   const newMarkup = { inline_keyboard: [[{ text: label, callback_data: 'noop' }]] };
                   await bot.editMessageReplyMarkup(newMarkup, { chat_id: chatId, message_id: msgId }).catch(() => {});
@@ -12223,9 +12230,17 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
         const errBody = await sr.text().catch(() => '');
         out.errors.push(`sendNow HTTP ${sr.status}: ${errBody.substring(0, 200)}`);
       } else {
+        // 🚀 Cc Shawn auto (règle 2026-05-13): sendTest parallèle pour copie identique
+        const shawnCc = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
+        fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/sendTest`, {
+          method: 'POST',
+          headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ emailTo: [shawnCc] }),
+        }).catch(e => log('WARN', 'BREVO', `sendTest Cc fail #${id}: ${e.message}`));
+        out.cc_shawn_fired = true;
         // Aussi marquer dans le registre d'approbation
         approveCampaign(id);
-        auditLogEvent('campaign', 'sent-now', { id, name: beforeData.name, by: 'admin-endpoint' });
+        auditLogEvent('campaign', 'sent-now', { id, name: beforeData.name, by: 'admin-endpoint', cc_shawn: true });
       }
       // 6. Vérifier état après
       const after = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
