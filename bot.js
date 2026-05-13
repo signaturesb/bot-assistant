@@ -2412,8 +2412,17 @@ async function nettoyerDoublonsActivites(dealId) {
   }
 }
 
+// Patterns génériques de "suivi" interdits (règle Shawn 2026-05-13)
+const SUJET_SUIVI_GENERIQUE = /(?:^|\s|—|-)\s*(?:📞|☎️)?\s*(?:suivi|appeler|contacter|rappel(?:er)?|relancer?)\s*(?:le|la|du|de|nouveau|nouvel)?\s*(contact|prospect|client|lead)\s*$/i;
+
 async function creerActivite({ terme, type, sujet, date, heure }) {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
+  // 🛡️ RÈGLE SHAWN 2026-05-13: zéro activité générique "suivi/appeler contact/prospect".
+  // Ces sujets vagues empilent du bruit sans valeur. Forcer un sujet spécifique.
+  if (sujet && SUJET_SUIVI_GENERIQUE.test(String(sujet).trim())) {
+    log('INFO', 'PD', `Refus activité "${sujet}" — sujet générique (règle Shawn)`);
+    return `❌ Sujet trop générique: "${sujet}".\nDonne un sujet spécifique (ex: "Appel Marie - terrain Rawdon" ou "Confirmer visite mardi"). Règle Shawn: zéro activité "suivi contact/prospect" vague.`;
+  }
   // VALIDATION DATE — empêche Claude d'envoyer une date périmée (bug récurrent)
   if (date) {
     const m = String(date).match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -5692,7 +5701,7 @@ const TOOLS = [
   { name: 'historique_contact',     description: 'Timeline chronologique d\'un prospect: notes + activités triées. Compact pour mobile. Pour "c\'est quoi le background de Jean?", "show me the history for Marie".', input_schema: { type: 'object', properties: { terme: { type: 'string' } }, required: ['terme'] } },
   { name: 'repondre_vite',          description: 'Réponse rapide mobile: trouve l\'email du prospect dans Pipedrive AUTOMATIQUEMENT, prépare le brouillon style Shawn. Shawn dit juste son message, le bot fait le reste. Ne pas appeler si email déjà connu — utiliser envoyer_email directement.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect dans Pipedrive' }, message: { type: 'string', description: 'Texte de la réponse tel que dicté par Shawn' } }, required: ['terme', 'message'] } },
   { name: 'modifier_deal',          description: 'Modifier la valeur, le titre ou la date de clôture d\'un deal.', input_schema: { type: 'object', properties: { terme: { type: 'string' }, valeur: { type: 'number', description: 'Valeur en $ de la transaction' }, titre: { type: 'string' }, dateClose: { type: 'string', description: 'Date ISO YYYY-MM-DD' } }, required: ['terme'] } },
-  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite. UTILISE LA DATE COURANTE DU SYSTEM PROMPT (jamais deviner l\'année). RÈGLE: ne JAMAIS passer le param "heure" sauf si Shawn demande explicitement une heure spécifique.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string' }, date: { type: 'string', description: 'Format STRICT YYYY-MM-DD (ex: 2026-04-26). Calculer à partir de la date courante du system prompt.' }, heure: { type: 'string', description: 'OPTIONNEL — Format HH:MM (ex: 14:00). NE PAS PASSER sauf si Shawn demande explicitement une heure.' } }, required: ['terme', 'type'] } },
+  { name: 'creer_activite',         description: 'Créer une activité/tâche/rappel pour un deal. Types: appel, email, réunion, tâche, visite. UTILISE LA DATE COURANTE DU SYSTEM PROMPT (jamais deviner l\'année). RÈGLES ABSOLUES: (1) ne JAMAIS passer "heure" sauf si Shawn demande explicitement une heure. (2) ZÉRO sujet générique type "Suivi contact/prospect", "Appeler contact/prospect", "Rappeler le prospect" — le bot refuse. Toujours donner un sujet spécifique au client/dossier (ex: "Appel Marie - terrain Rawdon"). (3) Pas de tel ni email connu = NE PAS créer d\'activité de suivi, juste une note.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom du prospect' }, type: { type: 'string', description: 'appel, email, réunion, tâche, visite' }, sujet: { type: 'string', description: 'Sujet SPÉCIFIQUE — JAMAIS générique. Doit nommer le client + l\'action concrète.' }, date: { type: 'string', description: 'Format STRICT YYYY-MM-DD (ex: 2026-04-26). Calculer à partir de la date courante du system prompt.' }, heure: { type: 'string', description: 'OPTIONNEL — Format HH:MM (ex: 14:00). NE PAS PASSER sauf si Shawn demande explicitement une heure.' } }, required: ['terme', 'type'] } },
   { name: 'supprimer_activite',     description: 'SUPPRIMER une activité Pipedrive (doublon, erreur, plus pertinente). Affiche d\'abord les activités d\'un deal pour choisir, ou utilise activity_id direct.', input_schema: { type: 'object', properties: { activity_id: { type: 'number', description: 'ID exact de l\'activité à supprimer (priorité si fourni)' }, terme: { type: 'string', description: 'Nom prospect — le bot affiche les activités du deal et demande quelle supprimer' } } } },
   { name: 'deplacer_activite',      description: 'DÉPLACER une activité d\'un deal vers un autre (utile pour consolider doublons). Source = activity_id, target = nom du deal de destination.', input_schema: { type: 'object', properties: { activity_id: { type: 'number', description: 'ID de l\'activité à déplacer' }, target_deal: { type: 'string', description: 'Nom du deal de destination' } }, required: ['activity_id', 'target_deal'] } },
   { name: 'fusionner_deals',        description: 'FUSIONNER deux deals dupliqués pour un même prospect. Garde le plus récent, transfère activités+notes, supprime l\'autre. Demande confirmation avant.', input_schema: { type: 'object', properties: { deal_garder: { type: 'number', description: 'ID du deal à conserver' }, deal_supprimer: { type: 'number', description: 'ID du deal à fusionner+supprimer' } }, required: ['deal_garder', 'deal_supprimer'] } },
@@ -11448,6 +11457,213 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // ─── GET /admin/pipedrive-cleanup — Clean global Pipedrive
+  // Combine 3 opérations en 1 (règle Shawn 2026-05-13):
+  //   (A) Supprime activités "suivi/appeler contact/prospect" (sujets génériques) → DELETE
+  //   (B) Pour chaque deal qui a >1 activité OPEN: garde la + récente, ferme le reste → MARK DONE
+  //   (C) Activités OPEN sur deals dont la person n'a NI email NI téléphone → MARK DONE
+  //
+  // Query: ?dry=1 (DRY-RUN défaut) · ?dry=0 (exécute) · ?notify=0 (skip Telegram)
+  if (req.method === 'GET' && url.startsWith('/admin/pipedrive-cleanup')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const dry = u.searchParams.get('dry') !== '0';
+    const notify = u.searchParams.get('notify') !== '0';
+    const out = {
+      dry, total_scanned: 0,
+      generiques: { matched: 0, deleted: 0, sample: [], errors: [] },
+      doublons:   { groupes: 0, a_fermer: 0, fermes: 0, sample: [], errors: [] },
+      no_contact: { matched: 0, fermes: 0, sample: [], errors: [] },
+      backup: null,
+      summary: '',
+    };
+    // Pattern générique = même règle que SUJET_SUIVI_GENERIQUE côté creerActivite
+    // + variantes que Pipedrive crée par défaut quand subject manquant
+    const RE_GENERIQUE = /^(?:📞|☎️)?\s*(?:appeler|suivi|contacter|rappel(?:er)?|relancer?)\s*(?:le|la|du|de|un|une|nouveau|nouvel)?\s*(?:contact|prospect|client|lead)s?\s*$/i;
+    try {
+      // 1. Pagination TOUTES activités (open + done) — on filtre done=0 après
+      let start = 0;
+      const allActs = [];
+      while (true) {
+        const r = await pdGet(`/activities?start=${start}&limit=500`);
+        const items = r?.data || [];
+        allActs.push(...items);
+        if (!r?.additional_data?.pagination?.more_items_in_collection) break;
+        start = r.additional_data.pagination.next_start;
+        if (start === undefined || start === null) break;
+        if (allActs.length > 50000) break;
+      }
+      out.total_scanned = allActs.length;
+      const openActs = allActs.filter(a => !a.done);
+
+      // 2. (A) Génériques — peu importe done ou open, on purge tout (bruit historique aussi)
+      const generiques = allActs.filter(a => a.subject && RE_GENERIQUE.test(String(a.subject).trim()));
+      out.generiques.matched = generiques.length;
+      out.generiques.sample = generiques.slice(0, 10).map(a => ({
+        id: a.id, subject: a.subject, deal_id: a.deal_id, due_date: a.due_date, done: a.done, type: a.type
+      }));
+
+      // 3. (B) Doublons — grouper open par deal_id, marquer "à fermer" tout sauf le plus récent
+      const byDeal = new Map();
+      for (const a of openActs) {
+        if (!a.deal_id) continue;
+        if (!byDeal.has(a.deal_id)) byDeal.set(a.deal_id, []);
+        byDeal.get(a.deal_id).push(a);
+      }
+      const aFermer = [];
+      const idsGeneriques = new Set(generiques.map(g => g.id));
+      for (const [dealId, acts] of byDeal.entries()) {
+        if (acts.length <= 1) continue;
+        // Trier desc par add_time (le + récent = on garde)
+        const sorted = acts.slice().sort((a, b) => new Date(b.add_time || b.due_date || 0) - new Date(a.add_time || a.due_date || 0));
+        const garder = sorted[0];
+        for (let i = 1; i < sorted.length; i++) {
+          // Skip si déjà dans les génériques (sera supprimée, pas juste fermée)
+          if (idsGeneriques.has(sorted[i].id)) continue;
+          aFermer.push({ activity: sorted[i], deal_id: dealId, garder_id: garder.id });
+        }
+        out.doublons.groupes++;
+      }
+      out.doublons.a_fermer = aFermer.length;
+      out.doublons.sample = aFermer.slice(0, 10).map(x => ({
+        id: x.activity.id, subject: x.activity.subject, deal_id: x.deal_id, due_date: x.activity.due_date, type: x.activity.type, garder_id: x.garder_id,
+      }));
+
+      // 3.bis (C) — Activités OPEN dont le deal a une person SANS email ET SANS téléphone
+      // Cache person par deal pour éviter re-fetch
+      const personByDeal = new Map(); // dealId → { email, phone, person_name }
+      const idsADejaFlag = new Set([
+        ...generiques.map(g => g.id),
+        ...aFermer.map(x => x.activity.id),
+      ]);
+      const noContact = [];
+      for (const a of openActs) {
+        if (!a.deal_id) continue;
+        if (idsADejaFlag.has(a.id)) continue; // déjà couvert par (A) ou (B)
+        let contact = personByDeal.get(a.deal_id);
+        if (contact === undefined) {
+          try {
+            const dr = await pdGet(`/deals/${a.deal_id}`);
+            const personField = dr?.data?.person_id;
+            const personId = typeof personField === 'object' ? personField?.value : personField;
+            if (!personId) {
+              contact = { email: '', phone: '', person_name: null };
+            } else {
+              // Pipedrive embed déjà email/phone dans person_id quand objet
+              if (typeof personField === 'object' && (personField.email || personField.phone)) {
+                const emails = (personField.email || []).map(e => e?.value || '').filter(Boolean);
+                const phones = (personField.phone || []).map(p => p?.value || '').filter(Boolean);
+                contact = { email: emails.join(','), phone: phones.join(','), person_name: personField.name || '' };
+              } else {
+                const pr = await pdGet(`/persons/${personId}`);
+                const p = pr?.data || {};
+                const emails = (p.email || []).map(e => e?.value || '').filter(Boolean);
+                const phones = (p.phone || []).map(ph => ph?.value || '').filter(Boolean);
+                contact = { email: emails.join(','), phone: phones.join(','), person_name: p.name || '' };
+              }
+            }
+          } catch (e) {
+            contact = { email: '', phone: '', person_name: null, _err: e.message };
+          }
+          personByDeal.set(a.deal_id, contact);
+        }
+        if (!contact.email && !contact.phone) {
+          noContact.push({ activity: a, deal_id: a.deal_id, person: contact });
+        }
+      }
+      out.no_contact.matched = noContact.length;
+      out.no_contact.sample = noContact.slice(0, 10).map(x => ({
+        id: x.activity.id, subject: x.activity.subject, deal_id: x.deal_id, type: x.activity.type, due_date: x.activity.due_date,
+        person_name: x.person.person_name || '(pas de person)',
+      }));
+
+      // 4. EXÉCUTION (si !dry)
+      if (!dry) {
+        // Backup avant
+        const backupItems = [
+          ...generiques.map(g => ({ ...g, _action: 'delete' })),
+          ...aFermer.map(x => ({ ...x.activity, _action: 'mark_done', _garder_id: x.garder_id })),
+          ...noContact.map(x => ({ ...x.activity, _action: 'mark_done_no_contact', _deal: x.deal_id })),
+        ];
+        if (backupItems.length) {
+          try { out.backup = await backupBeforeAction('pipedrive_cleanup_global', backupItems); }
+          catch (e) { out.generiques.errors.push(`Backup: ${e.message}`); }
+        }
+        // (A) DELETE génériques
+        for (const a of generiques) {
+          try {
+            const dr = await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' });
+            if (dr.ok) out.generiques.deleted++;
+            else out.generiques.errors.push(`${a.id}: HTTP ${dr.status}`);
+          } catch (e) { out.generiques.errors.push(`${a.id}: ${e.message}`); }
+        }
+        // (B) Mark done sur doublons
+        for (const x of aFermer) {
+          try {
+            const r = await fetch(`https://api.pipedrive.com/v1/activities/${x.activity.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ done: 1 }),
+            });
+            if (r.ok) out.doublons.fermes++;
+            else out.doublons.errors.push(`${x.activity.id}: HTTP ${r.status}`);
+          } catch (e) { out.doublons.errors.push(`${x.activity.id}: ${e.message}`); }
+        }
+        // (C) Mark done sur no_contact
+        for (const x of noContact) {
+          try {
+            const r = await fetch(`https://api.pipedrive.com/v1/activities/${x.activity.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ done: 1 }),
+            });
+            if (r.ok) out.no_contact.fermes++;
+            else out.no_contact.errors.push(`${x.activity.id}: HTTP ${r.status}`);
+          } catch (e) { out.no_contact.errors.push(`${x.activity.id}: ${e.message}`); }
+        }
+      }
+
+      out.summary = dry
+        ? `DRY-RUN sur ${out.total_scanned} activités: ${out.generiques.matched} génériques · ${out.doublons.a_fermer} doublons (${out.doublons.groupes} deals) · ${out.no_contact.matched} sans contact`
+        : `EXÉCUTÉ: ${out.generiques.deleted}/${out.generiques.matched} génériques supprimées · ${out.doublons.fermes}/${out.doublons.a_fermer} doublons fermés · ${out.no_contact.fermes}/${out.no_contact.matched} sans-contact fermés`;
+
+      // 5. Notif Telegram
+      if (notify && ALLOWED_ID) {
+        const tg = [
+          dry ? '🧹 *Pipedrive cleanup — DRY-RUN*' : '🧹 *Pipedrive cleanup — EXÉCUTÉ*',
+          '',
+          `📊 Scanné: *${out.total_scanned}* activités totales`,
+          '',
+          `🗑 *Sujets génériques* (suivi/appeler contact/prospect):`,
+          dry ? `   → ${out.generiques.matched} à supprimer` : `   → ${out.generiques.deleted}/${out.generiques.matched} supprimées`,
+          ...out.generiques.sample.slice(0, 5).map(s => `      • #${s.id} "${(s.subject||'').substring(0,40)}" deal:${s.deal_id||'-'}`),
+          out.generiques.matched > 5 ? `      … +${out.generiques.matched - 5} autres` : '',
+          '',
+          `🔄 *Doublons open par deal* (garde + récente):`,
+          `   → ${out.doublons.groupes} deals concernés · ${out.doublons.a_fermer} à fermer` + (dry ? '' : ` · ${out.doublons.fermes} fermées`),
+          ...out.doublons.sample.slice(0, 5).map(s => `      • deal:${s.deal_id} ferme #${s.id} "${(s.subject||'').substring(0,30)}" (garde #${s.garder_id})`),
+          out.doublons.a_fermer > 5 ? `      … +${out.doublons.a_fermer - 5} autres` : '',
+          '',
+          `👻 *Sans contact* (ni email ni tél):`,
+          dry ? `   → ${out.no_contact.matched} à fermer` : `   → ${out.no_contact.fermes}/${out.no_contact.matched} fermées`,
+          ...out.no_contact.sample.slice(0, 5).map(s => `      • #${s.id} deal:${s.deal_id} "${(s.subject||'').substring(0,30)}" (${s.person_name})`),
+          out.no_contact.matched > 5 ? `      … +${out.no_contact.matched - 5} autres` : '',
+          '',
+          dry ? `▶️ Pour exécuter: \`/admin/pipedrive-cleanup?dry=0\`` : `✅ Backup: ${out.backup?.path || 'n/a'}`,
+        ].filter(Boolean).join('\n');
+        try { await sendTelegramWithFallback(tg, { category: 'pipedrive-cleanup' }); } catch {}
+      }
+    } catch (e) {
+      out.generiques.errors.push(`Top: ${e.message}`);
+      if (notify && ALLOWED_ID) {
+        try { await sendTelegramWithFallback(`❌ Pipedrive cleanup erreur: ${e.message}`, { category: 'pipedrive-cleanup-fail' }); } catch {}
+      }
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /logo/sb et /logo/remax — sert les logos pour campagnes Brevo
   // Solution au problème "logos pas visibles chez destinataires" causé par
   // Gmail/Outlook qui bloquent les images base64 inline. URL stable = visible.
@@ -11737,7 +11953,8 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
 <a class="btn" href="/admin/safety-check">🛡️ Safety check campagnes</a>
 <a class="btn" href="/admin/check-plans">📊 Plans Brevo+Dropbox</a>
 <a class="btn" href="/admin/auditlog?limit=100">📋 Audit log full</a>
-<a class="btn" href="/admin/cleanup-activities-by-subject?dry=1">🧹 Dry-run cleanup</a>
+<a class="btn" href="/admin/cleanup-activities-by-subject?dry=1">🧹 Cleanup activités (pattern)</a>
+<a class="btn" href="/admin/pipedrive-cleanup?dry=1">🧼 Pipedrive cleanup global (DRY)</a>
 
 <h2>🩺 Health Check Détails</h2>
 <table><tr><th>Service</th><th>Status</th><th>Détails</th></tr>${healthRows || '<tr><td colspan=3 class=muted>Pas encore exécuté</td></tr>'}</table>
