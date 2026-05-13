@@ -2419,6 +2419,8 @@ async function creerActivite({ terme, type, sujet, date, heure }) {
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   // 🛡️ RÈGLE SHAWN 2026-05-13: zéro activité générique "suivi/appeler contact/prospect".
   // Ces sujets vagues empilent du bruit sans valeur. Forcer un sujet spécifique.
+  // creer_activite reste actif quand Shawn demande explicitement (Claude/Telegram)
+  // ou quand un lead entre via poller. PAS de système de suivi auto (on n'y est pas).
   if (sujet && SUJET_SUIVI_GENERIQUE.test(String(sujet).trim())) {
     log('INFO', 'PD', `Refus activité "${sujet}" — sujet générique (règle Shawn)`);
     return `❌ Sujet trop générique: "${sujet}".\nDonne un sujet spécifique (ex: "Appel Marie - terrain Rawdon" ou "Confirmer visite mardi"). Règle Shawn: zéro activité "suivi contact/prospect" vague.`;
@@ -11458,10 +11460,12 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   }
 
   // ─── GET /admin/pipedrive-cleanup — Clean global Pipedrive
-  // Combine 3 opérations en 1 (règle Shawn 2026-05-13):
+  // Combine 4 opérations + 1 audit (règle Shawn 2026-05-13):
   //   (A) Supprime activités "suivi/appeler contact/prospect" (sujets génériques) → DELETE
   //   (B) Pour chaque deal qui a >1 activité OPEN: garde la + récente, ferme le reste → MARK DONE
   //   (C) Activités OPEN sur deals dont la person n'a NI email NI téléphone → MARK DONE
+  //   (D) Activités OPEN où la person = Shawn lui-même (emails + tel) → DELETE
+  //   (E) AUDIT retards (overdue) — liste seulement, pas d'action
   //
   // Query: ?dry=1 (DRY-RUN défaut) · ?dry=0 (exécute) · ?notify=0 (skip Telegram)
   if (req.method === 'GET' && url.startsWith('/admin/pipedrive-cleanup')) {
@@ -11469,11 +11473,18 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     const u = new URL(req.url, 'http://x');
     const dry = u.searchParams.get('dry') !== '0';
     const notify = u.searchParams.get('notify') !== '0';
+    // Identifiants Shawn — toute person qui matche un de ces 3 = Shawn lui-même
+    const SHAWN_EMAILS = ['shawn@signaturesb.com', 'shawnbarrette@icloud.com'];
+    const SHAWN_PHONES_RAW = ['514-927-1340', '5149271340', '14149271340'];
+    const normPhone = s => String(s || '').replace(/\D/g, '');
+    const SHAWN_PHONES = SHAWN_PHONES_RAW.map(normPhone);
     const out = {
       dry, total_scanned: 0,
       generiques: { matched: 0, deleted: 0, sample: [], errors: [] },
       doublons:   { groupes: 0, a_fermer: 0, fermes: 0, sample: [], errors: [] },
       no_contact: { matched: 0, fermes: 0, sample: [], errors: [] },
+      shawn:      { matched: 0, deleted: 0, sample: [], errors: [] },
+      retards:    { count: 0, sample: [] }, // audit only
       backup: null,
       summary: '',
     };
@@ -11577,6 +11588,64 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         person_name: x.person.person_name || '(pas de person)',
       }));
 
+      // 3.ter (D) — Activités où la person EST Shawn (emails + tel match)
+      // Cache personFull (avec tous emails/phones bruts) — séparé de personByDeal
+      // car ce dernier ne stocke que le concat. Ici on veut matcher item par item.
+      const shawnByDeal = new Map(); // dealId → boolean
+      const shawnAsContact = [];
+      const isShawnPerson = (emails, phones) => {
+        const emailsL = (emails || []).map(e => String(e || '').toLowerCase().trim()).filter(Boolean);
+        const phonesN = (phones || []).map(normPhone).filter(Boolean);
+        if (emailsL.some(e => SHAWN_EMAILS.includes(e))) return true;
+        if (phonesN.some(p => SHAWN_PHONES.some(sp => p === sp || p.endsWith(sp) || sp.endsWith(p)))) return true;
+        return false;
+      };
+      for (const a of openActs) {
+        if (!a.deal_id) continue;
+        if (idsADejaFlag.has(a.id)) continue;
+        let isShawn = shawnByDeal.get(a.deal_id);
+        if (isShawn === undefined) {
+          try {
+            const dr = await pdGet(`/deals/${a.deal_id}`);
+            const personField = dr?.data?.person_id;
+            const personId = typeof personField === 'object' ? personField?.value : personField;
+            let emails = [], phones = [];
+            if (typeof personField === 'object' && personField) {
+              emails = (personField.email || []).map(e => e?.value || '');
+              phones = (personField.phone || []).map(p => p?.value || '');
+            }
+            if ((!emails.length && !phones.length) && personId) {
+              const pr = await pdGet(`/persons/${personId}`);
+              const p = pr?.data || {};
+              emails = (p.email || []).map(e => e?.value || '');
+              phones = (p.phone || []).map(ph => ph?.value || '');
+            }
+            isShawn = isShawnPerson(emails, phones);
+          } catch (e) {
+            isShawn = false;
+          }
+          shawnByDeal.set(a.deal_id, isShawn);
+        }
+        if (isShawn) shawnAsContact.push(a);
+      }
+      out.shawn.matched = shawnAsContact.length;
+      out.shawn.sample = shawnAsContact.slice(0, 10).map(a => ({
+        id: a.id, subject: a.subject, deal_id: a.deal_id, type: a.type, due_date: a.due_date,
+      }));
+
+      // 3.quater (E) — AUDIT retards (overdue): open + due_date < aujourd'hui
+      // Pas d'action, juste lister pour que Shawn voie ce qui traîne
+      const todayISO = new Date().toISOString().substring(0, 10);
+      const retards = openActs.filter(a => a.due_date && a.due_date < todayISO);
+      out.retards.count = retards.length;
+      out.retards.sample = retards
+        .sort((a, b) => (a.due_date || '').localeCompare(b.due_date || ''))
+        .slice(0, 15)
+        .map(a => ({
+          id: a.id, subject: (a.subject || '').substring(0, 50), deal_id: a.deal_id,
+          due_date: a.due_date, type: a.type, jours_retard: Math.round((Date.now() - new Date(a.due_date).getTime()) / 86400000),
+        }));
+
       // 4. EXÉCUTION (si !dry)
       if (!dry) {
         // Backup avant
@@ -11584,6 +11653,7 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
           ...generiques.map(g => ({ ...g, _action: 'delete' })),
           ...aFermer.map(x => ({ ...x.activity, _action: 'mark_done', _garder_id: x.garder_id })),
           ...noContact.map(x => ({ ...x.activity, _action: 'mark_done_no_contact', _deal: x.deal_id })),
+          ...shawnAsContact.map(a => ({ ...a, _action: 'delete_shawn_contact' })),
         ];
         if (backupItems.length) {
           try { out.backup = await backupBeforeAction('pipedrive_cleanup_global', backupItems); }
@@ -11621,11 +11691,19 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
             else out.no_contact.errors.push(`${x.activity.id}: HTTP ${r.status}`);
           } catch (e) { out.no_contact.errors.push(`${x.activity.id}: ${e.message}`); }
         }
+        // (D) DELETE sur Shawn-as-contact
+        for (const a of shawnAsContact) {
+          try {
+            const dr = await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' });
+            if (dr.ok) out.shawn.deleted++;
+            else out.shawn.errors.push(`${a.id}: HTTP ${dr.status}`);
+          } catch (e) { out.shawn.errors.push(`${a.id}: ${e.message}`); }
+        }
       }
 
       out.summary = dry
-        ? `DRY-RUN sur ${out.total_scanned} activités: ${out.generiques.matched} génériques · ${out.doublons.a_fermer} doublons (${out.doublons.groupes} deals) · ${out.no_contact.matched} sans contact`
-        : `EXÉCUTÉ: ${out.generiques.deleted}/${out.generiques.matched} génériques supprimées · ${out.doublons.fermes}/${out.doublons.a_fermer} doublons fermés · ${out.no_contact.fermes}/${out.no_contact.matched} sans-contact fermés`;
+        ? `DRY-RUN sur ${out.total_scanned}: ${out.generiques.matched} génériques · ${out.doublons.a_fermer} doublons (${out.doublons.groupes} deals) · ${out.no_contact.matched} sans contact · ${out.shawn.matched} Shawn-as-contact · ${out.retards.count} retards (audit)`
+        : `EXÉCUTÉ: ${out.generiques.deleted}/${out.generiques.matched} génériques · ${out.doublons.fermes}/${out.doublons.a_fermer} doublons · ${out.no_contact.fermes}/${out.no_contact.matched} sans-contact · ${out.shawn.deleted}/${out.shawn.matched} Shawn-contact · ${out.retards.count} retards (audit)`;
 
       // 5. Notif Telegram
       if (notify && ALLOWED_ID) {
@@ -11648,6 +11726,16 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
           dry ? `   → ${out.no_contact.matched} à fermer` : `   → ${out.no_contact.fermes}/${out.no_contact.matched} fermées`,
           ...out.no_contact.sample.slice(0, 5).map(s => `      • #${s.id} deal:${s.deal_id} "${(s.subject||'').substring(0,30)}" (${s.person_name})`),
           out.no_contact.matched > 5 ? `      … +${out.no_contact.matched - 5} autres` : '',
+          '',
+          `🙋 *Shawn-as-contact* (toi comme person):`,
+          dry ? `   → ${out.shawn.matched} à supprimer` : `   → ${out.shawn.deleted}/${out.shawn.matched} supprimées`,
+          ...out.shawn.sample.slice(0, 5).map(s => `      • #${s.id} deal:${s.deal_id} "${(s.subject||'').substring(0,30)}" ${s.due_date||''}`),
+          out.shawn.matched > 5 ? `      … +${out.shawn.matched - 5} autres` : '',
+          '',
+          `⏰ *Retards* (audit, aucune action):`,
+          `   → ${out.retards.count} activité(s) overdue`,
+          ...out.retards.sample.slice(0, 10).map(s => `      • #${s.id} deal:${s.deal_id} "${s.subject}" — ${s.due_date} (${s.jours_retard}j retard)`),
+          out.retards.count > 10 ? `      … +${out.retards.count - 10} autres` : '',
           '',
           dry ? `▶️ Pour exécuter: \`/admin/pipedrive-cleanup?dry=0\`` : `✅ Backup: ${out.backup?.path || 'n/a'}`,
         ].filter(Boolean).join('\n');
