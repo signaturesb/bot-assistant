@@ -5011,16 +5011,60 @@ async function centrisOAuthLoginWithMFA(opts = {}) {
     let mfaChallenge = null;
     let formPostFinal = null;
     for (let hop = 0; hop < 20; hop++) {
+      lg('INFO', `hop ${hop} → ${nextUrl.substring(0, 120)}`);
       const r = await fetch(nextUrl, fOpts({ redirect: 'manual' }));
       apply(r);
       if (r.status >= 300 && r.status < 400) {
         const loc = decode(r.headers.get('location') || '');
+        lg('INFO', `hop ${hop} ${r.status} → location: ${loc.substring(0, 120)}`);
         if (!loc) break;
         nextUrl = loc.startsWith('http') ? loc : new URL(loc, nextUrl).href;
         continue;
       }
       if (r.status !== 200) { lg('WARN', `hop ${hop} status ${r.status}`); break; }
       const html = await r.text();
+      // PASS 1 — Auth0 new flow: identifier/password split
+      // Si on est sur /u/login/identifier, faut soumettre l'identifier puis le password
+      if (nextUrl.includes('/u/login/identifier')) {
+        const stateMatch = html.match(/name=["']state["'][^>]+value=["']([^"']+)["']/i);
+        const actionMatch = html.match(/<form[^>]+action=["']([^"']*identifier[^"']*)["']/i) || html.match(/<form[^>]+method=["']post["'][^>]+action=["']([^"']+)["']/i);
+        if (stateMatch && actionMatch) {
+          lg('INFO', `Auth0 new flow: identifier step at ${nextUrl}`);
+          const idAction = decode(actionMatch[1]).startsWith('http') ? decode(actionMatch[1]) : `https://centris-prod.ca.auth0.com${decode(actionMatch[1])}`;
+          const idRes = await fetch(idAction, {
+            method: 'POST', redirect: 'manual',
+            headers: { ...HD, 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieStr(), 'Referer': nextUrl, 'Origin': 'https://centris-prod.ca.auth0.com' },
+            body: new URLSearchParams({ state: decode(stateMatch[1]), username: user, action: 'default' }).toString(),
+          });
+          apply(idRes);
+          if (idRes.status >= 300 && idRes.status < 400) {
+            const loc = decode(idRes.headers.get('location') || '');
+            nextUrl = loc.startsWith('http') ? loc : new URL(loc, idAction).href;
+            lg('INFO', `identifier → password step: ${nextUrl.substring(0, 120)}`);
+            continue;
+          }
+        }
+      }
+      if (nextUrl.includes('/u/login/password') || nextUrl.includes('/u/login') && /password/i.test(html)) {
+        const stateMatch = html.match(/name=["']state["'][^>]+value=["']([^"']+)["']/i);
+        const actionMatch = html.match(/<form[^>]+action=["']([^"']*(?:password|login)[^"']*)["']/i) || html.match(/<form[^>]+method=["']post["'][^>]+action=["']([^"']+)["']/i);
+        if (stateMatch && actionMatch) {
+          lg('INFO', `Auth0 new flow: password step at ${nextUrl}`);
+          const pwAction = decode(actionMatch[1]).startsWith('http') ? decode(actionMatch[1]) : `https://centris-prod.ca.auth0.com${decode(actionMatch[1])}`;
+          const pwRes = await fetch(pwAction, {
+            method: 'POST', redirect: 'manual',
+            headers: { ...HD, 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieStr(), 'Referer': nextUrl, 'Origin': 'https://centris-prod.ca.auth0.com' },
+            body: new URLSearchParams({ state: decode(stateMatch[1]), username: user, password: pass, action: 'default' }).toString(),
+          });
+          apply(pwRes);
+          if (pwRes.status >= 300 && pwRes.status < 400) {
+            const loc = decode(pwRes.headers.get('location') || '');
+            nextUrl = loc.startsWith('http') ? loc : new URL(loc, pwAction).href;
+            lg('INFO', `password → next: ${nextUrl.substring(0, 120)}`);
+            continue;
+          }
+        }
+      }
       if (/mfa-sms-challenge|sms-challenge/i.test(html) || nextUrl.includes('mfa-sms-challenge')) {
         const stateMatch = html.match(/name=["']state["'][^>]+value=["']([^"']+)["']/i);
         const actionMatch = html.match(/<form[^>]+action=["']([^"']+\/u\/mfa-sms-challenge[^"']*)["']/i);
@@ -5043,7 +5087,9 @@ async function centrisOAuthLoginWithMFA(opts = {}) {
         formPostFinal = { url: fpMatch[1], inputs: allInputs };
         break;
       }
-      lg('WARN', `hop ${hop}: 200 sans MFA ni form_post — stuck`);
+      // STUCK: log les premiers 500 chars HTML pour debug
+      const htmlPreview = html.substring(0, 500).replace(/\s+/g, ' ');
+      lg('WARN', `hop ${hop} STUCK at ${nextUrl.substring(0, 80)} — HTML: ${htmlPreview.substring(0, 200)}`);
       break;
     }
 
