@@ -5134,8 +5134,26 @@ async function centrisOAuthLoginWithMFA(opts = {}) {
 async function centrisLogin() {
   const user = process.env.CENTRIS_USER;
   const pass = process.env.CENTRIS_PASS;
-  if (!user || !pass) return false;
+  if (!user || !pass) {
+    log('WARN', 'CENTRIS', 'CENTRIS_USER ou CENTRIS_PASS manquants dans env');
+    return false;
+  }
 
+  // PRIORITÉ 1 — Nouveau flow OAuth Auth0 avec MFA SMS (Centris a migré vers ça)
+  // L'ancien flow form-based à /fr/connexion ne marche plus pour le portail Matrix.
+  // centrisOAuthLoginWithMFA set centrisSession directement à l'intérieur si OK.
+  try {
+    const oauth = await centrisOAuthLoginWithMFA({ mfaTimeoutMs: 120000 });
+    if (oauth?.ok && centrisSession?.cookies) {
+      log('OK', 'CENTRIS', `OAuth Auth0 + MFA SMS ✓ (agent: ${user}, ${oauth.cookieCount} cookies)`);
+      return true;
+    }
+    log('WARN', 'CENTRIS', `OAuth flow échoué: ${oauth?.error || 'unknown'} — fallback form-based`);
+  } catch (e) {
+    log('WARN', 'CENTRIS', `OAuth flow exception: ${e.message?.substring(0, 100)} — fallback form-based`);
+  }
+
+  // FALLBACK — Ancien flow form-based (peut encore marcher pour certains comptes)
   try {
     // 1. Charger la page login pour obtenir le token CSRF et les cookies de session
     const pageController = new AbortController();
