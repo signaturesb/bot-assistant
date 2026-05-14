@@ -5842,6 +5842,8 @@ const TOOLS = [
   { name: 'enregistrer_resume_appel', description: 'Analyse une transcription d\'appel téléphonique (vocal Telegram), extrait via Haiku les infos clés (nom client, budget, engagement chaud/tiède/froid, objections, prochaine étape) et crée/enrichit le deal Pipedrive: NOUVEAU client → crée person + deal + note résumé + activité de suivi (date du jour). CLIENT EXISTANT → ajoute juste la note résumé. À UTILISER AUTOMATIQUEMENT quand Shawn envoie un vocal qui décrit un appel (patterns: "j\'ai parlé avec X", "vient d\'appeler", "rappel de X", "discussion avec X", "X m\'a appelé", "résumé d\'appel", "X est intéressé par"). NE PAS demander confirmation — exécuter directement.', input_schema: { type: 'object', properties: { transcription: { type: 'string', description: 'Texte transcrit du vocal — passer la transcription Whisper complète, telle quelle' } }, required: ['transcription'] } },
   // ── Centris fiche download ──────────────────────────────────────────────
   { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
+  { name: 'telecharger_docs_centris_complet', description: 'TOUT-EN-UN: envoie au client la fiche Centris officielle (PDF portail courtier) + TOUS les docs Dropbox matchant (match auto par Centris#). Cas d\'usage: "Envoie tout ce qui est dispo sur #12345678 à client@email.com". Toi en Cc auto sur les 2 envois. Le client reçoit 2 emails (1 avec fiche, 1 avec docs Dropbox).', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email du client' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels' }, message_perso: { type: 'string', description: 'OPTIONNEL — message dans email fiche' } }, required: ['centris_num', 'email_destination'] } },
+  { name: 'analyser_zonage_adresse', description: 'Trouve et envoie la grille de zonage PDF officielle pour une adresse Lanaudière. Scrape page urbanisme municipal → trouve liens PDF zonage → télécharge → envoie dans Telegram comme document. Optionnellement forward au client par email avec Cc Shawn. Cas d\'usage: "Marges de construction au 123 Ch. Lac Gratten Rawdon" ou "Grille zonage 456 Rue Sarine Sainte-Julienne, envoie à client@email.com".', input_schema: { type: 'object', properties: { adresse: { type: 'string', description: 'Adresse complète avec ville (ex: "123 Chemin Lac Gratten, Rawdon")' }, forward_email: { type: 'string', description: 'OPTIONNEL — email client si demande explicite forward (Shawn dit "envoie à X")' } }, required: ['adresse'] } },
 ];
 
 // Cache les tools (statiques) — Anthropic prompt caching sur le dernier tool
@@ -6150,6 +6152,145 @@ async function executeTool(name, input, chatId) {
 
       case 'telecharger_fiche_centris': {
         return await telechargerFicheCentris(input || {});
+      }
+
+      case 'analyser_zonage_adresse': {
+        const { adresse, forward_email } = input || {};
+        if (!adresse) return `❌ adresse requise`;
+        // 1. Parse ville depuis l'adresse
+        const villesSlug = {
+          'sainte-julienne': /sainte[\s-]?julienne|st[\s-]?julienne/i,
+          'rawdon': /rawdon/i,
+          'chertsey': /chertsey/i,
+          'saint-calixte': /saint[\s-]?calixte|st[\s-]?calixte/i,
+          'saint-jean-de-matha': /saint[\s-]?jean[\s-]?de[\s-]?matha|st[\s-]?jean[\s-]?de[\s-]?matha/i,
+          'saint-didace': /saint[\s-]?didace|st[\s-]?didace/i,
+          'matawinie': /matawinie/i,
+          'd-autray': /d[\s-]?autray|d'autray/i,
+        };
+        let ville = null;
+        for (const [slug, re] of Object.entries(villesSlug)) {
+          if (re.test(adresse)) { ville = slug; break; }
+        }
+        if (!ville) return `❌ Ville non détectée dans "${adresse}". Villes supportées: ${Object.keys(villesSlug).join(', ')}`;
+        // 2. Scrape page urbanisme + extract PDFs zonage
+        if (!process.env.FIRECRAWL_API_KEY) return `❌ FIRECRAWL_API_KEY absent`;
+        const firecrawl = require('./firecrawl_scraper');
+        let pdfFound = null;
+        try {
+          const r = await firecrawl.scrapMunicipalite(ville, 'zonage');
+          if (!r?.success) return `❌ Scrape ${ville} échoué: ${r?.error || 'unknown'}`;
+          const html = r.markdown || r.contenu || '';
+          // Cherche liens PDF "zonage", "grille", "règlement"
+          const pdfRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+\.pdf[^\s)]*)\)/gi;
+          const matches = [...html.matchAll(pdfRegex)];
+          const zonagePdfs = matches.filter(m =>
+            /zonage|grille|règlement|usage/i.test(m[1] + ' ' + m[2])
+          );
+          pdfFound = (zonagePdfs[0] || matches[0]) || null;
+          if (!pdfFound) {
+            // Fallback: regex naked URLs
+            const naked = (html.match(/https?:\/\/[^\s<>"']+\.pdf\b/gi) || []);
+            const nakedZonage = naked.find(u => /zonage|grille|reglement/i.test(u));
+            if (nakedZonage) pdfFound = ['', 'Zonage', nakedZonage];
+          }
+        } catch (e) { return `❌ Scrape exception: ${e.message?.substring(0, 100)}`; }
+        if (!pdfFound) {
+          return `⚠️ Aucun PDF zonage trouvé sur le site de ${ville}.\nL'adresse: ${adresse}\nPour le récupérer manuellement, va sur la page urbanisme de la municipalité.`;
+        }
+        const pdfUrl = pdfFound[2];
+        const pdfLabel = pdfFound[1] || 'Grille de zonage';
+        // 3. Download PDF
+        let pdfBuffer = null;
+        try {
+          const dl = await fetch(pdfUrl, { redirect: 'follow', signal: AbortSignal.timeout(60000), headers: { 'User-Agent': 'Mozilla/5.0 KiraBot/1.0' } });
+          if (!dl.ok) return `❌ Download PDF HTTP ${dl.status} pour ${pdfUrl}`;
+          pdfBuffer = Buffer.from(await dl.arrayBuffer());
+          if (pdfBuffer.length === 0) return `❌ PDF vide`;
+          if (pdfBuffer.length > 25 * 1024 * 1024) return `❌ PDF trop gros (${Math.round(pdfBuffer.length/1024/1024)}MB)`;
+        } catch (e) { return `❌ Download exception: ${e.message?.substring(0, 100)}`; }
+        const filename = `Zonage_${ville}_${Date.now()}.pdf`;
+        // 4. Envoyer dans Telegram (Shawn voit)
+        if (ALLOWED_ID && chatId) {
+          await bot.sendDocument(chatId, pdfBuffer, {
+            caption: `🗺 *${pdfLabel}* — ${ville}\nAdresse: ${adresse}\n📎 ${Math.round(pdfBuffer.length/1024)}KB\n🔗 ${pdfUrl.substring(0,80)}`,
+            parse_mode: 'Markdown',
+          }, { filename, contentType: 'application/pdf' }).catch(e => log('WARN', 'ZONAGE', `Telegram send: ${e.message}`));
+        }
+        // 5. Forward au client si demandé (avec Cc Shawn auto)
+        let forwardMsg = '';
+        if (forward_email && /@/.test(forward_email)) {
+          try {
+            const token = await getGmailToken();
+            if (!token) { forwardMsg = `\n⚠️ Forward client échoué: Gmail token absent`; }
+            else {
+              const subject = `Grille de zonage — ${adresse}`;
+              const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+              const outer = `zon${Date.now()}`;
+              const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:20px;"><div style="max-width:600px;margin:auto;border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;">${escapeHtml(AGENT.nom)}</h2><p style="color:#cccccc;line-height:1.7;">Bonjour,<br><br>Voici la grille de zonage pour ${escapeHtml(adresse)}.<br><br>N'hésitez pas si vous avez des questions.<br><br>${escapeHtml(AGENT.nom)}<br>${escapeHtml(AGENT.titre)} | ${escapeHtml(AGENT.compagnie)}<br>📞 ${AGENT.telephone}<br>${AGENT.email}</p></div></body></html>`;
+              const ccLine = `Cc: ${AGENT.email}`;
+              const lines = [
+                `From: ${AGENT.nom} <${AGENT.email}>`,
+                `To: ${forward_email}`,
+                ccLine,
+                `Reply-To: ${AGENT.email}`,
+                `Subject: ${enc(subject)}`,
+                'MIME-Version: 1.0',
+                `Content-Type: multipart/mixed; boundary="${outer}"`,
+                '',
+                `--${outer}`,
+                'Content-Type: text/html; charset=UTF-8',
+                'Content-Transfer-Encoding: base64',
+                '',
+                Buffer.from(html, 'utf-8').toString('base64'),
+                `--${outer}`,
+                `Content-Type: application/pdf`,
+                `Content-Disposition: attachment; filename="${enc(filename)}"`,
+                'Content-Transfer-Encoding: base64',
+                '',
+                pdfBuffer.toString('base64'),
+                `--${outer}--`,
+              ];
+              const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+              const sent = await sendEmailLogged({
+                via: 'gmail', to: forward_email, cc: [AGENT.email], subject,
+                category: 'zonage-forward',
+                shawnConsent: true,
+                sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+                  method: 'POST',
+                  headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ raw }),
+                }),
+              });
+              forwardMsg = sent.ok ? `\n✅ Email envoyé à *${forward_email}* (Cc shawn@)` : `\n❌ Email échoué: ${sent.error || sent.status}`;
+            }
+          } catch (e) { forwardMsg = `\n❌ Forward exception: ${e.message?.substring(0,80)}`; }
+        }
+        auditLogEvent('zonage', 'analysed', { adresse, ville, pdfUrl, forwarded: !!forward_email });
+        return `🗺 *Zonage trouvé* — ${ville}\nAdresse: ${adresse}\n📎 PDF envoyé dans Telegram (${Math.round(pdfBuffer.length/1024)}KB)\n🔗 Source: ${pdfUrl.substring(0,100)}${forwardMsg}`;
+      }
+
+      case 'telecharger_docs_centris_complet': {
+        const { centris_num, email_destination, cc, message_perso } = input || {};
+        if (!centris_num || !email_destination) return `❌ centris_num + email_destination requis`;
+        const num = String(centris_num).replace(/\D/g, '').trim();
+        const results = [];
+        // 1. Fiche Centris officielle (portail courtier)
+        try {
+          const r1 = await telechargerFicheCentris({ centris_num: num, email_destination, cc, message_perso });
+          results.push(`📄 *Fiche Centris:*\n${r1}`);
+        } catch (e) {
+          results.push(`📄 *Fiche Centris:* ❌ ${e.message?.substring(0, 100)}`);
+        }
+        // 2. Docs Dropbox matching (par Centris#)
+        try {
+          const r2 = await envoyerDocsProspect(num, email_destination, null, { centrisHint: num });
+          results.push(`📁 *Docs Dropbox:*\n${r2}`);
+        } catch (e) {
+          results.push(`📁 *Docs Dropbox:* ❌ ${e.message?.substring(0, 100)}`);
+        }
+        auditLogEvent('centris', 'docs-complet-sent', { num, to: email_destination });
+        return `✅ *Tout envoyé pour #${num}* → ${email_destination}\n\n${results.join('\n\n')}\n\n_Client a reçu 2 emails: fiche + docs Dropbox. Tu es en Cc sur les 2._`;
       }
 
       case 'recherche_documents': {
@@ -13035,6 +13176,7 @@ function resetRetryCount(msgId) {
 }
 
 async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {}) {
+  const leadStart = Date.now();
   const { nom, telephone, email, centris, adresse, type } = lead;
 
   // DÉDUP multi-clé 7j — email OU tel OU centris# OU (nom+source) = skip
@@ -13384,6 +13526,33 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
 
   // PERSIST audit trail — indexé par msgId + email + centris pour /lead-audit
   auditLogEvent('lead', leadAudit.decision, leadAudit);
+
+  // LEADS_LOG.jsonl — format structuré demandé Shawn 2026-05-13 (PROMPT_CLAUDE_CODE_SESSION)
+  // Append-only JSON Lines pour analyse offline + audit historique persistant
+  try {
+    const leadsLogPath = path.join(DATA_DIR, 'LEADS_LOG.jsonl');
+    const entry = {
+      ts: new Date().toISOString(),
+      centris: centris || null,
+      nom: nom || null,
+      email: email || null,
+      tel: telephone || null,
+      parse_method: (lead._aiValidated || lead._haikuUsed) ? 'haiku' : 'regex',
+      pipedrive_deal: dealId || null,
+      dropbox_match: dbxMatch?.score || 0,
+      dropbox_dossier: dbxMatch?.folder?.name || null,
+      envoi: leadAudit.decision === 'auto_sent' ? 'auto'
+           : leadAudit.decision === 'pending_preview_sent' ? 'pending'
+           : leadAudit.decision === 'blocked_suspect_name' ? 'skip_name'
+           : leadAudit.decision === 'no_dropbox_match' ? 'brouillon'
+           : leadAudit.decision,
+      docs_count: dbxMatch?.pdfs?.length || 0,
+      duree_ms: typeof leadStart === 'number' ? Date.now() - leadStart : null,
+      source: source?.source || null,
+      msgId: msgId || null,
+    };
+    require('fs').appendFileSync(leadsLogPath, JSON.stringify(entry) + '\n');
+  } catch (e) { log('WARN', 'LEADS_LOG', e.message?.substring(0, 100)); }
 
   // Préparer brouillon J+0
   const prospectNom   = nom || (email?.split('@')[0]) || 'Madame/Monsieur';
