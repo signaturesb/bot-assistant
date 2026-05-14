@@ -10178,16 +10178,23 @@ async function checkVeilleCampagnesBackup() {
     const lists = det.recipients?.lists || det.recipients?.listIds || [];
     const dateStr = new Date(camp.scheduledAt).toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
 
-    const tgText = `📧 *Campagne demain à 10h* (backup veille)\n\n` +
+    const tgText = `📧 *Campagne demain à 10h*\n\n` +
       `*${segment}* · #${camp.id}\n` +
       `📅 ${dateStr}\n` +
       `👥 listes [${lists.join(',')}]\n` +
       `📝 ${(det.subject || camp.subject || '').substring(0, 80)}\n\n` +
-      (testOK ? `📬 *Email de prévisualisation envoyé* — vérifie ton inbox.\n\n` : `⚠️ Test email Brevo échoué — voir l'aperçu Brevo direct.\n\n`) +
-      `→ Tape \`/campaigns\` dans le bot pour confirmer/annuler\n\n` +
-      `_Ce notif est un backup côté cloud. Le Mac scheduler peut aussi en avoir envoyé._`;
+      (testOK ? `📬 *Preview envoyé* à shawn@signaturesb.com — vérifie ton inbox.\n\n` : `⚠️ Preview Brevo échoué — voir l'aperçu Brevo direct.\n\n`) +
+      `_Rien ne s'envoie sans ton ✅ Confirmer ci-dessous._`;
 
-    await sendTelegramWithFallback(tgText, { category: 'veille-backup' }).catch(() => {});
+    // Boutons inline direct (1 click, pas besoin de taper /campaigns)
+    const replyMarkup = {
+      inline_keyboard: [[
+        { text: '✅ Confirmer', callback_data: `cmp_send:${camp.id}` },
+        { text: '🚫 Annuler', callback_data: `cmp_cancel:${camp.id}` },
+        { text: '👁 Preview', callback_data: `cmp_preview:${camp.id}` },
+      ]],
+    };
+    await sendTelegramWithFallback(tgText, { category: 'veille-backup', replyMarkup }).catch(() => {});
     state[dedupKey] = new Date().toISOString();
     log('OK', 'VEILLE', `Notif backup #${camp.id} envoyée`);
   }
@@ -10676,12 +10683,16 @@ function startDailyTasks() {
       runDedupHebdo().catch(e => log('WARN', 'DEDUP', `Hebdo: ${e.message}`));
     }
 
-    // ── VEILLE J-1 BACKUP — fail-safe si Mac scheduler.js ne tourne pas ──────
-    // Tourne 19h Eastern: cherche les campagnes suspended schedulées DEMAIN.
-    // Pour chacune: envoie test email Brevo + notif Telegram + marque dédup.
-    // Le Mac scheduler.js peut faire la même chose avant — la dédup empêche
-    // les doublons (key: veille_campaign_<id>).
-    if (h === 19 && lastCron.veilleCampaign !== todayStr) {
+    // ── VEILLE J-1 SUR RENDER (Shawn 2026-05-13) — source de vérité primaire ─
+    // Bug réel (perdu #39 24-avril + #40 8-mai): Mac scheduler.js LaunchAgent
+    // dort si Mac fermé pendant la fenêtre 18-23h Eastern. Render tourne 24/7,
+    // donc on déplace la veille J-1 ici. La fonction interne fait dédup par
+    // campagne (clé veille_<id>_<date>) dans fichier persistent — donc safe
+    // même si réessayé plusieurs fois OU si Mac scheduler fait pareil.
+    //
+    // FENÊTRE ÉLARGIE 19h-23h Eastern (vs h===19 strict avant) — tolère redeploy
+    // Render. Toute heure dans la fenêtre = exécution; dédup interne empêche spam.
+    if (h >= 19 && h <= 23 && lastCron.veilleCampaign !== todayStr) {
       lastCron.veilleCampaign = todayStr;
       checkVeilleCampagnesBackup().catch(e => log('WARN', 'VEILLE', `${e.message}`));
     }
@@ -13922,6 +13933,18 @@ async function main() {
   refreshMailingPlan().catch(e => log('WARN', 'BOOT', `Mailing plan: ${e.message}`));
   // Refresh toutes les heures pour rester à jour
   setInterval(() => refreshMailingPlan().catch(() => {}), 60 * 60 * 1000);
+
+  // Step 2c — CATCH-UP veille J-1 (Shawn 2026-05-13):
+  // Si redeploy/boot pendant la fenêtre 19-23h Eastern et veille pour aujourd'hui
+  // pas encore faite, fire immédiatement. La fonction interne dédup par campagne
+  // dans /data/veille_state.json — donc safe même si recall.
+  try {
+    const bootHourET = parseInt(new Date().toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' }), 10);
+    if (bootHourET >= 19 && bootHourET <= 23) {
+      log('INFO', 'BOOT', `Step 2c: catch-up veille J-1 (boot dans fenêtre ${bootHourET}h Eastern)`);
+      checkVeilleCampagnesBackup().catch(e => log('WARN', 'BOOT', `Veille catch-up: ${e.message}`));
+    }
+  } catch (e) { log('WARN', 'BOOT', `Veille catch-up check: ${e.message}`); }
 
   log('INFO', 'BOOT', 'Step 3: init Gist');
   try { await initGistId(); } catch (e) { log('WARN', 'BOOT', `Gist init: ${e.message}`); }
