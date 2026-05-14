@@ -1534,33 +1534,48 @@ async function uploadDropboxSecret(key, value) {
   if (!dropboxToken) await refreshDropboxToken();
   if (!dropboxToken) { _lastSecretError = 'no dropboxToken — local save only'; return localOk; }
   // Ensure folder exists first (idempotent — 409 si existe = OK)
+  // Auto-retry sur 401 missing_scope (token cached avec vieux scopes) — refresh + retry
+  const tryCreateFolder = async () => fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${dropboxToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: '/bot-secrets', autorename: false }),
+  });
+  const tryUpload = async () => fetch('https://content.dropboxapi.com/2/files/upload', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${dropboxToken}`,
+      'Content-Type': 'application/octet-stream',
+      'Dropbox-API-Arg': JSON.stringify({ path: `/bot-secrets/${key}.txt`, mode: 'overwrite', autorename: false, mute: true })
+    },
+    body: Buffer.from(String(value))
+  });
   try {
-    const fr = await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${dropboxToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: '/bot-secrets', autorename: false }),
-    });
+    let fr = await tryCreateFolder();
+    if (fr.status === 401) {
+      log('WARN', 'SECRETS', `create_folder 401 → refresh token + retry`);
+      await refreshDropboxToken();
+      fr = await tryCreateFolder();
+    }
     if (!fr.ok && fr.status !== 409) {
       const fb = await fr.text().catch(() => '');
       log('WARN', 'SECRETS', `create_folder ${fr.status}: ${fb.substring(0, 150)}`);
     }
   } catch (e) { log('WARN', 'SECRETS', `create_folder exception: ${e.message}`); }
   try {
-    const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${dropboxToken}`,
-        'Content-Type': 'application/octet-stream',
-        'Dropbox-API-Arg': JSON.stringify({ path: `/bot-secrets/${key}.txt`, mode: 'overwrite', autorename: false, mute: true })
-      },
-      body: Buffer.from(String(value))
-    });
+    let res = await tryUpload();
+    if (res.status === 401) {
+      log('WARN', 'SECRETS', `upload 401 → refresh token + retry`);
+      await refreshDropboxToken();
+      res = await tryUpload();
+    }
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
       _lastSecretError = `Dropbox HTTP ${res.status}: ${errBody.substring(0, 200)} (local saved: ${localOk})`;
       log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: ${_lastSecretError}`);
+    } else {
+      log('OK', 'SECRETS', `uploadDropboxSecret ${key} → Dropbox /bot-secrets/${key}.txt`);
     }
-    return res.ok || localOk; // OK si Dropbox OU local marche
+    return res.ok || localOk;
   } catch (e) {
     _lastSecretError = `Dropbox exception: ${e.message} (local saved: ${localOk})`;
     log('WARN', 'SECRETS', `uploadDropboxSecret ${key}: ${e.message}`);
