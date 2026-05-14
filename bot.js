@@ -6658,17 +6658,35 @@ async function testApisHealth() {
       if (!r.ok) fail.push(`Anthropic HTTP ${r.status}`);
     } else { results.anthropic = { ok: false, error: 'key missing' }; fail.push('Anthropic key missing'); }
   } catch (e) { results.anthropic = { ok: false, error: e.message }; fail.push(`Anthropic: ${e.message}`); }
-  // 5. OpenAI (Whisper key valid)
+  // 5. Transcription audio — AssemblyAI primaire OU OpenAI Whisper fallback
+  // Shawn 2026-05-13: AssemblyAI 5h/mois gratuit suffit pour Zapier workflow.
+  // OpenAI = fallback only. Health OK si AU MOINS UN provider configuré.
   try {
-    if (process.env.OPENAI_API_KEY) {
+    const hasAAI = !!process.env.ASSEMBLYAI_API_KEY;
+    const hasOAI = !!process.env.OPENAI_API_KEY;
+    if (hasAAI) {
+      // Test AssemblyAI: GET /v2/transcript/dummy retourne 404 (auth OK) ou 401 (auth KO)
+      const r = await fetch('https://api.assemblyai.com/v2/transcript', {
+        method: 'GET',
+        headers: { 'Authorization': process.env.ASSEMBLYAI_API_KEY },
+        signal: AbortSignal.timeout(8000)
+      });
+      // Codes acceptés: 200, 400 (params manquants mais auth OK), 405 (méthode KO mais auth OK)
+      const aaiOk = r.status < 500 && r.status !== 401 && r.status !== 403;
+      results.transcribe = { ok: aaiOk, provider: 'assemblyai', status: r.status, fallback_openai: hasOAI };
+      if (!aaiOk && !hasOAI) fail.push(`Transcribe AssemblyAI HTTP ${r.status} et pas de fallback OpenAI`);
+    } else if (hasOAI) {
       const r = await fetch('https://api.openai.com/v1/models', {
         headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
         signal: AbortSignal.timeout(8000)
       });
-      results.openai = { ok: r.ok, status: r.status };
+      results.transcribe = { ok: r.ok, provider: 'openai-whisper', status: r.status };
       if (!r.ok) fail.push(`OpenAI HTTP ${r.status}`);
-    } else { results.openai = { ok: false, error: 'key missing' }; fail.push('OpenAI key missing'); }
-  } catch (e) { results.openai = { ok: false, error: e.message }; fail.push(`OpenAI: ${e.message}`); }
+    } else {
+      results.transcribe = { ok: false, error: 'aucun provider configuré (AssemblyAI ni OpenAI)' };
+      fail.push('Transcription: ni AssemblyAI ni OpenAI configuré');
+    }
+  } catch (e) { results.transcribe = { ok: false, error: e.message }; fail.push(`Transcribe: ${e.message}`); }
 
   const allOk = fail.length === 0;
   healthState.lastRun = new Date().toISOString();
