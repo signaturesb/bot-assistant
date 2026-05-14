@@ -5395,33 +5395,106 @@ function parseCentrisHTML(html, ville, jours) {
   return listings.slice(0, 30);
 }
 
+// ─── Fallback: send email avec lien Centris.ca public (Shawn 2026-05-14)
+// Quand Centris courtier inaccessible OU listing pas dans Dropbox Shawn,
+// envoie email pro avec lien Centris.ca public + Cc Shawn auto.
+async function _envoyerListingPubliqueLink({ num, email_destination, cc, message_perso, publicUrl }) {
+  const token = await getGmailToken();
+  if (!token) return `❌ Gmail token absent — pas pouvoir envoyer lien`;
+  const ccUserRaw = cc;
+  const ccUser = !ccUserRaw ? [] : (Array.isArray(ccUserRaw) ? ccUserRaw : String(ccUserRaw).split(',')).map(s => s.trim()).filter(Boolean);
+  const ccFinal = [...new Set([AGENT.email, ...ccUser].filter(e => e && e.toLowerCase() !== email_destination.toLowerCase()))];
+  const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+  const subject = `Propriété Centris #${num} — ${AGENT.compagnie}`;
+  const intro = message_perso || `Bonjour,\n\nVoici les détails de la propriété Centris #${num} que vous m'avez demandée. Tous les détails sont disponibles en ligne via le lien ci-dessous.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
+  const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;margin:0;padding:20px;"><div style="max-width:600px;margin:auto;"><div style="border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;margin:0 0 8px;">${escapeHtml(AGENT.nom)}</h2><div style="color:#999;font-size:13px;font-style:italic;">${escapeHtml(AGENT.titre)} · ${escapeHtml(AGENT.compagnie)}</div></div><p style="color:#cccccc;line-height:1.7;white-space:pre-line;">${escapeHtml(intro)}</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:24px;margin:20px 0;text-align:center;"><div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">🏡 Fiche détaillée</div><div style="color:#f5f5f7;margin-bottom:18px;">Voir la propriété Centris #${num} avec photos, prix, description, taxes, dimensions et tous les détails:</div><a href="${publicUrl}" style="display:inline-block;background:${AGENT.couleur};color:#fff;padding:14px 28px;border-radius:4px;text-decoration:none;font-weight:700;">Voir la fiche complète →</a></div><div style="border-top:1px solid #1a1a1a;padding-top:16px;color:#666;font-size:12px;">📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a></div></div></body></html>`;
+  const lines = [
+    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `To: ${email_destination}`,
+    ccFinal.length ? `Cc: ${ccFinal.join(', ')}` : '',
+    `Reply-To: ${AGENT.email}`,
+    `Subject: ${enc(subject)}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html, 'utf-8').toString('base64'),
+  ].filter(Boolean);
+  const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  const sent = await sendEmailLogged({
+    via: 'gmail', to: email_destination, cc: ccFinal, subject,
+    category: 'centris-fiche-public-link', shawnConsent: true,
+    sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw }),
+    }),
+  });
+  if (!sent.ok) return `❌ Email échoué: ${sent.error || sent.status}`;
+  auditLogEvent('centris', 'public-link-sent', { num, to: email_destination });
+  return `✅ Lien Centris #${num} envoyé à *${email_destination}*\n   🔗 ${publicUrl}\n   Cc: ${ccFinal.join(', ')}\n   _Fiche officielle Matrix inaccessible — envoyé via lien public Centris.ca (contient toutes les infos + photos)._`;
+}
+
 // Chercher les VENDUS sur Centris (avec session agent)
 // ─── Centris fiche download — outil le plus robuste ─────────────────────
 // Télécharge la fiche détaillée PDF d'un listing Centris (peu importe le
 // courtier inscripteur) en utilisant les credentials de Shawn. Stratégies:
-// 1. Try patterns URL directs (MX/PrintSheet, fr/agent/...)
+// 0. Pré-check: listing existe sur Centris.ca public (évite waste session)
+// 1. Try patterns URL directs (MX/PrintSheet, fr/agent/...) — vieux portail
 // 2. Si rien → fetch page listing + extract liens PDF
-// 3. Send email avec PDF en pièce jointe (consent attesté par la commande)
+// 3. Si tout échoue → fallback _envoyerListingPubliqueLink (lien public)
 async function telechargerFicheCentris({ centris_num, email_destination, cc, message_perso }) {
   const num = String(centris_num || '').replace(/\D/g, '').trim();
   if (!num || num.length < 7 || num.length > 9) return `❌ Numéro Centris invalide (7-9 chiffres requis)`;
   if (!email_destination || !/@/.test(email_destination)) return `❌ Email destination requis`;
+
+  // STRATÉGIE 0 — Vérif listing existe sur Centris.ca public (gate against typos/invalid MLS)
+  // Si 404 sur public, on évite waste de session courtier sur listing inexistant.
+  let listingExistsPublic = false;
+  let publicUrl = `https://www.centris.ca/fr/properties~a-vendre/${num}`;
+  let listingPublicHtml = null;
+  try {
+    const r = await fetch(publicUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(15000), redirect: 'follow',
+    });
+    if (r.ok) {
+      listingPublicHtml = await r.text();
+      // Page existe si pas "404" et contient signaux listing
+      if (!/Property Not Found|404|Page non trouvée/i.test(listingPublicHtml.substring(0, 5000))
+          && /MLS|address|adresse|price|prix/i.test(listingPublicHtml.substring(0, 5000))
+          && listingPublicHtml.length > 50000) {
+        listingExistsPublic = true;
+      }
+    }
+  } catch {}
+  if (!listingExistsPublic) {
+    return `⚠️ Listing #${num} introuvable sur Centris.ca public.\n\nPossibilités:\n  • MLS invalide ou typo\n  • Listing expiré/retiré\n  • Listing très récent (pas encore indexé)\n\nVérifie le numéro et réessaie. Pour listings dans ton Dropbox, utilise plutôt envoyer_docs_prospect.`;
+  }
+
   if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) {
     return `❌ CENTRIS_USER/PASS non configurés dans Render — impossible d'accéder au portail courtier`;
   }
   // Auto-login si pas connecté
   if (!centrisSession.cookies || Date.now() > centrisSession.expiry) {
     const ok = await centrisLogin();
-    if (!ok) return `❌ Login Centris échoué — vérifie CENTRIS_USER/CENTRIS_PASS`;
+    if (!ok) {
+      // Si login fail, on PEUT quand même envoyer le lien public au client
+      log('WARN', 'CENTRIS', `Login échoué, fallback: send lien public`);
+      return await _envoyerListingPubliqueLink({ num, email_destination, cc, message_perso, publicUrl });
+    }
   }
 
   // STRATÉGIE 1 — patterns URL PDF directs (testés en ordre)
-  // Centris agent expose plusieurs endpoints selon version site
+  // Mise à jour 2026-05-14: agent.centris.ca retiré, faut matrix.centris.ca
+  // Note: matrix.centris.ca URLs sont state-based donc difficile en server-side.
+  // Si tous échouent → fallback lien public.
   const pdfUrls = [
     `${CENTRIS_BASE}/MX/PrintSheet/${num}`,
     `${CENTRIS_BASE}/MX/PrintSheet?num=${num}`,
     `${CENTRIS_BASE}/fr/agent/listings/${num}/sheet`,
     `${CENTRIS_BASE}/fr/print/${num}`,
+    `https://matrix.centris.ca/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${num}`,
   ];
   let pdfBuffer = null;
   let pdfSource = null;
@@ -5486,10 +5559,10 @@ async function telechargerFicheCentris({ centris_num, email_destination, cc, mes
   }
 
   if (!pdfBuffer) {
-    return `❌ Fiche PDF non trouvée pour Centris #${num}\n` +
-           `Stratégies tentées: 4 URLs PDF directs + 3 pages listing\n` +
-           `Possibles raisons: listing n'existe pas, accès courtier limité, format Centris a changé.\n` +
-           `Workaround: va sur agent.centris.ca → listing → "Imprimer fiche" → forward le PDF au bot avec /pdf <url>`;
+    // FALLBACK final — listing existe (vérifié strat 0) mais PDF Matrix inaccessible
+    // Envoie lien public Centris.ca au client (contient toutes les infos + photos)
+    log('WARN', 'CENTRIS', `PDF Matrix non trouvé pour #${num} — fallback lien public`);
+    return await _envoyerListingPubliqueLink({ num, email_destination, cc, message_perso, publicUrl });
   }
 
   // ENVOI EMAIL — via Gmail avec sendEmailLogged (audit + consent attesté)
