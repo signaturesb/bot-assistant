@@ -13204,6 +13204,73 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/centris-mfa-code — lit Gmail pour code MFA email Centris/Auth0
+  // Pour autonomie complète: Auth0 envoie email à shawn@signaturesb.com, bot lit
+  // via OAuth Gmail (déjà setup), extract code 6 chiffres, return.
+  // Permet à un script externe de récupérer le code MFA sans intervention manuelle.
+  if (req.method === 'GET' && url.startsWith('/admin/centris-mfa-code')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 30)) {
+      res.writeHead(429); res.end('rate limit'); return;
+    }
+    const u = new URL(req.url, 'http://x');
+    const token = u.searchParams.get('token') || '';
+    if (!process.env.WEBHOOK_SECRET || token !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    try {
+      const gmailTok = await getGmailToken();
+      if (!gmailTok) { res.writeHead(500); res.end(JSON.stringify({error:'no gmail token'})); return; }
+      // Cherche emails récents de Centris/Auth0 dans les 5 dernières minutes
+      const query = encodeURIComponent('(from:noreply@centris.ca OR from:no-reply@centris.ca OR from:auth0 OR subject:Centris OR subject:"verification code") newer_than:1h');
+      const listRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query}&maxResults=5`, {
+        headers: { 'Authorization': `Bearer ${gmailTok}` },
+        signal: AbortSignal.timeout(10000),
+      });
+      const list = await listRes.json();
+      const messages = list.messages || [];
+      let foundCode = null;
+      let foundSubject = null;
+      for (const m of messages.slice(0, 5)) {
+        const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`, {
+          headers: { 'Authorization': `Bearer ${gmailTok}` },
+          signal: AbortSignal.timeout(10000),
+        });
+        const msg = await msgRes.json();
+        const headers = msg.payload?.headers || [];
+        const subject = headers.find(h => h.name === 'Subject')?.value || '';
+        const snippet = msg.snippet || '';
+        // Parse body parts for full text
+        let bodyText = snippet;
+        const parts = msg.payload?.parts || [msg.payload];
+        for (const p of parts) {
+          if (p?.body?.data) {
+            try {
+              bodyText += ' ' + Buffer.from(p.body.data, 'base64').toString('utf8');
+            } catch {}
+          }
+        }
+        // Match 6-digit code
+        const codeMatch = bodyText.match(/\b(\d{6})\b/);
+        if (codeMatch) {
+          foundCode = codeMatch[1];
+          foundSubject = subject;
+          break;
+        }
+      }
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        ok: !!foundCode,
+        code: foundCode,
+        subject: foundSubject,
+        emails_checked: messages.length,
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({error: e.message?.substring(0, 200)}));
+    }
+    return;
+  }
+
   // ─── POST /admin/centris-cookies — push cookies depuis Mac (>4KB) ───────
   // Bypass Telegram 4096 char limit. Sécurité: bot teste les cookies contre
   // Centris AVANT de save — si ça marche pas, on save pas. Donc inutile pour
