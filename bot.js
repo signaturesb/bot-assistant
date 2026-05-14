@@ -4354,50 +4354,129 @@ const WHISPER_PROMPT_BASE =
   `Rawdon, Sainte-Julienne, Saint-Calixte, Chertsey, Saint-Jean-de-Matha, Saint-Didace, Joliette, Berthierville, ` +
   `Mascouche, Terrebonne, Repentigny, Saint-Donat, Saint-Côme, Notre-Dame-de-la-Merci, Entrelacs, MRC Matawinie, MRC D'Autray.`;
 
-async function transcrire(audioBuffer, opts = {}) {
+// Post-correction commune (Whisper + AssemblyAI ont tendance à mal entendre les noms locaux)
+function _postCorrigerTranscription(text) {
+  if (!text) return text;
+  return text
+    .replace(/\bSente Julienne\b/gi, 'Sainte-Julienne')
+    .replace(/\bSainte Julienne\b/gi, 'Sainte-Julienne')
+    .replace(/\bRedon\b/gi, 'Rawdon').replace(/\bReadon\b/gi, 'Rawdon')
+    .replace(/\bCentrice\b/gi, 'Centris').replace(/\bcentriste?\b/gi, 'Centris')
+    .replace(/\bpipe drive\b/gi, 'Pipedrive')
+    .replace(/\bpro fab\b/gi, 'ProFab')
+    .replace(/\bdesjardin\b/gi, 'Desjardins')
+    .replace(/\bre max\b/gi, 'RE/MAX')
+    .replace(/\bmatawini\b/gi, 'Matawinie')
+    .replace(/\bdupropraio\b/gi, 'DuProprio');
+}
+
+// ─── AssemblyAI transcription (provider primaire, 5h/mois gratuit) ───────────
+async function _transcrireAssemblyAI(audioBuffer, opts = {}) {
+  const key = process.env.ASSEMBLYAI_API_KEY;
+  if (!key) throw new Error('ASSEMBLYAI_API_KEY absent');
+  // 1. Upload audio bytes (raw binary, pas multipart)
+  const uploadRes = await fetch('https://api.assemblyai.com/v2/upload', {
+    method: 'POST',
+    headers: { 'Authorization': key, 'Content-Type': 'application/octet-stream' },
+    body: audioBuffer,
+    signal: AbortSignal.timeout(45000),
+  });
+  if (!uploadRes.ok) {
+    const err = await uploadRes.text().catch(() => '');
+    throw new Error(`AssemblyAI upload ${uploadRes.status}: ${err.substring(0, 120)}`);
+  }
+  const { upload_url } = await uploadRes.json();
+  // 2. Submit transcript request (fr, prompt boost noms)
+  const submitBody = {
+    audio_url: upload_url,
+    speech_models: ['universal-3-pro', 'universal-2'],
+    language_code: 'fr',
+  };
+  if (opts.recentContext) {
+    // keyterms_prompt: jusqu'à 1000 termes avec U3 Pro
+    submitBody.keyterms_prompt = String(opts.recentContext).split(/[,\s]+/).filter(Boolean).slice(0, 50);
+  }
+  const submitRes = await fetch('https://api.assemblyai.com/v2/transcript', {
+    method: 'POST',
+    headers: { 'Authorization': key, 'Content-Type': 'application/json' },
+    body: JSON.stringify(submitBody),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!submitRes.ok) {
+    const err = await submitRes.text().catch(() => '');
+    throw new Error(`AssemblyAI submit ${submitRes.status}: ${err.substring(0, 120)}`);
+  }
+  const { id } = await submitRes.json();
+  // 3. Poll until completed (max 90s, audio courts = ~5-15s)
+  const start = Date.now();
+  while (Date.now() - start < 90000) {
+    await new Promise(r => setTimeout(r, 2000));
+    const pollRes = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, {
+      headers: { 'Authorization': key },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!pollRes.ok) continue;
+    const data = await pollRes.json();
+    if (data.status === 'completed') return data.text?.trim() || null;
+    if (data.status === 'error') throw new Error(`AssemblyAI transcript error: ${data.error || 'unknown'}`);
+  }
+  throw new Error('AssemblyAI transcription timeout (90s)');
+}
+
+// ─── OpenAI Whisper transcription (fallback) ─────────────────────────────────
+async function _transcrireWhisper(audioBuffer, opts = {}) {
   const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error('OPENAI_API_KEY non configuré dans Render');
-  if (audioBuffer.length > 24 * 1024 * 1024) throw new Error('Message vocal trop long (max ~15 min)');
+  if (!key) throw new Error('OPENAI_API_KEY absent');
   const formData = new FormData();
   formData.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'voice.ogg');
   formData.append('model', 'whisper-1');
   formData.append('language', 'fr');
-  // Prompt: base + contexte récent (noms de prospects récents pour meilleure reco)
   let prompt = WHISPER_PROMPT_BASE;
   if (opts.recentContext) {
-    // Append les noms/Centris# des derniers leads pour booster reconnaissance
-    const ctx = opts.recentContext.substring(0, 200); // garde sous limite tokens
+    const ctx = opts.recentContext.substring(0, 200);
     prompt = (prompt + ' ' + ctx).substring(0, 1000);
   }
   formData.append('prompt', prompt);
-  // Temperature 0 = max déterminisme (pas de variation aléatoire)
   formData.append('temperature', '0');
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 30000);
-  try {
-    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', signal: controller.signal, headers: { 'Authorization': `Bearer ${key}` }, body: formData });
-    if (!res.ok) { const err = await res.text(); throw new Error(`Whisper HTTP ${res.status}: ${err.substring(0, 150)}`); }
-    const data = await res.json();
-    let text = data.text?.trim() || null;
-    if (text) {
-      // Post-correction: Whisper a tendance à mal entendre certains noms — fix manuel
-      text = text
-        .replace(/\bSente Julienne\b/gi, 'Sainte-Julienne')
-        .replace(/\bSainte Julienne\b/gi, 'Sainte-Julienne')
-        .replace(/\bRedon\b/gi, 'Rawdon').replace(/\bReadon\b/gi, 'Rawdon')
-        .replace(/\bCentrice\b/gi, 'Centris').replace(/\bcentriste?\b/gi, 'Centris')
-        .replace(/\bpipe drive\b/gi, 'Pipedrive')
-        .replace(/\bpro fab\b/gi, 'ProFab')
-        .replace(/\bdesjardin\b/gi, 'Desjardins')
-        .replace(/\bre max\b/gi, 'RE/MAX')
-        .replace(/\bmatawini\b/gi, 'Matawinie')
-        .replace(/\bdupropraio\b/gi, 'DuProprio');
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST', headers: { 'Authorization': `Bearer ${key}` }, body: formData,
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) { const err = await res.text(); throw new Error(`Whisper HTTP ${res.status}: ${err.substring(0, 150)}`); }
+  const data = await res.json();
+  return data.text?.trim() || null;
+}
+
+async function transcrire(audioBuffer, opts = {}) {
+  if (audioBuffer.length > 24 * 1024 * 1024) throw new Error('Message vocal trop long (max ~15 min)');
+  // Provider hiérarchie (Shawn 2026-05-13): AssemblyAI primaire (5h/mois gratuit), Whisper fallback
+  const hasAAI = !!process.env.ASSEMBLYAI_API_KEY;
+  const hasOAI = !!process.env.OPENAI_API_KEY;
+  if (!hasAAI && !hasOAI) throw new Error('Aucun provider transcription configuré (ASSEMBLYAI_API_KEY ni OPENAI_API_KEY)');
+  let lastErr = null;
+  // 1. Tente AssemblyAI d'abord
+  if (hasAAI) {
+    try {
+      const text = await _transcrireAssemblyAI(audioBuffer, opts);
+      log('OK', 'TRANSCRIBE', `AssemblyAI ${text?.length || 0} chars`);
+      return _postCorrigerTranscription(text);
+    } catch (e) {
+      lastErr = e;
+      log('WARN', 'TRANSCRIBE', `AssemblyAI fail: ${e.message?.substring(0, 100)} — fallback Whisper`);
     }
-    return text;
-  } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Transcription trop longue (timeout 30s)');
-    throw e;
-  } finally { clearTimeout(t); }
+  }
+  // 2. Fallback Whisper
+  if (hasOAI) {
+    try {
+      const text = await _transcrireWhisper(audioBuffer, opts);
+      log('OK', 'TRANSCRIBE', `Whisper fallback ${text?.length || 0} chars`);
+      return _postCorrigerTranscription(text);
+    } catch (e) {
+      lastErr = e;
+      log('ERR', 'TRANSCRIBE', `Whisper fail aussi: ${e.message?.substring(0, 100)}`);
+    }
+  }
+  throw lastErr || new Error('Transcription failed');
 }
 
 // ─── Résumé d'appel téléphonique (Haiku → JSON structuré) ───────────────────
