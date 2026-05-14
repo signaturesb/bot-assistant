@@ -5859,6 +5859,7 @@ const TOOLS = [
   { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'telecharger_docs_centris_complet', description: 'TOUT-EN-UN: envoie au client la fiche Centris officielle (PDF portail courtier) + TOUS les docs Dropbox matchant (match auto par Centris#). Cas d\'usage: "Envoie tout ce qui est dispo sur #12345678 à client@email.com". Toi en Cc auto sur les 2 envois. Le client reçoit 2 emails (1 avec fiche, 1 avec docs Dropbox).', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email du client' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels' }, message_perso: { type: 'string', description: 'OPTIONNEL — message dans email fiche' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'analyser_zonage_adresse', description: 'Trouve et envoie la grille de zonage PDF officielle pour une adresse Lanaudière. Scrape page urbanisme municipal → trouve liens PDF zonage → télécharge → envoie dans Telegram comme document. Optionnellement forward au client par email avec Cc Shawn. Cas d\'usage: "Marges de construction au 123 Ch. Lac Gratten Rawdon" ou "Grille zonage 456 Rue Sarine Sainte-Julienne, envoie à client@email.com".', input_schema: { type: 'object', properties: { adresse: { type: 'string', description: 'Adresse complète avec ville (ex: "123 Chemin Lac Gratten, Rawdon")' }, forward_email: { type: 'string', description: 'OPTIONNEL — email client si demande explicite forward (Shawn dit "envoie à X")' } }, required: ['adresse'] } },
+  { name: 'telecharger_annexes_centris', description: 'Récupère TOUTES les annexes Centris d\'un listing via portail courtier authentifié: Déclaration Vendeur (DV), certificat de localisation, plans cadastraux, rapport inspection, etc. Tout ce qui est dans la section "Annexes" du listing Matrix. Cas d\'usage: "Donne-moi la DV du #12345678" ou "Toutes les annexes Centris pour #12345678 à client@email.com".', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS (7-9 chiffres)' }, email_destination: { type: 'string', description: 'OPTIONNEL — email client pour forward avec Cc Shawn. Si vide: envoi dans Telegram seulement.' }, filtre: { type: 'string', description: 'OPTIONNEL — filtrer par mot-clé dans nom annexe (ex: "DV", "déclaration", "localisation", "plan"). Si vide: toutes les annexes.' } }, required: ['centris_num'] } },
 ];
 
 // Cache les tools (statiques) — Anthropic prompt caching sur le dernier tool
@@ -6167,6 +6168,184 @@ async function executeTool(name, input, chatId) {
 
       case 'telecharger_fiche_centris': {
         return await telechargerFicheCentris(input || {});
+      }
+
+      case 'telecharger_annexes_centris': {
+        const { centris_num, email_destination, filtre } = input || {};
+        const num = String(centris_num || '').replace(/\D/g, '').trim();
+        if (!num || num.length < 7) return `❌ Numéro Centris invalide`;
+        if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) return `❌ CENTRIS_USER/PASS absents`;
+        // Login si pas connecté
+        if (!centrisSession.cookies || Date.now() > centrisSession.expiry) {
+          const ok = await centrisLogin();
+          if (!ok) return `❌ Login Centris échoué`;
+        }
+        // 1. Naviguer page detail comme un humain — tester plusieurs URLs Matrix
+        const listingUrls = [
+          `${CENTRIS_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${num}`,
+          `${CENTRIS_BASE}/MX/Detail/${num}`,
+          `${CENTRIS_BASE}/fr/agent/listings/${num}`,
+          `${CENTRIS_BASE}/fr/listings/${num}`,
+          `${CENTRIS_BASE}/Detail/${num}`,
+        ];
+        let detailHtml = null;
+        let detailUrl = null;
+        for (const url of listingUrls) {
+          try {
+            const r = await fetch(url, {
+              headers: { ...CENTRIS_HEADERS, 'Cookie': centrisSession.cookies, 'Referer': CENTRIS_BASE },
+              signal: AbortSignal.timeout(20000), redirect: 'follow',
+            });
+            if (!r.ok) continue;
+            const html = await r.text();
+            if (html.length < 5000 || /login|signin|connexion/i.test(html.substring(0, 2000))) continue;
+            detailHtml = html;
+            detailUrl = r.url || url;
+            break;
+          } catch {}
+        }
+        if (!detailHtml) return `❌ Page detail listing #${num} inaccessible. Vérifie session Centris.`;
+        // 2. Extract TOUS les liens documents/annexes
+        // Patterns Centris Matrix:
+        //  /Matrix/Public/MediaHandler.ashx?ID=XXX  (PDFs annexes)
+        //  /Matrix/Public/Annex.ashx?ID=XXX
+        //  /MX/Annex/{id}
+        //  href="...déclaration..." href="...DV..." href="...localisation..." href="...plan..."
+        const allLinks = [...detailHtml.matchAll(/href=["']([^"']+)["'][^>]*>([^<]{3,120})</gi)]
+          .map(m => ({ url: m[1], label: m[2].replace(/&[a-z]+;/g, ' ').replace(/\s+/g, ' ').trim() }));
+        const annexLinks = allLinks.filter(l => {
+          const both = (l.url + ' ' + l.label).toLowerCase();
+          return /\.pdf|annex|déclaration|declaration|localisation|cadastre|plan|inspection|mediahandler|certificat|servitude|titre/.test(both)
+              && !/javascript:|mailto:|tel:|#$/.test(l.url);
+        });
+        // Dédup
+        const seen = new Set();
+        const uniqueAnnexes = [];
+        for (const a of annexLinks) {
+          const key = a.url.split('?')[0];
+          if (seen.has(key)) continue;
+          seen.add(key);
+          uniqueAnnexes.push(a);
+        }
+        // Filtre optionnel par mot-clé
+        let toDownload = uniqueAnnexes;
+        if (filtre) {
+          const f = filtre.toLowerCase();
+          toDownload = uniqueAnnexes.filter(a => (a.url + ' ' + a.label).toLowerCase().includes(f));
+        }
+        if (!toDownload.length) {
+          return `📭 Aucune annexe trouvée pour Centris #${num}${filtre ? ` (filtre: "${filtre}")` : ''}.\n` +
+                 `${uniqueAnnexes.length} liens totaux détectés mais aucun match.\n` +
+                 `Liens trouvés: ${uniqueAnnexes.slice(0, 5).map(a => a.label || a.url.substring(0, 60)).join(' | ')}`;
+        }
+        // 3. Download chaque annexe (max 15) — SEQUENTIEL avec délais "humains"
+        // pour éviter détection scraping par Centris (rate limit + comportement réel)
+        const downloads = [];
+        for (let idx = 0; idx < Math.min(toDownload.slice(0, 15).length, 15); idx++) {
+          const a = toDownload[idx];
+          // Délai aléatoire 800-2400ms entre downloads (comme un humain qui regarde chaque doc)
+          if (idx > 0) await new Promise(r => setTimeout(r, 800 + Math.random() * 1600));
+          try {
+            const absUrl = a.url.startsWith('http') ? a.url : `${CENTRIS_BASE}${a.url.startsWith('/') ? a.url : '/' + a.url}`;
+            const dl = await fetch(absUrl, {
+              headers: {
+                ...CENTRIS_HEADERS,
+                'Cookie': centrisSession.cookies,
+                'Referer': detailUrl,
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Sec-Fetch-User': '?1',
+              },
+              signal: AbortSignal.timeout(45000), redirect: 'follow',
+            });
+            if (!dl.ok) { downloads.push({ label: a.label, error: `HTTP ${dl.status}` }); continue; }
+            const buf = Buffer.from(await dl.arrayBuffer());
+            // Vérifie c'est un PDF (magic bytes)
+            if (buf.length < 1000 || buf.slice(0, 4).toString() !== '%PDF') {
+              downloads.push({ label: a.label, error: 'pas un PDF' }); continue;
+            }
+            const cleanLabel = (a.label || `Annexe_${num}`).replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+            const filename = `${cleanLabel}_${num}.pdf`;
+            downloads.push({ label: a.label, buffer: buf, size: buf.length, filename, url: absUrl });
+          } catch (e) { downloads.push({ label: a.label, error: e.message.substring(0, 80) }); }
+        }
+        const ok = downloads.filter(d => d.buffer);
+        const fails = downloads.filter(d => d.error);
+        if (!ok.length) {
+          return `❌ Aucune annexe téléchargée. ${fails.length} échec(s):\n${fails.slice(0, 5).map(f => `  • ${f.label}: ${f.error}`).join('\n')}`;
+        }
+        // 4. Envoyer chacune dans Telegram
+        if (ALLOWED_ID && chatId) {
+          for (const doc of ok) {
+            await bot.sendDocument(chatId, doc.buffer, {
+              caption: `📎 *${doc.label}*\nCentris #${num} · ${Math.round(doc.size/1024)}KB`,
+              parse_mode: 'Markdown',
+            }, { filename: doc.filename, contentType: 'application/pdf' }).catch(e => log('WARN', 'CENTRIS', `Telegram send: ${e.message}`));
+          }
+        }
+        // 5. Forward email si demandé (multi-PJ en 1 email)
+        let emailMsg = '';
+        if (email_destination && /@/.test(email_destination)) {
+          const token = await getGmailToken();
+          if (!token) { emailMsg = `\n⚠️ Forward client échoué: Gmail token absent`; }
+          else {
+            const subject = `Annexes Centris #${num}${filtre ? ` — ${filtre}` : ''}`;
+            const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+            const outer = `ann${Date.now()}`;
+            const pjList = ok.map(d => `📎 ${d.filename} (${Math.round(d.size/1024)}KB)`).join('<br>');
+            const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:20px;"><div style="max-width:600px;margin:auto;border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;">${escapeHtml(AGENT.nom)}</h2><p style="color:#cccccc;line-height:1.7;">Bonjour,<br><br>Voici les ${ok.length} annexes Centris pour le listing #${num}:<br><br>${pjList}<br><br>N'hésitez pas si vous avez des questions.<br><br>${escapeHtml(AGENT.nom)}<br>${escapeHtml(AGENT.titre)} | ${escapeHtml(AGENT.compagnie)}<br>📞 ${AGENT.telephone}<br>${AGENT.email}</p></div></body></html>`;
+            const parts = [
+              `From: ${AGENT.nom} <${AGENT.email}>`,
+              `To: ${email_destination}`,
+              `Cc: ${AGENT.email}`,
+              `Reply-To: ${AGENT.email}`,
+              `Subject: ${enc(subject)}`,
+              'MIME-Version: 1.0',
+              `Content-Type: multipart/mixed; boundary="${outer}"`,
+              '',
+              `--${outer}`,
+              'Content-Type: text/html; charset=UTF-8',
+              'Content-Transfer-Encoding: base64',
+              '',
+              Buffer.from(html, 'utf-8').toString('base64'),
+            ];
+            // Cap total taille à 22MB (Gmail limit 25MB avec encoding)
+            let totalSize = 0;
+            const includedDocs = [];
+            for (const d of ok) {
+              const encodedSize = Math.ceil(d.size * 4 / 3);
+              if (totalSize + encodedSize > 22 * 1024 * 1024) break;
+              totalSize += encodedSize;
+              includedDocs.push(d);
+              parts.push(`--${outer}`);
+              parts.push(`Content-Type: application/pdf`);
+              parts.push(`Content-Disposition: attachment; filename="${enc(d.filename)}"`);
+              parts.push('Content-Transfer-Encoding: base64');
+              parts.push('');
+              parts.push(d.buffer.toString('base64'));
+            }
+            parts.push(`--${outer}--`);
+            const raw = Buffer.from(parts.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+            const sent = await sendEmailLogged({
+              via: 'gmail', to: email_destination, cc: [AGENT.email], subject,
+              category: 'centris-annexes-forward', shawnConsent: true,
+              sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ raw }),
+              }),
+            });
+            emailMsg = sent.ok
+              ? `\n✅ ${includedDocs.length} annexes envoyées à *${email_destination}* (Cc shawn@)`
+              : `\n❌ Email échoué: ${sent.error || sent.status}`;
+          }
+        }
+        auditLogEvent('centris', 'annexes-downloaded', { num, count: ok.length, filtre, forwarded: !!email_destination });
+        return `📂 *${ok.length} annexes Centris #${num}* récupérées${filtre ? ` (filtre: "${filtre}")` : ''}\n\n` +
+               ok.map(d => `  📎 ${d.label} (${Math.round(d.size/1024)}KB)`).join('\n') +
+               (fails.length ? `\n\n⚠️ ${fails.length} échec(s):\n${fails.slice(0, 3).map(f => `  • ${f.label}: ${f.error}`).join('\n')}` : '') +
+               emailMsg;
       }
 
       case 'analyser_zonage_adresse': {
