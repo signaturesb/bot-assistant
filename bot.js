@@ -6465,24 +6465,45 @@ async function testApisHealth() {
 // ─── BACKUP HELPER (snapshot avant action destructive) ────────────────────────
 async function backupBeforeAction(label, items) {
   if (!items || !items.length) return { backed_up: 0, dropbox_path: null };
+  // Auto-refresh si pas de token (vs skip avant) — résout 401 fréquent (Shawn 2026-05-13)
   if (!dropboxToken) {
-    log('WARN', 'BACKUP', `Pas de Dropbox token — skip backup ${label}`);
-    return { backed_up: 0, dropbox_path: null, error: 'no dropbox' };
+    log('WARN', 'BACKUP', `Pas de Dropbox token — tentative refresh pour ${label}`);
+    const ok = await refreshDropboxToken();
+    if (!ok) {
+      // Fallback: persistent disk Render
+      try {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        const localPath = path.join(DATA_DIR, 'backups', `${label}_${ts}.json`);
+        require('fs').mkdirSync(require('path').dirname(localPath), { recursive: true });
+        require('fs').writeFileSync(localPath, JSON.stringify({ at: new Date().toISOString(), label, count: items.length, items }, null, 2));
+        log('OK', 'BACKUP', `${label}: ${items.length} items → ${localPath} (local fallback)`);
+        return { backed_up: items.length, dropbox_path: null, local_path: localPath, fallback: 'local' };
+      } catch (e) {
+        return { backed_up: 0, dropbox_path: null, error: 'no dropbox + local fail' };
+      }
+    }
   }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const dbxPath = `/Backups/${label}_${ts}.json`;
+  const content = JSON.stringify({ at: new Date().toISOString(), label, count: items.length, items }, null, 2);
+  const buffer = Buffer.from(content, 'utf-8');
+  const doUpload = async () => fetch('https://content.dropboxapi.com/2/files/upload', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${dropboxToken}`,
+      'Dropbox-API-Arg': JSON.stringify({ path: dbxPath, mode: 'add', autorename: true, mute: true }),
+      'Content-Type': 'application/octet-stream',
+    },
+    body: buffer,
+  });
   try {
-    const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const path = `/Backups/${label}_${ts}.json`;
-    const content = JSON.stringify({ at: new Date().toISOString(), label, count: items.length, items }, null, 2);
-    const buffer = Buffer.from(content, 'utf-8');
-    const res = await fetch('https://content.dropboxapi.com/2/files/upload', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${dropboxToken}`,
-        'Dropbox-API-Arg': JSON.stringify({ path, mode: 'add', autorename: true, mute: true }),
-        'Content-Type': 'application/octet-stream',
-      },
-      body: buffer,
-    });
+    let res = await doUpload();
+    // Auto-retry sur 401 (token expiré pendant l'opération) — comme dropboxAPI wrapper
+    if (res.status === 401) {
+      log('WARN', 'BACKUP', `${label}: token expiré, refresh + retry`);
+      const ok = await refreshDropboxToken();
+      if (ok) res = await doUpload();
+    }
     if (res.ok) {
       const data = await res.json();
       log('OK', 'BACKUP', `${label}: ${items.length} items → ${data.path_lower}`);
@@ -6490,7 +6511,16 @@ async function backupBeforeAction(label, items) {
     } else {
       const err = await res.text();
       log('WARN', 'BACKUP', `${label} fail: ${res.status} ${err.substring(0, 100)}`);
-      return { backed_up: 0, dropbox_path: null, error: `HTTP ${res.status}` };
+      // Fallback local disk si Dropbox toujours en échec après retry
+      try {
+        const localPath = path.join(DATA_DIR, 'backups', `${label}_${ts}.json`);
+        require('fs').mkdirSync(require('path').dirname(localPath), { recursive: true });
+        require('fs').writeFileSync(localPath, content);
+        log('OK', 'BACKUP', `${label}: fallback → ${localPath}`);
+        return { backed_up: items.length, dropbox_path: null, local_path: localPath, fallback: 'local_after_401' };
+      } catch {
+        return { backed_up: 0, dropbox_path: null, error: `HTTP ${res.status}` };
+      }
     }
   } catch (e) {
     log('WARN', 'BACKUP', `${label} exception: ${e.message}`);
