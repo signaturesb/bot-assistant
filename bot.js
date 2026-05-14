@@ -13204,6 +13204,47 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/centris-fetch?url=URL — fetch n'importe quelle URL Centris avec session
+  // Pour debug: tester quelles URLs Matrix retournent PDF avec les cookies fresh du bot
+  if (req.method === 'GET' && url.startsWith('/admin/centris-fetch')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 20)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const token = u.searchParams.get('token') || '';
+    if (token !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const targetUrl = u.searchParams.get('url') || '';
+    if (!targetUrl || !targetUrl.startsWith('http')) { res.writeHead(400); res.end('url required'); return; }
+    if (!centrisSession?.cookies) { res.writeHead(503); res.end(JSON.stringify({error:'no centris session'})); return; }
+    try {
+      const r = await fetch(targetUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
+          'Cookie': centrisSession.cookies,
+          'Referer': 'https://matrix.centris.ca/Matrix/Home',
+        },
+        signal: AbortSignal.timeout(30000),
+        redirect: 'follow',
+      });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const ct = r.headers.get('content-type') || '';
+      const isPdf = buf.length > 100 && buf.slice(0, 4).toString() === '%PDF';
+      const preview = isPdf ? '(PDF binary)' : buf.toString('utf8', 0, 500);
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        url: targetUrl,
+        finalUrl: r.url,
+        status: r.status,
+        contentType: ct,
+        size: buf.length,
+        isPdf,
+        preview: preview.substring(0, 500),
+      }));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({error: e.message?.substring(0, 200)}));
+    }
+    return;
+  }
+
   // ─── GET /admin/centris-mfa-code — lit Gmail pour code MFA email Centris/Auth0
   // Pour autonomie complète: Auth0 envoie email à shawn@signaturesb.com, bot lit
   // via OAuth Gmail (déjà setup), extract code 6 chiffres, return.
