@@ -13311,6 +13311,23 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/brevo-events?email=X — vérifier statut delivery
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-events')) {
+    if (!requireAdmin(req, res)) return;
+    const u = new URL(req.url, 'http://x');
+    const email = u.searchParams.get('email') || SHAWN_EMAIL;
+    const limit = u.searchParams.get('limit') || '20';
+    try {
+      const r = await fetch(`https://api.brevo.com/v3/smtp/statistics/events?email=${encodeURIComponent(email)}&limit=${limit}`, {
+        headers: { 'api-key': process.env.BREVO_API_KEY },
+      });
+      const data = await r.json();
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify(data, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
   // ─── GET /admin/brevo-send-raw?id=N&to=email — bypass sendTest, envoie via SMTP API
   // Permet de garantir delivery quand sendTest Brevo échoue (sender unauthorized etc)
   if (req.method === 'GET' && url.startsWith('/admin/brevo-send-raw')) {

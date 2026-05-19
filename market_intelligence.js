@@ -229,7 +229,7 @@ const SOURCES = {
   },
   oaciq: {
     label: 'OACIQ — Règlements + Pratique',
-    url: 'https://www.oaciq.com/fr/articles',
+    url: 'https://www.oaciq.com',
     keywords: ['nouveauté', 'règlement', 'avis', 'pratique', 'courtier', 'mise à jour'],
     extract: (md) => {
       // Filtre lignes texte (pas images/links uniquement)
