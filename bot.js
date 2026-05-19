@@ -13379,6 +13379,13 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         ...[...html.matchAll(/\$\s*(\d{1,3}(?:[\s, ]\d{3})+)/g)].map(m => m[1]),
         ...[...html.matchAll(/(\d{1,3}(?:[\s, ]\d{3})+)\s*\$/g)].map(m => m[1]),
       ];
+      // Cherche AUSSI "4.44", "4,44", "4&#46;44" même sans % (au cas où entity ou texte alt)
+      const hardSearch = ['4.44', '4,44', '4&#46;44', '4&#x2E;44', '4.04', '4,04', '6.09', '6,09'];
+      const hardSearchResults = {};
+      for (const term of hardSearch) {
+        const cnt = (html.match(new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+        if (cnt > 0) hardSearchResults[term] = cnt;
+      }
       // Cherche contexte autour de chaque taux (50 chars avant/après)
       const rateContexts = [];
       let m;
@@ -13396,6 +13403,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         rates_found: [...new Set(rateMatches)],
         amounts_found: [...new Set(amountMatches)],
         rate_contexts: rateContexts.slice(0, 20),
+        hard_search: hardSearchResults,
         html_first_3000: html.substring(0, 3000),
       }, null, 2));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
