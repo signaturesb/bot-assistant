@@ -118,7 +118,8 @@ const SOURCES = {
   // === ÉCONOMIQUES — taux qui bougent souvent ===
   banque_canada: {
     label: 'Banque du Canada — Taux directeur',
-    url: 'https://www.bankofcanada.ca/rates/',
+    // Page principale /rates/ contient juste des liens. La vraie page avec le chiffre:
+    url: 'https://www.bankofcanada.ca/core-functions/monetary-policy/key-interest-rate/',
     keywords: ['target for the overnight rate', 'taux du financement', 'bank rate', 'policy rate', 'taux directeur'],
     fresh: true, // re-scrape souvent
     extract: (md) => {
@@ -185,16 +186,33 @@ const SOURCES = {
   },
   oaciq: {
     label: 'OACIQ — Règlements + Pratique',
-    url: 'https://www.oaciq.com/fr',
+    url: 'https://www.oaciq.com/fr/articles',
     keywords: ['nouveauté', 'règlement', 'avis', 'pratique', 'courtier', 'mise à jour'],
     extract: (md) => {
-      // Cherche titres récents (lignes commençant par #)
-      const headings = md.split('\n').filter(l => /^#+\s/.test(l)).slice(0, 8).map(h => h.replace(/^#+\s*/, '').trim());
-      // Cherche bullet points ou liens dans les nouveautés
-      const articles = md.match(/^\s*[-*]\s+(.+)$/gm)?.slice(0, 10).map(l => l.replace(/^\s*[-*]\s+/, '').substring(0, 120)) || [];
+      // Filtre lignes texte (pas images/links uniquement)
+      const isCleanLine = (s) => s.length > 5 && s.length < 200
+        && !/^!?\[.*\]\(.*\)$/.test(s.trim())  // pas juste markdown image/link
+        && !/^(https?:\/\/|www\.|\!\[)/i.test(s.trim()) // pas URL nue
+        && /[a-zàâéèêëïîôöùûüç]/i.test(s); // contient lettres FR
+      const headings = md.split('\n').filter(l => /^#+\s/.test(l))
+        .map(h => h.replace(/^#+\s*/, '').replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1').trim())
+        .filter(isCleanLine).slice(0, 8);
+      // Liens internes OACIQ avec texte
+      const articles = [];
+      const linkRe = /\[([^\]\n]{10,150})\]\(([^)\s]+)\)/g;
+      let lm;
+      while ((lm = linkRe.exec(md)) !== null && articles.length < 10) {
+        const text = lm[1].trim();
+        const href = lm[2];
+        if (isCleanLine(text) && !/\.(jpg|png|gif|webp|svg)/i.test(href)
+            && !articles.some(a => a.text === text)) {
+          articles.push({ text: text.substring(0, 120), href });
+        }
+      }
       return {
         headings_recents: headings,
-        articles_recents: articles,
+        articles_recents: articles.map(a => a.text), // backward compat
+        articles_with_links: articles,
         dates_recentes: findRecentDates(md),
         resume: md.substring(0, 1500),
         scraped_at: new Date().toISOString(),
