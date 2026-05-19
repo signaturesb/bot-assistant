@@ -13311,6 +13311,33 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/brevo-html?id=N — return HTML raw pour debug/audit
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-html')) {
+    if (!requireAdmin(req, res)) return;
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    try {
+      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
+      const camp = await r1.json();
+      // Extract taux patterns (X.X% ou X,X%)
+      const html = camp.htmlContent || '';
+      const rateMatches = [...html.matchAll(/(\d+[\.,]\d{1,3})\s*%/g)].map(m => m[1]);
+      // Extract montants $
+      const amountMatches = [...html.matchAll(/\$\s*(\d{1,3}(?:[\s,]\d{3})+)/g)].map(m => m[1]);
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        id, name: camp.name, subject: camp.subject,
+        html_length: html.length,
+        rates_found: [...new Set(rateMatches)],
+        amounts_found: [...new Set(amountMatches)],
+        html_first_3000: html.substring(0, 3000),
+      }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
   // ─── GET /admin/preview-via-gmail?id=N&to=X — envoie campagne via Gmail OAuth
   // Bypass Brevo SMTP qui hold les emails (status=requests sans delivered).
   // Défaut: shawn@signaturesb.com (Inbox + Sent puisque Gmail OAuth = shawn@).
