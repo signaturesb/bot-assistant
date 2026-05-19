@@ -7487,7 +7487,7 @@ function formatBusinessReport() {
 function today() { return new Date().toISOString().slice(0, 10); }
 function thisMonth() { return new Date().toISOString().slice(0, 7); }
 function trackCost(model, usage) {
-  if (!usage) return;
+  if (!usage) return 0;
   const p = PRICING[model] || PRICING['claude-sonnet-4-6'];
   const inp = (usage.input_tokens || 0) / 1e6 * p.in;
   const out = (usage.output_tokens || 0) / 1e6 * p.out;
@@ -7536,6 +7536,7 @@ function trackCost(model, usage) {
     saveJSON(COST_FILE, costTracker);
     sendTelegramWithFallback(`💰 *Anthropic mois: $${monthCost.toFixed(2)}*\nSeuil 100$/mois atteint. Vérifier usage dans /cout.`, { category: 'cost-monthly-threshold' }).catch(() => {});
   }
+  return cost; // pour CONV_BUDGET_USD check dans tool loop
 }
 
 // ─── Routing auto modèle selon type de tâche ─────────────────────────────────
@@ -7587,7 +7588,19 @@ async function callClaude(chatId, userMsg, retries = 3) {
       }
       let finalReply = null;
       let allMemos   = [];
+      // BUDGET GUARD (audit P0 #3): cap par conversation
+      // Empêche les boucles tool_use coûteuses (Opus = $15/M output → 12 rounds × 16k = ~$3)
+      const CONV_BUDGET_USD = parseFloat(process.env.CONV_BUDGET_USD || '2.50');
+      let convCostUSD = 0;
+      let consecutiveToolErrors = 0; // si même tool fail 3× → abort
+      let lastFailedTool = null;
       for (let round = 0; round < 12; round++) {
+        // Hard stop sur budget conversation dépassé
+        if (convCostUSD >= CONV_BUDGET_USD) {
+          log('WARN', 'CLAUDE', `Budget conversation atteint ($${convCostUSD.toFixed(2)} >= $${CONV_BUDGET_USD}) — abort round ${round}`);
+          finalReply = `⚠️ J'arrête ici — j'ai dépassé le budget conversation ($${convCostUSD.toFixed(2)}). Reformule ta demande de façon plus directe pour économiser.`;
+          break;
+        }
         const systemBlocks = [{ type: 'text', text: SYSTEM_BASE, cache_control: { type: 'ephemeral' } }];
         const dyn = getSystemDynamic();
         if (dyn) systemBlocks.push({ type: 'text', text: dyn });
@@ -7600,7 +7613,8 @@ async function callClaude(chatId, userMsg, retries = 3) {
         mTick('api', 'claude');
         const res = await claude.messages.create(params);
         circuitSuccess('claude');
-        trackCost(localModel, res.usage);
+        const usdCost = trackCost(localModel, res.usage);
+        if (typeof usdCost === 'number') convCostUSD += usdCost;
         if (res.stop_reason === 'tool_use') {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
@@ -7608,9 +7622,24 @@ async function callClaude(chatId, userMsg, retries = 3) {
             log('INFO', 'TOOL', `${b.name}(${JSON.stringify(b.input).substring(0, 80)})`);
             mTick('tools', b.name);
             const result = await executeToolSafe(b.name, b.input, chatId);
-            return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
+            return { type: 'tool_result', tool_use_id: b.id, content: String(result), _toolName: b.name };
           }));
-          messages.push({ role: 'user', content: results });
+          // Détecter pattern: même outil fail 3× consécutifs → abort
+          const errorTools = results.filter(r => /^(❌|⚠️|Erreur|Error|HTTP \d{3})/i.test(r.content));
+          if (errorTools.length > 0 && errorTools.length === results.length) {
+            const tn = errorTools[0]._toolName;
+            if (tn === lastFailedTool) consecutiveToolErrors++;
+            else { consecutiveToolErrors = 1; lastFailedTool = tn; }
+            if (consecutiveToolErrors >= 3) {
+              log('WARN', 'CLAUDE', `Tool ${tn} a échoué 3× consécutifs — abort conversation`);
+              finalReply = `⚠️ L'outil ${tn} a échoué 3 fois de suite (${errorTools[0].content.substring(0, 100)}). J'arrête pour éviter une boucle. Vérifie le service/clé puis réessaie.`;
+              messages.push({ role: 'user', content: results.map(r => ({ type: 'tool_result', tool_use_id: r.tool_use_id, content: r.content })) });
+              break;
+            }
+          } else {
+            consecutiveToolErrors = 0; lastFailedTool = null;
+          }
+          messages.push({ role: 'user', content: results.map(r => ({ type: 'tool_result', tool_use_id: r.tool_use_id, content: r.content })) });
           continue;
         }
         const text = res.content.find(b => b.type === 'text')?.text;
@@ -7620,6 +7649,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
         allMemos   = memos;
         break;
       }
+      if (convCostUSD > 0) log('INFO', 'CLAUDE', `Conversation coût: $${convCostUSD.toFixed(3)}`);
       if (!finalReply) finalReply = '_(délai dépassé — réessaie)_';
       addMsg(chatId, 'assistant', finalReply);
       return { reply: finalReply, memos: allMemos };
@@ -14647,7 +14677,23 @@ async function autoTrashGitHubNoise(opts = {}) {
 // - 24h fenêtre au boot (pas 6h)
 // - Alert Telegram P0 si email match source mais deal non créé (bug detection)
 // - Logging structuré par étape
+// MUTEX: empêche overlap des runs (poll 30s mais run peut prendre 60s+)
+// Sans ça → double-traitement leads (cf audit P0 #2)
+let _pollerInFlight = false;
 async function runGmailLeadPoller(opts = {}) {
+  if (_pollerInFlight) {
+    log('INFO', 'POLLER', 'Skip — run précédent toujours en cours (mutex)');
+    return;
+  }
+  _pollerInFlight = true;
+  try {
+    return await _runGmailLeadPollerInner(opts);
+  } finally {
+    _pollerInFlight = false;
+  }
+}
+
+async function _runGmailLeadPollerInner(opts = {}) {
   const t0 = Date.now();
 
   // CIRCUIT BREAKER CRÉDIT: si Anthropic a retourné credit/auth error dans les
