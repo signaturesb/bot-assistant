@@ -40,6 +40,49 @@ function getFC() {
   return _fc || null;
 }
 
+// Lazy load Anthropic pour LLM extraction (fallback intelligent quand regex échoue)
+let _anthropic = null;
+function getAnthropic() {
+  if (_anthropic === null) {
+    try {
+      const Anthropic = require('@anthropic-ai/sdk');
+      _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    } catch (e) { _anthropic = false; console.warn('[MARKET] Anthropic indispo:', e.message); }
+  }
+  return _anthropic || null;
+}
+
+/**
+ * Extract structuré via Claude Haiku — robuste contre HTML/JS-rendered pages.
+ * Coût: ~$0.001-0.003 par appel (Haiku $0.80/M input, $4/M output).
+ * @param {string} markdown
+ * @param {string} prompt — instructions structurées + format JSON désiré
+ * @param {number} maxTokens
+ * @returns {object|null}
+ */
+async function llmExtract(markdown, prompt, maxTokens = 500) {
+  const a = getAnthropic();
+  if (!a || !markdown) return null;
+  try {
+    const res = await a.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: maxTokens,
+      messages: [{
+        role: 'user',
+        content: `${prompt}\n\nMARKDOWN À ANALYSER:\n\`\`\`\n${markdown.substring(0, 12000)}\n\`\`\`\n\nRéponds UNIQUEMENT avec un JSON valide, rien d'autre.`,
+      }],
+    });
+    const txt = res.content.find(b => b.type === 'text')?.text || '';
+    // Extract first {...} JSON block
+    const m = txt.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    return JSON.parse(m[0]);
+  } catch (e) {
+    console.warn('[MARKET] llmExtract:', e.message?.substring(0, 100));
+    return null;
+  }
+}
+
 // Helper: extract premier taux % proche d'un mot-clé
 function findRateNear(md, keywords, opts = {}) {
   const txt = md.toLowerCase();
@@ -332,6 +375,16 @@ async function refreshMarketSnapshot({ sources = null, parallel = 3 } = {}) {
   const keys = sources || Object.keys(SOURCES);
   const result = { ts: Date.now(), updated: new Date().toISOString(), data: {}, errors: {} };
 
+  // Prompts LLM ciblés par source clé — fallback intelligent si regex échoue
+  const LLM_PROMPTS = {
+    banque_canada: 'Tu lis une page de la Banque du Canada. Extrait UNIQUEMENT le taux directeur actuel (policy rate / target overnight rate) en pourcentage. Format: {"taux_directeur": <nombre>, "date_decision": "<YYYY-MM-DD ou null>"}. Si pas trouvé, mets null.',
+    multipret: 'Tu lis une page de taux hypothécaires MultiPrêt. Extrait les taux suivants en %: 5 ans fixe, 5 ans variable, 3 ans fixe, 1 an fixe. Format: {"fixe_5ans":<num>,"variable_5ans":<num>,"fixe_3ans":<num>,"fixe_1an":<num>}. Null si absent.',
+    planipret: 'Tu lis une page de taux hypothécaires PlaniPrêt. Extrait les taux 5 ans fixe et variable en %. Format: {"fixe_5ans":<num>,"variable_5ans":<num>}. Null si absent.',
+    apciq: 'Tu lis une page de statistiques APCIQ (Association des courtiers immobiliers QC). Extrait: prix médian unifamiliale QC ($), prix médian copropriété QC ($), variation ventes vs an passé (%), variation prix vs an passé (%), période visée (ex "T3 2024"). Format: {"prix_median_unifamiliale":<num>,"prix_median_copropriete":<num>,"ventes_variation":<num>,"prix_variation":<num>,"periode":"<str>"}. Null si non trouvé.',
+    apciq_lanaudiere: 'Tu lis stats APCIQ région Lanaudière. Extrait: prix médian ($), ventes du dernier mois/trim, variation %. Format: {"prix_median":<num>,"ventes_total":<num>,"variation":<num>,"periode":"<str>"}.',
+    oaciq: 'Tu lis l\'accueil OACIQ (organisme régulateur courtage QC). Liste les 5 nouveautés/avis/règlements les plus récents avec leur titre et date si dispo. Format: {"nouveautes":[{"titre":"...","date":"YYYY-MM-DD ou null"}]}.',
+  };
+
   // Run en mini-batches pour respecter quota Firecrawl
   for (let i = 0; i < keys.length; i += parallel) {
     const batch = keys.slice(i, i + parallel);
@@ -342,6 +395,24 @@ async function refreshMarketSnapshot({ sources = null, parallel = 3 } = {}) {
         const r = await fc.scrapUrl(src.url, src.keywords || []);
         if (!r || !r.contenu) { result.errors[key] = 'empty content'; return; }
         const extracted = src.extract ? src.extract(r.contenu) : { resume: r.contenu.substring(0, 1500) };
+        // Fallback LLM si valeurs clés null + prompt défini pour cette source
+        if (LLM_PROMPTS[key]) {
+          const hasNullKey = Object.values(extracted).some(v => v === null);
+          if (hasNullKey) {
+            try {
+              const llmData = await llmExtract(r.contenu, LLM_PROMPTS[key]);
+              if (llmData) {
+                // Merge: LLM remplace null/undefined, garde le reste
+                for (const [k, v] of Object.entries(llmData)) {
+                  if (v != null && (extracted[k] == null || extracted[k] === undefined)) {
+                    extracted[k] = v;
+                  }
+                }
+                extracted._llm_enhanced = true;
+              }
+            } catch {}
+          }
+        }
         result.data[key] = {
           label: src.label,
           url: src.url,
