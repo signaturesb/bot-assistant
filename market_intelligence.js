@@ -26,7 +26,9 @@ const path = require('path');
 
 const DATA_DIR = fs.existsSync('/data') ? '/data' : '/tmp';
 const SNAPSHOT_FILE = path.join(DATA_DIR, 'market_snapshot.json');
-const SNAPSHOT_TTL = 24 * 60 * 60 * 1000; // 24h
+// Shawn: spot-check des nouvelles infos toutes les 3 semaines
+const SNAPSHOT_TTL = 21 * 24 * 60 * 60 * 1000; // 3 semaines
+const FRESH_CHECK_TTL = 3 * 24 * 60 * 60 * 1000; // mais re-check 3j pour taux qui bougent
 
 // Lazy load firecrawl (déjà installé)
 let _fc = null;
@@ -38,89 +40,141 @@ function getFC() {
   return _fc || null;
 }
 
-// ── Sources configurées ─────────────────────────────────────────────────────
+// Helper: extract premier taux % proche d'un mot-clé
+function findRateNear(md, keywords, opts = {}) {
+  const txt = md.toLowerCase();
+  for (const kw of keywords) {
+    const idx = txt.indexOf(kw.toLowerCase());
+    if (idx < 0) continue;
+    // Cherche % dans 200 chars avant et après
+    const start = Math.max(0, idx - 200);
+    const end = Math.min(md.length, idx + 200);
+    const window = md.substring(start, end);
+    const m = window.match(/(\d+[\.,]\d{1,3})\s*%/);
+    if (m) {
+      const val = parseFloat(m[1].replace(',', '.'));
+      if (val > (opts.min || 0) && val < (opts.max || 20)) return val;
+    }
+  }
+  return null;
+}
+
+// ── Sources configurées (toutes celles demandées par Shawn) ──────────────────
 const SOURCES = {
+  // === ÉCONOMIQUES — taux qui bougent souvent ===
   banque_canada: {
-    label: 'Banque du Canada',
+    label: 'Banque du Canada — Taux directeur',
     url: 'https://www.bankofcanada.ca/rates/',
-    keywords: ['target for the overnight rate', 'taux du financement', 'bank rate', 'taux officiel', 'policy rate'],
+    keywords: ['target for the overnight rate', 'taux du financement', 'bank rate', 'policy rate', 'taux directeur'],
+    fresh: true, // re-scrape souvent
     extract: (md) => {
-      // Cherche pattern "X.XX%" précédé/suivi de "policy rate" ou "taux directeur"
-      const patterns = [
-        /(\d+\.\d{1,2})\s*%[^.\n]{0,80}(policy|overnight|directeur|officiel)/i,
-        /(policy|overnight|directeur|officiel)[^.\n]{0,80}(\d+\.\d{1,2})\s*%/i,
-        /current\s+target[^.\n]{0,30}(\d+\.\d{1,2})/i,
-      ];
-      for (const p of patterns) {
-        const m = md.match(p);
-        if (m) {
-          const rate = m[1].includes('.') ? m[1] : m[2];
-          return { taux_directeur: parseFloat(rate), as_of: new Date().toISOString().slice(0, 10) };
-        }
-      }
-      return null;
+      const taux = findRateNear(md, ['policy rate', 'target for the overnight', 'taux directeur', 'overnight rate'], { min: 0.1, max: 10 });
+      return {
+        taux_directeur: taux,
+        as_of: new Date().toISOString().slice(0, 10),
+        resume: md.substring(0, 800),
+      };
     },
-  },
-  apciq: {
-    label: 'APCIQ — Stats marché QC',
-    url: 'https://apciq.ca/statistiques-immobilieres/',
-    keywords: ['statistiques', 'ventes', 'prix médian', 'inventaire', 'mois'],
-    extract: (md) => {
-      // Heuristique simple: garde 1500 premiers chars qui contiennent les chiffres clés
-      const snippet = md.substring(0, 2500);
-      return { resume: snippet, scraped_at: new Date().toISOString() };
-    },
-  },
-  oaciq: {
-    label: 'OACIQ — Règlements',
-    url: 'https://www.oaciq.com/fr',
-    keywords: ['nouveauté', 'règlement', 'avis', 'pratique', 'courtier'],
-    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
   },
   multipret: {
     label: 'MultiPrêt — Taux hypothécaires',
     url: 'https://multi-prets.com/taux-hypothecaires/',
-    keywords: ['taux fixe', 'taux variable', '5 ans', 'hypothèque'],
+    keywords: ['taux fixe', 'taux variable', '5 ans', '3 ans', 'hypothèque'],
+    fresh: true,
     extract: (md) => {
-      // Cherche taux fixes 5 ans
-      const m5fix = md.match(/5\s*ans?[^\n]{0,60}fixe[^.\n]{0,40}(\d+\.\d{1,2})\s*%/i);
-      const m5var = md.match(/5\s*ans?[^\n]{0,60}variable[^.\n]{0,40}(\d+\.\d{1,2})\s*%/i);
-      const out = { scraped_at: new Date().toISOString() };
-      if (m5fix) out.fixe_5ans = parseFloat(m5fix[1]);
-      if (m5var) out.variable_5ans = parseFloat(m5var[1]);
-      out.resume = md.substring(0, 1200);
-      return out;
+      const m5fix = findRateNear(md, ['fixe 5 ans', '5 ans fixe', '5-year fixed'], { min: 2, max: 10 });
+      const m5var = findRateNear(md, ['variable 5 ans', '5 ans variable'], { min: 2, max: 10 });
+      const m3fix = findRateNear(md, ['fixe 3 ans', '3 ans fixe'], { min: 2, max: 10 });
+      return {
+        fixe_5ans: m5fix, variable_5ans: m5var, fixe_3ans: m3fix,
+        resume: md.substring(0, 1500), scraped_at: new Date().toISOString(),
+      };
     },
   },
   planipret: {
     label: 'PlaniPrêt — Taux hypothécaires',
     url: 'https://planipret.com/taux-hypothecaires/',
     keywords: ['taux fixe', 'taux variable', '5 ans'],
+    fresh: true,
+    extract: (md) => {
+      const m5fix = findRateNear(md, ['fixe 5 ans', '5 ans fixe', '5-year'], { min: 2, max: 10 });
+      const m5var = findRateNear(md, ['variable 5 ans', '5 ans variable'], { min: 2, max: 10 });
+      return { fixe_5ans: m5fix, variable_5ans: m5var, resume: md.substring(0, 1500), scraped_at: new Date().toISOString() };
+    },
+  },
+  // === STATS MARCHÉ QC ===
+  apciq: {
+    label: 'APCIQ — Statistiques marché QC',
+    url: 'https://apciq.ca/statistiques-immobilieres/',
+    keywords: ['statistiques', 'ventes', 'prix médian', 'inventaire', 'mois', 'trimestre'],
+    extract: (md) => ({ resume: md.substring(0, 2500), scraped_at: new Date().toISOString() }),
+  },
+  apciq_lanaudiere: {
+    label: 'APCIQ — Lanaudière',
+    url: 'https://apciq.ca/statistiques/lanaudiere/',
+    keywords: ['lanaudière', 'ventes', 'prix'],
+    extract: (md) => ({ resume: md.substring(0, 2000), scraped_at: new Date().toISOString() }),
+  },
+  oaciq: {
+    label: 'OACIQ — Règlements + Pratique',
+    url: 'https://www.oaciq.com/fr',
+    keywords: ['nouveauté', 'règlement', 'avis', 'pratique', 'courtier', 'mise à jour'],
     extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
   },
+  // === SITES IMMOBILIERS QC (les plus gros) ===
   centris_public: {
-    label: 'Centris.ca — Marché public',
-    url: 'https://www.centris.ca/fr/quartiers',
-    keywords: ['propriétés', 'vente', 'région'],
-    extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+    label: 'Centris.ca — Tendances',
+    url: 'https://www.centris.ca/fr/tendances',
+    keywords: ['marché', 'tendance', 'prix', 'région'],
+    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
   },
   duproprio: {
-    label: 'DuProprio — Inventaire',
+    label: 'DuProprio',
     url: 'https://duproprio.com/fr',
-    keywords: ['proprietes', 'vente', 'pour vente', 'maisons'],
-    extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+    keywords: ['propriétés', 'vente', 'maisons'],
+    extract: (md) => ({ resume: md.substring(0, 1000), scraped_at: new Date().toISOString() }),
   },
   realtor: {
-    label: 'Realtor.ca — Marché Canada',
+    label: 'Realtor.ca — National',
     url: 'https://www.realtor.ca/blog/data-and-analysis',
-    keywords: ['housing', 'sales', 'price'],
-    extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+    keywords: ['housing', 'sales', 'price', 'national', 'monthly'],
+    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
   },
   remax_qc: {
     label: 'RE/MAX Québec',
     url: 'https://www.remax-quebec.com/fr/blogue/',
     keywords: ['marché', 'tendance', 'région'],
     extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+  },
+  royal_lepage: {
+    label: 'Royal LePage',
+    url: 'https://www.royallepage.ca/fr/realestate/news/',
+    keywords: ['marché', 'prix', 'maison', 'tendance'],
+    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
+  },
+  sutton_qc: {
+    label: 'Sutton Québec',
+    url: 'https://www.suttonquebec.com/fr/articles',
+    keywords: ['marché', 'région', 'maison'],
+    extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+  },
+  via_capitale: {
+    label: 'Via Capitale',
+    url: 'https://www.viacapitalevendu.com/fr/blogue',
+    keywords: ['marché', 'région', 'maison'],
+    extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+  },
+  jlr: {
+    label: 'JLR Solutions Foncières',
+    url: 'https://www.jlr.ca/articles-immobiliers',
+    keywords: ['marché', 'prix', 'statistique', 'région'],
+    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
+  },
+  shq: {
+    label: 'Société Habitation Québec',
+    url: 'https://www.habitation.gouv.qc.ca/',
+    keywords: ['programme', 'aide', 'logement', 'subvention'],
+    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
   },
 };
 

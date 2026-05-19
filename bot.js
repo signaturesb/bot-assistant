@@ -978,6 +978,22 @@ function logActivity(event) {
 function getSystemDynamic() {
   const parts = [];
 
+  // ━━ MARCHÉ IMMOBILIER QC — DONNÉES FRAÎCHES (auto-inject Shawn) ━━━━━━━━━
+  // Le bot a accès aux taux + stats les plus récents sans Shawn devoir demander
+  try {
+    const mi = require('./market_intelligence');
+    const digest = mi.buildMarketDigest();
+    if (digest && digest.sources_count > 0) {
+      const lines = [`━━ DONNÉES MARCHÉ FRAÎCHES (auto, age ${digest.age_hours||0}h) ━━`];
+      if (digest.taux_directeur != null) lines.push(`💰 Taux directeur Banque du Canada: ${digest.taux_directeur}%`);
+      if (digest.hypotheque_fixe_5ans != null) lines.push(`🏠 Taux hypothèque fixe 5 ans: ${digest.hypotheque_fixe_5ans}%`);
+      if (digest.hypotheque_variable_5ans != null) lines.push(`📊 Taux hypothèque variable 5 ans: ${digest.hypotheque_variable_5ans}%`);
+      lines.push(`📈 ${digest.sources_count} sources surveillées (APCIQ, OACIQ, Centris, MultiPrêt, PlaniPrêt, RE/MAX, Royal LePage, Sutton, Via Capitale, JLR, etc.)`);
+      lines.push(`Utilise ces données quand tu rédiges emails clients ou expliques le marché — pas besoin de chercher ailleurs.`);
+      parts.push(lines.join('\n'));
+    }
+  } catch {}
+
   // ━━ DATE & HEURE — INJECTÉ À CHAQUE REQUÊTE (PAS CACHÉ) ━━
   // Bug fix 2026-04-25: SYSTEM_BASE est caché par Anthropic prompt caching.
   // Si on y mettait la date au boot, Claude verrait toujours la date du
@@ -11467,19 +11483,37 @@ function startDailyTasks() {
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
 
-    // ── Market Intelligence refresh quotidien 5h matin ──────────────────────
-    if (h === 5 && lastCron.marketRefresh !== todayStr) {
-      lastCron.marketRefresh = todayStr;
-      (async () => {
-        try {
-          const mi = require('./market_intelligence');
-          log('INFO', 'MARKET', 'Refresh quotidien démarré');
-          const r = await mi.refreshMarketSnapshot();
-          const okCount = Object.keys(r.data || {}).length;
-          const failCount = Object.keys(r.errors || {}).length;
-          log('OK', 'MARKET', `Refresh complet: ${okCount} sources OK, ${failCount} échecs`);
-        } catch (e) { log('ERR', 'MARKET', `Refresh: ${e.message}`); }
-      })();
+    // ── Market Intelligence refresh ──────────────────────────────────────────
+    // Stratégie Shawn: spot-check toutes 3 semaines (full) + refresh "fresh" sources
+    // (taux hypothèque + Banque Canada) toutes 72h
+    if (h === 5 && lastCron.marketFullRefresh !== todayStr) {
+      // Full refresh: dimanche matin uniquement (1 fois/semaine = ~3 fois en 3 sem)
+      // Combiné avec freshCheck → spot-check toutes ~3 semaines comme demandé
+      const dayOfWeek = now.getDay(); // 0=Sun
+      const snap = (() => { try { return require('./market_intelligence').marketStatus(); } catch { return null; }})();
+      const ageHours = snap?.age_hours || 9999;
+      // Full scrape si: dimanche matin OU snapshot trop vieux (> 21 jours)
+      if (dayOfWeek === 0 || ageHours > 21 * 24) {
+        lastCron.marketFullRefresh = todayStr;
+        (async () => {
+          try {
+            const mi = require('./market_intelligence');
+            log('INFO', 'MARKET', `Full refresh démarré (snapshot ${ageHours}h ago, dow=${dayOfWeek})`);
+            const r = await mi.refreshMarketSnapshot();
+            log('OK', 'MARKET', `Full: ${Object.keys(r.data||{}).length} ok, ${Object.keys(r.errors||{}).length} fail`);
+          } catch (e) { log('ERR', 'MARKET', `Full refresh: ${e.message}`); }
+        })();
+      } else {
+        // Fresh-only: taux qui bougent souvent (banque_canada, multipret, planipret)
+        lastCron.marketFullRefresh = todayStr;
+        (async () => {
+          try {
+            const mi = require('./market_intelligence');
+            const r = await mi.refreshMarketSnapshot({ sources: ['banque_canada', 'multipret', 'planipret'] });
+            log('OK', 'MARKET', `Fresh refresh: ${Object.keys(r.data||{}).length} ok`);
+          } catch (e) { log('ERR', 'MARKET', `Fresh: ${e.message}`); }
+        })();
+      }
     }
 
     // ── Pipedrive Proactive — 5 features anti-perte-de-lead ──────────────────
@@ -13210,6 +13244,29 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     } catch (e) { out.errors.push(`Top: ${e.message}`); }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  // ─── GET /admin/market-debug?source=banque_canada — raw markdown pour fix regex
+  if (req.method === 'GET' && url.startsWith('/admin/market-debug')) {
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const sourceKey = u.searchParams.get('source') || 'banque_canada';
+    try {
+      const mi = require('./market_intelligence');
+      const firecrawl = require('./firecrawl_scraper');
+      const src = mi.SOURCES[sourceKey];
+      if (!src) { res.writeHead(404); res.end(JSON.stringify({error: 'source unknown', avail: Object.keys(mi.SOURCES)})); return; }
+      const r = await firecrawl.scrapUrl(src.url, src.keywords || []);
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        source: sourceKey, url: src.url,
+        len: r?.contenu?.length || 0,
+        markdown_first_3000: (r?.contenu || '').substring(0, 3000),
+        extracted: src.extract ? src.extract(r?.contenu || '') : null,
+      }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
     return;
   }
 
