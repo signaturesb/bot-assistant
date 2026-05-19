@@ -13313,12 +13313,12 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
 
   // ─── GET /admin/preview-via-gmail?id=N&to=X — envoie campagne via Gmail OAuth
   // Bypass Brevo SMTP qui hold les emails (status=requests sans delivered).
-  // Gmail signe SPF/DKIM proprement → delivery garantie à icloud/gmail/outlook.
+  // Défaut: shawn@signaturesb.com (Inbox + Sent puisque Gmail OAuth = shawn@).
   if (req.method === 'GET' && url.startsWith('/admin/preview-via-gmail')) {
     if (!requireAdmin(req, res)) return;
     const u = new URL(req.url, 'http://x');
     const id = u.searchParams.get('id');
-    const to = u.searchParams.get('to') || 'shawnbarrette@icloud.com';
+    const to = u.searchParams.get('to') || SHAWN_EMAIL;
     if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
     try {
       // 1. Fetch campagne Brevo (subject + htmlContent)
@@ -13327,7 +13327,9 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       const camp = await r1.json();
       const subject = `[PREVIEW] ${camp.subject}`;
       const htmlContent = camp.htmlContent || '<p>(no html)</p>';
-      // 2. Send via Gmail API (utilise sendEmailLogged pour Telegram trace + audit)
+      // 2. Send via Gmail API directement (PAS sendEmailLogged car self-send vers shawn@)
+      // sendEmailLogged check Cc Shawn → si To=shawn@, skip Cc auto + skip Telegram trace
+      // (sinon notif de notif). On garde l'audit log manuellement.
       const token = await getGmailToken();
       if (!token) { res.writeHead(500); res.end(JSON.stringify({error:'gmail token absent'})); return; }
       const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
@@ -13343,25 +13345,25 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
         Buffer.from(htmlContent, 'utf-8').toString('base64'),
       ];
       const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-      const sent = await sendEmailLogged({
-        via: 'gmail', to, cc: [], subject,
-        category: 'preview-via-gmail', shawnConsent: true,
-        sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ raw }),
-        }),
+      const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw }),
       });
+      const gmailBody = await gmailRes.json().catch(() => ({}));
+      const ok = gmailRes.ok;
       res.writeHead(200, {'content-type':'application/json'});
       res.end(JSON.stringify({
-        ok: sent.ok, status: sent.status,
+        ok, status: gmailRes.status,
         to, subject,
         campaign_name: camp.name,
         html_length: htmlContent.length,
-        via: 'gmail',
-        error: sent.error,
+        via: 'gmail-direct',
+        gmail_message_id: gmailBody.id,
+        gmail_thread_id: gmailBody.threadId,
+        error: ok ? null : gmailBody.error?.message,
       }, null, 2));
-      if (sent.ok) auditLogEvent('preview', 'sent-via-gmail', { id, to });
+      if (ok) auditLogEvent('preview', 'sent-via-gmail', { id, to, gmail_id: gmailBody.id });
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
     return;
   }
