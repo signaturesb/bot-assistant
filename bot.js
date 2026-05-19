@@ -368,6 +368,62 @@ function saveEmailOutbox() {
  *   - sendFn: async () => Response — exécute l'envoi réel
  * @returns {object} { ok, status, durationMs, entryId, error? }
  */
+// ─── Master template Signature SB — cache + helper centralisé ───────────────
+// Règle Shawn 2026-05-19: TOUS les emails clients utilisent le master template
+// avec logos Signature SB + RE/MAX. Cache en memory pour éviter re-fetch Dropbox.
+let _masterTplCache = { html: null, fetchedAt: 0, ttl: 60 * 60 * 1000 }; // 1h TTL
+async function loadMasterTemplate(forceRefresh = false) {
+  if (!forceRefresh && _masterTplCache.html && (Date.now() - _masterTplCache.fetchedAt) < _masterTplCache.ttl) {
+    return _masterTplCache.html;
+  }
+  try {
+    const tplPath = `${AGENT.dbx_templates || '/Liste de contact/email_templates'}/master_template_signature_sb.html`.replace(/\/+/g, '/');
+    const fullPath = tplPath.startsWith('/') ? tplPath : '/' + tplPath;
+    const r = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: fullPath }, true);
+    if (r?.ok) {
+      const html = await r.text();
+      if (html && html.length > 5000) {
+        _masterTplCache = { html, fetchedAt: Date.now(), ttl: 60 * 60 * 1000 };
+        log('OK', 'TEMPLATE', `Master template chargé ${Math.round(html.length/1024)}KB`);
+        return html;
+      }
+    }
+  } catch (e) { log('WARN', 'TEMPLATE', `Load master template: ${e.message?.substring(0, 100)}`); }
+  return null;
+}
+
+// Helper: build HTML email avec master template Signature SB + filtre terrain-a-construire
+// Params: tous les {{ params.X }} du template (TITRE_EMAIL, INTRO_TEXTE, HERO_TITRE, etc.)
+async function buildEmailFromMasterTpl(params = {}) {
+  const tpl = await loadMasterTemplate();
+  if (!tpl) return null;
+  const fill = (s, p) => { let h = s; for (const [k, v] of Object.entries(p)) h = h.split(`{{ params.${k} }}`).join(v ?? ''); return h; };
+  let html = fill(tpl, {
+    TITRE_EMAIL: '', LABEL_SECTION: '', DATE_MOIS: new Date().toLocaleDateString('fr-CA', { month:'long', year:'numeric', timeZone:'America/Toronto' }),
+    TERRITOIRES: '', SOUS_TITRE_ANALYSE: '', HERO_TITRE: '', INTRO_TEXTE: '',
+    TITRE_SECTION_1: '', MARCHE_LABEL: '', PRIX_MEDIAN: '', VARIATION_PRIX: '', SOURCE_STAT: '',
+    LABEL_TABLEAU: '', TABLEAU_STATS_HTML: '', TITRE_SECTION_2: '', CITATION: '',
+    CONTENU_STRATEGIE: '',
+    CTA_TITRE: 'Des questions?', CTA_SOUS_TITRE: 'Appelez-moi directement, je vous réponds rapidement.',
+    CTA_URL: `tel:${AGENT.telephone.replace(/\D/g,'')}`,
+    CTA_BOUTON: `Appeler ${AGENT.prenom} — ${AGENT.telephone}`,
+    CTA_NOTE: `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie}`,
+    REFERENCE_URL: `tel:${AGENT.telephone.replace(/\D/g,'')}`,
+    SOURCES: `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie}`,
+    DESINSCRIPTION_URL: '',
+    ...params,
+  });
+  // FILTRE terrain-a-construire (règle Shawn 2026-05-19) — JAMAIS ce site dans emails clients
+  html = html.replace(/<a[^>]*terrain-a-construire[^>]*>[\s\S]*?<\/a>/gi, '');
+  html = html.replace(/(https?:\/\/)?(www\.)?terrain-a-construire\.\w+(\/[^\s"'<>]*)?/gi, '');
+  // CLEANUP placeholders Brevo non-remplacés
+  html = html
+    .replace(/Bonjour\s+\{\{\s*contact\.[A-Z_]+\s*\}\}[\s,]*/gi, 'Bonjour,')
+    .replace(/\{\{\s*contact\.[A-Z_]+\s*\}\}/gi, '')
+    .replace(/\{\{\s*params\.[A-Z_]+\s*\}\}/gi, '');
+  return html;
+}
+
 async function sendEmailLogged(opts) {
   const entry = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -5430,8 +5486,30 @@ async function _envoyerListingPubliqueLink({ num, email_destination, cc, message
   const ccFinal = [...new Set([AGENT.email, ...ccUser].filter(e => e && e.toLowerCase() !== email_destination.toLowerCase()))];
   const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const subject = `Propriété Centris #${num} — ${AGENT.compagnie}`;
-  const intro = message_perso || `Bonjour,\n\nVoici les détails de la propriété Centris #${num} que vous m'avez demandée. Tous les détails sont disponibles en ligne via le lien ci-dessous.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
-  const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;margin:0;padding:20px;"><div style="max-width:600px;margin:auto;"><div style="border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;margin:0 0 8px;">${escapeHtml(AGENT.nom)}</h2><div style="color:#999;font-size:13px;font-style:italic;">${escapeHtml(AGENT.titre)} · ${escapeHtml(AGENT.compagnie)}</div></div><p style="color:#cccccc;line-height:1.7;white-space:pre-line;">${escapeHtml(intro)}</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:24px;margin:20px 0;text-align:center;"><div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">🏡 Fiche détaillée</div><div style="color:#f5f5f7;margin-bottom:18px;">Voir la propriété Centris #${num} avec photos, prix, description, taxes, dimensions et tous les détails:</div><a href="${publicUrl}" style="display:inline-block;background:${AGENT.couleur};color:#fff;padding:14px 28px;border-radius:4px;text-decoration:none;font-weight:700;">Voir la fiche complète →</a></div><div style="border-top:1px solid #1a1a1a;padding-top:16px;color:#666;font-size:12px;">📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a></div></div></body></html>`;
+  const introMsg = message_perso || `Voici les détails de la propriété Centris #${num} que vous m'avez demandée. Tous les détails (photos, prix, description, taxes, dimensions) sont disponibles via le lien ci-dessous.`;
+  // Contenu métier injecté dans INTRO_TEXTE du master template
+  const contentHTML = `
+<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">${escapeHtml(introMsg)}</p>
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:24px;margin:20px 0;text-align:center;">
+<div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">🏡 Fiche détaillée Centris</div>
+<div style="color:#f5f5f7;margin-bottom:18px;font-size:15px;">Cliquez pour voir la propriété complète avec photos:</div>
+<a href="${publicUrl}" style="display:inline-block;background:${AGENT.couleur};color:#fff;padding:14px 32px;border-radius:4px;text-decoration:none;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-size:13px;">Voir la fiche complète →</a>
+</div>
+<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions — je suis disponible au <strong style="color:${AGENT.couleur};">${AGENT.telephone}</strong>.</p>`;
+  // Build HTML avec master template Signature SB (logos + branding)
+  let html = await buildEmailFromMasterTpl({
+    TITRE_EMAIL: `Propriété Centris #${num}`,
+    LABEL_SECTION: `Fiche propriété`,
+    TERRITOIRES: `Centris #${num}`,
+    HERO_TITRE: `Propriété<br>Centris #${num}.`,
+    INTRO_TEXTE: contentHTML,
+    CITATION: `Je reste disponible pour toute question concernant ce dossier.`,
+  });
+  // Fallback HTML inline si template Dropbox indispo (très rare)
+  if (!html) {
+    html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;margin:0;padding:20px;"><div style="max-width:600px;margin:auto;"><div style="border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;margin:0 0 8px;">${escapeHtml(AGENT.nom)}</h2><div style="color:#999;font-size:13px;font-style:italic;">${escapeHtml(AGENT.titre)} · ${escapeHtml(AGENT.compagnie)}</div></div>${contentHTML}<div style="border-top:1px solid #1a1a1a;padding-top:16px;color:#666;font-size:12px;">📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a></div></div></body></html>`;
+    log('WARN', 'CENTRIS', `Master template Dropbox indispo, fallback HTML inline (sans logos)`);
+  }
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${email_destination}`,
@@ -5600,8 +5678,26 @@ async function telechargerFicheCentris({ centris_num, email_destination, cc, mes
   const ccLine = ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : [];
   const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
   const outer = `sbOut${Date.now()}`;
-  const intro = message_perso || `Bonjour,\n\nVoici la fiche détaillée du listing Centris #${num} tel que demandé.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.titre} | ${AGENT.compagnie}\n📞 ${AGENT.telephone}\n${AGENT.email}`;
-  const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;margin:0;padding:20px;"><div style="max-width:600px;margin:auto;"><div style="border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;margin:0 0 8px;">${escapeHtml(AGENT.nom)}</h2><div style="color:#999;font-size:13px;font-style:italic;">${escapeHtml(AGENT.titre)} · ${escapeHtml(AGENT.compagnie)}</div></div><p style="color:#cccccc;line-height:1.7;white-space:pre-line;">${escapeHtml(intro)}</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:16px;margin:20px 0;"><div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">📎 Pièce jointe</div><div style="color:#f5f5f7;">📄 ${escapeHtml(filename)} (${Math.round(pdfBuffer.length/1024)} KB)</div></div><div style="border-top:1px solid #1a1a1a;padding-top:16px;color:#666;font-size:12px;">📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a></div></div></body></html>`;
+  const introMsg = message_perso || `Voici la fiche détaillée du listing Centris #${num} tel que demandé. Le document complet est en pièce jointe.`;
+  const contentHTML = `
+<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">${escapeHtml(introMsg)}</p>
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;margin:20px 0;">
+<div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">📎 Pièce jointe</div>
+<div style="color:#f5f5f7;font-size:14px;">📄 ${escapeHtml(filename)} <span style="color:#888;">(${Math.round(pdfBuffer.length/1024)} KB)</span></div>
+</div>
+<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions — je suis disponible au <strong style="color:${AGENT.couleur};">${AGENT.telephone}</strong>.</p>`;
+  let html = await buildEmailFromMasterTpl({
+    TITRE_EMAIL: `Fiche Centris #${num}`,
+    LABEL_SECTION: `Fiche officielle`,
+    TERRITOIRES: `Centris #${num}`,
+    HERO_TITRE: `Fiche<br>Centris #${num}.`,
+    INTRO_TEXTE: contentHTML,
+    CITATION: `Je reste disponible pour répondre à toutes vos questions sur ce dossier.`,
+  });
+  if (!html) {
+    html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;margin:0;padding:20px;"><div style="max-width:600px;margin:auto;"><div style="border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;margin:0 0 8px;">${escapeHtml(AGENT.nom)}</h2><div style="color:#999;font-size:13px;font-style:italic;">${escapeHtml(AGENT.titre)} · ${escapeHtml(AGENT.compagnie)}</div></div>${contentHTML}<div style="border-top:1px solid #1a1a1a;padding-top:16px;color:#666;font-size:12px;">📞 ${AGENT.telephone} · <a href="mailto:${AGENT.email}" style="color:${AGENT.couleur};">${AGENT.email}</a></div></div></body></html>`;
+    log('WARN', 'CENTRIS', `Master template indispo pour fiche #${num}, fallback HTML inline`);
+  }
   const lines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${email_destination}`,
@@ -6454,8 +6550,26 @@ async function executeTool(name, input, chatId) {
             const subject = `Annexes Centris #${num}${filtre ? ` — ${filtre}` : ''}`;
             const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
             const outer = `ann${Date.now()}`;
-            const pjList = ok.map(d => `📎 ${d.filename} (${Math.round(d.size/1024)}KB)`).join('<br>');
-            const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:20px;"><div style="max-width:600px;margin:auto;border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;">${escapeHtml(AGENT.nom)}</h2><p style="color:#cccccc;line-height:1.7;">Bonjour,<br><br>Voici les ${ok.length} annexes Centris pour le listing #${num}:<br><br>${pjList}<br><br>N'hésitez pas si vous avez des questions.<br><br>${escapeHtml(AGENT.nom)}<br>${escapeHtml(AGENT.titre)} | ${escapeHtml(AGENT.compagnie)}<br>📞 ${AGENT.telephone}<br>${AGENT.email}</p></div></body></html>`;
+            const pjList = ok.map(d => `<div style="color:#f5f5f7;margin:6px 0;font-size:14px;">📎 ${escapeHtml(d.filename)} <span style="color:#888;">(${Math.round(d.size/1024)}KB)</span></div>`).join('');
+            const annexesContent = `
+<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Voici les ${ok.length} annexes Centris pour le listing #${num}${filtre ? ` (filtre: <em>${escapeHtml(filtre)}</em>)` : ''}:</p>
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;margin:20px 0;">
+<div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">📂 Pièces jointes</div>
+${pjList}
+</div>
+<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions — je suis disponible au <strong style="color:${AGENT.couleur};">${AGENT.telephone}</strong>.</p>`;
+            let html = await buildEmailFromMasterTpl({
+              TITRE_EMAIL: `Annexes Centris #${num}`,
+              LABEL_SECTION: `Annexes officielles`,
+              TERRITOIRES: `Centris #${num}`,
+              HERO_TITRE: `Annexes<br>Centris #${num}.`,
+              INTRO_TEXTE: annexesContent,
+              CITATION: `Je reste disponible pour répondre à toutes vos questions.`,
+            });
+            if (!html) {
+              html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:20px;"><div style="max-width:600px;margin:auto;border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;">${escapeHtml(AGENT.nom)}</h2>${annexesContent}</div></body></html>`;
+              log('WARN', 'CENTRIS', `Master template indispo pour annexes #${num}, fallback inline`);
+            }
             const parts = [
               `From: ${AGENT.nom} <${AGENT.email}>`,
               `To: ${email_destination}`,
@@ -6582,7 +6696,25 @@ async function executeTool(name, input, chatId) {
               const subject = `Grille de zonage — ${adresse}`;
               const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
               const outer = `zon${Date.now()}`;
-              const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:20px;"><div style="max-width:600px;margin:auto;border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;">${escapeHtml(AGENT.nom)}</h2><p style="color:#cccccc;line-height:1.7;">Bonjour,<br><br>Voici la grille de zonage pour ${escapeHtml(adresse)}.<br><br>N'hésitez pas si vous avez des questions.<br><br>${escapeHtml(AGENT.nom)}<br>${escapeHtml(AGENT.titre)} | ${escapeHtml(AGENT.compagnie)}<br>📞 ${AGENT.telephone}<br>${AGENT.email}</p></div></body></html>`;
+              const zonageContent = `
+<p style="margin:0 0 16px;color:#cccccc;font-size:14px;line-height:1.7;">Voici la grille de zonage officielle de la municipalité de <strong style="color:#f5f5f7;">${escapeHtml(ville)}</strong> pour l'adresse <strong style="color:#f5f5f7;">${escapeHtml(adresse)}</strong>.</p>
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;margin:20px 0;">
+<div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">📎 Document officiel</div>
+<div style="color:#f5f5f7;font-size:14px;">🗺 ${escapeHtml(filename)} <span style="color:#888;">(${Math.round(pdfBuffer.length/1024)}KB)</span></div>
+</div>
+<p style="margin:16px 0;color:#cccccc;font-size:14px;line-height:1.6;">N'hésitez pas si vous avez des questions sur les marges, usages permis ou tout autre détail — je suis disponible au <strong style="color:${AGENT.couleur};">${AGENT.telephone}</strong>.</p>`;
+              let html = await buildEmailFromMasterTpl({
+                TITRE_EMAIL: `Grille de zonage — ${ville}`,
+                LABEL_SECTION: `Document officiel municipal`,
+                TERRITOIRES: ville,
+                HERO_TITRE: `Grille<br>de zonage.`,
+                INTRO_TEXTE: zonageContent,
+                CITATION: `Je reste disponible pour vous accompagner dans votre projet.`,
+              });
+              if (!html) {
+                html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:20px;"><div style="max-width:600px;margin:auto;border-top:4px solid ${AGENT.couleur};padding:24px 0;"><h2 style="color:#f5f5f7;">${escapeHtml(AGENT.nom)}</h2>${zonageContent}</div></body></html>`;
+                log('WARN', 'ZONAGE', `Master template indispo, fallback inline`);
+              }
               const ccLine = `Cc: ${AGENT.email}`;
               const lines = [
                 `From: ${AGENT.nom} <${AGENT.email}>`,
@@ -14715,6 +14847,13 @@ async function main() {
 
   log('INFO', 'BOOT', 'Step 5: load session live context');
   try { await loadSessionLiveContext(); } catch (e) { log('WARN', 'BOOT', `Session live: ${e.message}`); }
+
+  log('INFO', 'BOOT', 'Step 5b: pre-warm master email template');
+  try {
+    const tpl = await loadMasterTemplate(true);
+    if (tpl) log('OK', 'BOOT', `Master template chargé (${(tpl.length/1024).toFixed(1)} KB) — logos Signature SB + RE/MAX prêts`);
+    else log('WARN', 'BOOT', `Master template Dropbox indispo au boot — fallback inline activé`);
+  } catch (e) { log('WARN', 'BOOT', `Pre-warm template: ${e.message}`); }
 
   // Refresh token Dropbox toutes les 3h (tokens expirent ~4h)
   setInterval(async () => {
