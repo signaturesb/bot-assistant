@@ -13262,8 +13262,16 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
-      const senderObj = camp.sender || { name: AGENT.nom, email: AGENT.email };
-      const subject = `[PREVIEW] ${camp.subject}`;
+      // Brevo refuse sender avec BOTH id AND email → garder seulement email + name
+      const rawSender = camp.sender || { name: AGENT.nom, email: AGENT.email };
+      const senderObj = { email: rawSender.email, name: rawSender.name };
+      // Self-send trap: Gmail filtre les emails de shawn@ → shawn@. On force destinataire
+      // alternatif si match. Override via ?to=...
+      const isSameAsSender = senderObj.email?.toLowerCase() === to.toLowerCase();
+      const finalTo = isSameAsSender && u.searchParams.get('force') !== '1'
+        ? (u.searchParams.get('alt') || 'shawnbarrette@icloud.com')
+        : to;
+      const subject = `[PREVIEW${isSameAsSender ? ' — destinataire ajusté' : ''}] ${camp.subject}`;
       const htmlContent = camp.htmlContent || '<p>(no html)</p>';
       // 2. Envoyer via Brevo SMTP API (sendinblue transactional)
       const r2 = await fetch('https://api.brevo.com/v3/smtp/email', {
@@ -13271,7 +13279,8 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
         headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
         body: JSON.stringify({
           sender: senderObj,
-          to: [{ email: to, name: 'Shawn' }],
+          to: [{ email: finalTo, name: 'Shawn' }],
+          replyTo: { email: AGENT.email, name: AGENT.nom },
           subject,
           htmlContent,
           tags: ['preview', `campaign-${id}`],
@@ -13282,11 +13291,14 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       res.end(JSON.stringify({
         ok: r2.ok, status: r2.status,
         sender_used: senderObj,
-        to, subject,
+        to_requested: to,
+        to_actual: finalTo,
+        self_send_detected: isSameAsSender,
+        subject,
         html_length: htmlContent.length,
         brevo_response: body.substring(0, 500),
       }, null, 2));
-      if (r2.ok) auditLogEvent('preview', 'sent-raw', { id, to, sender: senderObj.email });
+      if (r2.ok) auditLogEvent('preview', 'sent-raw', { id, to: finalTo, sender: senderObj.email });
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
     return;
   }
