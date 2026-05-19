@@ -182,91 +182,139 @@ async function loginCentris(context) {
   const page = await context.newPage();
   await page.setViewportSize(VIEWPORT);
 
-  // Essayer session cachée d'abord (cookies bot.js partagés via /data/centris_cookies.json)
+  // Essayer session cachée d'abord (CUA propre OU cookies bot principal partagés)
   const savedCookies = loadSession() || loadBotCentrisCookies();
-  if (savedCookies) {
+  if (savedCookies && savedCookies.length > 0) {
     try {
       await context.addCookies(savedCookies);
       await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await page.waitForTimeout(2000);
-
-      // Vérifier qu'on est bien connecté (pas redirigé vers login)
       const url = page.url();
-      if (!url.includes('/login') && !url.includes('/auth') && !url.includes('signin') && !url.includes('LoginIntermediate')) {
-        console.log('[CUA] Session cachée valide ✅');
+      if (!/\/login|\/auth|signin|LoginIntermediate|accounts\.centris/i.test(url)) {
+        console.log('[CUA] Session cachée valide ✅', url.substring(0, 80));
         return page;
       }
       console.log('[CUA] Session expirée, re-login...');
       clearSession();
-    } catch (e) {
-      console.warn('[CUA] Échec session cachée:', e.message);
-      clearSession();
-    }
+    } catch (e) { console.warn('[CUA] Cookie session échouée:', e.message); clearSession(); }
   }
 
-  // Login frais — Centris login page
-  console.log('[CUA] Login Centris matrix...');
+  // Login frais — page Centris Matrix qui redirige vers accounts.centris.ca
+  console.log('[CUA] Login Centris matrix (fresh)...');
   await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2500);
 
-  // Auth0 flow — identifier puis password (split form)
   const currentUrl = page.url();
-  console.log('[CUA] URL login:', currentUrl);
+  console.log('[CUA] URL login:', currentUrl.substring(0, 100));
 
-  // Step 1: email / identifiant
+  // Centris form: UserCode + Password sur même page (pas Auth0 split)
   try {
-    const emailField = page.locator('input[name="username"], input[type="email"], #username, #identifier').first();
-    await emailField.waitFor({ timeout: 8000 });
-    await emailField.fill(user);
+    // UserCode field — selecteurs multiples pour robustesse
+    const userField = page.locator('input[id*="UserCode"], input[name*="UserCode"], input[id="UserCode"], input[placeholder*="user" i], input[placeholder*="code" i]').first();
+    await userField.waitFor({ timeout: 10000 });
+    await userField.fill(user);
+    console.log('[CUA] UserCode rempli');
 
-    // Chercher bouton Continue / Next
-    const continueBtn = page.locator('button[type="submit"], button:has-text("Continue"), button:has-text("Continuer"), button:has-text("Next")').first();
-    await continueBtn.click();
-    await page.waitForTimeout(1500);
-  } catch {
-    // Peut-être form unique username+password
-  }
-
-  // Step 2: password
-  try {
-    const passField = page.locator('input[name="password"], input[type="password"], #password').first();
-    await passField.waitFor({ timeout: 8000 });
+    const passField = page.locator('input[id="Password"], input[type="password"], input[name="Password"]').first();
     await passField.fill(pass);
+    console.log('[CUA] Password rempli');
 
-    const submitBtn = page.locator('button[type="submit"], button:has-text("Sign In"), button:has-text("Connexion"), button:has-text("Log In")').first();
+    // Submit button — labels FR + EN
+    const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Connect"), button:has-text("Connexion"), button:has-text("Sign In"), button:has-text("Log In")').first();
     await submitBtn.click();
-    await page.waitForTimeout(3000);
+    console.log('[CUA] Submit cliqué');
+    await page.waitForTimeout(4000);
   } catch (e) {
-    throw new Error(`Login step password échoué: ${e.message}`);
+    throw new Error(`Centris login form échec: ${e.message}`);
   }
 
-  // Gérer MFA SMS si présent
-  const mfaField = page.locator('input[name="code"], input[placeholder*="code"], input[placeholder*="Code"]').first();
-  const mfaVisible = await mfaField.isVisible().catch(() => false);
-  if (mfaVisible) {
-    console.log('[CUA] MFA requis — attente code SMS (max 90s)...');
-    // Le LaunchAgent Mac gère le SMS bridge — attendre que /data/centris_mfa.txt apparaisse
-    const mfaCode = await waitForMFACode(90000);
-    if (!mfaCode) throw new Error('MFA timeout — pas de code SMS reçu en 90s');
+  // Handle MFA (Email ou SMS) — Centris envoie code par email après login basic
+  for (let mfaAttempt = 0; mfaAttempt < 2; mfaAttempt++) {
+    const mfaField = page.locator('input[name*="ode"], input[id*="ode"], input[placeholder*="code" i], input[placeholder*="vérif" i], input[type="tel"]').first();
+    const mfaVisible = await mfaField.isVisible().catch(() => false);
+    if (!mfaVisible) break;
+
+    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — fetch code via Gmail (max 60s)...`);
+    const mfaCode = await fetchMFACodeFromBot(60000);
+    if (!mfaCode) throw new Error('MFA timeout — pas de code MFA reçu en 60s via Gmail/bot');
+    console.log(`[CUA] MFA code reçu: ${mfaCode.substring(0, 2)}****`);
+
     await mfaField.fill(mfaCode);
-    const mfaSubmit = page.locator('button[type="submit"]').first();
+    const mfaSubmit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Vérif"), button:has-text("Submit"), button:has-text("Confirmer")').first();
     await mfaSubmit.click();
+    await page.waitForTimeout(4000);
+  }
+
+  // Handle disclaimers "I've Read This" / "Continue"
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const url = page.url();
+    if (!/LoginIntermediate|Disclaimer|Consent/i.test(url)) break;
+    console.log('[CUA] Disclaimer detected, clicking continue...');
+    const continueBtn = page.locator('button:has-text("Continue"), input[type="submit"][value*="Continue"], button:has-text("I.?ve Read")').first();
+    const visible = await continueBtn.isVisible().catch(() => false);
+    if (!visible) break;
+    await continueBtn.click();
     await page.waitForTimeout(3000);
-    // Effacer le fichier MFA
-    try { fs.unlinkSync(path.join(DATA_DIR, 'centris_mfa.txt')); } catch {}
   }
 
-  // Vérifier login réussi
   const finalUrl = page.url();
-  if (finalUrl.includes('/login') || finalUrl.includes('/auth')) {
-    throw new Error(`Login Centris échoué — URL finale: ${finalUrl}`);
+  if (/\/login|\/auth|signin|accounts\.centris/i.test(finalUrl)) {
+    throw new Error(`Login Centris échoué — URL finale: ${finalUrl.substring(0, 200)}`);
   }
 
-  // Sauvegarder session
+  // Sauvegarder session pour reuse 12h
   const cookies = await context.cookies();
   saveSession(cookies);
-  console.log('[CUA] Login Centris réussi ✅ Session sauvegardée.');
+  // Push aussi vers bot principal pour partage
+  try { pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', e.message); }
+  console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', finalUrl.substring(0, 80));
   return page;
+}
+
+// Fetch MFA code depuis le bot Render qui lit Gmail automatiquement
+async function fetchMFACodeFromBot(timeoutMs) {
+  const botUrl = process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com';
+  const token = process.env.WEBHOOK_SECRET;
+  if (!token) {
+    console.warn('[CUA] WEBHOOK_SECRET manquant — fallback file /data/centris_mfa.txt');
+    return await waitForMFACode(timeoutMs);
+  }
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const r = await fetch(`${botUrl}/admin/centris-mfa-code?token=${encodeURIComponent(token)}&since=${start}`, {
+        signal: AbortSignal.timeout(15000),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        if (d.code && /^\d{4,8}$/.test(d.code)) return d.code;
+      }
+    } catch (e) { console.warn('[CUA] fetchMFA:', e.message); }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  return null;
+}
+
+// Push cookies au bot principal pour qu'il bénéficie de la session CUA
+async function pushCookiesToBot(playwrightCookies) {
+  const botUrl = process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com';
+  const token = process.env.WEBHOOK_SECRET;
+  if (!token) return;
+  // Convert Playwright format → Cookie header string
+  const cookieStr = playwrightCookies
+    .filter(c => /centris\.ca$/i.test(c.domain || ''))
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
+  if (!cookieStr) return;
+  try {
+    await fetch(`${botUrl}/admin/centris-cookies?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cookies: cookieStr, source: 'cua', ts: Date.now() }),
+      signal: AbortSignal.timeout(10000),
+    });
+    console.log('[CUA] Cookies pushed to bot ✅');
+  } catch (e) { console.warn('[CUA] pushCookies failed:', e.message); }
 }
 
 // Attendre code MFA dans /data/centris_mfa.txt (écrit par sms-bridge LaunchAgent)
