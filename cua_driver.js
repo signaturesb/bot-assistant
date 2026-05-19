@@ -37,8 +37,10 @@ const PDF_DIR        = path.join(DATA_DIR, 'cua_pdfs');
 const SESSION_TTL    = 12 * 60 * 60 * 1000;   // 12h — refresh auto
 const MAX_STEPS      = 25;                      // iterations max par tâche
 const VIEWPORT       = { width: 1280, height: 900 };
-const CENTRIS_BASE   = 'https://agent.centris.ca';
-const MATRIX_BASE    = 'https://matrix.agent.centris.ca';
+// Centris a migré 2026: agent.centris.ca retiré → matrix.centris.ca
+const CENTRIS_BASE   = 'https://matrix.centris.ca';
+const MATRIX_BASE    = 'https://matrix.centris.ca';
+const PUBLIC_BASE    = 'https://www.centris.ca';
 
 // Lazy-load — Playwright optionnel (pas dans package.json par défaut)
 let playwright = null;
@@ -140,6 +142,34 @@ function clearSession() {
   try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch {}
 }
 
+// Récupère cookies du bot principal (centris_cookies.json) si CUA n'a pas sa propre session
+// Le LaunchAgent Mac push les cookies fresh tous les 12h via /admin/centris-cookies
+function loadBotCentrisCookies() {
+  try {
+    const botCookieFile = path.join(DATA_DIR, 'centris_cookies.json');
+    if (!fs.existsSync(botCookieFile)) return null;
+    const data = JSON.parse(fs.readFileSync(botCookieFile, 'utf8'));
+    // Format bot.js: { cookies: "name1=val1; name2=val2", expiry: timestamp }
+    // Format Playwright requis: [{ name, value, domain, path }, ...]
+    if (!data.cookies || typeof data.cookies !== 'string') return null;
+    if (data.expiry && Date.now() > data.expiry) return null;
+    const pairs = data.cookies.split(';').map(s => s.trim()).filter(Boolean);
+    return pairs.map(pair => {
+      const idx = pair.indexOf('=');
+      if (idx < 0) return null;
+      return {
+        name: pair.substring(0, idx).trim(),
+        value: pair.substring(idx + 1).trim(),
+        domain: '.centris.ca',
+        path: '/',
+        httpOnly: false,
+        secure: true,
+        sameSite: 'Lax',
+      };
+    }).filter(Boolean);
+  } catch (e) { console.warn('[CUA] loadBotCentrisCookies:', e.message); return null; }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // LOGIN CENTRIS (avec ou sans session cachée)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -152,17 +182,17 @@ async function loginCentris(context) {
   const page = await context.newPage();
   await page.setViewportSize(VIEWPORT);
 
-  // Essayer session cachée d'abord
-  const savedCookies = loadSession();
+  // Essayer session cachée d'abord (cookies bot.js partagés via /data/centris_cookies.json)
+  const savedCookies = loadSession() || loadBotCentrisCookies();
   if (savedCookies) {
     try {
       await context.addCookies(savedCookies);
-      await page.goto(`${CENTRIS_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await page.waitForTimeout(2000);
 
       // Vérifier qu'on est bien connecté (pas redirigé vers login)
       const url = page.url();
-      if (!url.includes('/login') && !url.includes('/auth') && !url.includes('signin')) {
+      if (!url.includes('/login') && !url.includes('/auth') && !url.includes('signin') && !url.includes('LoginIntermediate')) {
         console.log('[CUA] Session cachée valide ✅');
         return page;
       }
@@ -174,9 +204,9 @@ async function loginCentris(context) {
     }
   }
 
-  // Login frais
-  console.log('[CUA] Login Centris agent...');
-  await page.goto(`${CENTRIS_BASE}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  // Login frais — Centris login page
+  console.log('[CUA] Login Centris matrix...');
+  await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1500);
 
   // Auth0 flow — identifier puis password (split form)
@@ -546,7 +576,7 @@ async function cuaGetCentrisPDF(centrisNum) {
 
     // Essayer URL directe Matrix d'abord
     try {
-      await page.goto(`${MATRIX_BASE}/Listing/${centrisNum}`, {
+      await page.goto(`${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}`, {
         waitUntil: 'domcontentloaded', timeout: 15000
       });
       await page.waitForTimeout(2000);
@@ -665,11 +695,11 @@ Les annexes peuvent inclure: Déclaration du vendeur (DV), Certificat de localis
 3. Télécharge ${filtreStr} les annexes disponibles
 4. Confirme chaque téléchargement
 
-URL à essayer: ${MATRIX_BASE}/Listing/${centrisNum}
+URL à essayer: ${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}
 `.trim();
 
     try {
-      await page.goto(`${MATRIX_BASE}/Listing/${centrisNum}`, {
+      await page.goto(`${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}`, {
         waitUntil: 'domcontentloaded', timeout: 15000
       });
       await page.waitForTimeout(2000);
