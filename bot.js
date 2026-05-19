@@ -13326,12 +13326,23 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       const rateMatches = [...html.matchAll(/(\d+[\.,]\d{1,3})\s*%/g)].map(m => m[1]);
       // Extract montants $
       const amountMatches = [...html.matchAll(/\$\s*(\d{1,3}(?:[\s,]\d{3})+)/g)].map(m => m[1]);
+      // Cherche contexte autour de chaque taux (50 chars avant/après)
+      const rateContexts = [];
+      let m;
+      const re = /(\d+[\.,]\d{1,3})\s*%/g;
+      while ((m = re.exec(html)) !== null) {
+        const start = Math.max(0, m.index - 80);
+        const end = Math.min(html.length, m.index + 80);
+        const ctx = html.substring(start, end).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        rateContexts.push({ rate: m[1], context: ctx });
+      }
       res.writeHead(200, {'content-type':'application/json'});
       res.end(JSON.stringify({
         id, name: camp.name, subject: camp.subject,
         html_length: html.length,
         rates_found: [...new Set(rateMatches)],
         amounts_found: [...new Set(amountMatches)],
+        rate_contexts: rateContexts.slice(0, 20),
         html_first_3000: html.substring(0, 3000),
       }, null, 2));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
