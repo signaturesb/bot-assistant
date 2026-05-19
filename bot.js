@@ -11467,6 +11467,21 @@ function startDailyTasks() {
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
 
+    // ── Market Intelligence refresh quotidien 5h matin ──────────────────────
+    if (h === 5 && lastCron.marketRefresh !== todayStr) {
+      lastCron.marketRefresh = todayStr;
+      (async () => {
+        try {
+          const mi = require('./market_intelligence');
+          log('INFO', 'MARKET', 'Refresh quotidien démarré');
+          const r = await mi.refreshMarketSnapshot();
+          const okCount = Object.keys(r.data || {}).length;
+          const failCount = Object.keys(r.errors || {}).length;
+          log('OK', 'MARKET', `Refresh complet: ${okCount} sources OK, ${failCount} échecs`);
+        } catch (e) { log('ERR', 'MARKET', `Refresh: ${e.message}`); }
+      })();
+    }
+
     // ── Pipedrive Proactive — 5 features anti-perte-de-lead ──────────────────
     // 🧊 SUR GLACE — désactivé jusqu'à ordre Shawn. Pour réactiver: tape dans
     // Telegram /setsecret PROACTIVE_ENABLED true → effet immédiat (sans redeploy).
@@ -13195,6 +13210,37 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     } catch (e) { out.errors.push(`Top: ${e.message}`); }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  // ─── GET /admin/market-refresh — force refresh market_intelligence
+  if (req.method === 'GET' && url.startsWith('/admin/market-refresh')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const sources = u.searchParams.get('sources')?.split(',').filter(Boolean) || null;
+    try {
+      const mi = require('./market_intelligence');
+      const r = await mi.refreshMarketSnapshot({ sources });
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        ok: true,
+        sources_ok: Object.keys(r.data || {}),
+        sources_err: r.errors || {},
+        digest: mi.buildMarketDigest(),
+      }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
+  // ─── GET /admin/market-status — snapshot actuel sans refresh
+  if (req.method === 'GET' && url.startsWith('/admin/market-status')) {
+    try {
+      const mi = require('./market_intelligence');
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({ status: mi.marketStatus(), digest: mi.buildMarketDigest() }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
     return;
   }
 
