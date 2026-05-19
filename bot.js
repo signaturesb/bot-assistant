@@ -17,6 +17,28 @@ function getCUA() {
   return _cua || null;
 }
 
+// Auth helper centralisé pour endpoints /admin/* (audit P1 #4)
+// Utilise timingSafeEqual + retourne le token parsé proprement via URL
+// Usage:
+//   if (!requireAdmin(req, res)) return;
+function requireAdmin(req, res) {
+  try {
+    const u = new URL(req.url, 'http://x');
+    const token = u.searchParams.get('token') || '';
+    const expected = process.env.WEBHOOK_SECRET || '';
+    if (!expected) {
+      res.writeHead(503); res.end('WEBHOOK_SECRET non configuré'); return false;
+    }
+    const crypto = require('crypto');
+    const a = Buffer.from(token, 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      res.writeHead(401); res.end('unauthorized'); return false;
+    }
+    return true;
+  } catch { res.writeHead(400); res.end('bad request'); return false; }
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_ID  = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID || '0');
@@ -275,13 +297,29 @@ try {
   }
 } catch { /* silent: bad json → start fresh */ }
 {
+  const PENDING_DOCS_CAP = 200; // audit P1 #6 — empêche fuite mémoire si parser fait fausses détections
+  let _pdsDebounceTimer = null;
+  function _debouncedSave() {
+    if (_pdsDebounceTimer) clearTimeout(_pdsDebounceTimer);
+    _pdsDebounceTimer = setTimeout(() => { _pdsDebounceTimer = null; savePendingDocs(); }, 500);
+  }
   const _pdsSet = pendingDocSends.set.bind(pendingDocSends);
   const _pdsDel = pendingDocSends.delete.bind(pendingDocSends);
   pendingDocSends.set = (k, v) => {
     if (v && typeof v === 'object' && !v._firstSeen) v._firstSeen = Date.now();
-    const r = _pdsSet(k, v); savePendingDocs(); return r;
+    // LRU evict si on dépasse le cap
+    if (pendingDocSends.size >= PENDING_DOCS_CAP && !pendingDocSends.has(k)) {
+      const oldest = [...pendingDocSends.entries()].sort((a, b) => (a[1]?._firstSeen || 0) - (b[1]?._firstSeen || 0))[0];
+      if (oldest) {
+        _pdsDel(oldest[0]);
+        if (typeof log === 'function') log('WARN', 'PENDING_DOCS', `Cap ${PENDING_DOCS_CAP} atteint — evict ${oldest[0]}`);
+      }
+    }
+    const r = _pdsSet(k, v); _debouncedSave(); return r;
   };
-  pendingDocSends.delete = (k) => { const r = _pdsDel(k); savePendingDocs(); return r; };
+  pendingDocSends.delete = (k) => { const r = _pdsDel(k); _debouncedSave(); return r; };
+  // Helper safe pour itération depuis crons (snapshot)
+  pendingDocSends.safeEntries = () => Array.from(pendingDocSends.entries());
 }
 
 // (rate limiting webhooks géré par webhookRateOK() défini plus bas — DRY)
@@ -1536,6 +1574,9 @@ async function writeBotActivity() {
 
 // ─── Dropbox (avec refresh auto) ─────────────────────────────────────────────
 let dropboxToken = process.env.DROPBOX_ACCESS_TOKEN || '';
+// Audit P2 #7: tracker expiry (4h Dropbox) pour pre-emptive refresh
+let dropboxTokenExp = 0; // ms epoch
+let dropboxRefreshInProgress = null; // mutex pour éviter refresh parallèles
 async function refreshDropboxToken() {
   const { DROPBOX_APP_KEY: key, DROPBOX_APP_SECRET: secret, DROPBOX_REFRESH_TOKEN: refresh } = process.env;
   if (!key || !secret || !refresh) {
@@ -1556,15 +1597,26 @@ async function refreshDropboxToken() {
     const data = await res.json();
     if (!data.access_token) { log('ERR', 'DROPBOX', `Refresh: pas de access_token — ${JSON.stringify(data).substring(0,100)}`); return false; }
     dropboxToken = data.access_token;
-    log('OK', 'DROPBOX', 'Token rafraîchi ✓');
+    // Dropbox tokens vivent ~4h. expires_in en sec — fallback 14000s (3h53m)
+    const expiresInSec = parseInt(data.expires_in || '14000');
+    dropboxTokenExp = Date.now() + (expiresInSec - 120) * 1000; // -2min safety margin
+    log('OK', 'DROPBOX', `Token rafraîchi ✓ (exp dans ${Math.round(expiresInSec/60)}min)`);
     return true;
   } catch (e) { log('ERR', 'DROPBOX', `Refresh exception: ${e.message}`); return false; }
 }
 async function dropboxAPI(apiUrl, body, isDownload = false) {
-  if (!dropboxToken) {
-    log('WARN', 'DROPBOX', 'Token absent — tentative refresh...');
-    const ok = await refreshDropboxToken();
-    if (!ok) { log('ERR', 'DROPBOX', 'Refresh échoué — Dropbox inaccessible'); return null; }
+  // Pre-emptive refresh si token absent OU expire dans <60s (audit P2 #7)
+  if (!dropboxToken || (dropboxTokenExp && Date.now() > dropboxTokenExp - 60000)) {
+    // Mutex pour éviter refresh parallèles batch (gros listings → 30 appels parallèles)
+    if (dropboxRefreshInProgress) {
+      await dropboxRefreshInProgress.catch(() => {});
+    } else {
+      dropboxRefreshInProgress = (async () => {
+        try { await refreshDropboxToken(); } finally { dropboxRefreshInProgress = null; }
+      })();
+      await dropboxRefreshInProgress;
+    }
+    if (!dropboxToken) { log('ERR', 'DROPBOX', 'Refresh échoué — Dropbox inaccessible'); return null; }
   }
   // Endpoints sans paramètres (ex: /users/get_current_account) doivent avoir
   // body=null, pas {}. Dropbox retourne 400 sur {} pour ces endpoints.

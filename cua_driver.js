@@ -68,12 +68,27 @@ async function launchBrowser() {
   const wsEndpoint = process.env.BROWSERLESS_WS;
   if (wsEndpoint) {
     console.log('[CUA] Mode Browserless externe (WS)');
-    try {
-      return await playwright.chromium.connect(wsEndpoint, { timeout: 30000 });
-    } catch (e) {
-      console.error('[CUA] Browserless connect échoué:', e.message);
-      throw new Error(`Browserless WS connect échoué: ${e.message}. Vérifie BROWSERLESS_WS env var.`);
+    // Audit P3 #10: retry 3× avec backoff 3s/8s/20s
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const browser = await playwright.chromium.connect(wsEndpoint, { timeout: 30000 });
+        // Track disconnect pour visibilité
+        browser.on('disconnected', () => console.warn('[CUA] Browser disconnected (Browserless)'));
+        if (attempt > 1) console.log(`[CUA] Browserless connect OK (attempt ${attempt})`);
+        return browser;
+      } catch (e) {
+        lastErr = e;
+        if (attempt < 3) {
+          const delay = [3000, 8000, 20000][attempt - 1];
+          console.warn(`[CUA] Browserless connect échoué (attempt ${attempt}/${3}, retry ${delay}ms): ${e.message}`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
     }
+    // 3 fails → reset cache disponibilité pour forcer re-check au prochain appel
+    _cuaAvailable = null;
+    throw new Error(`Browserless WS connect échoué 3× — last: ${lastErr?.message}. Vérifie BROWSERLESS_WS / quota.`);
   }
   console.log('[CUA] Mode local Chromium');
   return await playwright.chromium.launch({
