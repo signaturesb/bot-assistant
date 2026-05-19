@@ -13588,8 +13588,8 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     try {
       const gmailTok = await getGmailToken();
       if (!gmailTok) { res.writeHead(500); res.end(JSON.stringify({error:'no gmail token'})); return; }
-      // Cherche emails récents de Centris/Auth0 dans les 5 dernières minutes
-      const query = encodeURIComponent('(from:noreply@centris.ca OR from:no-reply@centris.ca OR from:auth0 OR subject:Centris OR subject:"verification code") newer_than:1h');
+      // Cherche emails récents Centris/Auth0/MFA dans la dernière heure — query large
+      const query = encodeURIComponent('(from:centris.ca OR from:auth0 OR from:noreply OR from:no-reply OR subject:Centris OR subject:Matrix OR subject:vérification OR subject:verification OR subject:code OR subject:authentif) newer_than:1h');
       const listRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${query}&maxResults=5`, {
         headers: { 'Authorization': `Bearer ${gmailTok}` },
         signal: AbortSignal.timeout(10000),

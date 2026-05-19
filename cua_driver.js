@@ -208,24 +208,41 @@ async function loginCentris(context) {
   console.log('[CUA] URL login:', currentUrl.substring(0, 100));
 
   // Centris form: UserCode + Password sur même page (pas Auth0 split)
+  let loginDeterministicOK = false;
   try {
-    // UserCode field — selecteurs multiples pour robustesse
     const userField = page.locator('input[id*="UserCode"], input[name*="UserCode"], input[id="UserCode"], input[placeholder*="user" i], input[placeholder*="code" i]').first();
     await userField.waitFor({ timeout: 10000 });
     await userField.fill(user);
-    console.log('[CUA] UserCode rempli');
 
     const passField = page.locator('input[id="Password"], input[type="password"], input[name="Password"]').first();
     await passField.fill(pass);
-    console.log('[CUA] Password rempli');
 
-    // Submit button — labels FR + EN
     const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Connect"), button:has-text("Connexion"), button:has-text("Sign In"), button:has-text("Log In")').first();
     await submitBtn.click();
-    console.log('[CUA] Submit cliqué');
-    await page.waitForTimeout(4000);
+    console.log('[CUA] Login form rempli (deterministic) ✅');
+    await page.waitForTimeout(4500);
+    loginDeterministicOK = true;
   } catch (e) {
-    throw new Error(`Centris login form échec: ${e.message}`);
+    console.warn(`[CUA] Login deterministic échoué: ${e.message}. Fallback CUA visuel...`);
+  }
+
+  // FALLBACK CUA — si selectors deterministic ratent (UI change), Claude voit l'écran et décide
+  if (!loginDeterministicOK) {
+    console.log('[CUA] Activation CUA pour login visuel...');
+    const loginTask = `Tu es sur la page de login Centris/Matrix. Mes credentials:
+- UserCode/Username: "${user}"
+- Password: "${pass}"
+
+Étapes:
+1. Trouve le champ UserCode/Username et entre "${user}"
+2. Trouve le champ Password et entre "${pass}"
+3. Clique le bouton Connect/Connexion/Sign In/Log In
+4. Attends que la page suivante charge
+
+Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accueil Matrix.`;
+    const visualResult = await runCUATask(page, loginTask);
+    if (!visualResult.success) throw new Error(`CUA visual login échec: ${visualResult.message}`);
+    console.log('[CUA] Login visuel réussi ✅');
   }
 
   // Handle MFA (Email ou SMS) — Centris envoie code par email après login basic
@@ -272,6 +289,8 @@ async function loginCentris(context) {
 }
 
 // Fetch MFA code depuis le bot Render qui lit Gmail automatiquement
+// Fallback 1: /data/centris_mfa.txt (Mac LaunchAgent sms-bridge)
+// Fallback 2: alerte Telegram à Shawn avec demande manuelle
 async function fetchMFACodeFromBot(timeoutMs) {
   const botUrl = process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com';
   const token = process.env.WEBHOOK_SECRET;
@@ -280,19 +299,55 @@ async function fetchMFACodeFromBot(timeoutMs) {
     return await waitForMFACode(timeoutMs);
   }
   const start = Date.now();
+  let alertSent = false;
   while (Date.now() - start < timeoutMs) {
     try {
-      const r = await fetch(`${botUrl}/admin/centris-mfa-code?token=${encodeURIComponent(token)}&since=${start}`, {
+      // 1. Try Gmail via bot endpoint
+      const r = await fetch(`${botUrl}/admin/centris-mfa-code?token=${encodeURIComponent(token)}`, {
         signal: AbortSignal.timeout(15000),
       });
       if (r.ok) {
         const d = await r.json();
-        if (d.code && /^\d{4,8}$/.test(d.code)) return d.code;
+        if (d.code && /^\d{4,8}$/.test(d.code)) {
+          console.log(`[CUA] MFA from Gmail (${d.emails_checked} emails scanned, subject="${d.subject?.substring(0,40)}")`);
+          return d.code;
+        }
       }
-    } catch (e) { console.warn('[CUA] fetchMFA:', e.message); }
+      // 2. Try local file (Mac LaunchAgent sms-bridge)
+      const mfaFile = path.join(DATA_DIR, 'centris_mfa.txt');
+      if (fs.existsSync(mfaFile)) {
+        const code = fs.readFileSync(mfaFile, 'utf8').trim();
+        if (code && /^\d{4,8}$/.test(code)) {
+          fs.unlinkSync(mfaFile);
+          console.log('[CUA] MFA from local file (sms-bridge)');
+          return code;
+        }
+      }
+      // 3. Après 30s, alerter Shawn sur Telegram (1 fois)
+      if (!alertSent && Date.now() - start > 30000) {
+        alertSent = true;
+        await alertShawnMFA(botUrl, token).catch(() => {});
+      }
+    } catch (e) { console.warn('[CUA] fetchMFA loop:', e.message); }
     await new Promise(r => setTimeout(r, 3000));
   }
   return null;
+}
+
+// Alerte Telegram à Shawn quand MFA tarde — il peut envoyer code via /mfa CMD
+async function alertShawnMFA(botUrl, token) {
+  try {
+    await fetch(`${botUrl}/admin/notify?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        text: '🔐 *CUA Centris* attend code MFA\n\nCode pas trouvé dans Gmail en 30s.\n\n👉 Envoie le code via `/mfa 123456` ou réponds avec le code seul.\n\n_(timeout 60s total)_',
+        parse_mode: 'Markdown',
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    console.log('[CUA] Alerte MFA envoyée à Shawn');
+  } catch (e) { console.warn('[CUA] alertShawn:', e.message); }
 }
 
 // Push cookies au bot principal pour qu'il bénéficie de la session CUA
