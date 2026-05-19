@@ -7,6 +7,16 @@ const fs          = require('fs');
 const path        = require('path');
 const leadParser  = require('./lead_parser');
 
+// CUA driver — lazy-loaded pour ne pas bloquer boot si playwright-core manque
+let _cua = null;
+function getCUA() {
+  if (_cua === null) {
+    try { _cua = require('./cua_driver'); }
+    catch (e) { _cua = false; console.warn('[BOT] cua_driver indispo:', e.message); }
+  }
+  return _cua || null;
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_ID  = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID || '0');
@@ -5660,10 +5670,32 @@ async function telechargerFicheCentris({ centris_num, email_destination, cc, mes
     }
   }
 
+  // STRATÉGIE 3 — fallback CUA (Computer Use Agent) si Matrix HTTP a fail
+  // Pilote un vrai Chromium (Browserless ou local) via Claude CUA API pour
+  // simuler le clic "Imprimer PDF" sur le portail courtier.
   if (!pdfBuffer) {
-    // FALLBACK final — listing existe (vérifié strat 0) mais PDF Matrix inaccessible
+    const cua = getCUA();
+    if (cua && cua.CUA_AVAILABLE()) {
+      log('INFO', 'CENTRIS', `PDF Matrix HTTP non trouvé pour #${num} — tentative CUA browserless`);
+      try {
+        const cuaRes = await cua.cuaGetCentrisPDF(num);
+        if (cuaRes && cuaRes.success && cuaRes.buffer && cuaRes.buffer.length > 5000) {
+          pdfBuffer = cuaRes.buffer;
+          pdfSource = `CUA${cuaRes.fromCache ? ' (cache 24h)' : ''}`;
+          log('OK', 'CENTRIS', `CUA a récupéré PDF #${num} (${Math.round(pdfBuffer.length/1024)}KB) — ${cuaRes.message}`);
+        } else {
+          log('WARN', 'CENTRIS', `CUA a échoué pour #${num}: ${cuaRes?.message || 'no buffer'}`);
+        }
+      } catch (e) {
+        log('WARN', 'CENTRIS', `CUA exception pour #${num}: ${e.message?.substring(0,150)}`);
+      }
+    }
+  }
+
+  if (!pdfBuffer) {
+    // FALLBACK final — listing existe (vérifié strat 0) mais PDF Matrix + CUA inaccessibles
     // Envoie lien public Centris.ca au client (contient toutes les infos + photos)
-    log('WARN', 'CENTRIS', `PDF Matrix non trouvé pour #${num} — fallback lien public`);
+    log('WARN', 'CENTRIS', `PDF Matrix + CUA tous échoués pour #${num} — fallback lien public`);
     return await _envoyerListingPubliqueLink({ num, email_destination, cc, message_perso, publicUrl });
   }
 
@@ -6461,7 +6493,38 @@ async function executeTool(name, input, chatId) {
             break;
           } catch {}
         }
-        if (!detailHtml) return `❌ Page detail listing #${num} inaccessible. Vérifie session Centris.`;
+        if (!detailHtml) {
+          // FALLBACK CUA — pilote vrai navigateur si Matrix HTTP bloqué
+          const cuaMod = getCUA();
+          if (cuaMod && cuaMod.CUA_AVAILABLE()) {
+            log('INFO', 'CENTRIS', `Page detail HTTP non accessible #${num} — tentative annexes via CUA`);
+            try {
+              const cuaRes = await cuaMod.cuaGetCentrisAnnexes(num, filtre);
+              if (cuaRes && cuaRes.success && cuaRes.annexes?.length > 0) {
+                // Reformatage compatible avec le reste du flow (toDownload + dl)
+                const ok = cuaRes.annexes.map(a => ({
+                  buffer: a.buffer, filename: a.filename, label: a.filename,
+                  size: a.buffer.length, source: 'CUA'
+                }));
+                // Envoie Telegram + return msg
+                if (ALLOWED_ID) {
+                  for (const doc of ok) {
+                    await bot.sendDocument(ALLOWED_ID, doc.buffer, {
+                      caption: `📎 *${doc.label}*\nCentris #${num} · ${Math.round(doc.size/1024)}KB · via CUA`,
+                      parse_mode: 'Markdown',
+                    }, { filename: doc.filename, contentType: 'application/pdf' }).catch(e => log('WARN', 'CENTRIS', `Telegram send: ${e.message}`));
+                  }
+                }
+                auditLogEvent('centris', 'annexes-downloaded-cua', { num, count: ok.length, filtre });
+                return `📂 *${ok.length} annexes Centris #${num}* récupérées via CUA${filtre ? ` (filtre: "${filtre}")` : ''}\n\n` +
+                       ok.map(d => `  📎 ${d.label} (${Math.round(d.size/1024)}KB)`).join('\n');
+              }
+            } catch (e) {
+              log('WARN', 'CENTRIS', `CUA annexes exception: ${e.message?.substring(0,150)}`);
+            }
+          }
+          return `❌ Page detail listing #${num} inaccessible. Vérifie session Centris${cuaMod?.CUA_AVAILABLE() ? ' (CUA aussi échoué)' : ''}.`;
+        }
         // 2. Extract TOUS les liens documents/annexes
         // Patterns Centris Matrix:
         //  /Matrix/Public/MediaHandler.ashx?ID=XXX  (PDFs annexes)
@@ -12716,7 +12779,11 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         centris: !!(process.env.CENTRIS_USER && process.env.CENTRIS_PASS),
         firecrawl: !!process.env.FIRECRAWL_API_KEY,
         perplexity: !!process.env.PERPLEXITY_API_KEY,
+        browserless: !!process.env.BROWSERLESS_WS,
       },
+      cua: (() => {
+        try { const m = getCUA(); return m ? m.cuaStatus() : { available: false }; } catch { return { available: false }; }
+      })(),
       costs: {
         anthropic_today: costTracker.daily?.[today()] || 0,
         anthropic_month: costTracker.monthly?.[thisMonth()] || 0,
@@ -13430,6 +13497,37 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
         res.writeHead(500); res.end(`error: ${e.message?.substring(0, 200)}`);
       }
     });
+    return;
+  }
+
+  // ─── GET /admin/cua-test?num=N — test CUA end-to-end sur un listing
+  // Retourne taille PDF + source + message. Auth WEBHOOK_SECRET requise.
+  if (req.method === 'GET' && url.startsWith('/admin/cua-test')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const num = u.searchParams.get('num') || '';
+    if (!/^\d{7,9}$/.test(num)) { res.writeHead(400); res.end(JSON.stringify({error: '?num=N (7-9 chiffres) requis'})); return; }
+    const out = { num, started: new Date().toISOString() };
+    try {
+      const cua = getCUA();
+      if (!cua || !cua.CUA_AVAILABLE()) {
+        out.error = 'CUA non disponible (playwright-core ou @anthropic-ai/sdk manquant)';
+        res.writeHead(503); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      out.status_before = cua.cuaStatus();
+      const r = await cua.cuaGetCentrisPDF(num);
+      out.success = r.success;
+      out.message = r.message;
+      out.filename = r.filename;
+      out.bytes = r.buffer ? r.buffer.length : 0;
+      out.fromCache = r.fromCache || false;
+      out.status_after = cua.cuaStatus();
+    } catch (e) { out.exception = e.message; }
+    out.finished = new Date().toISOString();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
     return;
   }
 

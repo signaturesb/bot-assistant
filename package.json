@@ -18,13 +18,15 @@
     "test-smoke": "node test_all.js --smoke",
     "test-parser": "node test_parser.js",
     "test-firecrawl": "node test_firecrawl.js",
+    "test-cua": "node test_cua.js",
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",
     "dotenv": "^16.0.0",
     "node-telegram-bot-api": "^0.67.0",
-    "pdf-lib": "^1.17.1"
+    "pdf-lib": "^1.17.1",
+    "playwright-core": "^1.60.0"
   },
   "overrides": {
     "form-data": "^4.0.4",

@@ -1,10 +1,19 @@
 // cua_driver.js — Computer Use Agent Driver
-// Pilote Playwright headless avec Claude Computer Use API pour naviguer
-// agent.centris.ca, télécharger fiches PDF + annexes (DV, certificat, plans).
+// Pilote Playwright (local OU Browserless externe) avec Claude Computer Use API
+// pour naviguer agent.centris.ca, télécharger fiches PDF + annexes.
 //
 // Architecture:
 //   screenshot → Claude CUA analyse → action (click/type/scroll) → repeat
 //   jusqu'à PDF trouvé ou max 25 itérations
+//
+// MODE BROWSERLESS (recommandé Render free):
+//   ENV: BROWSERLESS_WS=wss://chrome.browserless.io?token=<API_KEY>
+//   → Connexion WebSocket à Chromium remote, isolé du bot.
+//   → 1000 min/mois gratuit. Bot reste léger.
+//
+// MODE LOCAL:
+//   Sans BROWSERLESS_WS → launch Chromium local (nécessite Render Starter +
+//   `playwright install chromium --with-deps` dans Build Command).
 //
 // Cache: cookies Centris persistés /data/cua_session.json (12h)
 // Fallback: si Playwright absent → erreur explicite (pas de crash silencieux)
@@ -37,13 +46,42 @@ let Anthropic   = null;
 
 function loadDeps() {
   if (!playwright) {
-    try { playwright = require('playwright'); }
-    catch { throw new Error('Playwright non installé. Run: npm install playwright && npx playwright install chromium'); }
+    try { playwright = require('playwright-core'); }
+    catch {
+      try { playwright = require('playwright'); }
+      catch { throw new Error('Playwright non installé. Run: npm install playwright-core (mode browserless) OU npm install playwright + npx playwright install chromium (mode local)'); }
+    }
   }
   if (!Anthropic) {
     try { Anthropic = require('@anthropic-ai/sdk'); }
     catch { throw new Error('@anthropic-ai/sdk non installé'); }
   }
+}
+
+// Launch browser — Browserless externe (recommandé) OU local Chromium
+// Si BROWSERLESS_WS env var défini → WebSocket connect (1000 min/mois free).
+// Sinon → launch local (nécessite Chromium installé).
+async function launchBrowser() {
+  loadDeps();
+  const wsEndpoint = process.env.BROWSERLESS_WS;
+  if (wsEndpoint) {
+    console.log('[CUA] Mode Browserless externe (WS)');
+    try {
+      return await playwright.chromium.connect(wsEndpoint, { timeout: 30000 });
+    } catch (e) {
+      console.error('[CUA] Browserless connect échoué:', e.message);
+      throw new Error(`Browserless WS connect échoué: ${e.message}. Vérifie BROWSERLESS_WS env var.`);
+    }
+  }
+  console.log('[CUA] Mode local Chromium');
+  return await playwright.chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--window-size=1280,900'
+    ]
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -54,9 +92,12 @@ let _cuaAvailable = null;
 function CUA_AVAILABLE() {
   if (_cuaAvailable !== null) return _cuaAvailable;
   try {
-    require.resolve('playwright');
     require.resolve('@anthropic-ai/sdk');
-    _cuaAvailable = true;
+    try { require.resolve('playwright-core'); _cuaAvailable = true; }
+    catch {
+      try { require.resolve('playwright'); _cuaAvailable = true; }
+      catch { _cuaAvailable = false; }
+    }
   } catch {
     _cuaAvailable = false;
   }
@@ -272,7 +313,7 @@ async function runCUATask(page, task, onPDF = null) {
     let response;
     try {
       response = await anthropic.beta.messages.create({
-        model: 'claude-opus-4-5',
+        model: 'claude-opus-4-7',
         max_tokens: 1024,
         tools: [
           {
@@ -492,14 +533,7 @@ async function cuaGetCentrisPDF(centrisNum) {
   let browser = null;
   try {
     console.log(`[CUA] Démarrage browser pour listing #${centrisNum}...`);
-    browser = await playwright.chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox', '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', '--disable-gpu',
-        '--window-size=1280,900'
-      ]
-    });
+    browser = await launchBrowser();
 
     const context = await browser.newContext({
       viewport: VIEWPORT,
@@ -608,10 +642,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
 
   let browser = null;
   try {
-    browser = await playwright.chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-    });
+    browser = await launchBrowser();
 
     const context = await browser.newContext({
       viewport: VIEWPORT,
@@ -692,10 +723,7 @@ async function cuaNavigate(task, startUrl = null) {
 
   let browser = null;
   try {
-    browser = await playwright.chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-    });
+    browser = await launchBrowser();
 
     const context = await browser.newContext({
       viewport: VIEWPORT,
@@ -744,9 +772,14 @@ function cuaStatus() {
     } catch { return 0; }
   })();
 
+  const useBrowserless = !!process.env.BROWSERLESS_WS;
   return {
     available,
-    playwright: available ? 'installed' : 'missing (npm install playwright)',
+    playwright: available ? 'installed' : 'missing (npm install playwright-core)',
+    browser_mode: useBrowserless ? 'browserless (remote)' : 'local Chromium',
+    browserless_configured: useBrowserless,
+    anthropic_key: !!process.env.ANTHROPIC_API_KEY,
+    centris_creds: !!(process.env.CENTRIS_USER && process.env.CENTRIS_PASS),
     session: sessionAge !== null
       ? (sessionAge < SESSION_TTL / 60000 ? `active (${sessionAge}min ago)` : 'expired')
       : 'none',
