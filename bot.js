@@ -13319,13 +13319,15 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       const fc = require('./firecrawl_scraper');
       const Anthropic = require('@anthropic-ai/sdk');
       const a = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      // Scrape les 3 sources en parallèle
-      const [mp, pp, bc] = await Promise.all([
+      // Scrape sources avec contenus statiques + Ratehub aggregator
+      const [rh, mp, pp, bc, nbc] = await Promise.all([
+        fc.scrapUrl('https://www.ratehub.ca/best-mortgage-rates', []).catch(() => null),
         fc.scrapUrl('https://multi-prets.com/taux-hypothecaires/', []).catch(() => null),
         fc.scrapUrl('https://planipret.com/taux-hypothecaires/', []).catch(() => null),
-        fc.scrapUrl('https://www.bankofcanada.ca/core-functions/monetary-policy/key-interest-rate/', []).catch(() => null),
+        fc.scrapUrl('https://www.bankofcanada.ca/wp-content/themes/boc/widgets/policy-rate.html', []).catch(() => null),
+        fc.scrapUrl('https://www.nbc.ca/personal/mortgages/posted-rates.html', []).catch(() => null),
       ]);
-      const combined = `=== MULTIPRET ===\n${mp?.contenu?.substring(0, 4000) || ''}\n\n=== PLANIPRET ===\n${pp?.contenu?.substring(0, 4000) || ''}\n\n=== BANQUE CANADA ===\n${bc?.contenu?.substring(0, 2500) || ''}`;
+      const combined = `=== RATEHUB ===\n${rh?.contenu?.substring(0, 5000) || ''}\n\n=== MULTIPRET ===\n${mp?.contenu?.substring(0, 4000) || ''}\n\n=== PLANIPRET ===\n${pp?.contenu?.substring(0, 3000) || ''}\n\n=== BANQUE CANADA ===\n${bc?.contenu?.substring(0, 2000) || ''}\n\n=== BNC ===\n${nbc?.contenu?.substring(0, 3000) || ''}`;
       const prompt = `Tu reçois 3 sources de taux d'intérêt québécois mai 2026. Extrait UNIQUEMENT les taux ACTUELS (pas historiques).
 
 Réponds avec ce JSON exactement:
