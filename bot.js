@@ -13168,6 +13168,67 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/brevo-replace?id=N&from=X&to=Y[&dry=1] — find/replace HTML+subject
+  // Cas typique: fix "avril" → "mai" dans campagne. dry=1 = preview seulement.
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-replace')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const id = u.searchParams.get('id');
+    const fromText = u.searchParams.get('from');
+    const toText = u.searchParams.get('to');
+    const dry = u.searchParams.get('dry') === '1';
+    if (!id || !fromText || !toText) { res.writeHead(400); res.end(JSON.stringify({error: 'id+from+to requis'})); return; }
+    try {
+      // 1. Fetch campagne
+      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
+      const camp = await r1.json();
+      const oldSubject = camp.subject || '';
+      const oldHtml = camp.htmlContent || '';
+      // Case-insensitive replace mais préserve la casse simple (mai/Mai/MAI)
+      const reFrom = new RegExp(fromText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      const newSubject = oldSubject.replace(reFrom, (m) => {
+        if (m === m.toUpperCase()) return toText.toUpperCase();
+        if (m[0] === m[0].toUpperCase()) return toText.charAt(0).toUpperCase() + toText.slice(1);
+        return toText;
+      });
+      const newHtml = oldHtml.replace(reFrom, (m) => {
+        if (m === m.toUpperCase()) return toText.toUpperCase();
+        if (m[0] === m[0].toUpperCase()) return toText.charAt(0).toUpperCase() + toText.slice(1);
+        return toText;
+      });
+      const subjectChanged = oldSubject !== newSubject;
+      const htmlChanged = oldHtml !== newHtml;
+      const occurrencesSubject = (oldSubject.match(reFrom) || []).length;
+      const occurrencesHtml = (oldHtml.match(reFrom) || []).length;
+      const out = {
+        id, from: fromText, to: toText, dry,
+        campaign_name: camp.name,
+        subject_changed: subjectChanged,
+        html_changed: htmlChanged,
+        occurrences_subject: occurrencesSubject,
+        occurrences_html: occurrencesHtml,
+        old_subject: oldSubject,
+        new_subject: newSubject,
+      };
+      if (dry) { res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return; }
+      // 2. PUT update si changement
+      if (!subjectChanged && !htmlChanged) { out.note = 'Aucun changement nécessaire'; res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return; }
+      const r2 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, {
+        method: 'PUT',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ subject: newSubject, htmlContent: newHtml }),
+      });
+      out.put_status = r2.status;
+      out.put_ok = r2.ok || r2.status === 204;
+      if (!out.put_ok) out.put_error = (await r2.text()).substring(0, 300);
+      else auditLogEvent('brevo', 'replace-applied', { id, from: fromText, to: toText, subject: subjectChanged, html: htmlChanged });
+      res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return;
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); return; }
+  }
+
   // ─── GET /admin/brevo-list?status=X — liste campagnes Brevo
   if (req.method === 'GET' && url.startsWith('/admin/brevo-list')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
