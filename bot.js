@@ -13247,6 +13247,50 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/brevo-send-raw?id=N&to=email — bypass sendTest, envoie via SMTP API
+  // Permet de garantir delivery quand sendTest Brevo échoue (sender unauthorized etc)
+  if (req.method === 'GET' && url.startsWith('/admin/brevo-send-raw')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 10)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const id = u.searchParams.get('id');
+    const to = u.searchParams.get('to') || SHAWN_EMAIL;
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    try {
+      // 1. Fetch full campagne pour récupérer subject + htmlContent + sender
+      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
+      const camp = await r1.json();
+      const senderObj = camp.sender || { name: AGENT.nom, email: AGENT.email };
+      const subject = `[PREVIEW] ${camp.subject}`;
+      const htmlContent = camp.htmlContent || '<p>(no html)</p>';
+      // 2. Envoyer via Brevo SMTP API (sendinblue transactional)
+      const r2 = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sender: senderObj,
+          to: [{ email: to, name: 'Shawn' }],
+          subject,
+          htmlContent,
+          tags: ['preview', `campaign-${id}`],
+        }),
+      });
+      const body = await r2.text();
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        ok: r2.ok, status: r2.status,
+        sender_used: senderObj,
+        to, subject,
+        html_length: htmlContent.length,
+        brevo_response: body.substring(0, 500),
+      }, null, 2));
+      if (r2.ok) auditLogEvent('preview', 'sent-raw', { id, to, sender: senderObj.email });
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
   // ─── GET /admin/market-debug?source=banque_canada — raw markdown pour fix regex
   if (req.method === 'GET' && url.startsWith('/admin/market-debug')) {
     const u = new URL(req.url, 'http://x');
