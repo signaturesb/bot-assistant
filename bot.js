@@ -13311,6 +13311,54 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     return;
   }
 
+  // ─── GET /admin/taux-actuels — scrape live + LLM extract des taux du jour
+  // Sources: MultiPrêt + PlaniPrêt + Banque Canada → retourne best rates
+  if (req.method === 'GET' && url.startsWith('/admin/taux-actuels')) {
+    if (!requireAdmin(req, res)) return;
+    try {
+      const fc = require('./firecrawl_scraper');
+      const Anthropic = require('@anthropic-ai/sdk');
+      const a = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      // Scrape les 3 sources en parallèle
+      const [mp, pp, bc] = await Promise.all([
+        fc.scrapUrl('https://multi-prets.com/taux-hypothecaires/', []).catch(() => null),
+        fc.scrapUrl('https://planipret.com/taux-hypothecaires/', []).catch(() => null),
+        fc.scrapUrl('https://www.bankofcanada.ca/core-functions/monetary-policy/key-interest-rate/', []).catch(() => null),
+      ]);
+      const combined = `=== MULTIPRET ===\n${mp?.contenu?.substring(0, 4000) || ''}\n\n=== PLANIPRET ===\n${pp?.contenu?.substring(0, 4000) || ''}\n\n=== BANQUE CANADA ===\n${bc?.contenu?.substring(0, 2500) || ''}`;
+      const prompt = `Tu reçois 3 sources de taux d'intérêt québécois mai 2026. Extrait UNIQUEMENT les taux ACTUELS (pas historiques).
+
+Réponds avec ce JSON exactement:
+{
+  "taux_directeur_bdc": <%>,
+  "taux_qualification_bdc": <% — stress test B-20, généralement le plus haut de "taux contractuel + 2%" ou 5.25%>,
+  "fixe_5ans_meilleur": <% — le MEILLEUR taux fixe 5 ans entre MultiPret et PlaniPret>,
+  "variable_5ans_meilleur": <%>,
+  "fixe_3ans_meilleur": <% si dispo>,
+  "source_meilleur_5fix": "MultiPret ou PlaniPret",
+  "as_of": "mai 2026"
+}
+
+Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
+      const llmRes = await a.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 400,
+        messages: [{ role: 'user', content: prompt + '\n\n' + combined.substring(0, 12000) }],
+      });
+      const llmTxt = llmRes.content.find(b => b.type === 'text')?.text || '';
+      const jsonM = llmTxt.match(/\{[\s\S]*\}/);
+      const parsed = jsonM ? JSON.parse(jsonM[0]) : null;
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({
+        ok: !!parsed, taux: parsed,
+        sources_scraped: { multipret: !!mp, planipret: !!pp, banque_canada: !!bc },
+        scraped_at: new Date().toISOString(),
+        llm_raw: llmTxt.substring(0, 500),
+      }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
   // ─── GET /admin/brevo-html?id=N — return HTML raw pour debug/audit
   if (req.method === 'GET' && url.startsWith('/admin/brevo-html')) {
     if (!requireAdmin(req, res)) return;
