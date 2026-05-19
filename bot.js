@@ -13424,7 +13424,10 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
-      const subject = `[PREVIEW] ${camp.subject}`;
+      // Subject avec timestamp + version pour distinguer plusieurs previews
+      const u2 = new URL(req.url, 'http://x');
+      const tag = u2.searchParams.get('tag') || new Date().toLocaleTimeString('fr-CA', { timeZone: 'America/Toronto', hour: '2-digit', minute: '2-digit' });
+      const subject = `[PREVIEW ${tag}] ${camp.subject}`;
       const htmlContent = camp.htmlContent || '<p>(no html)</p>';
       // 2. Send via Gmail API directement (PAS sendEmailLogged car self-send vers shawn@)
       // sendEmailLogged check Cc Shawn → si To=shawn@, skip Cc auto + skip Telegram trace
