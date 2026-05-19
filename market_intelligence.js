@@ -59,6 +59,60 @@ function findRateNear(md, keywords, opts = {}) {
   return null;
 }
 
+// Helper: extract montant $ proche d'un mot-clé (ex: prix médian "$XXX XXX")
+function findAmountNear(md, keywords, opts = {}) {
+  const txt = md.toLowerCase();
+  for (const kw of keywords) {
+    const idx = txt.indexOf(kw.toLowerCase());
+    if (idx < 0) continue;
+    const start = Math.max(0, idx - 300);
+    const end = Math.min(md.length, idx + 300);
+    const window = md.substring(start, end);
+    // Pattern QC: "$XXX XXX" ou "XXX XXX $" ou "XXX,XXX $"
+    const patterns = [
+      /\$\s*(\d{1,3}(?:[\s,]\d{3})+(?:\.\d{1,2})?)/,
+      /(\d{1,3}(?:[\s,]\d{3})+(?:\.\d{1,2})?)\s*\$/,
+      /(\d{1,3}(?:[\s,]\d{3})+)\s*(?:CAD|\$CA)/i,
+    ];
+    for (const p of patterns) {
+      const m = window.match(p);
+      if (m) {
+        const num = parseFloat(m[1].replace(/[\s,]/g, ''));
+        if (num > (opts.min || 50000) && num < (opts.max || 5000000)) return num;
+      }
+    }
+  }
+  return null;
+}
+
+// Helper: extract pourcentage variation (ex: "+12% vs an passé")
+function findVariationNear(md, keywords, opts = {}) {
+  const txt = md.toLowerCase();
+  for (const kw of keywords) {
+    const idx = txt.indexOf(kw.toLowerCase());
+    if (idx < 0) continue;
+    const window = md.substring(Math.max(0, idx - 200), Math.min(md.length, idx + 200));
+    const m = window.match(/([+\-−]\s*\d+[\.,]?\d*)\s*%/);
+    if (m) {
+      const val = parseFloat(m[1].replace(/[\s,−]/g, m => m === ',' ? '.' : m === '−' ? '-' : ''));
+      if (!isNaN(val) && val > -100 && val < 200) return val;
+    }
+  }
+  return null;
+}
+
+// Helper: extract dates récentes mentionnées
+function findRecentDates(md) {
+  const dates = [];
+  const monthsFR = '(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)';
+  const re = new RegExp(`(\\d{1,2})\\s*${monthsFR}\\s*(\\d{4})`, 'gi');
+  let m;
+  while ((m = re.exec(md)) !== null && dates.length < 5) {
+    dates.push(`${m[1]} ${m[2]} ${m[3]}`);
+  }
+  return dates;
+}
+
 // ── Sources configurées (toutes celles demandées par Shawn) ──────────────────
 const SOURCES = {
   // === ÉCONOMIQUES — taux qui bougent souvent ===
@@ -107,26 +161,60 @@ const SOURCES = {
     label: 'APCIQ — Statistiques marché QC',
     url: 'https://apciq.ca/statistiques-immobilieres/',
     keywords: ['statistiques', 'ventes', 'prix médian', 'inventaire', 'mois', 'trimestre'],
-    extract: (md) => ({ resume: md.substring(0, 2500), scraped_at: new Date().toISOString() }),
+    extract: (md) => ({
+      prix_median_unifamiliale: findAmountNear(md, ['prix médian unifamiliale', 'unifamiliale', 'maison médiane'], { min: 200000, max: 2000000 }),
+      prix_median_copropriete: findAmountNear(md, ['copropriété', 'condo'], { min: 150000, max: 1500000 }),
+      ventes_variation: findVariationNear(md, ['ventes', 'transactions']),
+      prix_variation: findVariationNear(md, ['prix médian', 'augmentation', 'baisse']),
+      dates_recentes: findRecentDates(md),
+      resume: md.substring(0, 2500),
+      scraped_at: new Date().toISOString(),
+    }),
   },
   apciq_lanaudiere: {
     label: 'APCIQ — Lanaudière',
     url: 'https://apciq.ca/statistiques/lanaudiere/',
     keywords: ['lanaudière', 'ventes', 'prix'],
-    extract: (md) => ({ resume: md.substring(0, 2000), scraped_at: new Date().toISOString() }),
+    extract: (md) => ({
+      prix_median: findAmountNear(md, ['prix médian', 'médian', 'lanaudière'], { min: 200000, max: 1500000 }),
+      ventes_variation: findVariationNear(md, ['ventes', 'lanaudière']),
+      dates_recentes: findRecentDates(md),
+      resume: md.substring(0, 2000),
+      scraped_at: new Date().toISOString(),
+    }),
   },
   oaciq: {
     label: 'OACIQ — Règlements + Pratique',
     url: 'https://www.oaciq.com/fr',
     keywords: ['nouveauté', 'règlement', 'avis', 'pratique', 'courtier', 'mise à jour'],
-    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
+    extract: (md) => {
+      // Cherche titres récents (lignes commençant par #)
+      const headings = md.split('\n').filter(l => /^#+\s/.test(l)).slice(0, 8).map(h => h.replace(/^#+\s*/, '').trim());
+      // Cherche bullet points ou liens dans les nouveautés
+      const articles = md.match(/^\s*[-*]\s+(.+)$/gm)?.slice(0, 10).map(l => l.replace(/^\s*[-*]\s+/, '').substring(0, 120)) || [];
+      return {
+        headings_recents: headings,
+        articles_recents: articles,
+        dates_recentes: findRecentDates(md),
+        resume: md.substring(0, 1500),
+        scraped_at: new Date().toISOString(),
+      };
+    },
   },
   // === SITES IMMOBILIERS QC (les plus gros) ===
   centris_public: {
     label: 'Centris.ca — Tendances',
     url: 'https://www.centris.ca/fr/tendances',
     keywords: ['marché', 'tendance', 'prix', 'région'],
-    extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
+    extract: (md) => ({
+      prix_median_qc: findAmountNear(md, ['prix médian', 'médian Québec'], { min: 200000, max: 2000000 }),
+      prix_variation: findVariationNear(md, ['prix médian', 'année passée']),
+      ventes_variation: findVariationNear(md, ['ventes', 'transactions']),
+      dates_recentes: findRecentDates(md),
+      headings_recents: md.split('\n').filter(l => /^#+\s/.test(l)).slice(0, 5).map(h => h.replace(/^#+\s*/, '').trim()),
+      resume: md.substring(0, 1500),
+      scraped_at: new Date().toISOString(),
+    }),
   },
   duproprio: {
     label: 'DuProprio',
@@ -141,10 +229,29 @@ const SOURCES = {
     extract: (md) => ({ resume: md.substring(0, 1500), scraped_at: new Date().toISOString() }),
   },
   remax_qc: {
-    label: 'RE/MAX Québec',
+    label: 'RE/MAX Québec — Blogue',
     url: 'https://www.remax-quebec.com/fr/blogue/',
-    keywords: ['marché', 'tendance', 'région'],
-    extract: (md) => ({ resume: md.substring(0, 1200), scraped_at: new Date().toISOString() }),
+    keywords: ['marché', 'tendance', 'région', 'prix'],
+    extract: (md) => ({
+      headings_recents: md.split('\n').filter(l => /^#+\s/.test(l)).slice(0, 8).map(h => h.replace(/^#+\s*/, '').trim()),
+      articles_recents: md.match(/^\s*[-*]\s+(.+)$/gm)?.slice(0, 10).map(l => l.replace(/^\s*[-*]\s+/, '').substring(0, 120)) || [],
+      prix_median: findAmountNear(md, ['prix médian', 'maison', 'condo'], { min: 200000, max: 2000000 }),
+      prix_variation: findVariationNear(md, ['prix', 'augmentation', 'baisse']),
+      dates_recentes: findRecentDates(md),
+      resume: md.substring(0, 1500),
+      scraped_at: new Date().toISOString(),
+    }),
+  },
+  remax_marche: {
+    label: 'RE/MAX Canada — Analyse de marché',
+    url: 'https://blog.remax.ca/fr-ca/quebec/',
+    keywords: ['marché', 'analyse', 'tendance', 'région'],
+    extract: (md) => ({
+      headings_recents: md.split('\n').filter(l => /^#+\s/.test(l)).slice(0, 8).map(h => h.replace(/^#+\s*/, '').trim()),
+      dates_recentes: findRecentDates(md),
+      resume: md.substring(0, 1500),
+      scraped_at: new Date().toISOString(),
+    }),
   },
   royal_lepage: {
     label: 'Royal LePage',
@@ -250,12 +357,30 @@ function buildMarketDigest() {
   const data = snap.data || {};
   return {
     as_of: snap.updated,
+    // Taux économiques
     taux_directeur: data.banque_canada?.taux_directeur || null,
     hypotheque_fixe_5ans: data.multipret?.fixe_5ans || data.planipret?.fixe_5ans || null,
-    hypotheque_variable_5ans: data.multipret?.variable_5ans || null,
-    apciq_stats: data.apciq?.resume?.substring(0, 500) || null,
+    hypotheque_variable_5ans: data.multipret?.variable_5ans || data.planipret?.variable_5ans || null,
+    hypotheque_fixe_3ans: data.multipret?.fixe_3ans || null,
+    // Stats marché APCIQ (national QC)
+    apciq_prix_median_unifamiliale: data.apciq?.prix_median_unifamiliale || null,
+    apciq_prix_median_copro: data.apciq?.prix_median_copropriete || null,
+    apciq_ventes_variation: data.apciq?.ventes_variation || null,
+    apciq_prix_variation: data.apciq?.prix_variation || null,
+    // Stats Lanaudière spécifique
+    lanaudiere_prix_median: data.apciq_lanaudiere?.prix_median || null,
+    lanaudiere_ventes_variation: data.apciq_lanaudiere?.ventes_variation || null,
+    // Centris public
+    centris_prix_median_qc: data.centris_public?.prix_median_qc || null,
+    // OACIQ nouveautés
+    oaciq_articles: data.oaciq?.articles_recents?.slice(0, 5) || [],
+    oaciq_headings: data.oaciq?.headings_recents?.slice(0, 5) || [],
+    // RE/MAX
+    remax_articles: data.remax_qc?.articles_recents?.slice(0, 3) || [],
+    // Méta
     sources_count: Object.keys(data).length,
     age_hours: snap.ts ? Math.round((Date.now() - snap.ts) / 3600000) : null,
+    sources_list: Object.keys(data),
   };
 }
 

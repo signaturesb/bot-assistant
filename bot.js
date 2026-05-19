@@ -1022,12 +1022,24 @@ function getSystemDynamic() {
     const mi = require('./market_intelligence');
     const digest = mi.buildMarketDigest();
     if (digest && digest.sources_count > 0) {
-      const lines = [`━━ DONNÉES MARCHÉ FRAÎCHES (auto, age ${digest.age_hours||0}h) ━━`];
-      if (digest.taux_directeur != null) lines.push(`💰 Taux directeur Banque du Canada: ${digest.taux_directeur}%`);
-      if (digest.hypotheque_fixe_5ans != null) lines.push(`🏠 Taux hypothèque fixe 5 ans: ${digest.hypotheque_fixe_5ans}%`);
-      if (digest.hypotheque_variable_5ans != null) lines.push(`📊 Taux hypothèque variable 5 ans: ${digest.hypotheque_variable_5ans}%`);
-      lines.push(`📈 ${digest.sources_count} sources surveillées (APCIQ, OACIQ, Centris, MultiPrêt, PlaniPrêt, RE/MAX, Royal LePage, Sutton, Via Capitale, JLR, etc.)`);
-      lines.push(`Utilise ces données quand tu rédiges emails clients ou expliques le marché — pas besoin de chercher ailleurs.`);
+      const lines = [`━━ DONNÉES MARCHÉ FRAÎCHES (auto, age ${digest.age_hours||0}h, ${digest.sources_count} sources) ━━`];
+      const fmt$ = (n) => n ? '$' + Math.round(n).toLocaleString('fr-CA').replace(/,/g, ' ') : null;
+      // Taux
+      if (digest.taux_directeur != null) lines.push(`💰 Banque du Canada — taux directeur: ${digest.taux_directeur}%`);
+      if (digest.hypotheque_fixe_5ans != null) lines.push(`🏠 Hypothèque fixe 5 ans: ${digest.hypotheque_fixe_5ans}%`);
+      if (digest.hypotheque_variable_5ans != null) lines.push(`📊 Hypothèque variable 5 ans: ${digest.hypotheque_variable_5ans}%`);
+      // Prix médians
+      if (digest.apciq_prix_median_unifamiliale) lines.push(`🏡 APCIQ prix médian unifamiliale QC: ${fmt$(digest.apciq_prix_median_unifamiliale)}`);
+      if (digest.apciq_prix_median_copro) lines.push(`🏢 APCIQ prix médian copropriété QC: ${fmt$(digest.apciq_prix_median_copro)}`);
+      if (digest.lanaudiere_prix_median) lines.push(`🌲 Lanaudière prix médian: ${fmt$(digest.lanaudiere_prix_median)}`);
+      // Variations
+      if (digest.apciq_ventes_variation != null) lines.push(`📈 APCIQ ventes vs an passé: ${digest.apciq_ventes_variation > 0 ? '+' : ''}${digest.apciq_ventes_variation}%`);
+      if (digest.apciq_prix_variation != null) lines.push(`💹 APCIQ prix vs an passé: ${digest.apciq_prix_variation > 0 ? '+' : ''}${digest.apciq_prix_variation}%`);
+      // News
+      if (digest.oaciq_articles?.length) lines.push(`📜 OACIQ nouveautés: ${digest.oaciq_articles.slice(0, 3).join(' | ')}`);
+      if (digest.remax_articles?.length) lines.push(`📰 RE/MAX articles récents: ${digest.remax_articles.slice(0, 2).join(' | ')}`);
+      lines.push(`Sources actives: ${digest.sources_list?.join(', ')}`);
+      lines.push(`USAGE: Quand tu rédiges un email client ou expliques le marché, cite ces chiffres récents.`);
       parts.push(lines.join('\n'));
     }
   } catch {}
