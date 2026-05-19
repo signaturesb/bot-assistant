@@ -13374,8 +13374,11 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       // Extract taux patterns (X.X% ou X,X%)
       const html = camp.htmlContent || '';
       const rateMatches = [...html.matchAll(/(\d+[\.,]\d{1,3})\s*%/g)].map(m => m[1]);
-      // Extract montants $
-      const amountMatches = [...html.matchAll(/\$\s*(\d{1,3}(?:[\s,]\d{3})+)/g)].map(m => m[1]);
+      // Extract montants $ — patterns multiples (avant et après $)
+      const amountMatches = [
+        ...[...html.matchAll(/\$\s*(\d{1,3}(?:[\s, ]\d{3})+)/g)].map(m => m[1]),
+        ...[...html.matchAll(/(\d{1,3}(?:[\s, ]\d{3})+)\s*\$/g)].map(m => m[1]),
+      ];
       // Cherche contexte autour de chaque taux (50 chars avant/après)
       const rateContexts = [];
       let m;
