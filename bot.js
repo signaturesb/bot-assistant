@@ -399,6 +399,30 @@ async function sendEmailLogged(opts) {
       entry.outcome = 'sent'; // pas de Response standard mais pas d'exception → succès
     }
     saveEmailOutbox();
+
+    // 🔒 RÈGLE ABSOLUE Shawn ("100 fois je te le dit"): TOUJOURS Cc Shawn + Telegram notif
+    // Si envoi réussi ET destinataire ≠ Shawn ET Cc ne contient pas shawn@signaturesb.com
+    // → notif Telegram immédiate avec to/subject/category pour qu'il sache ce qui est parti
+    if (entry.outcome === 'sent' && ALLOWED_ID) {
+      const SHAWN_ADDR = 'shawn@signaturesb.com';
+      const isShawnTo = entry.to.includes('shawn') || entry.to.includes('signaturesb.com');
+      const ccs = (Array.isArray(entry.cc) ? entry.cc : []).map(s => String(s).toLowerCase());
+      const hasShawnCc = ccs.some(c => c.includes(SHAWN_ADDR));
+      const isCopyForward = entry.category === 'auto-copy-to-shawn';
+      if (!isShawnTo && !isCopyForward) {
+        // Notif Telegram pour traçabilité — Shawn voit TOUT ce qui part
+        const ccLine = ccs.length ? `\nCc: ${ccs.join(', ')}` : '';
+        const cccWarn = hasShawnCc ? '' : '\n⚠️ *Tu n\'étais PAS en Cc* — copie envoyée séparément ci-dessous';
+        sendTelegramWithFallback(
+          `📧 *Email envoyé*\n` +
+          `Cat: ${entry.category}\n` +
+          `À: ${entry.to}${ccLine}\n` +
+          `Sujet: ${entry.subject.substring(0, 100)}${cccWarn}`,
+          { category: 'email-trace' }
+        ).catch(() => {});
+      }
+    }
+
     return { ok: entry.outcome === 'sent', status: entry.status, durationMs: entry.durationMs, entryId: entry.id, error: entry.error };
   } catch (e) {
     entry.outcome = 'exception';
