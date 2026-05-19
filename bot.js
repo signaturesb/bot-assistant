@@ -11085,17 +11085,45 @@ async function checkVeilleCampagnesBackup() {
     const dedupKey = `veille_${camp.id}_${tomorrowKey}`;
     if (state[dedupKey]) { log('INFO', 'VEILLE', `${dedupKey} déjà fait (Mac scheduler probablement)`); continue; }
 
-    // 1. Envoie test email Brevo
+    // 1. Envoie preview via GMAIL API (Brevo sendTest hold → unreliable)
+    // On fetch le HTML campagne + send via Gmail OAuth (delivery garantie).
     let testOK = false;
+    let previewError = null;
     try {
-      const tr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}/sendTest`, {
-        method: 'POST',
-        headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
-        body: JSON.stringify({ emailTo: [SHAWN_EMAIL] }),
-        signal: AbortSignal.timeout(15000)
+      const detRes = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}`, {
+        headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000)
       });
-      testOK = tr.ok || tr.status === 204;
-    } catch (e) { log('WARN', 'VEILLE', `sendTest err: ${e.message}`); }
+      const campFull = detRes.ok ? await detRes.json() : null;
+      const html = campFull?.htmlContent;
+      const subj = campFull?.subject || camp.name;
+      const gmailTok = await getGmailToken();
+      if (html && gmailTok) {
+        const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+        const lines = [
+          `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+          `To: ${SHAWN_EMAIL}`,
+          `Reply-To: ${AGENT.email}`,
+          `Subject: ${enc(`[VEILLE J-1] ${subj}`)}`,
+          'MIME-Version: 1.0',
+          'Content-Type: text/html; charset=UTF-8',
+          'Content-Transfer-Encoding: base64', '',
+          Buffer.from(html, 'utf-8').toString('base64'),
+        ];
+        const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+        const gm = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${gmailTok}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ raw }),
+          signal: AbortSignal.timeout(15000),
+        });
+        testOK = gm.ok;
+        if (!gm.ok) previewError = `Gmail ${gm.status}`;
+      } else if (!html) {
+        previewError = 'no htmlContent';
+      } else {
+        previewError = 'gmail token absent';
+      }
+    } catch (e) { log('WARN', 'VEILLE', `preview-gmail err: ${e.message}`); previewError = e.message?.substring(0, 80); }
 
     // 2. Notif Telegram
     const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}`, {
@@ -11111,7 +11139,7 @@ async function checkVeilleCampagnesBackup() {
       `📅 ${dateStr}\n` +
       `👥 listes [${lists.join(',')}]\n` +
       `📝 ${(det.subject || camp.subject || '').substring(0, 80)}\n\n` +
-      (testOK ? `📬 *Preview envoyé* à shawn@signaturesb.com — vérifie ton inbox.\n\n` : `⚠️ Preview Brevo échoué — voir l'aperçu Brevo direct.\n\n`) +
+      (testOK ? `📬 *Preview envoyé via Gmail* à shawn@signaturesb.com — sujet \\[VEILLE J-1\\]\n\n` : `⚠️ Preview échoué (${previewError || '?'}) — utilise \`/admin/preview-via-gmail?id=${camp.id}\`\n\n`) +
       `_Rien ne s'envoie sans ton ✅ Confirmer ci-dessous._`;
 
     // Boutons inline direct (1 click, pas besoin de taper /campaigns)
