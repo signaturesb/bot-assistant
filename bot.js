@@ -14753,6 +14753,47 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     return;
   }
 
+  // ─── GET /admin/zone-test?num=N — test Zone Centris dry-run (preview docs + courtier)
+  // Reproduce le tool envoyer_tous_documents_zone sans envoyer, capture erreur exacte
+  if (req.method === 'GET' && url.startsWith('/admin/zone-test')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const num = u.searchParams.get('num') || '';
+    if (!/^\d{7,9}$/.test(num)) { res.writeHead(400); res.end(JSON.stringify({error: '?num=N (7-9 chiffres) requis'})); return; }
+    const out = { num, started: new Date().toISOString() };
+    try {
+      const cua = getCUA();
+      if (!cua || !cua.CUA_AVAILABLE()) {
+        out.error = 'CUA non disponible';
+        res.writeHead(503); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      if (!cua.shareCentrisZoneDocuments) {
+        out.error = 'shareCentrisZoneDocuments absent (deploy needed)';
+        res.writeHead(503); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      out.status_before = cua.cuaStatus();
+      const r = await cua.shareCentrisZoneDocuments({ centris_num: num, dry_run: true });
+      out.success = r.success;
+      out.dry_run = r.dry_run;
+      out.broker_info = r.broker_info;
+      out.docs_count = r.docs_count;
+      out.docs_list = r.docs_list;
+      out.message = r.message;
+      out.listing_url = r.listing_url;
+      out.status_after = cua.cuaStatus();
+    } catch (e) {
+      out.exception = e.message;
+      out.stack = (e.stack || '').split('\n').slice(0, 5);
+    }
+    out.finished = new Date().toISOString();
+    out.elapsed_ms = Date.now() - new Date(out.started).getTime();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
   // ─── GET /admin/centris-fetch?url=URL — fetch n'importe quelle URL Centris avec session
   // Pour debug: tester quelles URLs Matrix retournent PDF avec les cookies fresh du bot
   if (req.method === 'GET' && url.startsWith('/admin/centris-fetch')) {
