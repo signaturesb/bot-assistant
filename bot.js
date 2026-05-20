@@ -5,6 +5,7 @@ const Anthropic   = require('@anthropic-ai/sdk');
 const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
+const crypto      = require('crypto');
 const leadParser  = require('./lead_parser');
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -12449,6 +12450,70 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       metrics: { ...metrics, tools: undefined },
       lastApiError: metrics.lastApiError,
     }, null, 2));
+    return;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CONFIRM/CANCEL CAMPAIGN — migré du confirm_server Mac → Render direct
+  // Élimine dépendance Cloudflare Worker + tunnel (cause des 3 alertes 530 du matin).
+  // URL stable: https://signaturesb-bot-s272.onrender.com/confirm?id=X&tok=Y&segment=Z
+  // HMAC SHA256 via CONFIRM_SECRET env var (même secret que confirm_server Mac).
+  // ═══════════════════════════════════════════════════════════════════════════
+  if ((req.method === 'GET') && (url.startsWith('/confirm') || url.startsWith('/cancel'))) {
+    try {
+      const u = new URL(req.url, 'http://x');
+      const campaignId = parseInt(u.searchParams.get('id'));
+      const tok = u.searchParams.get('tok') || '';
+      const segment = u.searchParams.get('segment') || 'Campagne';
+      const action = url.startsWith('/confirm') ? 'confirm' : 'cancel';
+      const pageHTML = (emoji, titre, sousTitre, couleur = '#aa0721') => `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${titre}</title></head><body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,sans-serif;"><div style="text-align:center;padding:40px 24px;max-width:340px;"><div style="font-size:64px;margin-bottom:20px;">${emoji}</div><div style="color:#f5f5f7;font-size:22px;font-weight:700;margin-bottom:12px;">${titre}</div><div style="color:#666;font-size:14px;line-height:1.6;">${sousTitre}</div><div style="margin-top:28px;color:${couleur};font-size:10px;font-weight:700;letter-spacing:2px;">SIGNATURE SB · RE/MAX PRESTIGE</div></div></body></html>`;
+      if (!campaignId) { res.writeHead(400); res.end('ID manquant'); return; }
+      // Validation HMAC token
+      const secret = process.env.CONFIRM_SECRET || '';
+      if (!secret) { res.writeHead(503); res.end('CONFIRM_SECRET non configuré'); return; }
+      const expected = crypto.createHmac('sha256', secret).update(String(campaignId)).digest('hex').slice(0, 16);
+      let valid = false;
+      try {
+        valid = tok.length === expected.length && crypto.timingSafeEqual(Buffer.from(tok), Buffer.from(expected));
+      } catch {}
+      if (!valid) {
+        log('WARN', 'CONFIRM', `Token invalide ${action} #${campaignId} from ${req.socket.remoteAddress}`);
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(pageHTML('⛔', 'Lien expiré', 'Ce lien est périmé. Utilise le DERNIER email de veille reçu (le plus récent) — c\'est lui qui a le bon bouton.', '#aa0721'));
+        return;
+      }
+      // Brevo API call
+      const newStatus = action === 'confirm' ? 'queued' : 'suspended';
+      const brevoRes = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/status`, {
+        method: 'PUT',
+        headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      if (!brevoRes.ok && brevoRes.status !== 400) {
+        const err = await brevoRes.text();
+        log('ERR', 'CONFIRM', `Brevo ${action} #${campaignId} HTTP ${brevoRes.status}: ${err.substring(0, 200)}`);
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(pageHTML('❌', 'Erreur', `Brevo HTTP ${brevoRes.status}`));
+        return;
+      }
+      log('OK', 'CONFIRM', `${action.toUpperCase()} #${campaignId} (${segment}) — status → ${newStatus}`);
+      auditLogEvent('campaign', action, { id: campaignId, segment, ip: req.socket.remoteAddress });
+      // Push to campaignApprovals registry (pour safetyCheck cron)
+      try {
+        if (action === 'confirm' && campaignApprovals?.approved) {
+          campaignApprovals.approved[campaignId] = { at: new Date().toISOString(), via: 'email-confirm-link', segment };
+          saveJSON(APPROVAL_FILE, campaignApprovals);
+        }
+      } catch {}
+      const html = action === 'confirm'
+        ? pageHTML('✅', 'Activée', `La campagne ${segment} est en file d'attente.`, '#aa0721')
+        : pageHTML('🚫', 'Envoi annulé', `${segment} ne partira pas.`, '#555');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (e) {
+      log('ERR', 'CONFIRM', `Exception: ${e.message}`);
+      res.writeHead(500); res.end('Server error');
+    }
     return;
   }
 
