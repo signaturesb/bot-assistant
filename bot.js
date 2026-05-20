@@ -891,6 +891,39 @@ Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]
 Connexion DIRECTE à Centris.ca avec le compte agent de Shawn.
 Credentials: CENTRIS_USER=110509 / CENTRIS_PASS (dans Render)
 
+═══ RECHERCHE COMPARABLES / LISTINGS (workflow Matrix) ═══
+
+Quand Shawn demande des comparables/listings (vendus ou actifs), utilise
+\`chercher_comparables\` ou \`envoyer_rapport_comparables\`. Le bot va dans
+RECHERCHE Matrix et choisit auto la catégorie selon les mots-clés:
+
+MAPPING keywords → catégorie Matrix:
+• "maison" / "maisons" / "unifamiliale" / "bungalow" / "plain pied" / "à étages"
+  / "cottage" / "split level" → type=Unifamiliale
+• "condo" / "copropriété" / "copro" / "appartement résidentiel" / "loft"
+  → type=Copropriété/Appartement résidentiel
+• "ferme" / "fermette" / "agricole" / "fermier" → type=Ferme/Fermette
+• "commercial" / "industriel" / "atelier" / "entrepôt" / "boutique"
+  → type=Propriété commerciale ou industrielle
+• "revenus" / "duplex" / "triplex" / "quadruplex" / "plex" / "multi-logement"
+  → type=Propriété à revenus
+• "terrain" / "terre" / "lot" / "agricole vacant" → type=Terre/Terrain
+• Si Shawn dit plusieurs types ("maison ou condo") → type=Multicatégories
+
+MODE par défaut: Personnalisée (toutes les options de filtres disponibles).
+Si Shawn dit "par numéro" → Mode No Centris.
+Si Shawn dit "par adresse" → Mode Adresse.
+
+EXEMPLES SHAWN → ACTIONS:
+• "envoie-moi les maisons vendues entre 400 et 600k à Rawdon dans les 6 derniers mois"
+  → chercher_comparables(type=Unifamiliale, region=Lanaudière, muni=Rawdon, statut=Vendu, prix_min=400000, prix_max=600000, jours=180)
+• "terrains à vendre Sainte-Julienne au-dessus de 100k"
+  → chercher_comparables(type=Terre/Terrain, muni=Sainte-Julienne, statut=En vigueur, prix_min=100000)
+• "duplex vendus dans Joliette 14 derniers jours"
+  → chercher_comparables(type=Propriété à revenus, muni=Joliette, statut=Vendu, jours=14)
+• "plain pied vendus dans Chertsey"
+  → chercher_comparables(type=Unifamiliale, sous_type=Plain-pied, muni=Chertsey, statut=Vendu)
+
 ═══ ENVOI FICHE D'UN LISTING À UN CLIENT (PRIORITÉ ABSOLUE) ═══
 TOUJOURS utiliser \`envoyer_fiche_centris_native\` en PREMIER quand demande:
 • "envoie la fiche du #X à client@email.com"
