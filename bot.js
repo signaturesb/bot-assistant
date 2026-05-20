@@ -13406,23 +13406,36 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       const camp = await r1.json();
       const audience = variation.detectAudience(camp.name);
       if (!audience) { res.writeHead(400); res.end(JSON.stringify({error: `audience non détectée dans nom: ${camp.name}`})); return; }
-      // 2. Génère variation avec données marché actuelles
+      // 2. Génère variation avec données marché actuelles + HTML existant pour rewrite ciblé
       const marketDigest = mi.buildMarketDigest() || {};
       const variant = await variation.generateVariation(audience, marketDigest, {
         customNote: u.searchParams.get('note') || null,
+        existingHtml: camp.htmlContent || '',
       });
-      // 3. Injection dans HTML actuel — remplace première section <p> avec nouvelle intro
+      // 3. Injection HTML — préserve TOUT (logos, tables, images, footer)
+      // Stratégie: LLM réécrit UNIQUEMENT le contenu des <p>...</p> contenant du
+      // texte narratif (>40 chars, pas juste un chiffre/lien). Tout le reste
+      // (img, table, css, structure) reste 100% intact.
       const oldHtml = camp.htmlContent || '';
-      // Pattern: remplace bloc INTRO ENTRE COMMENTAIRES HTML <!-- INTRO --> ou first <p>
       let newHtml = oldHtml;
-      if (variant.intro_html) {
-        // Stratégie: remplace la première grosse section <p> par notre intro
-        // Pattern conservateur: remplace seulement si on trouve un placeholder ou intro existante
-        if (/<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/.test(oldHtml)) {
-          newHtml = oldHtml.replace(/<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/, `<!-- INTRO_TEXTE -->${variant.intro_html}<!-- /INTRO_TEXTE -->`);
-        } else {
-          // Sinon, on ne touche pas (conservateur — Shawn doit avoir mis les marqueurs)
+      let replacements = [];
+      if (variant.paragraphs_replacement && Array.isArray(variant.paragraphs_replacement)) {
+        // LLM a retourné liste {old_text, new_text} — on applique
+        for (const r of variant.paragraphs_replacement) {
+          if (!r.old_text || !r.new_text) continue;
+          // Escape regex special chars dans old_text
+          const escaped = r.old_text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+          const re = new RegExp(escaped, 'g');
+          const count = (newHtml.match(re) || []).length;
+          if (count > 0) {
+            newHtml = newHtml.replace(re, r.new_text);
+            replacements.push({ from: r.old_text.substring(0, 60), to: r.new_text.substring(0, 60), count });
+          }
         }
+      } else if (variant.intro_html && /<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/.test(oldHtml)) {
+        // Fallback: si marqueurs présents, replace block
+        newHtml = oldHtml.replace(/<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/, `<!-- INTRO_TEXTE -->${variant.intro_html}<!-- /INTRO_TEXTE -->`);
+        replacements.push({ via: 'marker' });
       }
       const subject_changed = variant.subject && variant.subject !== camp.subject;
       const html_changed = newHtml !== oldHtml;
@@ -13430,6 +13443,8 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         id, audience, angle: variant.angle, focus: variant.focus,
         new_subject: variant.subject,
         subject_changed, html_changed,
+        replacements_applied: replacements.length,
+        replacements_summary: replacements.slice(0, 5),
         intro_preview: variant.intro_html?.substring(0, 400),
         key_points: variant.key_points,
         dry,

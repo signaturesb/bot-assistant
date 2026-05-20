@@ -132,11 +132,36 @@ function getAnthropic() {
 }
 
 /**
+ * Extrait paragraphes texte (>40 chars de texte, pas juste chiffres/liens) du HTML.
+ * Sert à montrer au LLM ce qu'il doit réécrire.
+ */
+function extractParagraphs(html) {
+  if (!html) return [];
+  const paragraphs = [];
+  // Match <p>...</p> avec contenu texte significatif
+  const re = /<p[^>]*>([\s\S]*?)<\/p>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const inner = m[1];
+    // Strip nested tags pour mesurer texte pur
+    const textOnly = inner.replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, ' ').trim();
+    if (textOnly.length >= 40 && /[a-zàâéèêëïîôöùûüç]{3,}/i.test(textOnly)) {
+      // C'est un paragraphe narratif (contient du texte FR/EN, pas juste un chiffre)
+      paragraphs.push({
+        html: m[0],
+        text: textOnly.substring(0, 500),
+      });
+    }
+  }
+  return paragraphs;
+}
+
+/**
  * Génère un nouvel angle pour une campagne — varie le content sans toucher branding.
  * @param {string} audience — acheteurs/vendeurs/etc
  * @param {object} marketData — depuis market_intelligence.buildMarketDigest()
- * @param {object} options — { sectorFocus, customNote }
- * @returns {Promise<{angle, subject, intro_html, key_points}>}
+ * @param {object} options — { sectorFocus, customNote, existingHtml }
+ * @returns {Promise<{angle, subject, intro_html, key_points, paragraphs_replacement}>}
  */
 async function generateVariation(audience, marketData = {}, options = {}) {
   const angle = pickNextAngle(audience);
@@ -154,7 +179,13 @@ async function generateVariation(audience, marketData = {}, options = {}) {
   if (marketData.apciq_prix_median_copro) marketLines.push(`Prix médian copropriété QC: ${marketData.apciq_prix_median_copro.toLocaleString('fr-CA')}$`);
   if (marketData.apciq_ventes_variation) marketLines.push(`Ventes vs an passé: ${marketData.apciq_ventes_variation > 0 ? '+' : ''}${marketData.apciq_ventes_variation}%`);
 
-  const prompt = `Tu écris un email de courtier immobilier au Québec (Lanaudière + Rive-Nord) — courtier: Shawn Barrette, RE/MAX PRESTIGE Rawdon, Signature SB.
+  // Extract paragraphes existants si HTML fourni (mode "rewrite zone par zone")
+  const existingParagraphs = options.existingHtml ? extractParagraphs(options.existingHtml) : [];
+  const paragraphsContext = existingParagraphs.length > 0
+    ? existingParagraphs.map((p, i) => `[P${i+1}] "${p.text.substring(0, 200)}"`).join('\n')
+    : '';
+
+  const prompt = `Tu réécris le texte d'un email de courtier immobilier au Québec (Lanaudière + Rive-Nord) — courtier: Shawn Barrette, RE/MAX PRESTIGE Rawdon, Signature SB.
 
 AUDIENCE: ${audience}
 ANGLE À DÉVELOPPER: "${angle.tag}" — ${angle.focus}
@@ -166,25 +197,29 @@ HISTORIQUE RÉCENT À ÉVITER (pour différenciation):
 ${recentAngles || '(aucun)'}
 
 ${options.customNote ? `NOTE SHAWN: ${options.customNote}\n` : ''}
+${existingParagraphs.length > 0 ? `\nPARAGRAPHES EXISTANTS DANS L'EMAIL (à RÉÉCRIRE, garde le HTML wrapper):\n${paragraphsContext}\n` : ''}
 INSTRUCTIONS:
 - Ton chaleureux mais professionnel, tutoiement
-- 2-3 paragraphes maximum, court et impactant
+- Garde la MÊME LONGUEUR par paragraphe (±20%)
 - 1 angle UNIQUE basé sur "${angle.tag}" — pas de mélange
 - Inclut au moins 1 chiffre concret du marché si dispo
-- Termine par CTA clair (visite Calendly OU répondre à l'email)
 - AUCUN mot-clé spam: "gratuit", "promo", "urgent" → utiliser "sans engagement", "stratégie", "consultation"
 - PAS de "Cher/Chère ${audience}" — direct "Bonjour,"
+- NE TOUCHE PAS aux chiffres exacts (taux, mensualités, prix) — réécris seulement les phrases d'enrobage
 
 Retourne UNIQUEMENT ce JSON exactement:
 {
-  "subject": "<sujet court 60-80 chars, accroche>",
-  "intro_html": "<HTML 3 paragraphes en <p style=...> couleur #cccccc, max 600 mots>",
-  "key_points": ["<point clé 1>", "<point clé 2>", "<point clé 3>"]
+  "subject": "<nouveau sujet 60-80 chars, accroche unique>",
+  "intro_html": "<HTML fallback 3 paragraphes <p style='color:#cccccc;line-height:1.7'>...</p>>",
+  "key_points": ["<point clé 1>", "<point clé 2>", "<point clé 3>"]${existingParagraphs.length > 0 ? `,
+  "paragraphs_replacement": [
+    {"old_text": "<texte exact d'un paragraphe existant>", "new_text": "<nouveau texte HTML pour ce paragraphe — même longueur, nouveau angle>"}
+  ]` : ''}
 }`;
 
   const res = await a.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 1500,
+    max_tokens: 3000,
     messages: [{ role: 'user', content: prompt }],
   });
   const txt = res.content.find(b => b.type === 'text')?.text || '';
