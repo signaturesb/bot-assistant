@@ -11721,6 +11721,10 @@ function startDailyTasks() {
     const now = new Date();
     const heure    = now.toLocaleString('fr-CA', { hour: 'numeric', hour12: false, timeZone: 'America/Toronto' });
     const h        = parseInt(heure);
+    // Fix crash 2026-05-20 'm is not defined': définir m AU NIVEAU DU SETINTERVAL
+    // pour que toutes les conditions h+m fonctionnent (avant: m seulement
+    // dans le if PROACTIVE_ENABLED, donc crash si désactivé).
+    const m        = now.getMinutes();
     const todayStr = now.toDateString();
     if (h === 6  && lastCron.trashCI !== todayStr)  { lastCron.trashCI = todayStr; autoTrashGitHubNoise(); }
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
@@ -11763,8 +11767,7 @@ function startDailyTasks() {
     // 🧊 SUR GLACE — désactivé jusqu'à ordre Shawn. Pour réactiver: tape dans
     // Telegram /setsecret PROACTIVE_ENABLED true → effet immédiat (sans redeploy).
     if (process.env.PROACTIVE_ENABLED === 'true') {
-      const minute = now.toLocaleString('fr-CA', { minute: 'numeric', hour12: false, timeZone: 'America/Toronto' });
-      const m = parseInt(minute);
+      // m est défini au niveau du setInterval ci-dessus — pas de redéclaration
       if (h === 6 && m === 0 && lastCron.stagnant !== todayStr) {
         lastCron.stagnant = todayStr;
         getProactive()?.stagnantDeals?.().catch(e => log('WARN', 'PROACTIVE', `stagnant: ${e.message}`));
@@ -11841,8 +11844,7 @@ function startDailyTasks() {
     // Bug réel: campagne #34 [AUTO] Vendeurs scheduled sans approval.
     // Filet de sécurité: scan toutes les campagnes queued/in_process schedulées
     // dans les 48h. Sans approval explicite → suspend + alerte Telegram.
-    const minute = now.getMinutes();
-    if (minute < 5 && lastCron.safetyHourly !== `${todayStr}-${h}`) {
+    if (m < 5 && lastCron.safetyHourly !== `${todayStr}-${h}`) {
       lastCron.safetyHourly = `${todayStr}-${h}`;
       safetyCheckCampagnes().catch(e => log('WARN', 'SAFETY', `${e.message}`));
     }
