@@ -32,6 +32,8 @@
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5",
     "playwright-core": "^1.60.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "rebrowser-playwright": "^1.52.0"
   },
   "overrides": {
