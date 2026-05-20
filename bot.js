@@ -6296,6 +6296,7 @@ const TOOLS = [
   // ── Téléchargement PDF + scraping avancé ──────────────────────────────────
   { name: 'telecharger_pdf', description: 'Télécharge un PDF depuis n\'importe quelle URL et l\'envoie direct sur Telegram à Shawn. Utile pour récupérer rapports municipaux, règlements, fiches MLS, certificats de localisation, plans cadastraux. Max 25MB. Retourne URL + taille + envoi confirmé.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL complète vers PDF (ex: https://ville.qc.ca/.../zonage.pdf)' }, titre: { type: 'string', description: 'OPTIONNEL — titre/légende pour le PDF dans Telegram' } }, required: ['url'] } },
   { name: 'scraper_avance', description: 'Scrape une URL + extrait automatiquement TOUS les liens PDF trouvés. Utile pour explorer un site municipal/gouvernemental où les docs sont en PDF (ex: page urbanisme avec liens vers règlements, plans, formulaires). Retourne contenu + liste PDFs avec option de les télécharger.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL à scraper' }, mots_cles: { type: 'array', items: { type: 'string' }, description: 'OPTIONNEL — filtrer le contenu par mots-clés' }, telecharger_pdfs: { type: 'boolean', description: 'OPTIONNEL — si true, download auto les PDFs trouvés (max 5)' } }, required: ['url'] } },
+  { name: 'scraper_pdf_universel', description: 'SCRAPER ULTIME PDF — cascade 3 niveaux (HTTP direct → Firecrawl → Browserless stealth) avec bypass consent walls, anti-bot, JS-rendered. UTILISER quand scraper_avance échoue ou pour sites qui bloquent (cookies wall, Cloudflare, JS SPAs). Auto-click "Accepter cookies"+"J\'accepte". Télécharge auto les PDFs trouvés.', input_schema: { type: 'object', properties: { url: { type: 'string', description: 'URL à scraper' }, mot_cle_filtre: { type: 'string', description: 'OPTIONNEL — filtre PDFs par mot-clé (ex: "zonage", "règlement", "plan")' }, max_pdfs: { type: 'number', description: 'OPTIONNEL — max PDFs à télécharger (défaut 5)' } }, required: ['url'] } },
   { name: 'recherche_documents', description: 'COMBINAISON puissante: cherche sur le web (Perplexity) + scrape les sources trouvées (Firecrawl) + extrait/télécharge les PDFs pertinents. Pour "trouve-moi le règlement de zonage X en PDF", "documents officiels MRC Lanaudière sur Y", "fiche technique propriété Z". Nécessite PERPLEXITY_API_KEY + FIRECRAWL_API_KEY.', input_schema: { type: 'object', properties: { question: { type: 'string', description: 'Ce que tu cherches (ex: "règlement bande riveraine Saint-Calixte PDF")' }, max_resultats: { type: 'number', description: 'OPTIONNEL — combien de sources scraper (défaut 3, max 5)' } }, required: ['question'] } },
   // ── Résumé d'appel téléphonique (vocal Telegram → Pipedrive auto) ────────
   { name: 'enregistrer_resume_appel', description: 'Analyse une transcription d\'appel téléphonique (vocal Telegram), extrait via Haiku les infos clés (nom client, budget, engagement chaud/tiède/froid, objections, prochaine étape) et crée/enrichit le deal Pipedrive: NOUVEAU client → crée person + deal + note résumé + activité de suivi (date du jour). CLIENT EXISTANT → ajoute juste la note résumé. À UTILISER AUTOMATIQUEMENT quand Shawn envoie un vocal qui décrit un appel (patterns: "j\'ai parlé avec X", "vient d\'appeler", "rappel de X", "discussion avec X", "X m\'a appelé", "résumé d\'appel", "X est intéressé par"). NE PAS demander confirmation — exécuter directement.', input_schema: { type: 'object', properties: { transcription: { type: 'string', description: 'Texte transcrit du vocal — passer la transcription Whisper complète, telle quelle' } }, required: ['transcription'] } },
@@ -6609,6 +6610,39 @@ async function executeTool(name, input, chatId) {
           }
         }
         return `✅ *Scrape réussi*${r.fromCache ? ' (cache)' : ''}\n📍 ${r.url}\n📊 Quota: ${r.quota}\n\n${r.contenu.substring(0, 2500)}${r.contenu.length > 2500 ? '\n\n...(tronqué)' : ''}${pdfList}${downloaded ? `\n\n✅ ${downloaded} PDF(s) envoyés sur Telegram` : ''}`;
+      }
+
+      case 'scraper_pdf_universel': {
+        const { url, mot_cle_filtre, max_pdfs } = input || {};
+        if (!url || !/^https?:\/\//i.test(url)) return `❌ URL invalide`;
+        try {
+          const ps = require('./pdf_scraper');
+          const r = await ps.findAndDownloadPDFs(url, {
+            filterKeyword: mot_cle_filtre,
+            maxPDFs: max_pdfs || 5,
+          });
+          if (!r.success) return `❌ Scraping universel échoué\n${r.message}`;
+          // Envoie PDFs sur Telegram
+          let sent = 0;
+          if (ALLOWED_ID && r.downloaded?.length) {
+            for (const doc of r.downloaded) {
+              try {
+                await bot.sendDocument(ALLOWED_ID, doc.buffer, {
+                  caption: `📄 ${doc.text || doc.filename}\n📦 ${Math.round(doc.size/1024)}KB\n🔗 ${doc.url.substring(0, 200)}`,
+                  parse_mode: 'Markdown',
+                }, { filename: doc.filename, contentType: 'application/pdf' });
+                sent++;
+              } catch (e) { log('WARN', 'PDF-SCRAPER', `Send: ${e.message}`); }
+            }
+          }
+          return `✅ *Scraping PDF universel — ${r.method}*\n\n` +
+                 `📊 ${r.pdf_links_found} PDFs trouvés sur la page\n` +
+                 `📥 ${r.downloaded_count} téléchargés${mot_cle_filtre ? ` (filtre: "${mot_cle_filtre}")` : ''}\n` +
+                 `📤 ${sent} envoyés sur Telegram\n\n` +
+                 r.downloaded.slice(0, 5).map(d => `  📎 ${d.text} (${Math.round(d.size/1024)}KB)`).join('\n');
+        } catch (e) {
+          return `❌ Exception pdf_scraper: ${e.message?.substring(0, 200)}`;
+        }
       }
 
       case 'telecharger_fiche_centris': {

@@ -1,8 +1,40 @@
 # SESSION_LIVE — Travail Claude Code en temps réel
 
-> Synchronisé via git push vers `bot-assistant` (Render auto-deploy).
+> Synchronisé via git push vers `bot-assistant` + `kira-bot` (Render auto-deploy).
 > Bot lit ce fichier toutes les 30 min via `loadSessionLiveContext()`.
-> **Dernière maj: 2026-05-19 23:35 UTC** — Centris Matrix 100% maîtrisé
+> **Dernière maj: 2026-05-20** — Scraper PDF universel + Sainte-Julienne fix
+
+---
+
+## 🆕 2026-05-20 — Scraper PDF universel (commit e0bb1a0+)
+
+### Solution scraping PDF n'importe quel site (3 niveaux)
+Le bot peut maintenant récupérer des PDFs **même sur sites avec consent wall / anti-bot** via `pdf_scraper.js`:
+
+1. **LEVEL 1**: Direct HTTP fetch (got + stealth headers) — pour PDFs directs
+2. **LEVEL 2**: Firecrawl (sites statiques)
+3. **LEVEL 3**: rebrowser-playwright + Browserless stealth — **bypass consent walls, JS-rendered, anti-bot**
+   - Auto-click consent buttons (Accepter / J'accepte / OK / Continue)
+   - Anti-detect: navigator.webdriver=undefined, locale fr-CA, sec-ch-ua complets
+   - Download interception pour PDFs direct
+
+### Fix dual-repo sync (commit e0bb1a0)
+Bug: bot lisait SESSION_LIVE depuis `kira-bot` mais Claude Code pushait sur `bot-assistant` → bot voyait toujours version du 14 mai.
+Fix: `loadSessionLiveContext()` lit AUTO les 2 repos + prend le plus récent (max commit date).
+
+### Plan zonage Sainte-Julienne — Solution
+Site `sainte-julienne.com` bloque Firecrawl (consent wall). Maintenant avec stack Browserless stealth:
+```
+findAndDownloadPDFs('https://sainte-julienne.com/services-aux-citoyens/urbanisme/', {
+  filterKeyword: 'zonage',  // ou 'plan'
+  maxPDFs: 5
+})
+```
+→ Cascade auto: Firecrawl fail → Browserless avec handleConsentWalls() → extract PDF links → download.
+
+### Comment envoyer PDF dans Telegram (existant, juste rappel)
+Le bot a déjà l'outil `bot.sendDocument(chatId, buffer, {caption}, {filename, contentType: 'application/pdf'})`.
+`analyser_zonage_adresse` fait ça automatiquement: scrape → trouve PDF → envoie Telegram + optionnel forward client.
 
 ---
 
