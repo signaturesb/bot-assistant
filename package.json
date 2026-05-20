@@ -23,8 +23,12 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.96.0",
+    "cheerio": "^1.2.0",
     "dotenv": "^16.0.0",
+    "got": "^15.0.5",
+    "lru-cache": "^11.5.0",
     "node-telegram-bot-api": "^0.67.0",
+    "p-limit": "^7.3.0",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5",
     "playwright-core": "^1.60.0",

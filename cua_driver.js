@@ -1260,24 +1260,81 @@ async function sendCentrisListingByEmail(opts) {
 // Permet: maisons vendues, terrains à vendre, condos avec accès eau, etc.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Sélecteurs DOM exacts capturés live 2026-05-19 (form Générale Unifamiliale)
+// Source: memory reference_centris_unifamiliale_generale_selectors.md
+const MATRIX_SELECTORS = {
+  region: 'Fm43_Ctrl3565_LB',                // Listbox région
+  municipalite: 'Fm43_Ctrl3567_LB',          // Listbox muni (67 options Lanaudière)
+  municipalite_filter: 'Fm43_Ctrl3567_LB_TB', // Textbox filter muni
+  quartier: 'Fm43_Ctrl3568_LB',
+  statut: 'Fm43_Ctrl3227_LB',                // Listbox statut
+  prix_demande_vendu: 'Fm43_Ctrl3386_TB',    // Textbox prix range "400000-600000"
+  prix_loc: 'Fm43_Ctrl3387_TB',
+  date_changement_statut: 'Fm43_Ctrl3416_TB',// Date vendu range "0-180" jours
+  date_nouvelle: 'Fm43_Ctrl3381_TB',
+  date_modif_prix: 'Fm43_Ctrl3382_TB',
+  date_inscript_modif: 'Fm43_Ctrl3385_TB',
+  date_expiration: 'Fm43_Ctrl5517_TB',
+  genre_propriete: 'Fm43_Ctrl792_LB',        // Plain-pied, À étages, Paliers, 1.5 étage, Mobile
+  type_batiment: 'Fm43_Ctrl794_LB',          // Isolé, Jumelé, En rangée, Coin, Quadrex
+  annee_construction: 'Fm43_Ctrl3517_TB',
+  superficie_habitable_tb: 'Fm43_Ctrl3520_TB',
+  superficie_habitable_unit: 'Fm43_Ctrl3520_DD', // pc/mc
+  superficie_terrain_tb: 'Fm43_Ctrl3521_TB',
+  superficie_terrain_unit: 'Fm43_Ctrl3521_DD',   // pc/mc/ac/ha/arp.
+  sous_sol: 'Fm43_Ctrl3529_LB',
+  equipements: 'Fm43_Ctrl3532_LB',
+  foyer: 'Fm43_Ctrl3527_LB',
+  piscine: 'Fm43_Ctrl3528_LB',
+  eau: 'Fm43_Ctrl3530_LB',
+  vue: 'Fm43_Ctrl3531_LB',
+  terrain_caract: 'Fm43_Ctrl5716_LB',
+  proximite: 'Fm43_Ctrl5617_LB',
+  zonage: 'Fm43_Ctrl5695_LB',
+  fondation: 'Fm43_Ctrl5705_LB',
+};
+
 /**
- * Recherche dans Matrix Centris avec filtres avancés.
+ * Recherche dans Matrix Centris avec filtres avancés (mode Générale).
+ * Tous les sélecteurs DOM capturés live 2026-05-19.
+ *
  * @param {object} opts
  * @param {string} opts.type — 'unifamiliale' | 'copropriete' | 'ferme' | 'commercial' | 'revenus' | 'terrain' | 'multicategories'
  * @param {string} [opts.region] — Lanaudière, Laurentides, Montréal, etc.
- * @param {string} [opts.municipalite] — Rawdon, Sainte-Julienne, etc.
+ * @param {string} [opts.municipalite] — Rawdon, Sainte-Julienne, Joliette, etc. (67 options Lanaudière)
  * @param {string} [opts.statut] — 'En vigueur' (défaut) | 'Vendu' | 'Expiré' | 'Hors marché' | 'Annulé'
- * @param {number} [opts.prixMin] — fourchette prix min
- * @param {number} [opts.prixMax] — fourchette prix max
- * @param {number} [opts.joursVendus] — pour statut Vendu: dernière N jours (ex: 180 = 6 mois)
- * @param {string} [opts.sousType] — ex: 'Plain-pied', 'À étages' (Type de bâtiment)
+ * @param {number} [opts.prixMin] — fourchette prix min (ex 400000)
+ * @param {number} [opts.prixMax] — fourchette prix max (ex 600000)
+ * @param {number} [opts.joursVendus] — pour statut Vendu: derniers N jours (ex 180=6 mois, 90=3 mois, 14=2 sem)
+ * @param {string} [opts.genrePropriete] — 'Maison de plain-pied' | 'Maison à étages' | 'Maison à paliers multiples' | 'Maison à un étage et demi' | 'Maison mobile'
+ * @param {string} [opts.typeBatiment] — 'Isolé (détaché)' | 'Jumelé' | 'En rangée' | 'En rangée sur coin' | 'Quadrex'
  * @returns {Promise<{success, count, listings: [{mls, adresse, prix, ville}], message}>}
  */
+// Helper: select dans listbox Matrix par texte exact (avec change event)
+async function selectMatrixListbox(page, listboxId, value, multi = false) {
+  return await page.evaluate(({ id, val, m }) => {
+    const lb = document.getElementById(id);
+    if (!lb) return false;
+    if (lb.tagName !== 'SELECT') {
+      const li = [...lb.children].find(c => (c.textContent || '').trim() === val);
+      if (li) { li.click(); return true; }
+      return false;
+    }
+    if (!m) [...lb.options].forEach(o => o.selected = false);
+    const opt = [...lb.options].find(o => (o.text || '').trim() === val);
+    if (!opt) return false;
+    opt.selected = true;
+    lb.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }, { id: listboxId, val: value, m: multi });
+}
+
 async function searchCentrisVendus(opts = {}) {
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
-  const { type = 'unifamiliale', region, municipalite, statut = 'En vigueur', prixMin, prixMax, joursVendus, sousType } = opts;
+  const { type = 'unifamiliale', region, municipalite, statut = 'En vigueur',
+          prixMin, prixMax, joursVendus, genrePropriete, typeBatiment } = opts;
 
   const TYPE_URLS = {
     unifamiliale: 'Unifamiliale',
@@ -1296,129 +1353,87 @@ async function searchCentrisVendus(opts = {}) {
     const context = await newStealthContext(browser);
     const page = await loginCentris(context);
 
-    // 1. Navigate to Recherche Personnalisée du type
-    const searchUrl = `https://matrix.centris.ca/Matrix/Recherche/${typeSlug}/Personnalis%C3%A9e`;
-    console.log(`[CENTRIS-SEARCH] Type: ${type} → ${searchUrl}`);
+    // 1. Navigate Recherche GÉNÉRALE (vs Personnalisée — toute la grille visible)
+    const searchUrl = `https://matrix.centris.ca/Matrix/Recherche/${typeSlug}/G%C3%A9n%C3%A9rale`;
+    console.log(`[CENTRIS-SEARCH] Type=${type} URL=${searchUrl}`);
     await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(3500);
 
-    // 2. Sélectionner Région
+    // 2. Région
     if (region) {
-      console.log(`[CENTRIS-SEARCH] Région: ${region}`);
-      await page.evaluate((reg) => {
-        const lists = [...document.querySelectorAll('select[size], ul, [role=listbox]')];
-        for (const list of lists) {
-          const items = list.tagName === 'SELECT' ? [...list.options] : [...list.children];
-          const target = items.find(i => i.textContent.trim() === reg || i.text === reg);
-          if (target) {
-            if (target.tagName === 'OPTION') { target.selected = true; list.dispatchEvent(new Event('change', { bubbles: true })); }
-            else { target.click(); }
-            return true;
-          }
-        }
-        return false;
-      }, region);
+      const ok = await selectMatrixListbox(page, MATRIX_SELECTORS.region, region);
+      console.log(`[CENTRIS-SEARCH] Région ${region}: ${ok ? '✓' : '✗ (peut nécessiter --- plus ---)'}`);
       await page.waitForTimeout(1500);
     }
 
-    // 3. Sélectionner Municipalité
+    // 3. Municipalité — type dans filter textbox, attend, sélectionne dans LB
     if (municipalite) {
-      console.log(`[CENTRIS-SEARCH] Muni: ${municipalite}`);
-      // Type dans la textbox Municipalité, attend autocomplete, click la match
-      // Sélecteur générique — peut nécessiter ajustement
-      const muniInput = await page.locator('input[type=text]').nth(1); // 2e textbox = Municipalité
-      await muniInput.fill(municipalite);
-      await page.waitForTimeout(1500);
-      // Click le premier résultat de l'autocomplete dropdown
-      await page.evaluate((mu) => {
-        const items = [...document.querySelectorAll('ul li, [role=option]')];
-        const target = items.find(i => i.textContent.trim().toLowerCase().startsWith(mu.toLowerCase()));
-        if (target) target.click();
+      console.log(`[CENTRIS-SEARCH] Muni filter: ${municipalite}`);
+      await page.evaluate((m) => {
+        const tb = document.getElementById('Fm43_Ctrl3567_LB_TB');
+        if (tb) { tb.focus(); tb.value = m; tb.dispatchEvent(new Event('input', { bubbles: true })); tb.dispatchEvent(new Event('keyup', { bubbles: true })); }
       }, municipalite);
+      await page.waitForTimeout(1500);
+      const ok = await selectMatrixListbox(page, MATRIX_SELECTORS.municipalite, municipalite);
+      console.log(`[CENTRIS-SEARCH] Muni ${municipalite}: ${ok ? '✓' : '✗'}`);
       await page.waitForTimeout(1000);
     }
 
-    // 4. Sélectionner Statut
-    console.log(`[CENTRIS-SEARCH] Statut: ${statut}`);
-    await page.evaluate((s) => {
-      const lists = [...document.querySelectorAll('select, ul, [role=listbox]')];
-      for (const list of lists) {
-        const items = list.tagName === 'SELECT' ? [...list.options] : [...list.children];
-        const target = items.find(i => i.textContent.trim() === s || i.text === s);
-        if (target) {
-          if (target.tagName === 'OPTION') { target.selected = true; list.dispatchEvent(new Event('change', { bubbles: true })); }
-          else { target.click(); }
-          return true;
-        }
-      }
-      return false;
-    }, statut);
-    await page.waitForTimeout(1500);
+    // 4. Statut
+    const ok_st = await selectMatrixListbox(page, MATRIX_SELECTORS.statut, statut);
+    console.log(`[CENTRIS-SEARCH] Statut ${statut}: ${ok_st ? '✓' : '✗'}`);
+    await page.waitForTimeout(800);
 
-    // 5. Champs additionnels (prix, date vendu, sous-type)
-    if (prixMin || prixMax || joursVendus || sousType) {
-      console.log('[CENTRIS-SEARCH] Ajout champs additionnels');
-      // Click Ajouter
-      await page.evaluate(() => {
-        const btn = [...document.querySelectorAll('a,button')].find(b => (b.textContent || '').trim() === 'Ajouter');
-        if (btn) btn.click();
-      });
-      await page.waitForURL(/EditBubble/, { timeout: 10000 });
-      await page.waitForTimeout(2000);
-
-      // Sélectionner les champs voulus
-      const fieldsToAdd = [];
-      if (prixMin || prixMax) fieldsToAdd.push('Prix demandé/vendu');
-      if (joursVendus) fieldsToAdd.push('Date de changements de statut');
-      if (sousType) fieldsToAdd.push('Type de bâtiment');
-
-      for (const field of fieldsToAdd) {
-        await page.evaluate((f) => {
-          const lists = [...document.querySelectorAll('ul')];
-          const big = lists.find(ul => ul.children.length > 50);
-          const li = big && [...big.children].find(l => l.textContent.trim() === f);
-          if (li) li.click();
-        }, field);
-        await page.waitForTimeout(500);
-        // Click "Ajouter ->"
-        await page.evaluate(() => {
-          const btn = [...document.querySelectorAll('a,button,input')].find(b => /ajouter\s*-\s*>/i.test(b.textContent || b.value || ''));
-          if (btn) btn.click();
-        });
-        await page.waitForTimeout(500);
-      }
-
-      // Retour à la page recherche
-      await page.evaluate(() => {
-        const btn = [...document.querySelectorAll('a,button')].find(b => /^précédent$/i.test((b.textContent || '').trim()));
-        if (btn) btn.click();
-      });
-      await page.waitForTimeout(2000);
-
-      // TODO: remplir les valeurs des champs ajoutés (prix min/max, date range, sous-type)
-      // Selectors à capturer dans le crawl complet — non implémenté pour ce commit
+    // 5. Prix fourchette
+    if (prixMin || prixMax) {
+      const range = `${prixMin || 0}-${prixMax || 99999999}`;
+      await page.fill(`#${MATRIX_SELECTORS.prix_demande_vendu}`, range);
+      console.log(`[CENTRIS-SEARCH] Prix range: ${range}`);
     }
 
-    // 6. Click "Résultats"
+    // 6. Date changement statut (pour vendus N derniers jours)
+    if (joursVendus) {
+      // Format Matrix: "0-180" = entre aujourd'hui et 180 jours en arrière
+      await page.fill(`#${MATRIX_SELECTORS.date_changement_statut}`, `0-${joursVendus}`);
+      console.log(`[CENTRIS-SEARCH] Date changement statut: 0-${joursVendus} jours`);
+    }
+
+    // 7. Genre propriété (plain-pied, à étages, etc.)
+    if (genrePropriete) {
+      const ok = await selectMatrixListbox(page, MATRIX_SELECTORS.genre_propriete, genrePropriete);
+      console.log(`[CENTRIS-SEARCH] Genre ${genrePropriete}: ${ok ? '✓' : '✗'}`);
+    }
+
+    // 8. Type bâtiment (isolé, jumelé, etc.)
+    if (typeBatiment) {
+      const ok = await selectMatrixListbox(page, MATRIX_SELECTORS.type_batiment, typeBatiment);
+      console.log(`[CENTRIS-SEARCH] Type bâtiment ${typeBatiment}: ${ok ? '✓' : '✗'}`);
+    }
+    await page.waitForTimeout(1000);
+
+    // 9. Click "Résultats"
     console.log('[CENTRIS-SEARCH] Click Résultats');
     await page.evaluate(() => {
-      const btn = [...document.querySelectorAll('a,button')].find(b => /^résultats$/i.test((b.textContent || '').trim()));
+      const btn = [...document.querySelectorAll('a,button,input')]
+        .find(b => /^résultats$/i.test((b.textContent || b.value || '').trim()));
       if (btn) btn.click();
     });
-    await page.waitForURL(/Results/, { timeout: 15000 });
-    await page.waitForTimeout(3000);
+    await page.waitForURL(/Results/, { timeout: 20000 });
+    await page.waitForTimeout(3500);
 
-    // 7. Parse résultats
+    // 10. Parse table résultats
     const listings = await page.evaluate(() => {
       const rows = [...document.querySelectorAll('table tr')].filter(r => {
         const cells = r.querySelectorAll('td');
         return cells.length > 5 && [...cells].some(c => /^\d{7,9}$/.test(c.textContent.trim()));
       });
-      return rows.slice(0, 50).map(r => {
+      return rows.slice(0, 100).map(r => {
         const cells = [...r.querySelectorAll('td')].map(c => c.textContent.trim());
-        const mlsCell = cells.find(c => /^\d{7,9}$/.test(c));
-        const priceCell = cells.find(c => /\$/.test(c));
-        return { cells, mls: mlsCell, prix_raw: priceCell };
+        return {
+          mls: cells.find(c => /^\d{7,9}$/.test(c)),
+          prix_raw: cells.find(c => /\$/.test(c)),
+          all_cells: cells,
+        };
       });
     });
 
@@ -1426,8 +1441,8 @@ async function searchCentrisVendus(opts = {}) {
       success: true,
       count: listings.length,
       listings,
-      filters_applied: { type, region, municipalite, statut, prixMin, prixMax, joursVendus, sousType },
-      message: `${listings.length} résultats trouvés pour ${type} (${statut}) ${region || ''} ${municipalite || ''}`,
+      filters_applied: { type, region, municipalite, statut, prixMin, prixMax, joursVendus, genrePropriete, typeBatiment },
+      message: `${listings.length} résultats trouvés (${type}, ${statut}${region ? ', ' + region : ''}${municipalite ? ', ' + municipalite : ''})`,
     };
   } catch (e) {
     console.error('[CENTRIS-SEARCH] error:', e.message);
