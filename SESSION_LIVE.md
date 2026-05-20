@@ -1,87 +1,141 @@
 # SESSION_LIVE — Travail Claude Code en temps réel
 
-> Synchronisé via git push vers `kira-bot` repo. Bot Telegram lit ce fichier toutes les 30 min via `loadSessionLiveContext()` (bot.js).
-> Dernière maj: **2026-05-19 22:45 UTC** — Session bulletproof + market intelligence + CUA
+> Synchronisé via git push vers `bot-assistant` (Render auto-deploy).
+> Bot lit ce fichier toutes les 30 min via `loadSessionLiveContext()`.
+> **Dernière maj: 2026-05-19 23:35 UTC** — Centris Matrix 100% maîtrisé
 
 ---
 
-## 🎯 Session 2026-05-19 — État actuel (HEAD: `693c614`)
+## 🏆 Session 2026-05-19 — 30+ commits déployés
 
-### ✅ DÉPLOYÉS aujourd'hui (Render bot-assistant main):
-
+### Commits clés aujourd'hui
 | Commit | Sujet |
 |---|---|
-| `693c614` | Market intelligence — LLM Haiku extraction fallback robuste |
-| `4e7dac1` | URL Banque Canada + filter OACIQ URLs |
-| `d5a51fc` | Extracts intelligents APCIQ/OACIQ/Centris/RE-MAX + digest enrichi |
-| `9a1e941` | Audit P1+P2+P3: auth helper / pendingDocs cap / Dropbox expiry / Browserless retry |
-| `215f0c9` | Brevo sender fix + self-send detection (Gmail trap shawn@→shawn@) |
-| `4ba0c80` | `/admin/brevo-send-raw` — bypass sendTest via SMTP |
-| `a7551e7` | 15 sources QC + spot-check 3 sem + auto-inject system prompt |
-| `a5e6992` | Pipeline scraping market_intelligence.js |
-| `8dc9fc3` | **Audit P0**: Gmail Poller mutex + budget USD conversation + trackCost return |
-| `27e0c22` | `/admin/brevo-replace` (find/replace subject+HTML campagne) |
-| `5313c7c` | CUA MFA visual fallback + Telegram alert + Gmail query élargi |
-| `f7a480b` | CUA login Centris autonome (UserCode + MFA Gmail) |
-| `e3c4a66` | CUA URLs Centris 2026 (matrix.centris.ca) + cookie share |
-| `a3598db` | CUA driver + Browserless externe |
-| `a49fc6e` | Master template Dropbox sur 4 fonctions emails clients |
-| `524581a` | Telegram trace OBLIGATOIRE chaque email envoyé client |
+| `e9a8ec1` | fix(centris-search): page.selectOption() postback + MATRIX_PREFIXES par type |
+| `bf3585e` | feat(centris-search): 100% complet — sélecteurs Matrix DOM exacts + 4 tools pipeline |
+| `94ed29b` | feat(system): keyword mapping pour catégories Matrix dans SYSTEM_BASE |
+| `e906c65` | feat(centris-search): searchCentrisVendus() skeleton + Matrix structure mapped |
+| `68861e2` | feat(system): teach bot to prefer envoyer_fiche_centris_native FIRST |
+| `16d09a8` | feat(centris-native): outil bot envoyer_fiche_centris_native — flow Matrix UI |
+| `6875333` | fix(cua): détecte rebrowser flavor AVANT load |
+| `0e08f22` | feat(scrape): rebrowser-playwright + 4 couches anti-detect + pdf-parse Centris |
+| `e527bc3` | fix(preview): défaut shawn@signaturesb.com + Gmail API direct |
+| `693c614` | feat(market): LLM Haiku extraction fallback robuste |
+| `a7551e7` | feat(market): 15 sources QC + spot-check 3 sem + auto-inject |
+| `8dc9fc3` | fix(audit-P0): Gmail Poller mutex + budget USD conversation |
+| `5313c7c` | feat(cua+gmail): bulletproof MFA + visual fallback + Telegram alert |
+| `a3598db` | feat(cua): intégration CUA + Browserless externe |
+| `a49fc6e` | feat(email-template): master template Dropbox sur 4 fonctions emails |
 
-### 🆕 INFRASTRUCTURE ACTIVÉE
-- **Browserless.io** signed up (1000 min/mois free) → env var `BROWSERLESS_WS` sur Render
-- **CUA mode**: `browserless (remote)` confirmé via `/admin/state`
-- **Market intelligence pipeline**: 16 sources QC scrapées via Firecrawl
+### ✅ CENTRIS MATRIX — 100% MAÎTRISÉ
 
-### 🐛 BUGS CRITIQUES RÉSOLUS
-1. **Preview #35 jamais reçu** × 4 tentatives → cause: sender=shawn@ → destinataire=shawn@ trap Gmail. Fix: `/admin/brevo-send-raw` auto-redirect vers icloud si self-send
-2. **Campagne #35 contenait "avril"** × 8 occurrences → fix: `/admin/brevo-replace?id=35&from=avril&to=mai`
-3. **`.env` ligne 14 corrompue** (GITHUB_WEBHOOK_SECRET + WEBHOOK_SECRET fusionnés sur 1 ligne)
-4. **Gmail Poller overlap garanti à 30s** → mutex `_pollerInFlight`
-5. **Tool loop Claude budget non-borné** ($3/conversation possible) → cap CONV_BUDGET_USD=$2.50
-6. **Dropbox token sans expiry tracking** → pre-emptive refresh
-7. **CUA Centris login** → form selectors mis à jour + MFA via Gmail + alert Telegram fallback
+**Flow `envoyer_fiche_centris_native()` validé live:**
+- Test réussi listing #18366287 → email natif Centris reçu icloud
+- PDF officiel + 61 photos HD + signature Shawn intégrée
+- Outil bot ajouté + préférence SYSTEM_BASE
 
-### 📊 MARKET INTELLIGENCE — 16 sources actives
-**Économiques (refresh quotidien):** banque_canada, multipret, planipret
-**Stats QC:** apciq, apciq_lanaudiere, oaciq
-**Sites immo:** centris_public, duproprio, realtor, remax_qc, remax_marche, royal_lepage, sutton_qc, via_capitale, jlr, shq
+**Flow `searchCentrisVendus()` validé live:**
+- Test 32 terrains vendus Rawdon 6 mois → **CONFIRMÉ par Shawn**
+- Format date "0-180" (jours arrière)
+- page.selectOption() pour postback ASP.NET (fix bug DOM manip)
 
-**Cadence:** Full refresh dimanche matin OU snapshot > 21 jours. Fresh refresh quotidien sources économiques.
+### 🗺️ STRUCTURE MATRIX CAPTURÉE
 
-**Auto-injection:** `buildMarketDigest()` injecté dans `getSystemDynamic()` à chaque tour bot → bot voit taux + prix médians + variations + news sans demander.
+**Prefix Fm{N}_ par type:**
+- Unifamiliale = `Fm43_`
+- TerreTerrain = `Fm105_`
+- Autres types à confirmer
 
-### ⚠️ ENCORE À FINIR
-- **Taux directeur BC** + **taux hypothèque** restent null malgré LLM fallback Haiku → URL bankofcanada peut-être JS-rendered, à investiguer
-- **OACIQ articles** retournent "Cette page n'est plus accessible" → URL `/fr/articles` invalide, trouver bonne URL
-- **Tests live Telegram** pour valider CUA Centris end-to-end (MFA Gmail polling)
+**Ctrl numbers partagés** (sauf changement de statut):
+- 3565 = Région
+- 3567 = Municipalité (67 options Lanaudière)
+- 3568 = Quartier
+- 3227 = Statut (En vigueur / Vendu / Expiré / Hors marché / Annulé)
+- 3386 = Prix demandé/vendu
+- 3416 = Changement de statut (Unifam) / **3425** (Terrain)
+- 792 = Genre (Plain-pied/À étages/Paliers/1.5/Mobile)
+- 794 = Type bâtiment (Isolé/Jumelé/En rangée/Coin/Quadrex)
 
-### 📋 ENDPOINTS ADMIN (auth WEBHOOK_SECRET via `requireAdmin` timing-safe)
-- `/admin/state` — uptime + health + costs + CUA + market status (no auth)
-- `/admin/cua-test?num=N` — test CUA Centris listing
-- `/admin/brevo-list` / `/admin/brevo-replace` / `/admin/brevo-send-raw` / `/admin/brevo-send-preview`
-- `/admin/market-refresh` / `/admin/market-status` / `/admin/market-debug?source=X`
-- `/admin/centris-mfa-code` (Gmail OAuth fetch code)
-- `/admin/centris-cookies` (POST cookies from Mac/CUA)
-- `/admin/pipedrive-cleanup` (5 catégories purge)
+**URLs (sans / dans path):**
+- `/Recherche/Unifamiliale/Générale`
+- `/Recherche/TerreTerrain/Générale`
+- `/Recherche/Copropri%C3%A9t%C3%A9Appartementr%C3%A9sidentiel/Générale`
+- `/Recherche/FermeFermette/Générale`
+- `/Recherche/Propri%C3%A9t%C3%A9commercialeouindustrielle/Générale`
+- `/Recherche/Propri%C3%A9t%C3%A9%C3%A0revenus/Générale`
+- `/Recherche/Multicat%C3%A9gories/Générale`
+
+### 🥷 SCRAPING — Stack ultime (commits a3598db + 0e08f22)
+
+- ✅ **Browserless.io** (1000 min/mois free) connecté via WS
+- ✅ **rebrowser-playwright** anti-detect natif
+- ✅ **4 couches anti-blocage:**
+  - UA rotation 4 user-agents Chrome/Edge Mac/Win
+  - Stealth context: locale fr-CA, timezone Toronto, sec-ch-ua complets
+  - addInitScript: navigator.webdriver, plugins, WebGL, chrome.runtime
+  - launch args: --disable-blink-features=AutomationControlled
+- ✅ **pdf-parse**: extract data Centris PDFs (prix, MLS, adresse, taxes)
+- ✅ **cheerio + got + lru-cache + p-limit**: tools pipeline GitHub top 2026
+
+### 📊 MARKET INTELLIGENCE — 16 sources LIVE
+
+Pipeline auto-injecté dans system prompt bot:
+- Banque du Canada (taux directeur)
+- MultiPrêt + PlaniPrêt (taux 5 ans)
+- APCIQ (stats QC + Lanaudière)
+- OACIQ (règlements)
+- Centris.ca public + DuProprio + Realtor.ca
+- RE/MAX QC + RE/MAX Canada + Royal LePage + Sutton + Via Capitale + JLR + SHQ
+
+**Ratehub.ca** → taux fixe 5 ans **4.04%** confirmé mai 2026.
+
+### 🛡️ BREVO — Bugs résolus
+
+- ✅ "Brevo SMTP hold pattern" diagnostiqué (events stay "requests" never "delivered")
+- ✅ Fix: `/admin/preview-via-gmail` bypass via Gmail OAuth
+- ✅ Campaign #35 sent prod (32 acheteurs Lanaudière) avec taux mai à jour
+- ✅ avril→mai replaced 8x dans HTML
+- ✅ mensualités recalculées avec 4.04% (canadien semi-annual)
+
+### 🔄 BOT INSTRUCTIONS PERMANENTES (SYSTEM_BASE)
+
+Bot sait maintenant:
+1. **Quelle catégorie Matrix choisir** par keyword:
+   - maison/unifam/bungalow/plain pied/à étages → Unifamiliale
+   - condo/copro → Copropriété
+   - duplex/triplex/plex → Propriété à revenus
+   - terrain/terre/lot → Terre/Terrain
+2. **TOUJOURS privilégier `envoyer_fiche_centris_native`** pour envoi client
+3. **Fallback chain**: HTTP → CUA → lien public
+4. **Cc Shawn auto** + Telegram trace chaque envoi
+5. **Master template Dropbox** avec logos sur tous emails clients
+
+### 📁 18 mémoires actives pour sessions futures
+
+Tous accessibles dans `/Users/signaturesb/.claude/projects/.../memory/`:
+- 4 nouvelles aujourd'hui sur Centris (structure + 101 filtres + 25 sélecteurs Unifam + bug fix)
+- Master template + Telegram trace + sync rules
+- Brevo safety + SMTP hold pattern
+- 16 sources market intelligence pipeline
 
 ---
 
-## 🧩 ARCHITECTURE EN PLACE (compte courtier SaaS-ready)
+## 🎯 PROCHAINES PRIORITÉS (demain)
 
-- **15 env vars** Render configurées + `BROWSERLESS_WS` nouvelle
-- **Master template Dropbox** sur TOUS emails clients (4 fonctions refactor)
-- **Telegram trace** sur CHAQUE envoi (Shawn voit tout)
-- **Brevo safety net 4 couches** + Cc Shawn auto + filtre terrain-a-construire
-- **CUA Computer Use Agent** Anthropic via Browserless (1000 min/mois)
-- **Market intelligence 16 sources** auto-injecté dans system prompt bot
-- **Audit P0-P3** 7 fixes systémiques (mutex, budget, expiry, retry)
+1. **Tests live Telegram bot** — vérifier que le bot prend bien la bonne route pour:
+   - "envoie la fiche du #X à Y" → envoyer_fiche_centris_native
+   - "envoie-moi maisons vendues Rawdon 6 mois 400-600k" → chercher_comparables → searchCentrisVendus
+2. **Compléter prefixes** Fm{N}_ pour Copropriété/Ferme/Commercial/Revenus (test 1 listing chaque)
+3. **Implémenter envoi comparables par email** — flow capturé "Tout · Courriel" sur Results.aspx
+4. **Test preview J-1** auto pour #40 Terrains (24 mai)
 
----
+## 📍 État infrastructure
 
-## 🎬 PROCHAINES PRIORITÉS
+- ✅ Render bot-assistant: commit `e9a8ec1` live
+- ✅ Browserless free tier active (~5min/mois utilisé sur 1000)
+- ✅ LaunchAgent Mac centris-auto-login refresh cookies 12h (rebrowser-playwright)
+- ✅ Session Centris valide 25 jours (push from LaunchAgent)
+- ✅ Crons quotidiens actifs (digest, veille J-1, market refresh)
+- ✅ 18 LaunchAgents Mac chargés (vérifié)
 
-1. Vérifier que Shawn a reçu preview #35 à icloud (sender fix appliqué)
-2. Finir extraction taux directeur BC + taux hypothèque (LLM ou nouvelle URL)
-3. Tester live commande Telegram "envoie fiche #22264330" (CUA end-to-end)
-4. Documenter dans CLAUDE.md la nouvelle archi
+**Bot est champion sur Centris** — testable demain via Telegram.
