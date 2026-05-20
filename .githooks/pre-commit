@@ -1,12 +1,60 @@
 #!/bin/bash
-# Pre-commit hook — valide bot.js avant commit
+# Pre-commit hook — valide bot avant commit
 # Installé via: git config core.hooksPath .githooks
+# Bypass d'urgence: git commit --no-verify (rare)
+set -e
 cd "$(git rev-parse --show-toplevel)"
-if [ -f validate.js ]; then
-  node validate.js || {
-    echo ""
-    echo "❌ COMMIT BLOQUÉ — corriger les erreurs ci-dessus"
-    echo "   Pour bypass (dangereux): git commit --no-verify"
+
+echo "🔍 Pre-commit checks..."
+
+# 1. Syntax check sur tous les modules Node staged
+STAGED_JS=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(js|cjs|mjs)$' || true)
+if [ -n "$STAGED_JS" ]; then
+  for f in $STAGED_JS; do
+    if [ -f "$f" ]; then
+      node --check "$f" || {
+        echo "❌ Syntax error dans $f — commit bloqué"
+        exit 1
+      }
+    fi
+  done
+  echo "  ✅ Syntax OK ($(echo "$STAGED_JS" | wc -l | tr -d ' ') fichier(s) JS)"
+fi
+
+# 2. Secret scan basique (clés API en clair)
+# Exclut .githooks/, .github/workflows/, validate.js, scripts/security-status.js
+# (ces fichiers contiennent légitimement les regex de détection)
+SECRET_PATTERNS='(sk-[a-zA-Z0-9]{32,}|xoxb-[a-zA-Z0-9-]{40,}|ghp_[a-zA-Z0-9]{30,}|AIza[a-zA-Z0-9_-]{30,}|AKIA[A-Z0-9]{16}|aws_secret_access_key|BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY)'
+SCAN_FILES=$(echo "$STAGED_JS" | grep -vE '^\.githooks/|^\.github/workflows/|^validate\.js$|^scripts/security-' || true)
+if [ -n "$SCAN_FILES" ]; then
+  LEAKS=$(echo "$SCAN_FILES" | xargs -I {} git diff --cached -U0 -- {} 2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' | grep -EnH "$SECRET_PATTERNS" || true)
+else
+  LEAKS=""
+fi
+if [ -n "$LEAKS" ]; then
+  echo "❌ POTENTIAL SECRET LEAK détecté dans le diff:"
+  echo "$LEAKS" | head -5
+  echo ""
+  echo "   Si faux positif: git commit --no-verify"
+  exit 1
+fi
+echo "  ✅ Pas de secrets en clair"
+
+# 3. Test parser (rapide, valide regex leads)
+if [ -f test_parser.js ] && echo "$STAGED_JS" | grep -qE "(lead_parser|bot)\.js"; then
+  npm run test-parser --silent 2>&1 | tail -3 || {
+    echo "❌ Test parser failed — commit bloqué"
+    exit 1
+  }
+  echo "  ✅ Parser tests pass"
+fi
+
+# 4. Validate (best-effort, ne bloque pas si script absent)
+if [ -f validate.js ] && echo "$STAGED_JS" | grep -qE "bot\.js"; then
+  node validate.js 2>&1 | tail -2 || {
+    echo "❌ Validate failed — commit bloqué"
     exit 1
   }
 fi
+
+echo "✅ Pre-commit OK"

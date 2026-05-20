@@ -118,6 +118,13 @@ function isJunkLeadEmail(subject, from, body) {
   if (/demande\s+de\s+visite\s+-/i.test(s) && f.includes('remax')) return true;
   // Alertes système internes
   if (/watchdog|system\s+alert|hmac/i.test(s)) return true;
+  // ── DOCS DE TRANSACTION — Shawn 2026-05-20: "cest dans les document dune transaction gere pas ca"
+  // Plateformes signature électronique (transaction en cours, pas un lead)
+  if (/@(authentisign|docusign|hellosign|adobesign|signnow|pandadoc|notarius|conexsys)\b/i.test(f)) return true;
+  // Patterns sujet/body transaction (CP à PA, PA, contre-prop, acte vente, signature complétée)
+  if (/signature\s+(compl[eé]t[eé]e|requise|en\s+cours)|documents?\s+sign[eé]s?/i.test(s)) return true;
+  if (/\bCP\s+[aà]\s+PA\b|contre[\s-]?proposition|promesse\s+d['']?achat|acte\s+de\s+vente/i.test(s)) return true;
+  if (/dossier\s+de\s+la\s+propri[eé]t[eé]|date\s+de\s+l['']?acte\s+de\s+vente|fichier\s+joint\s+les\s+documents?\s+n[eé]cessaires/i.test(s + ' ' + b.substring(0, 800))) return true;
   return false;
 }
 
