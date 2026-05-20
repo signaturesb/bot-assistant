@@ -3854,18 +3854,24 @@ function firePreviewDocs({ email, nom, centris, deal, match }) {
 }
 
 async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
+  const _t0 = Date.now();
+  log('INFO', 'DOCS', `[STEP 1/9] envoyerDocsProspect START — terme="${terme}" email="${emailDest||'(none)'}" fichier="${fichier||'TOUS'}" opts=${JSON.stringify({dealHint:!!opts.dealHint,centrisHint:opts.centrisHint||null,folderHint:opts.folderHint?.name||null,preview:!!opts.preview,cc:opts.cc||null})}`);
   // 1. Chercher deal — ou utiliser hint si fourni (auto-envoi)
   // FALLBACK bulletproof: si pas de deal Pipedrive OU pas de PD_KEY, on continue
   // quand même si on a un email + (Centris# ou adresse via opts.centrisHint / terme).
   let deal = null;
   if (opts.dealHint) {
     deal = opts.dealHint;
+    log('INFO', 'DOCS', `[STEP 1/9] deal via hint: #${deal.id} "${deal.title}"`);
   } else if (PD_KEY) {
     try {
       const sr = await pdGet(`/deals/search?term=${encodeURIComponent(terme)}&limit=3`);
       const deals = sr?.data?.items || [];
       if (deals.length) deal = deals[0].item;
-    } catch (e) { log('WARN', 'DOCS', `Pipedrive search: ${e.message}`); }
+      log('INFO', 'DOCS', `[STEP 1/9] deal search Pipedrive: ${deals.length} résultat(s)${deal?` → #${deal.id} "${deal.title}"`:' (aucun)'}`);
+    } catch (e) { log('WARN', 'DOCS', `[STEP 1/9] Pipedrive search ERREUR: ${e.message}`); }
+  } else {
+    log('WARN', 'DOCS', `[STEP 1/9] PD_KEY absent — skip search Pipedrive, fallback stub deal`);
   }
   const centris = (deal && deal[PD_FIELD_CENTRIS]) || opts.centrisHint || '';
   // Stub deal si pas trouvé mais email fourni → on peut quand même envoyer
@@ -3884,28 +3890,48 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
     try {
       const p = await pdGet(`/persons/${deal.person_id}`);
       toEmail = p?.data?.email?.find(e => e.primary)?.value || p?.data?.email?.[0]?.value || '';
-    } catch {}
+    } catch (e) { log('WARN', 'DOCS', `[STEP 2/9] Pipedrive person fetch ERREUR: ${e.message}`); }
   }
+  log('INFO', 'DOCS', `[STEP 2/9] email destination: ${toEmail || '(VIDE — listing-mode)'} | centris=${centris || '(none)'}`);
 
   // 3. Dossier Dropbox — folder hint (auto) ou fastDropboxMatch via index complet
   let folder = opts.folderHint || null;
+  if (folder) {
+    log('INFO', 'DOCS', `[STEP 3/9] folder via hint: "${folder.name}" (path=${folder.path})`);
+  }
   if (!folder) {
     // Utilise l'index cross-source (Inscription + Terrain en ligne mergés)
     if (dropboxIndex.folders?.length) {
       const fast = fastDropboxMatch({ centris, adresse: deal.title || terme, rue: terme });
-      if (fast) folder = fast.folder;
+      if (fast) {
+        folder = fast.folder;
+        log('INFO', 'DOCS', `[STEP 3/9] folder via fastDropboxMatch: "${folder.name}" score=${fast.score} (path=${folder.path})`);
+      } else {
+        log('INFO', 'DOCS', `[STEP 3/9] fastDropboxMatch: aucun match dans index (${dropboxIndex.folders.length} folders indexés)`);
+      }
+    } else {
+      log('WARN', 'DOCS', `[STEP 3/9] dropboxIndex VIDE — fallback dropboxTerrains`);
     }
   }
   if (!folder) {
     let dossiers = dropboxTerrains;
-    if (!dossiers.length) { await loadDropboxStructure(); dossiers = dropboxTerrains; }
+    if (!dossiers.length) {
+      log('INFO', 'DOCS', `[STEP 3/9] dropboxTerrains vide — reload structure...`);
+      await loadDropboxStructure();
+      dossiers = dropboxTerrains;
+    }
     folder = centris ? dossiers.find(d => d.centris === centris) : null;
+    if (folder) {
+      log('INFO', 'DOCS', `[STEP 3/9] folder via centris# ${centris}: "${folder.name}"`);
+    }
     if (!folder) {
       const q = terme.toLowerCase().split(/\s+/)[0];
       folder = dossiers.find(d => d.name.toLowerCase().includes(q) || d.adresse.toLowerCase().includes(q));
+      if (folder) log('INFO', 'DOCS', `[STEP 3/9] folder via terme "${q}": "${folder.name}"`);
     }
     if (!folder) {
       const avail = dossiers.slice(0, 5).map(d => d.adresse || d.name).join(', ');
+      log('ERROR', 'DOCS', `[STEP 3/9] ❌ ABORT — aucun dossier Dropbox match (centris=${centris} terme="${terme}" ${dossiers.length} folders scannés)`);
       return `❌ Aucun dossier Dropbox pour "${deal.title}"${centris ? ` (#${centris})` : ''}.\nDisponible: ${avail}`;
     }
   }
@@ -3913,10 +3939,15 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   // 4. Lister TOUS les docs (PDFs + images + plans + Word/Excel) — triés Fiche_Detaillee en premier
   // Scan récursif: capture sous-dossiers Photos/, Plans/, Certificats/, etc.
   const lr = await dropboxAPI('https://api.dropboxapi.com/2/files/list_folder', { path: folder.path, recursive: true });
-  if (!lr?.ok) return `❌ Impossible de lire ${folder.name}`;
+  if (!lr?.ok) {
+    log('ERROR', 'DOCS', `[STEP 4/9] ❌ ABORT — Dropbox list_folder HTTP ${lr?.status || '?'} path=${folder.path}`);
+    return `❌ Impossible de lire ${folder.name}`;
+  }
   const all  = (await lr.json()).entries || [];
   const pdfs = _sortDocsPriority(all.filter(f => f['.tag'] === 'file' && DOC_EXTS.includes(_docExt(f.name))));
+  log('INFO', 'DOCS', `[STEP 4/9] list_folder OK — ${all.length} entrées totales, ${pdfs.length} docs filtrés (${DOC_EXTS.join('/')})`);
   if (!pdfs.length) {
+    log('ERROR', 'DOCS', `[STEP 4/9] ❌ ABORT — aucun doc dans "${folder.name}" (entrées: ${all.map(f => f.name).join(', ') || '(vide)'})`);
     return `❌ Aucun document dans *${folder.name}*.\nFichiers: ${all.map(f => f.name).join(', ') || '(vide)'}`;
   }
 
@@ -3929,11 +3960,14 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   const pdfsToSend = fichier
     ? pdfs.filter(p => p.name.toLowerCase().includes(fichier.toLowerCase()))
     : pdfs;
+  log('INFO', 'DOCS', `[STEP 5/9] filtre "${fichier||'(TOUS)'}" → ${pdfsToSend.length}/${pdfs.length} docs à envoyer: ${pdfsToSend.map(p=>p.name).join(', ')}`);
   if (!pdfsToSend.length) {
+    log('ERROR', 'DOCS', `[STEP 5/9] ❌ ABORT — aucun match pour filtre "${fichier}" (dispos: ${pdfs.map(p=>p.name).join(', ')})`);
     return `❌ Aucun document matchant "${fichier}" dans ${folder.name}.\nDisponibles: ${pdfs.map(p=>p.name).join(', ')}`;
   }
 
   // 6. Télécharger TOUS les PDFs en parallèle
+  const _tDL = Date.now();
   const downloads = await Promise.all(pdfsToSend.map(async p => {
     const dl = await dropboxAPI('https://content.dropboxapi.com/2/files/download', { path: p.path_lower }, true);
     if (!dl?.ok) return { name: p.name, error: `HTTP ${dl?.status || '?'}` };
@@ -3944,7 +3978,12 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
 
   const rawOk = downloads.filter(d => d.buffer);
   const fails = downloads.filter(d => d.error);
-  if (!rawOk.length) return `❌ Tous téléchargements Dropbox échoués:\n${fails.map(f => `  ${f.name}: ${f.error}`).join('\n')}`;
+  const dlMB = Math.round(rawOk.reduce((s,d)=>s+d.size,0)/1024/1024 * 10)/10;
+  log('INFO', 'DOCS', `[STEP 6/9] Dropbox download — ${rawOk.length}/${downloads.length} OK (${dlMB}MB total, ${Date.now()-_tDL}ms)${fails.length?` | FAILS: ${fails.map(f=>`${f.name}:${f.error}`).join(', ')}`:''}`);
+  if (!rawOk.length) {
+    log('ERROR', 'DOCS', `[STEP 6/9] ❌ ABORT — tous téléchargements Dropbox échoués`);
+    return `❌ Tous téléchargements Dropbox échoués:\n${fails.map(f => `  ${f.name}: ${f.error}`).join('\n')}`;
+  }
 
   // 6. CONVERSION → PDF (images combinées, autres formats skipped)
   const convResult = await convertDocsToPDF(rawOk, folder.adresse || folder.name);
@@ -3972,8 +4011,13 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   }
 
   // 7. Lire le master template Dropbox (logos Signature SB + RE/MAX base64)
+  log('INFO', 'DOCS', `[STEP 7/9] Gmail token request...`);
   const token = await getGmailToken();
-  if (!token) return `❌ Gmail non configuré.\nDocs dispo: ${ok.map(d=>d.name).join(', ')} dans ${folder.adresse || folder.name}`;
+  if (!token) {
+    log('ERROR', 'DOCS', `[STEP 7/9] ❌ ABORT — Gmail token null (refresh failed?). Docs prêts mais non envoyés.`);
+    return `❌ Gmail non configuré.\nDocs dispo: ${ok.map(d=>d.name).join(', ')} dans ${folder.adresse || folder.name}`;
+  }
+  log('INFO', 'DOCS', `[STEP 7/9] Gmail token OK (${token.length} chars)`);
 
   const tplPath = `${AGENT.dbx_templates}/master_template_signature_sb.html`.replace(/\/+/g, '/');
   let masterTpl = null;
@@ -4209,6 +4253,9 @@ Au plaisir,<br>
   const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
   // Envoi via sendEmailLogged → traçabilité intent + outcome dans email_outbox.json
+  const rawSizeMB = Math.round(raw.length/1024/1024 * 10)/10;
+  log('INFO', 'DOCS', `[STEP 8/9] Gmail send → to=${realToEmail} cc=[${ccFinal.join(',')}] subject="${sujet.substring(0,80)}" raw=${rawSizeMB}MB preview=${previewMode}`);
+  const _tGM = Date.now();
   const logged = await sendEmailLogged({
     via: 'gmail',
     to: realToEmail,
@@ -4229,8 +4276,10 @@ Au plaisir,<br>
     },
   });
   if (!logged.ok) {
+    log('ERROR', 'DOCS', `[STEP 8/9] ❌ Gmail FAIL ${logged.status||'?'} (${Date.now()-_tGM}ms) — ${(logged.error||'').substring(0,200)}`);
     return `❌ Gmail erreur ${logged.status || ''}: ${(logged.error || '').substring(0, 200)}`;
   }
+  log('OK', 'DOCS', `[STEP 8/9] ✅ Gmail send OK (${Date.now()-_tGM}ms) — message envoyé à ${realToEmail}`);
 
   // 9. Note Pipedrive — skip en mode preview (c'est juste un preview, pas une vraie livraison)
   const skippedMsg = fails.length > 0 ? `\n⚠️ ${fails.length} doc(s) échec téléchargement: ${fails.map(f=>f.name).join(', ')}` : '';
@@ -4261,6 +4310,7 @@ Au plaisir,<br>
   const noteLabel = skipNote
     ? '📝 Note Pipedrive skip (existe déjà <24h)'
     : (noteRes?.data?.id ? '📝 Note Pipedrive ajoutée' : '⚠️ Note Pipedrive non créée');
+  log('OK', 'DOCS', `[STEP 9/9] ✅ DONE (${Date.now()-_t0}ms total) — ${ok.length} doc(s) envoyés à ${realToEmail} | note=${skipNote?'skip-dup':(noteRes?.data?.id?'created':'fail')}`);
 
   return `✅ *${ok.length} document${ok.length>1?'s':''} envoyé${ok.length>1?'s':''}* à *${realToEmail}*\n${ok.map(d=>`  📎 ${d.name}`).join('\n')}\nProspect: ${deal.title}\n${noteLabel}${convMsg}${convSkipMsg}${skippedMsg}`;
 }
