@@ -1529,6 +1529,203 @@ async function searchCentrisVendus(opts = {}) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ZONE CENTRIS — Partager TOUS les documents d'un listing via courtier inscripteur
+// Capturé live 2026-05-20 avec Shawn (listing #18366287, Johnathan Cloutier)
+// Référence: memory reference_centris_zone_share_documents_flow.md
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Login Zone Centris (différent de Matrix — portail courtier read-only)
+async function loginCentrisZone(context) {
+  const user = process.env.CENTRIS_USER;
+  const pass = process.env.CENTRIS_PASS;
+  if (!user || !pass) throw new Error('CENTRIS_USER / CENTRIS_PASS manquants');
+  const page = await context.newPage();
+  await page.setViewportSize(VIEWPORT);
+
+  // Cookies cachés réutilisables (partagent souvent session Auth0 avec Matrix)
+  const savedCookies = loadBotCentrisCookies();
+  if (savedCookies?.length) {
+    try {
+      await context.addCookies(savedCookies);
+      await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const u = page.url();
+      if (/Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u)) {
+        console.log('[ZONE] Session cachée valide ✅');
+        return page;
+      }
+    } catch {}
+  }
+
+  // Login frais
+  console.log('[ZONE] Login frais Zone Centris...');
+  await page.goto('https://zone.centris.ca/signin?1=1&langue=fr&fromExternal=ConsumerSiteMenu', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2500);
+  await page.locator('input[type=text]').first().fill(user);
+  await page.locator('input[type=password]').first().fill(pass);
+  await page.locator('button:has-text("Connexion"), button[type=submit]').first().click();
+  await page.waitForTimeout(4000);
+
+  // MFA — prefer Email (SMS souvent rate-limited)
+  const currentUrl = page.url();
+  if (/mfa-sms-challenge|mfa-email-challenge|mfa-login-options/i.test(currentUrl)) {
+    if (/mfa-sms-challenge/.test(currentUrl)) {
+      // Switch à Email (SMS rate-limited souvent)
+      const changeBtn = page.locator('a:has-text("Changer de méthode"), button:has-text("Changer")').first();
+      if (await changeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await changeBtn.click();
+        await page.waitForTimeout(2000);
+        await page.locator('a:has-text("Courriel"), button:has-text("Courriel")').first().click();
+        await page.waitForTimeout(2000);
+      }
+    }
+    // Fetch code via Gmail bot endpoint
+    const code = await fetchMFACodeFromBot(90000);
+    if (!code) throw new Error('MFA timeout — aucun code Gmail Centris reçu en 90s');
+    await page.locator('input[type=text], input[type=tel]').first().fill(code);
+    await page.locator('button:has-text("Continuer"), button[type=submit]').first().click();
+    await page.waitForTimeout(4000);
+  }
+
+  // Vérif logged
+  if (!/Dashboard|Directory|Listings/i.test(page.url())) {
+    throw new Error(`Zone login échoué — URL: ${page.url().substring(0, 100)}`);
+  }
+  console.log('[ZONE] Logged ✅');
+  // Save cookies pour reuse
+  try {
+    const cookies = await context.cookies();
+    pushCookiesToBot(cookies).catch(() => {});
+  } catch {}
+  return page;
+}
+
+/**
+ * Identifie le courtier inscripteur d'un listing Centris (sans login requis).
+ * @param {string} centrisNum
+ * @returns {Promise<{name, agency, phone, source}>}
+ */
+async function getListingBroker(centrisNum) {
+  // Try public Centris.ca page first (no auth needed)
+  try {
+    const r = await fetch(`https://www.centris.ca/fr/properties~a-vendre/${centrisNum}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' },
+      signal: AbortSignal.timeout(15000),
+      redirect: 'follow',
+    });
+    if (r.ok) {
+      const html = await r.text();
+      // Extract broker name (pattern common: "Courtier inscripteur:" ou microdata)
+      const nameMatch = html.match(/courtier[^<>]{0,100}([A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ\-']+)+)/i)
+        || html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i);
+      const agencyMatch = html.match(/(?:RE\/?MAX|Royal LePage|Sutton|Via Capitale|Engel.*Volkers|Century 21|Keller Williams|Sotheby|Groupe Sutton|Immobilier[^<>]{0,40})/i);
+      const phoneMatch = html.match(/(\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})/);
+      return {
+        name: nameMatch?.[1] || null,
+        agency: agencyMatch?.[0] || null,
+        phone: phoneMatch?.[1] || null,
+        source: 'centris.ca-public',
+      };
+    }
+  } catch (e) { console.warn('[ZONE] getListingBroker fail:', e.message); }
+  return { name: null, agency: null, phone: null, source: 'unknown' };
+}
+
+/**
+ * Partage TOUS les documents d'un listing via Zone Centris (cherche courtier auto).
+ * @param {object} opts
+ * @param {string} opts.centris_num — # MLS
+ * @param {string} opts.email — email destinataire
+ * @param {boolean} [opts.sendSelfCopy] — défaut false
+ * @param {string} [opts.langue] — 'fr' (défaut) | 'en'
+ * @param {string} [opts.message] — message custom (sinon défaut Centris)
+ * @returns {Promise<{success, broker_info, docs_shared, sent_to, listing_url}>}
+ */
+async function shareCentrisZoneDocuments(opts = {}) {
+  if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
+  loadDeps();
+  initDirs();
+  const { centris_num, email, sendSelfCopy = false, langue = 'fr', message } = opts;
+  if (!centris_num || !email) return { success: false, message: 'centris_num + email requis' };
+
+  let browser = null;
+  try {
+    // 1. Get broker info (pour validation + message client enrichi)
+    const broker = await getListingBroker(centris_num);
+    console.log(`[ZONE] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'})`);
+
+    browser = await launchBrowser();
+    const context = await newStealthContext(browser);
+    const page = await loginCentrisZone(context);
+
+    // 2. URL directe page Documents
+    console.log(`[ZONE] Navigate /Listings/${centris_num}/Documents`);
+    await page.goto(`https://zone.centris.ca/Listings/${centris_num}/Documents`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3500);
+
+    // 3. Coche tous les checkboxes des docs
+    const checkedCount = await page.evaluate(() => {
+      const cbs = [...document.querySelectorAll('input[type=checkbox]')];
+      let count = 0;
+      for (const cb of cbs) { if (!cb.disabled && !cb.checked) { cb.click(); count++; } }
+      return count;
+    });
+    console.log(`[ZONE] ${checkedCount} documents cochés`);
+    if (checkedCount === 0) {
+      return { success: false, message: `Aucun document trouvé pour #${centris_num} (listing inexistant ou pas de docs)`, broker_info: broker };
+    }
+
+    // 4. Click "Partager les documents"
+    await page.locator('button[aria-label="Partager les documents"]').click();
+    await page.waitForTimeout(2000);
+
+    // 5. Étape 1/2: garder defaults (Client + Impérial) → Suivant
+    await page.locator('button:has-text("Suivant")').click();
+    await page.waitForTimeout(2000);
+
+    // 6. Étape 2/2: fill destinataire + options
+    console.log(`[ZONE] Remplir email destinataire: ${email}`);
+    await page.fill('#to', email);
+    await page.waitForTimeout(800);
+    await page.locator('#to').press('Enter');
+    await page.waitForTimeout(500);
+
+    if (sendSelfCopy) {
+      await page.locator('input[name=sendSelfCopy]').check();
+    }
+    if (langue === 'en') {
+      await page.locator('#language-0').click();
+    }
+    if (message) {
+      await page.fill('#message', message);
+    }
+
+    // 7. Click Partager (N)
+    console.log('[ZONE] Click Partager');
+    await page.locator('button:has-text("Partager (")').click();
+
+    // 8. Wait confirmation (toast, modal closed, ou redirect)
+    await page.waitForTimeout(4000);
+    const modalGone = await page.evaluate(() => !document.querySelector('[role=dialog]:has(button:contains("Partager"))'));
+
+    return {
+      success: true,
+      broker_info: broker,
+      docs_shared: checkedCount,
+      sent_to: email,
+      send_self_copy: sendSelfCopy,
+      langue,
+      listing_url: `https://zone.centris.ca/Listings/${centris_num}/Documents`,
+      via: 'zone-centris-share',
+    };
+  } catch (e) {
+    console.error('[ZONE] shareCentrisZoneDocuments error:', e.message);
+    return { success: false, message: e.message };
+  } finally {
+    if (browser) try { await browser.close(); } catch {}
+  }
+}
+
 module.exports = {
   cuaGetCentrisPDF,
   cuaGetCentrisAnnexes,
@@ -1540,6 +1737,9 @@ module.exports = {
   extractCentrisPDFData,
   sendCentrisListingByEmail,
   searchCentrisVendus,
+  shareCentrisZoneDocuments,
+  getListingBroker,
+  _loginCentrisZone: loginCentrisZone,
   // Internals exposés pour tests
   _loginCentris: loginCentris,
   _runCUATask: runCUATask,

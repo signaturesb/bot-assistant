@@ -6464,6 +6464,7 @@ const TOOLS = [
   // ── Centris fiche download ──────────────────────────────────────────────
   { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'envoyer_fiche_centris_native', description: 'MEILLEUR pour envoyer fiche Centris au client: utilise l\'UI Matrix native (Imprimer → Détaillé client avec album de photos → Envoyer par courriel). Le PDF est OFFICIEL Centris (photos haute résolution + signature Shawn intégrée), expédié par l\'infra Centris. PRIVILÉGIER pour tout envoi à un client. Toi en Cc auto. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com".', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS (7-9 chiffres)' }, email: { type: 'string', description: 'Email destinataire' }, cc: { type: 'string', description: 'OPTIONNEL — défaut shawn@signaturesb.com' }, sujet: { type: 'string', description: 'OPTIONNEL — sujet email (défaut: "Propriété Centris #N")' }, message: { type: 'string', description: 'OPTIONNEL — corps du courriel (défaut: template standard)' }, format: { type: 'string', enum: ['detaille_client_album_imperial', 'detaille_client_imperial', 'detaille_courtier_album_imperial', 'sommaire_imperial'], description: 'OPTIONNEL — format rapport (défaut album photos)' } }, required: ['centris_num', 'email'] } },
+  { name: 'envoyer_tous_documents_zone', description: 'Envoie TOUS les documents d\'un listing Centris (Fiche détaillée + DV + Taxes municipales + Taxes scolaires + Cert localisation + Plans) au destinataire via Zone Centris (zone.centris.ca). Identifie automatiquement le courtier inscripteur. Cas d\'usage: "envoie TOUS les docs du #12345678 à client@email.com". UNE seule action partage tous les documents uploadés par le courtier inscripteur. PLUS COMPLET que envoyer_fiche_centris_native (qui envoie juste la fiche).', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email: { type: 'string', description: 'Email destinataire' }, m_envoyer_copie: { type: 'boolean', description: 'OPTIONNEL — me mettre en copie (défaut false)' }, langue: { type: 'string', enum: ['fr', 'en'], description: 'OPTIONNEL — langue email (défaut fr)' }, message: { type: 'string', description: 'OPTIONNEL — message custom (défaut: message Centris standard)' } }, required: ['centris_num', 'email'] } },
   { name: 'telecharger_docs_centris_complet', description: 'TOUT-EN-UN: envoie au client la fiche Centris officielle (PDF portail courtier) + TOUS les docs Dropbox matchant (match auto par Centris#). Cas d\'usage: "Envoie tout ce qui est dispo sur #12345678 à client@email.com". Toi en Cc auto sur les 2 envois. Le client reçoit 2 emails (1 avec fiche, 1 avec docs Dropbox).', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email du client' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels' }, message_perso: { type: 'string', description: 'OPTIONNEL — message dans email fiche' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'analyser_zonage_adresse', description: 'Trouve et envoie la grille de zonage PDF officielle pour une adresse Lanaudière. Scrape page urbanisme municipal → trouve liens PDF zonage → télécharge → envoie dans Telegram comme document. Optionnellement forward au client par email avec Cc Shawn. Cas d\'usage: "Marges de construction au 123 Ch. Lac Gratten Rawdon" ou "Grille zonage 456 Rue Sarine Sainte-Julienne, envoie à client@email.com".', input_schema: { type: 'object', properties: { adresse: { type: 'string', description: 'Adresse complète avec ville (ex: "123 Chemin Lac Gratten, Rawdon")' }, forward_email: { type: 'string', description: 'OPTIONNEL — email client si demande explicite forward (Shawn dit "envoie à X")' } }, required: ['adresse'] } },
   { name: 'telecharger_annexes_centris', description: 'Récupère TOUTES les annexes Centris d\'un listing via portail courtier authentifié: Déclaration Vendeur (DV), certificat de localisation, plans cadastraux, rapport inspection, etc. Tout ce qui est dans la section "Annexes" du listing Matrix. Cas d\'usage: "Donne-moi la DV du #12345678" ou "Toutes les annexes Centris pour #12345678 à client@email.com".', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS (7-9 chiffres)' }, email_destination: { type: 'string', description: 'OPTIONNEL — email client pour forward avec Cc Shawn. Si vide: envoi dans Telegram seulement.' }, filtre: { type: 'string', description: 'OPTIONNEL — filtrer par mot-clé dans nom annexe (ex: "DV", "déclaration", "localisation", "plan"). Si vide: toutes les annexes.' } }, required: ['centris_num'] } },
@@ -6808,6 +6809,42 @@ async function executeTool(name, input, chatId) {
 
       case 'telecharger_fiche_centris': {
         return await telechargerFicheCentris(input || {});
+      }
+
+      case 'envoyer_tous_documents_zone': {
+        const { centris_num, email, m_envoyer_copie, langue, message } = input || {};
+        const num = String(centris_num || '').replace(/\D/g, '').trim();
+        if (!num || num.length < 7) return `❌ Numéro Centris invalide (7-9 chiffres)`;
+        if (!email || !/@/.test(email)) return `❌ Email destinataire invalide`;
+        if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) return `❌ CENTRIS_USER/PASS absents`;
+        const cuaMod = getCUA();
+        if (!cuaMod || !cuaMod.CUA_AVAILABLE()) return `❌ CUA driver indispo`;
+        if (!cuaMod.shareCentrisZoneDocuments) return `❌ Function shareCentrisZoneDocuments absente (deploy needed)`;
+        log('INFO', 'CENTRIS-ZONE', `Partage docs #${num} → ${email}`);
+        try {
+          const r = await cuaMod.shareCentrisZoneDocuments({
+            centris_num: num, email,
+            sendSelfCopy: m_envoyer_copie === true,
+            langue: langue || 'fr', message,
+          });
+          if (r.success) {
+            auditLogEvent('centris', 'zone-docs-shared', { num, email, docs: r.docs_shared, broker: r.broker_info?.name });
+            const brokerStr = r.broker_info?.name ? ` (courtier inscripteur: *${r.broker_info.name}* — ${r.broker_info.agency || 'agence ?'})` : '';
+            try {
+              await sendTelegramWithFallback(
+                `📂 *${r.docs_shared} documents Centris #${num} partagés via Zone*\n\n` +
+                `📬 À: ${email}\n` +
+                `📋 Inclus: Fiche détaillée + DV + Taxes + tout doc uploadé par le courtier inscripteur${brokerStr}\n` +
+                `${r.send_self_copy ? '📨 Copie à moi: ✓' : ''}`,
+                { category: 'centris-zone-share' }
+              ).catch(() => {});
+            } catch {}
+            return `✅ ${r.docs_shared} documents Centris #${num} partagés à *${email}* via Zone${brokerStr}`;
+          }
+          return `❌ Partage Zone échoué: ${r.message}\n\nFallback: utilise envoyer_fiche_centris_native (envoie juste la fiche détaillée).`;
+        } catch (e) {
+          return `❌ Exception partage Zone: ${e.message?.substring(0, 200)}`;
+        }
       }
 
       case 'envoyer_fiche_centris_native': {
