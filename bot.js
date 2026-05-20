@@ -11673,6 +11673,43 @@ async function runSuiviQuotidien() {
   } catch (e) { log('ERR', 'CRON', `Suivi: ${e.message}`); }
 }
 
+// 🛡️ Cron 6h30 — purge auto activités génériques Pipedrive
+// (créées par workflow Pipedrive natif ou import externe — bot lui-même bloque déjà)
+async function pipedriveCleanupAuto() {
+  if (!ALLOWED_ID || !process.env.WEBHOOK_SECRET) return;
+  try {
+    const port = process.env.PORT || 3000;
+    const url = `http://127.0.0.1:${port}/admin/pipedrive-cleanup?dry=0&notify=0&token=${encodeURIComponent(process.env.WEBHOOK_SECRET)}`;
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 120000);
+    const r = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) { log('WARN', 'CRON', `pdCleanupAuto HTTP ${r.status}`); return; }
+    const out = await r.json();
+    const g = out.generiques || {};
+    const d = out.doublons || {};
+    const nc = out.no_contact || {};
+    const sh = out.shawn || {};
+    const total = (g.deleted || 0) + (d.fermes || 0) + (nc.fermes || 0) + (sh.deleted || 0);
+    if (total > 0) {
+      const msg = [
+        `🧼 *Pipedrive cleanup auto (6h30)*`,
+        ``,
+        `✅ ${g.deleted || 0} activité(s) générique(s) supprimée(s)`,
+        `✅ ${d.fermes || 0} doublon(s) fermé(s)`,
+        `✅ ${nc.fermes || 0} activité(s) sans coordonnées fermée(s)`,
+        `✅ ${sh.deleted || 0} activité(s) Shawn-as-contact supprimée(s)`,
+        `📊 Scanné: ${out.total_scanned || '?'}`,
+        out.retards?.count > 0 ? `\n⚠️ ${out.retards.count} retard(s) (audit only)` : '',
+      ].filter(Boolean).join('\n');
+      await sendTelegramWithFallback(msg, { category: 'pipedrive-cleanup-cron' }).catch(() => {});
+    }
+    log('OK', 'CRON', `pdCleanupAuto: ${total} cleanup actions (génériques=${g.deleted} doublons=${d.fermes} no_contact=${nc.fermes} shawn=${sh.deleted})`);
+  } catch (e) {
+    log('WARN', 'CRON', `pdCleanupAuto: ${e.message}`);
+  }
+}
+
 async function rappelVisitesMatin() {
   if (!ALLOWED_ID) return;
   try {
@@ -12038,6 +12075,13 @@ function startDailyTasks() {
     if (h === 6  && lastCron.trashCI !== todayStr)  { lastCron.trashCI = todayStr; autoTrashGitHubNoise(); }
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
+    // 🛡️ Cron 6h30 — purge Pipedrive auto (activités génériques "appeler contact/prospect"
+    // créées par workflow Pipedrive natif ou autre source externe — bot lui-même bloque déjà
+    // via SHAWN_GERE_SES_SUIVIS, mais les imports externes/règles Pipedrive ne respectent pas).
+    if (h === 6 && m >= 30 && lastCron.pdCleanup !== todayStr) {
+      lastCron.pdCleanup = todayStr;
+      pipedriveCleanupAuto().catch(e => log('WARN', 'CRON', `pdCleanup: ${e.message}`));
+    }
 
     // ── Market Intelligence refresh ──────────────────────────────────────────
     // Stratégie Shawn: spot-check toutes 3 semaines (full) + refresh "fresh" sources
