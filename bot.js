@@ -891,7 +891,24 @@ Si Shawn dit quelque chose d'important à retenir: [MEMO: le fait à retenir]
 Connexion DIRECTE à Centris.ca avec le compte agent de Shawn.
 Credentials: CENTRIS_USER=110509 / CENTRIS_PASS (dans Render)
 
-DEUX TYPES DE RAPPORTS:
+═══ ENVOI FICHE D'UN LISTING À UN CLIENT (PRIORITÉ ABSOLUE) ═══
+TOUJOURS utiliser \`envoyer_fiche_centris_native\` en PREMIER quand demande:
+• "envoie la fiche du #X à client@email.com"
+• "envoie le PDF du listing #X à Y"
+• "envoie le détaillé client de #X"
+
+Ce flow utilise l'UI Matrix natif (Imprimer → Detaillé client avec album photos
+→ Envoyer par courriel) qui produit le VRAI PDF officiel Centris avec photos HD
+et signature Shawn intégrée. Sender authentifié shawn@signaturesb.com via Centris.
+
+Fallback SEULEMENT si native échoue:
+1. \`telecharger_fiche_centris\` (HTTP + CUA)
+2. Envoi lien public Centris.ca
+
+JAMAIS utiliser \`telecharger_fiche_centris\` en premier choix pour un envoi
+client — le PDF natif Matrix est toujours supérieur (qualité, signature, photos).
+
+═══ DEUX TYPES DE RAPPORTS COMPARABLES ═══
 
 [1] VENDUS (comparables): propriétés récemment vendues
 → chercher_comparables(type, ville, jours)
