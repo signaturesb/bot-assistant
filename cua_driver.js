@@ -198,10 +198,14 @@ function CUA_AVAILABLE() {
   if (_cuaAvailable !== null) return _cuaAvailable;
   try {
     require.resolve('@anthropic-ai/sdk');
-    try { require.resolve('playwright-core'); _cuaAvailable = true; }
+    // Set flavor pour cuaStatus AVANT load réel
+    try { require.resolve('rebrowser-playwright'); _cuaAvailable = true; if (playwrightFlavor === 'none') playwrightFlavor = 'rebrowser'; }
     catch {
-      try { require.resolve('playwright'); _cuaAvailable = true; }
-      catch { _cuaAvailable = false; }
+      try { require.resolve('playwright-core'); _cuaAvailable = true; if (playwrightFlavor === 'none') playwrightFlavor = 'core'; }
+      catch {
+        try { require.resolve('playwright'); _cuaAvailable = true; if (playwrightFlavor === 'none') playwrightFlavor = 'full'; }
+        catch { _cuaAvailable = false; }
+      }
     }
   } catch {
     _cuaAvailable = false;
