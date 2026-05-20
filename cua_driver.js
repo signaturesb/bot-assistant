@@ -1108,6 +1108,152 @@ function cuaCleanup() {
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SEND CENTRIS LISTING VIA MATRIX UI (FLOW NATIF — captured 2026-05-19)
+// Reproduit exactement le flow que Shawn fait manuellement:
+// Login → recherche #MLS → click listing → Imprimer → "Detaillé client avec
+// album de photos (Impérial)" → Envoyer le PDF par courriel → form → Envoyer
+// PDF natif Matrix + photos + signature Shawn = delivery garantie
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Envoie la fiche Centris officielle (PDF natif + photos) à un destinataire
+ * via l'UI Matrix native. Plus fiable que CUA Claude Computer Use.
+ *
+ * @param {object} opts
+ * @param {string} opts.centris_num — numéro Centris/MLS
+ * @param {string} opts.email — destinataire
+ * @param {string} [opts.cc] — défaut shawn@signaturesb.com
+ * @param {string} [opts.sujet] — défaut auto-généré
+ * @param {string} [opts.message] — défaut message standard
+ * @param {string} [opts.format] — 'detaille_client_album_imperial' (défaut), 'detaille_client_imperial', etc
+ * @returns {Promise<{success, message, email_sent_to, cc, listing_url, screenshots?}>}
+ */
+async function sendCentrisListingByEmail(opts) {
+  if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
+  loadDeps();
+  initDirs();
+  const { centris_num, email, cc = 'shawn@signaturesb.com', sujet, message, format = 'detaille_client_album_imperial' } = opts;
+  if (!centris_num || !email) return { success: false, message: 'centris_num + email requis' };
+
+  // Mapping format → titre exact du <li> dans listbox Matrix
+  const FORMAT_TITLES = {
+    detaille_client_album_imperial: 'Detaillé client avec album de photos (Impérial)',
+    detaille_client_imperial: 'Detaillé client (Impérial)',
+    detaille_courtier_album_imperial: 'Detaillé courtier avec album de photos (Impérial)',
+    detaille_courtier_imperial: 'Detaillé courtier (Impérial)',
+    sommaire_imperial: 'Sommaire (Impérial)',
+    partiel_imperial: 'Partiel (Impérial)',
+    detaille_client_album_metrique: 'Detaillé client avec album de photos (Métrique)',
+  };
+  const formatTitle = FORMAT_TITLES[format] || FORMAT_TITLES.detaille_client_album_imperial;
+
+  let browser = null;
+  try {
+    browser = await launchBrowser();
+    const context = await newStealthContext(browser);
+    const page = await loginCentris(context);
+
+    // 1. Recherche listing via search bar
+    console.log(`[CENTRIS-NATIVE] Recherche #${centris_num}`);
+    await page.fill('#QueryText', String(centris_num));
+    await page.locator('#QueryText').press('Enter');
+    await page.waitForTimeout(3000);
+
+    // 2. Vérifier qu'on a 1 résultat puis cliquer sur le lien (numéro Centris en bleu)
+    const linkClicked = await page.evaluate((num) => {
+      const a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === String(num));
+      if (a) { a.click(); return true; }
+      return false;
+    }, centris_num);
+    if (!linkClicked) throw new Error(`Listing #${centris_num} non trouvé dans résultats`);
+    await page.waitForTimeout(3000);
+
+    // 3. Click Imprimer (onglet Actions en bas)
+    console.log('[CENTRIS-NATIVE] Click Imprimer');
+    await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('a,button,input')]
+        .find(b => /^imprimer$/i.test((b.textContent || b.value || '').trim()));
+      if (btn) btn.click();
+    });
+    await page.waitForURL(/PrintOptions/, { timeout: 15000 });
+    await page.waitForTimeout(2000);
+
+    // 4. Sélectionner format (checkbox dans <li> avec title)
+    console.log(`[CENTRIS-NATIVE] Format: ${formatTitle}`);
+    const formatSelected = await page.evaluate((title) => {
+      const li = [...document.querySelectorAll('li')].find(l => l.title === title);
+      const cb = li?.querySelector('input[type=checkbox]');
+      if (cb) { cb.checked = true; cb.click(); return true; }
+      return false;
+    }, formatTitle);
+    if (!formatSelected) throw new Error(`Format "${formatTitle}" non trouvé dans listbox`);
+    await page.waitForTimeout(800);
+
+    // 5. Click "Envoyer le PDF par courriel"
+    console.log('[CENTRIS-NATIVE] Click Envoyer le PDF par courriel');
+    await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('a,button,input')]
+        .find(b => /envoyer.*pdf.*courriel/i.test(b.textContent || b.value || ''));
+      if (btn) btn.click();
+    });
+    await page.waitForURL(/EmailOptions/, { timeout: 15000 });
+    await page.waitForTimeout(2000);
+
+    // 6. Remplir form
+    console.log('[CENTRIS-NATIVE] Remplir form email');
+    await page.evaluate((data) => {
+      const setVal = (id, val) => {
+        const el = document.getElementById(id);
+        if (!el) return false;
+        el.focus();
+        const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        setter.call(el, val);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      };
+      setVal('m_EmailContactSelectReport_m_ucTo_m_tbx', data.email);
+      setVal('m_EmailContactSelectReport_m_ucCC_m_tbx', data.cc);
+      setVal('m_tbxSubject', data.sujet);
+      setVal('m_tbxMessage', data.message);
+    }, {
+      email, cc,
+      sujet: sujet || `Propriété Centris #${centris_num}`,
+      message: message || `Bonjour,\n\nVoici la fiche détaillée de la propriété Centris #${centris_num} que vous m'avez demandée. Le PDF inclut toutes les photos et informations complètes du listing.\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,`,
+    });
+    await page.waitForTimeout(800);
+
+    // 7. Click Envoyer
+    console.log('[CENTRIS-NATIVE] Click Envoyer (final)');
+    await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('a')].find(a => a.textContent.trim() === 'Envoyer');
+      if (btn) btn.click();
+    });
+
+    // 8. Wait confirmation banner "Courriel envoyé à"
+    await page.waitForTimeout(3000);
+    const confirmed = await page.evaluate(() => /Courriel envoyé à/.test(document.body.innerText));
+    if (!confirmed) throw new Error('Confirmation Centris "Courriel envoyé à" non détectée');
+
+    console.log(`[CENTRIS-NATIVE] ✅ Envoyé à ${email}`);
+    return {
+      success: true,
+      message: `Fiche Centris #${centris_num} envoyée à ${email} via Matrix natif (PDF + photos)`,
+      email_sent_to: email,
+      cc,
+      format,
+      via: 'matrix-native',
+    };
+  } catch (e) {
+    console.error('[CENTRIS-NATIVE] error:', e.message);
+    return { success: false, message: e.message };
+  } finally {
+    if (browser) try { await browser.close(); } catch {}
+  }
+}
+
 module.exports = {
   cuaGetCentrisPDF,
   cuaGetCentrisAnnexes,
@@ -1117,6 +1263,7 @@ module.exports = {
   CUA_AVAILABLE,
   parsePDFText,
   extractCentrisPDFData,
+  sendCentrisListingByEmail,
   // Internals exposés pour tests
   _loginCentris: loginCentris,
   _runCUATask: runCUATask,
