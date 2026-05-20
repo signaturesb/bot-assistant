@@ -5200,18 +5200,22 @@ class MFARequiredError extends Error {
 }
 
 // Génère code TOTP RFC 6238 si CENTRIS_TOTP_SECRET configuré (alternative SMS)
-// Setup: extraire secret du QR code Centris MFA initial → set env var
+// Setup: extraire secret du QR code Centris MFA initial → set env var (base32)
 function tryGenerateTOTP() {
   const secret = process.env.CENTRIS_TOTP_SECRET;
   if (!secret) return null;
   try {
-    const { authenticator } = require('otplib');
-    authenticator.options = { window: 1 };
-    const code = authenticator.generate(secret);
+    const { TOTP } = require('otpauth');
+    const totp = new TOTP({
+      issuer: 'Centris', label: 'CentrisMFA',
+      algorithm: 'SHA1', digits: 6, period: 30,
+      secret, // base32
+    });
+    const code = totp.generate();
     log('OK', 'MFA', `TOTP généré (CENTRIS_TOTP_SECRET configuré) — code ${code.substring(0, 2)}****`);
     return code;
   } catch (e) {
-    log('WARN', 'MFA', `TOTP generation échouée: ${e.message}`);
+    log('WARN', 'MFA', `TOTP generation échouée: ${e.message?.substring(0, 100)}`);
     return null;
   }
 }
