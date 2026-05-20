@@ -11712,9 +11712,9 @@ function startDailyTasks() {
   setInterval(() => syncStatusGitHub().catch(() => {}), 60 * 60 * 1000);
 
   // Sync bidirectionnelle Claude Code ↔ bot
-  // - Lire SESSION_LIVE.md depuis GitHub (ce que Claude Code a écrit) toutes les 30 min
+  // - Lire SESSION_LIVE.md depuis GitHub (ce que Claude Code a écrit) toutes les 3 min
   // - Écrire BOT_ACTIVITY.md vers GitHub (ce que le bot a fait) toutes les 10 min
-  setInterval(() => loadSessionLiveContext().catch(() => {}), 30 * 60 * 1000);
+  setInterval(() => loadSessionLiveContext().catch(() => {}), 3 * 60 * 1000);
   setInterval(() => writeBotActivity().catch(() => {}), 10 * 60 * 1000);
 
   setInterval(() => {
@@ -13536,6 +13536,19 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         scraped_at: new Date().toISOString(),
         llm_raw: llmTxt.substring(0, 500),
       }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
+  // ─── GET /admin/reload-session — force reload immédiat de SESSION_LIVE.md
+  // À appeler après git push pour que le bot ait l'info instantanément
+  if (req.method === 'GET' && url.startsWith('/admin/reload-session')) {
+    if (!requireAdmin(req, res)) return;
+    try {
+      await loadSessionLiveContext();
+      const len = sessionLiveContext?.length || 0;
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify({ ok: true, sessionLive_kb: Math.round(len/1024), reloaded_at: new Date().toISOString() }, null, 2));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
     return;
   }
