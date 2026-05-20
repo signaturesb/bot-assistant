@@ -1605,8 +1605,35 @@ async function loginCentrisZone(context) {
  * @param {string} centrisNum
  * @returns {Promise<{name, agency, phone, source}>}
  */
-async function getListingBroker(centrisNum) {
-  // Try public Centris.ca page first (no auth needed)
+async function getListingBroker(centrisNum, opts = {}) {
+  // Strategy A — si page Zone déjà accessible (via context loggé), scrape l'onglet Courtiers
+  // Strategy B — fallback Centris.ca public (URL og:title + meta)
+  if (opts.page) {
+    try {
+      const url = `https://zone.centris.ca/Listings/${centrisNum}/Brokers`;
+      await opts.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await opts.page.waitForTimeout(1500);
+      const data = await opts.page.evaluate(() => {
+        // Trouve le bloc "Inscripteur" (sur Zone, la section Courtiers)
+        const blocks = [...document.querySelectorAll('*')].filter(el => /inscripteur/i.test(el.innerText?.substring(0, 200) || ''));
+        if (blocks.length === 0) return null;
+        const ctx = blocks[0].closest('section, div, article') || blocks[0];
+        const txt = ctx.innerText || '';
+        // Patterns nom courtier (2-4 mots, première lettre maj)
+        const nameMatch = txt.match(/([A-ZÀ-Ÿ][a-zà-ÿ\-']+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ\-']+){1,3})\s+Courtier/);
+        const agencyMatch = txt.match(/(RE\/?MAX[^\n]{0,50}|Royal LePage[^\n]{0,40}|Sutton[^\n]{0,40}|Via Capitale[^\n]{0,40}|Century 21[^\n]{0,40}|Keller Williams[^\n]{0,40}|Sotheby[^\n]{0,40})/);
+        const phoneMatch = txt.match(/(\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})/);
+        return {
+          name: nameMatch?.[1]?.trim() || null,
+          agency: agencyMatch?.[1]?.trim() || null,
+          phone: phoneMatch?.[1] || null,
+          source: 'zone-brokers-tab',
+        };
+      });
+      if (data && (data.name || data.agency)) return data;
+    } catch (e) { console.warn('[ZONE] broker via Zone fail:', e.message); }
+  }
+  // Strategy B — fallback Centris.ca public
   try {
     const r = await fetch(`https://www.centris.ca/fr/properties~a-vendre/${centrisNum}`, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' },
@@ -1615,19 +1642,22 @@ async function getListingBroker(centrisNum) {
     });
     if (r.ok) {
       const html = await r.text();
-      // Extract broker name (pattern common: "Courtier inscripteur:" ou microdata)
-      const nameMatch = html.match(/courtier[^<>]{0,100}([A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ\-']+)+)/i)
-        || html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i);
-      const agencyMatch = html.match(/(?:RE\/?MAX|Royal LePage|Sutton|Via Capitale|Engel.*Volkers|Century 21|Keller Williams|Sotheby|Groupe Sutton|Immobilier[^<>]{0,40})/i);
-      const phoneMatch = html.match(/(\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})/);
+      // og:title contient typiquement "{Adresse} | Courtier {Nom Prenom}"
+      const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i)?.[1] || '';
+      const ogDesc  = html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)/i)?.[1] || '';
+      // Cherche pattern "Courtier {Nom Prenom}" dans og:title / og:description
+      const brokerMatch = (ogTitle + ' ' + ogDesc).match(/(?:Courtier(?:\s+immobilier)?(?:\s+r[eé]sidentiel)?\s+|inscripteur[\s:]+)([A-ZÀ-Ÿ][a-zà-ÿ\-']+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ\-']+){1,3})/);
+      const agencyMatch = html.match(/(RE\/?MAX[^<>]{0,40}|Royal LePage[^<>]{0,40}|Sutton[^<>]{0,40}|Via Capitale[^<>]{0,40}|Century 21[^<>]{0,40}|Keller Williams[^<>]{0,40}|Sotheby[^<>]{0,40})/);
+      const phoneMatch = (ogDesc || html).match(/(\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})/);
       return {
-        name: nameMatch?.[1] || null,
-        agency: agencyMatch?.[0] || null,
+        name: brokerMatch?.[1]?.trim() || null,
+        agency: agencyMatch?.[1]?.replace(/<[^>]+>/g, '').trim() || null,
         phone: phoneMatch?.[1] || null,
         source: 'centris.ca-public',
+        debug_og_title: ogTitle.substring(0, 120),
       };
     }
-  } catch (e) { console.warn('[ZONE] getListingBroker fail:', e.message); }
+  } catch (e) { console.warn('[ZONE] getListingBroker public fail:', e.message); }
   return { name: null, agency: null, phone: null, source: 'unknown' };
 }
 
@@ -1652,13 +1682,13 @@ async function shareCentrisZoneDocuments(opts = {}) {
 
   let browser = null;
   try {
-    // 1. Get broker info (pour validation + message client enrichi)
-    const broker = await getListingBroker(centris_num);
-    console.log(`[ZONE${dry_run?'-DRY':''}] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'})`);
-
     browser = await launchBrowser();
     const context = await newStealthContext(browser);
     const page = await loginCentrisZone(context);
+
+    // 1. Get broker info VIA Zone (onglet Courtiers, plus fiable que centris.ca public)
+    const broker = await getListingBroker(centris_num, { page });
+    console.log(`[ZONE${dry_run?'-DRY':''}] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'}) source=${broker.source}`);
 
     // 2. URL directe page Documents
     console.log(`[ZONE${dry_run?'-DRY':''}] Navigate /Listings/${centris_num}/Documents`);
@@ -1673,9 +1703,13 @@ async function shareCentrisZoneDocuments(opts = {}) {
         const cb = row.querySelector('input[type=checkbox]');
         if (!cb || cb.disabled) continue;
         const txt = row.innerText || row.textContent || '';
+        // Filtre: skip header table "Description Taille"
+        if (/^(Description\s+Taille|Description\tTaille)$/i.test(txt.trim())) continue;
         // Capture: nom doc + taille KB/MB si visible
         const sizeMatch = txt.match(/([\d,.]+)\s*(KB|MB|Mo|Ko)/i);
         const name = txt.split('\n').filter(Boolean)[0]?.substring(0, 120) || '(sans nom)';
+        // Skip ligne sans contenu utile
+        if (!name || name.toLowerCase().includes('description')) continue;
         docs.push({ name: name.trim(), size: sizeMatch?.[0] || null });
         if (!cb.checked) cb.click();
       }
