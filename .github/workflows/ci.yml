@@ -1,0 +1,62 @@
+name: CI — bot.js + modules
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    name: Node syntax + tests parser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci --legacy-peer-deps
+      - name: Node --check syntax
+        run: |
+          for f in bot.js cua_driver.js market_intelligence.js pdf_scraper.js firecrawl_scraper.js lead_parser.js pipedrive_proactive.js campaign_variation.js; do
+            if [ -f "$f" ]; then
+              node --check "$f" && echo "✅ $f"
+            fi
+          done
+      - name: Parser tests
+        run: npm run test-parser
+        continue-on-error: false
+      - name: Validate
+        run: npm run validate
+        continue-on-error: true
+      - name: Security status
+        run: npm run security-status
+        continue-on-error: true
+
+  health-check:
+    runs-on: ubuntu-latest
+    needs: syntax-check
+    name: Production health check
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Wait for Render deploy
+        run: sleep 90
+      - name: Check /healthz
+        run: |
+          curl -fsS --max-time 15 https://signaturesb-bot-s272.onrender.com/healthz | grep -q OK
+      - name: Check /readyz
+        run: |
+          curl -fsS --max-time 15 https://signaturesb-bot-s272.onrender.com/readyz | grep -q READY
+      - name: Check /admin/state
+        run: |
+          curl -fsS --max-time 15 https://signaturesb-bot-s272.onrender.com/admin/state | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          health = d.get('health', {})
+          all_ok = all(v.get('ok') for v in health.values())
+          if not all_ok:
+            print('❌ Health checks failed:', health)
+            sys.exit(1)
+          print('✅ All health checks OK:', list(health.keys()))
+          "

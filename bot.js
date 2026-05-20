@@ -12255,8 +12255,37 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 // ─── HTTP server (health + webhooks) ─────────────────────────────────────────
+// ─── Security headers (helmet-like, sans dépendance Express) ──────────────────
+// Appliqués à toutes les réponses pour XSS/clickjacking/MIME-sniff protection
+function applySecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+}
+
 const server = http.createServer(async (req, res) => {
+  applySecurityHeaders(res);
   const url = (req.url || '/').split('?')[0];
+
+  // ── Kubernetes-style health probes ────────────────────────────────────────
+  // /healthz: liveness (le process tourne)
+  // /readyz: readiness (toutes les deps OK)
+  // Existing /health: full JSON détaillé (observabilité)
+  if (req.method === 'GET' && url === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+    return;
+  }
+  if (req.method === 'GET' && url === '/readyz') {
+    // Ready si Anthropic + Brevo + Pipedrive keys présents
+    const ready = !!(process.env.ANTHROPIC_API_KEY && process.env.BREVO_API_KEY && process.env.PIPEDRIVE_API_KEY);
+    res.writeHead(ready ? 200 : 503, { 'Content-Type': 'text/plain' });
+    res.end(ready ? 'READY' : 'NOT_READY');
+    return;
+  }
 
   // ── Health endpoint détaillé (JSON) — observabilité complète ──────────────
   if (req.method === 'GET' && url === '/health') {
