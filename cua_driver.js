@@ -42,23 +42,74 @@ const CENTRIS_BASE   = 'https://matrix.centris.ca';
 const MATRIX_BASE    = 'https://matrix.centris.ca';
 const PUBLIC_BASE    = 'https://www.centris.ca';
 
-// Lazy-load — Playwright optionnel (pas dans package.json par défaut)
+// Lazy-load Playwright — Préférence: rebrowser-playwright (anti-detect natif)
+// > playwright-core > playwright (fallback)
 let playwright = null;
+let playwrightFlavor = 'none';
 let Anthropic   = null;
 
 function loadDeps() {
   if (!playwright) {
-    try { playwright = require('playwright-core'); }
+    // 1. Essai rebrowser-playwright (patches anti-detect: navigator.webdriver,
+    //    chrome.runtime, source detection, etc.)
+    try { playwright = require('rebrowser-playwright'); playwrightFlavor = 'rebrowser'; }
     catch {
-      try { playwright = require('playwright'); }
-      catch { throw new Error('Playwright non installé. Run: npm install playwright-core (mode browserless) OU npm install playwright + npx playwright install chromium (mode local)'); }
+      try { playwright = require('playwright-core'); playwrightFlavor = 'core'; }
+      catch {
+        try { playwright = require('playwright'); playwrightFlavor = 'full'; }
+        catch { throw new Error('Playwright non installé. npm install rebrowser-playwright'); }
+      }
     }
+    console.log(`[CUA] Playwright flavor: ${playwrightFlavor}`);
   }
   if (!Anthropic) {
     try { Anthropic = require('@anthropic-ai/sdk'); }
     catch { throw new Error('@anthropic-ai/sdk non installé'); }
   }
 }
+
+// User-Agent pool — Chrome + Edge récents, rotation aléatoire pour pas patterner
+const UA_POOL = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+];
+function pickUA() { return UA_POOL[Math.floor(Math.random() * UA_POOL.length)]; }
+
+// Script anti-detect injecté dans CHAQUE page via addInitScript
+// Override les properties que les détecteurs bot utilisent (navigator.webdriver,
+// chrome.runtime, permissions.query, plugins, etc.)
+const ANTI_DETECT_SCRIPT = `
+// Mask navigator.webdriver
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+// Languages: réaliste fr-CA + en
+Object.defineProperty(navigator, 'languages', { get: () => ['fr-CA', 'fr', 'en-CA', 'en'] });
+// Plugins: au moins 3 (signature humaine)
+Object.defineProperty(navigator, 'plugins', {
+  get: () => [
+    { name: 'PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+    { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+    { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', length: 1 },
+  ],
+});
+// chrome.runtime existe (mais vide) — détecteurs vérifient présence
+if (!window.chrome) window.chrome = {};
+if (!window.chrome.runtime) window.chrome.runtime = {};
+// Permissions: bypass notification check piège
+const origQuery = window.navigator.permissions?.query;
+if (origQuery) {
+  window.navigator.permissions.query = (param) =>
+    param.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : origQuery(param);
+}
+// WebGL vendor/renderer plausibles
+const getParameter = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function (p) {
+  if (p === 37445) return 'Intel Inc.';
+  if (p === 37446) return 'Intel Iris OpenGL Engine';
+  return getParameter.call(this, p);
+};
+`;
 
 // Launch browser — Browserless externe (recommandé) OU local Chromium
 // Si BROWSERLESS_WS env var défini → WebSocket connect (1000 min/mois free).
@@ -96,9 +147,46 @@ async function launchBrowser() {
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', '--disable-gpu',
+      '--disable-blink-features=AutomationControlled', // bypass headless detection
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--lang=fr-CA',
       '--window-size=1280,900'
     ]
   });
+}
+
+// Crée un context stealth — réutilisable par cuaGetCentrisPDF / Annexes / Navigate
+async function newStealthContext(browser) {
+  const ua = pickUA();
+  const ctx = await browser.newContext({
+    viewport: VIEWPORT,
+    userAgent: ua,
+    acceptDownloads: true,
+    locale: 'fr-CA',
+    timezoneId: 'America/Toronto',
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    javaScriptEnabled: true,
+    bypassCSP: true,
+    extraHTTPHeaders: {
+      'Accept-Language': 'fr-CA,fr;q=0.9,en-CA;q=0.8,en;q=0.7',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': ua.includes('Macintosh') ? '"macOS"' : '"Windows"',
+      'sec-fetch-dest': 'document',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-site': 'none',
+      'sec-fetch-user': '?1',
+      'upgrade-insecure-requests': '1',
+    },
+  });
+  // Anti-detect script sur chaque page nouvelle
+  await ctx.addInitScript(ANTI_DETECT_SCRIPT);
+  return ctx;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -682,14 +770,7 @@ async function cuaGetCentrisPDF(centrisNum) {
   try {
     console.log(`[CUA] Démarrage browser pour listing #${centrisNum}...`);
     browser = await launchBrowser();
-
-    const context = await browser.newContext({
-      viewport: VIEWPORT,
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      acceptDownloads: true,
-      locale: 'fr-CA',
-    });
-
+    const context = await newStealthContext(browser);
     const page = await loginCentris(context);
 
     // Essayer URL directe Matrix d'abord
@@ -792,13 +873,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
   try {
     browser = await launchBrowser();
 
-    const context = await browser.newContext({
-      viewport: VIEWPORT,
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-      acceptDownloads: true,
-      locale: 'fr-CA',
-    });
-
+    const context = await newStealthContext(browser);
     const page = await loginCentris(context);
 
     const filtreStr = filtre ? `en priorité "${filtre}"` : 'toutes';
@@ -873,13 +948,7 @@ async function cuaNavigate(task, startUrl = null) {
   try {
     browser = await launchBrowser();
 
-    const context = await browser.newContext({
-      viewport: VIEWPORT,
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-      acceptDownloads: true,
-      locale: 'fr-CA',
-    });
-
+    const context = await newStealthContext(browser);
     const page = await loginCentris(context);
 
     if (startUrl) {
@@ -923,7 +992,10 @@ function cuaStatus() {
   const useBrowserless = !!process.env.BROWSERLESS_WS;
   return {
     available,
-    playwright: available ? 'installed' : 'missing (npm install playwright-core)',
+    playwright: available ? `installed (${playwrightFlavor || 'unknown'})` : 'missing (npm install rebrowser-playwright)',
+    playwright_flavor: playwrightFlavor,
+    stealth: playwrightFlavor === 'rebrowser' ? 'rebrowser anti-detect ON' : 'basic',
+    pdf_parse: (() => { try { require.resolve('pdf-parse'); return true; } catch { return false; }})(),
     browser_mode: useBrowserless ? 'browserless (remote)' : 'local Chromium',
     browserless_configured: useBrowserless,
     anthropic_key: !!process.env.ANTHROPIC_API_KEY,
@@ -935,6 +1007,74 @@ function cuaStatus() {
     dataDir: DATA_DIR,
     maxSteps: MAX_STEPS
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PARSE PDF — extract data from Centris fiche/annexes PDFs
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _pdfParse = null;
+function getPdfParse() {
+  if (_pdfParse === null) {
+    try { _pdfParse = require('pdf-parse'); }
+    catch (e) { _pdfParse = false; console.warn('[CUA] pdf-parse indispo:', e.message); }
+  }
+  return _pdfParse || null;
+}
+
+/**
+ * Extrait du texte + données structurées d'un PDF Centris.
+ * @param {Buffer} pdfBuffer
+ * @returns {Promise<{text, pages, info, parsed}>}
+ */
+async function parsePDFText(pdfBuffer) {
+  const pdfParse = getPdfParse();
+  if (!pdfParse) throw new Error('pdf-parse non installé');
+  try {
+    const data = await pdfParse(pdfBuffer);
+    return {
+      text: data.text,
+      pages: data.numpages,
+      info: data.info,
+      length: data.text.length,
+    };
+  } catch (e) {
+    console.error('[CUA] parsePDF error:', e.message);
+    throw e;
+  }
+}
+
+/**
+ * Extract structured data from Centris fiche PDF text (prix, MLS, adresse, taxes, etc).
+ * @param {Buffer} pdfBuffer
+ * @returns {Promise<{prix, adresse, mls, taxes_municipales, taxes_scolaires, terrain_dim, batiment_dim, year_built, raw_text}>}
+ */
+async function extractCentrisPDFData(pdfBuffer) {
+  const { text } = await parsePDFText(pdfBuffer);
+  const data = { raw_text: text.substring(0, 2000) };
+  // Prix demandé
+  const prixM = text.match(/(?:prix|asking|demand[ée]?)\s*[:\s$]*?([\d\s,]+)\s*\$/i)
+    || text.match(/\$\s*([\d\s,]+)\b/);
+  if (prixM) data.prix = parseFloat(prixM[1].replace(/[\s,]/g, ''));
+  // MLS / Centris #
+  const mlsM = text.match(/(?:MLS|Centris)\s*#?\s*:?\s*(\d{7,9})/i);
+  if (mlsM) data.mls = mlsM[1];
+  // Adresse (heuristique: ligne avec numéro civique)
+  const adrM = text.match(/(\d{1,5}[A-Za-z]?[,\s]+(?:rue|avenue|av\.|boul\.|boulevard|chemin|ch\.|route|rang|rte)\s+[^\n]{3,80})/i);
+  if (adrM) data.adresse = adrM[1].trim().substring(0, 200);
+  // Taxes municipales (annuelles)
+  const taxMuniM = text.match(/taxes?\s*municipal[ea]s?\s*[:\s]*\$?\s*([\d\s,]+)/i);
+  if (taxMuniM) data.taxes_municipales = parseFloat(taxMuniM[1].replace(/[\s,]/g, ''));
+  // Taxes scolaires
+  const taxScolM = text.match(/taxes?\s*scolair[es]+\s*[:\s]*\$?\s*([\d\s,]+)/i);
+  if (taxScolM) data.taxes_scolaires = parseFloat(taxScolM[1].replace(/[\s,]/g, ''));
+  // Année construction
+  const yearM = text.match(/(?:ann[ée]?e?\s*(?:de\s*)?construction|built|construit)\s*[:\s]*(\d{4})/i);
+  if (yearM) data.year_built = parseInt(yearM[1]);
+  // Dimensions terrain (m²)
+  const terrainM = text.match(/(?:terrain|lot|superficie)\s*[:\s]*([\d\s,]+)\s*(?:m²|m2|pi²|pi2)/i);
+  if (terrainM) data.terrain_superficie = terrainM[1].replace(/[\s,]/g, '');
+  return data;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -971,8 +1111,11 @@ module.exports = {
   cuaStatus,
   cuaCleanup,
   CUA_AVAILABLE,
+  parsePDFText,
+  extractCentrisPDFData,
   // Internals exposés pour tests
   _loginCentris: loginCentris,
   _runCUATask: runCUATask,
   _executeCUAAction: executeCUAAction,
+  _newStealthContext: newStealthContext,
 };

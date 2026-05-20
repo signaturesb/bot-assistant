@@ -26,7 +26,9 @@
     "dotenv": "^16.0.0",
     "node-telegram-bot-api": "^0.67.0",
     "pdf-lib": "^1.17.1",
-    "playwright-core": "^1.60.0"
+    "pdf-parse": "^2.4.5",
+    "playwright-core": "^1.60.0",
+    "rebrowser-playwright": "^1.52.0"
   },
   "overrides": {
     "form-data": "^4.0.4",

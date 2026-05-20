@@ -13389,6 +13389,26 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     return;
   }
 
+  // ─── POST /admin/parse-pdf-centris — upload PDF buffer, retourne data structurée
+  // Body: binary PDF. Header: X-Token: WEBHOOK_SECRET
+  if (req.method === 'POST' && url.startsWith('/admin/parse-pdf-centris')) {
+    const tok = req.headers['x-token'] || (new URL(req.url, 'http://x')).searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    try {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const buf = Buffer.concat(chunks);
+      if (buf.length < 1000 || buf.slice(0, 4).toString() !== '%PDF') {
+        res.writeHead(400); res.end(JSON.stringify({error: 'not a PDF or too small'})); return;
+      }
+      const cua = getCUA();
+      const data = await cua.extractCentrisPDFData(buf);
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify(data, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
   // ─── GET /admin/campaign-regenerate?id=N — génère nouveau angle/intro
   // Évite que la même audience reçoive 2× la même version. Audience auto-détectée.
   if (req.method === 'GET' && url.startsWith('/admin/campaign-regenerate')) {
