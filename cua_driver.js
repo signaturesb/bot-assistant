@@ -1635,44 +1635,69 @@ async function getListingBroker(centrisNum) {
  * Partage TOUS les documents d'un listing via Zone Centris (cherche courtier auto).
  * @param {object} opts
  * @param {string} opts.centris_num — # MLS
- * @param {string} opts.email — email destinataire
+ * @param {string} opts.email — email destinataire (ignoré si dry_run=true)
+ * @param {boolean} [opts.dry_run] — preview-only: identifie courtier + liste docs SANS envoyer
  * @param {boolean} [opts.sendSelfCopy] — défaut false
  * @param {string} [opts.langue] — 'fr' (défaut) | 'en'
  * @param {string} [opts.message] — message custom (sinon défaut Centris)
- * @returns {Promise<{success, broker_info, docs_shared, sent_to, listing_url}>}
+ * @returns {Promise<{success, broker_info, docs_shared, docs_list?, sent_to, listing_url, dry_run?}>}
  */
 async function shareCentrisZoneDocuments(opts = {}) {
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
-  const { centris_num, email, sendSelfCopy = false, langue = 'fr', message } = opts;
-  if (!centris_num || !email) return { success: false, message: 'centris_num + email requis' };
+  const { centris_num, email, dry_run = false, sendSelfCopy = false, langue = 'fr', message } = opts;
+  if (!centris_num) return { success: false, message: 'centris_num requis' };
+  if (!dry_run && !email) return { success: false, message: 'email requis (sauf dry_run=true)' };
 
   let browser = null;
   try {
     // 1. Get broker info (pour validation + message client enrichi)
     const broker = await getListingBroker(centris_num);
-    console.log(`[ZONE] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'})`);
+    console.log(`[ZONE${dry_run?'-DRY':''}] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'})`);
 
     browser = await launchBrowser();
     const context = await newStealthContext(browser);
     const page = await loginCentrisZone(context);
 
     // 2. URL directe page Documents
-    console.log(`[ZONE] Navigate /Listings/${centris_num}/Documents`);
+    console.log(`[ZONE${dry_run?'-DRY':''}] Navigate /Listings/${centris_num}/Documents`);
     await page.goto(`https://zone.centris.ca/Listings/${centris_num}/Documents`, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(3500);
 
-    // 3. Coche tous les checkboxes des docs
-    const checkedCount = await page.evaluate(() => {
-      const cbs = [...document.querySelectorAll('input[type=checkbox]')];
-      let count = 0;
-      for (const cb of cbs) { if (!cb.disabled && !cb.checked) { cb.click(); count++; } }
-      return count;
+    // 3. Liste les docs (et coche pour count) — capture noms+tailles
+    const docsInfo = await page.evaluate(() => {
+      const rows = [...document.querySelectorAll('tr, [role=row], li')].filter(r => r.querySelector('input[type=checkbox]'));
+      const docs = [];
+      for (const row of rows) {
+        const cb = row.querySelector('input[type=checkbox]');
+        if (!cb || cb.disabled) continue;
+        const txt = row.innerText || row.textContent || '';
+        // Capture: nom doc + taille KB/MB si visible
+        const sizeMatch = txt.match(/([\d,.]+)\s*(KB|MB|Mo|Ko)/i);
+        const name = txt.split('\n').filter(Boolean)[0]?.substring(0, 120) || '(sans nom)';
+        docs.push({ name: name.trim(), size: sizeMatch?.[0] || null });
+        if (!cb.checked) cb.click();
+      }
+      return docs;
     });
-    console.log(`[ZONE] ${checkedCount} documents cochés`);
+    const checkedCount = docsInfo.length;
+    console.log(`[ZONE${dry_run?'-DRY':''}] ${checkedCount} documents listés${dry_run?' (DRY-RUN)':' cochés'}`);
     if (checkedCount === 0) {
       return { success: false, message: `Aucun document trouvé pour #${centris_num} (listing inexistant ou pas de docs)`, broker_info: broker };
+    }
+
+    // DRY-RUN: short-circuit ici, pas d'envoi
+    if (dry_run) {
+      return {
+        success: true,
+        dry_run: true,
+        broker_info: broker,
+        docs_count: checkedCount,
+        docs_list: docsInfo,
+        listing_url: `https://zone.centris.ca/Listings/${centris_num}/Documents`,
+        message: `PREVIEW — ${checkedCount} docs prêts à partager. Confirme avec envoyer_tous_documents_zone pour livrer.`,
+      };
     }
 
     // 4. Click "Partager les documents"
