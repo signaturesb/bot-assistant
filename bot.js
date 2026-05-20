@@ -7,6 +7,24 @@ const fs          = require('fs');
 const path        = require('path');
 const leadParser  = require('./lead_parser');
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 🛡️ RÈGLE ABSOLUE — Shawn gère SES suivis lui-même
+// ═══════════════════════════════════════════════════════════════════════════
+// Le bot NE CRÉE PAS d'activité Pipedrive automatiquement dans:
+//   - traiterNouveauLead() — lead entrant Gmail/webhook
+//   - enregistrerResumeAppel() — vocal Telegram résumé d'appel
+//   - creerDeal() — création de deal manuelle ou auto
+//
+// Notes Pipedrive = OK (résumé + transcription).
+// Activités = SEULEMENT si Claude/Shawn appelle explicitement creer_activite
+// ou planifier_visite via Telegram ("planifie visite mardi 14h").
+//
+// Cette constante est un garde-fou visuel pour future-proof — toute modification
+// de ces 3 fonctions doit vérifier qu'on ne réintroduit pas de pdPost('/activities').
+//
+// Référence: feedback_no_default_time + feedback_one_activity_per_deal
+const SHAWN_GERE_SES_SUIVIS = true;
+
 // CUA driver — lazy-loaded pour ne pas bloquer boot si playwright-core manque
 let _cua = null;
 function getCUA() {
@@ -3041,6 +3059,7 @@ async function statsBusiness() {
 }
 
 async function creerDeal({ prenom, nom, telephone, email, type, source, centris, note }) {
+  // 🛡️ SHAWN_GERE_SES_SUIVIS=true — cette fonction crée seulement person+deal+note, JAMAIS d'activité.
   if (!PD_KEY) return '❌ PIPEDRIVE_API_KEY absent';
   const fullName = [prenom, nom].filter(Boolean).join(' ');
   const titre = fullName || prenom || 'Nouveau prospect';
@@ -4909,6 +4928,8 @@ function _formatActivityNote(json, transcription) {
 }
 
 async function enregistrerResumeAppel({ transcription }) {
+  // 🛡️ SHAWN_GERE_SES_SUIVIS=true — cette fonction crée seulement deal+note, JAMAIS d'activité.
+  // Suivi auto désactivé 2026-05-05: "le suivi automatique soit enlevé aussi ça me fait trop de suivi pas rapport"
   if (!transcription || transcription.length < 20) {
     return '❌ Transcription trop courte pour analyse (min 20 chars).';
   }
@@ -14693,6 +14714,7 @@ function resetRetryCount(msgId) {
 }
 
 async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {}) {
+  // 🛡️ SHAWN_GERE_SES_SUIVIS=true — cette fonction crée seulement deal+note, JAMAIS d'activité.
   const leadStart = Date.now();
   const { nom, telephone, email, centris, adresse, type } = lead;
 
