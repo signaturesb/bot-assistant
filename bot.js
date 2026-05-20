@@ -5190,20 +5190,61 @@ let pendingMFACode = null;       // dernier code reçu non consommé
 let mfaWaiters = [];             // resolveurs Promise en attente d'un code
 const smsBridgeHealth = { alive: false, lastHeartbeat: 0, lastCodeAt: 0, totalCodes: 0 };
 
-// Attend un code MFA depuis le bridge SMS Mac, max timeoutMs.
-// Si déjà un code en attente non consommé (récent <2min), le retourne tout de suite.
+// Erreur spécifique MFA — l'appelant doit la catch pour fallback dégradé propre
+class MFARequiredError extends Error {
+  constructor(reason = 'MFA_REQUIRED') {
+    super(`MFA_REQUIRED: ${reason}`);
+    this.code = 'MFA_REQUIRED';
+    this.reason = reason;
+  }
+}
+
+// Génère code TOTP RFC 6238 si CENTRIS_TOTP_SECRET configuré (alternative SMS)
+// Setup: extraire secret du QR code Centris MFA initial → set env var
+function tryGenerateTOTP() {
+  const secret = process.env.CENTRIS_TOTP_SECRET;
+  if (!secret) return null;
+  try {
+    const { authenticator } = require('otplib');
+    authenticator.options = { window: 1 };
+    const code = authenticator.generate(secret);
+    log('OK', 'MFA', `TOTP généré (CENTRIS_TOTP_SECRET configuré) — code ${code.substring(0, 2)}****`);
+    return code;
+  } catch (e) {
+    log('WARN', 'MFA', `TOTP generation échouée: ${e.message}`);
+    return null;
+  }
+}
+
+// Attend un code MFA — cascade 3 niveaux:
+// 1. CENTRIS_TOTP_SECRET env var (TOTP RFC 6238) — instantané, jamais expiré
+// 2. pendingMFACode déjà disponible (<2min) — du bridge SMS Mac
+// 3. Attendre nouveau code via bridge — timeoutMs max
+//
+// Throws MFARequiredError si rien dispo (l'appelant catch et dégrade gracieusement).
 async function awaitMFACode(timeoutMs = 120000) {
-  // Code déjà disponible <2min?
+  // 1. TOTP si configuré (priorité absolue, instantané)
+  const totp = tryGenerateTOTP();
+  if (totp) return totp;
+
+  // 2. Code déjà disponible <2min via bridge?
   if (pendingMFACode && Date.now() - pendingMFACode.receivedAt < 120000) {
     const code = pendingMFACode.code;
     pendingMFACode = null;
     return code;
   }
-  // Attendre un nouveau code
+
+  // 3. Attendre un nouveau code du bridge
+  // Si bridge non actif (no heartbeat depuis 5min) → fail fast au lieu d'attendre
+  if (smsBridgeHealth.lastHeartbeat && Date.now() - smsBridgeHealth.lastHeartbeat > 5 * 60 * 1000) {
+    log('WARN', 'MFA', `SMS bridge silencieux depuis ${Math.round((Date.now()-smsBridgeHealth.lastHeartbeat)/60000)}min — pas d'attente`);
+    throw new MFARequiredError('SMS bridge inactif + pas de TOTP configuré');
+  }
+
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => {
       mfaWaiters = mfaWaiters.filter(r => r !== resolve);
-      reject(new Error(`Timeout MFA ${timeoutMs/1000}s — pas de code SMS reçu via bridge Mac`));
+      reject(new MFARequiredError(`timeout ${timeoutMs/1000}s — aucun code via bridge SMS + pas de TOTP`));
     }, timeoutMs);
     const wrappedResolve = (code) => {
       clearTimeout(t);
@@ -5364,7 +5405,10 @@ async function centrisOAuthLoginWithMFA(opts = {}) {
       try {
         smsCode = await awaitMFACode(opts.mfaTimeoutMs || 120000);
       } catch (e) {
-        return { ok: false, error: `MFA timeout — bridge Mac n'a pas envoyé de code en 2min. Vérifie sms-bridge daemon.` };
+        // Dégradation propre: log clair + return code MFA_REQUIRED (pas crash)
+        const reason = e.code === 'MFA_REQUIRED' ? e.reason : `timeout/${e.message?.substring(0, 80)}`;
+        log('WARN', 'CENTRIS', `MFA_REQUIRED — ${reason}. Configure CENTRIS_TOTP_SECRET ou démarre sms-bridge daemon.`);
+        return { ok: false, error: `MFA_REQUIRED: ${reason}`, mfaRequired: true };
       }
       const mfaRes = await fetch(mfaChallenge.actionUrl, {
         method: 'POST', redirect: 'manual',
@@ -5459,6 +5503,12 @@ async function centrisLogin() {
     if (oauth?.ok && centrisSession?.cookies) {
       log('OK', 'CENTRIS', `OAuth Auth0 + MFA SMS ✓ (agent: ${user}, ${oauth.cookieCount} cookies)`);
       return true;
+    }
+    // Dégradation propre: si MFA_REQUIRED → log clair, retourne false (pas crash)
+    // L'appelant (CUA driver, telechargerFiche etc) sait qu'il doit fallback ailleurs.
+    if (oauth?.mfaRequired) {
+      log('WARN', 'CENTRIS', `MFA_REQUIRED — login en mode dégradé. Solutions: (1) set CENTRIS_TOTP_SECRET env var, (2) démarre sms-bridge LaunchAgent Mac, (3) lance LaunchAgent centris-auto-login pour push cookies via Playwright`);
+      return false;
     }
     log('WARN', 'CENTRIS', `OAuth flow échoué: ${oauth?.error || 'unknown'} — fallback form-based`);
   } catch (e) {
