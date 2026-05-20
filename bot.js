@@ -13389,6 +13389,85 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     return;
   }
 
+  // ─── GET /admin/campaign-regenerate?id=N — génère nouveau angle/intro
+  // Évite que la même audience reçoive 2× la même version. Audience auto-détectée.
+  if (req.method === 'GET' && url.startsWith('/admin/campaign-regenerate')) {
+    if (!requireAdmin(req, res)) return;
+    const u = new URL(req.url, 'http://x');
+    const id = u.searchParams.get('id');
+    const dry = u.searchParams.get('dry') === '1';
+    if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
+    try {
+      const variation = require('./campaign_variation');
+      const mi = require('./market_intelligence');
+      // 1. Fetch campagne actuelle
+      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
+      const camp = await r1.json();
+      const audience = variation.detectAudience(camp.name);
+      if (!audience) { res.writeHead(400); res.end(JSON.stringify({error: `audience non détectée dans nom: ${camp.name}`})); return; }
+      // 2. Génère variation avec données marché actuelles
+      const marketDigest = mi.buildMarketDigest() || {};
+      const variant = await variation.generateVariation(audience, marketDigest, {
+        customNote: u.searchParams.get('note') || null,
+      });
+      // 3. Injection dans HTML actuel — remplace première section <p> avec nouvelle intro
+      const oldHtml = camp.htmlContent || '';
+      // Pattern: remplace bloc INTRO ENTRE COMMENTAIRES HTML <!-- INTRO --> ou first <p>
+      let newHtml = oldHtml;
+      if (variant.intro_html) {
+        // Stratégie: remplace la première grosse section <p> par notre intro
+        // Pattern conservateur: remplace seulement si on trouve un placeholder ou intro existante
+        if (/<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/.test(oldHtml)) {
+          newHtml = oldHtml.replace(/<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/, `<!-- INTRO_TEXTE -->${variant.intro_html}<!-- /INTRO_TEXTE -->`);
+        } else {
+          // Sinon, on ne touche pas (conservateur — Shawn doit avoir mis les marqueurs)
+        }
+      }
+      const subject_changed = variant.subject && variant.subject !== camp.subject;
+      const html_changed = newHtml !== oldHtml;
+      const out = {
+        id, audience, angle: variant.angle, focus: variant.focus,
+        new_subject: variant.subject,
+        subject_changed, html_changed,
+        intro_preview: variant.intro_html?.substring(0, 400),
+        key_points: variant.key_points,
+        dry,
+      };
+      if (dry) { res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return; }
+      // 4. PUT update si changement
+      if (subject_changed || html_changed) {
+        const r2 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, {
+          method: 'PUT',
+          headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            ...(subject_changed ? { subject: variant.subject } : {}),
+            ...(html_changed ? { htmlContent: newHtml } : {}),
+          }),
+        });
+        out.put_ok = r2.ok || r2.status === 204;
+        if (!out.put_ok) out.put_error = (await r2.text()).substring(0, 300);
+        else {
+          variation.recordSent(audience, id, variant.angle, variation.hashContent(newHtml), variant.subject);
+          auditLogEvent('campaign', 'regenerated', { id, audience, angle: variant.angle });
+        }
+      }
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify(out, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message?.substring(0, 300)})); }
+    return;
+  }
+
+  // ─── GET /admin/variation-status — voir historique angles par audience
+  if (req.method === 'GET' && url.startsWith('/admin/variation-status')) {
+    try {
+      const v = require('./campaign_variation');
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify(v.variationStatus(), null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
   // ─── GET /admin/brevo-html?id=N — return HTML raw pour debug/audit
   if (req.method === 'GET' && url.startsWith('/admin/brevo-html')) {
     if (!requireAdmin(req, res)) return;
