@@ -187,6 +187,14 @@ process.on('uncaughtException', err => {
   reportCrashToGitHub('uncaughtException', `${err.message}\n${err.stack || ''}`).finally(() => {
     // Ne pas exit immédiatement — laisser Render faire son health check
   });
+  // Bug tracker auto — crée Issue GitHub (dédup intégrée si même titre déjà open)
+  if (typeof reportBug === 'function') {
+    reportBug(
+      `[CRASH] uncaughtException: ${err.message?.substring(0, 80)}`,
+      `## Type\nuncaughtException\n\n## Message\n\`\`\`\n${err.message}\n\`\`\`\n\n## Stack\n\`\`\`\n${(err.stack || '').substring(0, 2500)}\n\`\`\``,
+      { labels: ['bug', 'auto-tracked', 'crash'] }
+    ).catch(() => {});
+  }
 });
 process.on('unhandledRejection', reason => {
   const msg = reason instanceof Error ? reason.message : String(reason);
@@ -194,6 +202,13 @@ process.on('unhandledRejection', reason => {
   if (msg.includes('EPIPE')) return;
   console.error('[CRASH unhandledRejection]', msg, stk);
   reportCrashToGitHub('unhandledRejection', `${msg}\n${stk}`).catch(()=>{});
+  if (typeof reportBug === 'function') {
+    reportBug(
+      `[CRASH] unhandledRejection: ${msg.substring(0, 80)}`,
+      `## Type\nunhandledRejection\n\n## Message\n\`\`\`\n${msg}\n\`\`\`\n\n## Stack\n\`\`\`\n${(stk || '').substring(0, 2500)}\n\`\`\``,
+      { labels: ['bug', 'auto-tracked', 'crash'] }
+    ).catch(() => {});
+  }
 });
 
 // ─── Persistance ──────────────────────────────────────────────────────────────
@@ -1581,6 +1596,76 @@ function githubHeaders() {
   const h = { 'User-Agent': 'Kira-Bot', 'Accept': 'application/vnd.github.v3+json' };
   if (process.env.GITHUB_TOKEN) h['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
   return h;
+}
+
+// ─── BUG TRACKER AUTO — Crée GitHub Issues automatiquement sur bugs critiques
+// Repo cible: signaturesb/kira-bot (lu par Claude Code dans futures sessions)
+// Dédup: si même titre déjà OPEN → comment au lieu de créer doublon
+// Cache mémoire 1h pour éviter spam même titre dans la même session
+const _bugReportCache = new Map(); // title → ts (dédup intra-session)
+const BUG_REPORT_REPO = 'kira-bot';
+
+async function reportBug(titre, description, opts = {}) {
+  if (!process.env.GITHUB_TOKEN) {
+    log('WARN', 'BUG-TRACKER', `reportBug skipped — pas de GITHUB_TOKEN: ${titre}`);
+    return null;
+  }
+  // Dédup intra-session 1h
+  const cacheKey = titre.substring(0, 80);
+  const lastReport = _bugReportCache.get(cacheKey);
+  if (lastReport && Date.now() - lastReport < 60 * 60 * 1000) {
+    return null; // déjà reporté <1h
+  }
+  _bugReportCache.set(cacheKey, Date.now());
+  // Cleanup cache si >100 entrées
+  if (_bugReportCache.size > 100) {
+    const oldest = [...(_bugReportCache.entries())].sort((a, b) => a[1] - b[1])[0][0];
+    _bugReportCache.delete(oldest);
+  }
+
+  try {
+    // 1. Cherche issue OPEN avec même titre (dédup persistent côté GitHub)
+    const searchUrl = `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:signaturesb/${BUG_REPORT_REPO} is:issue is:open in:title "${titre.substring(0, 50)}"`)}`;
+    const searchRes = await fetch(searchUrl, { headers: githubHeaders(), signal: AbortSignal.timeout(10000) });
+    if (searchRes.ok) {
+      const searchData = await searchRes.json();
+      const existing = searchData.items?.[0];
+      if (existing) {
+        // Ajoute un commentaire sur l'issue existante (au lieu de créer doublon)
+        await fetch(`https://api.github.com/repos/signaturesb/${BUG_REPORT_REPO}/issues/${existing.number}/comments`, {
+          method: 'POST',
+          headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            body: `🔁 **Reproduit ${new Date().toISOString()}**\n\n${description.substring(0, 2000)}\n\n_Auto-tracked by bot._`,
+          }),
+          signal: AbortSignal.timeout(10000),
+        }).catch(() => {});
+        log('OK', 'BUG-TRACKER', `Commenté issue #${existing.number} (déjà open): ${titre.substring(0, 60)}`);
+        return { existing: true, number: existing.number, url: existing.html_url };
+      }
+    }
+    // 2. Crée nouvelle issue
+    const createRes = await fetch(`https://api.github.com/repos/signaturesb/${BUG_REPORT_REPO}/issues`, {
+      method: 'POST',
+      headers: { ...githubHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: titre.substring(0, 200),
+        body: `${description.substring(0, 4000)}\n\n---\n**Auto-tracked** by bot at ${new Date().toISOString()}\nCommit: \`${(process.env.RENDER_GIT_COMMIT || 'unknown').substring(0, 7)}\``,
+        labels: opts.labels || ['bug', 'auto-tracked'],
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!createRes.ok) {
+      log('WARN', 'BUG-TRACKER', `Create fail HTTP ${createRes.status}: ${titre.substring(0, 60)}`);
+      return null;
+    }
+    const newIssue = await createRes.json();
+    log('OK', 'BUG-TRACKER', `Issue #${newIssue.number} créée: ${titre.substring(0, 60)}`);
+    return { created: true, number: newIssue.number, url: newIssue.html_url };
+  } catch (e) {
+    log('WARN', 'BUG-TRACKER', `Exception: ${e.message?.substring(0, 100)}`);
+    return null;
+  }
 }
 async function listGitHubRepos() {
   const url = process.env.GITHUB_TOKEN
@@ -13613,6 +13698,20 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         scraped_at: new Date().toISOString(),
         llm_raw: llmTxt.substring(0, 500),
       }, null, 2));
+    } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
+    return;
+  }
+
+  // ─── POST /admin/report-bug?token=X — trigger manuel bug tracker (test)
+  if (req.method === 'POST' && url.startsWith('/admin/report-bug')) {
+    if (!requireAdmin(req, res)) return;
+    try {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const r = await reportBug(body.title || 'Manual test', body.description || 'no description', { labels: body.labels });
+      res.writeHead(200, {'content-type':'application/json'});
+      res.end(JSON.stringify(r || { skipped: true }, null, 2));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({error: e.message})); }
     return;
   }

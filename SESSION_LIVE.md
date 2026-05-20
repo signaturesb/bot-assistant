@@ -6,6 +6,49 @@
 
 ---
 
+## 🆕 2026-05-20 (suite) — Audit P0 + Centris MFA + TOTP
+
+### Commits déployés ce matin
+| Commit | Sujet |
+|---|---|
+| `8a47cd6` | fix(centris): switch otplib→otpauth (API moderne) |
+| `d88af7f` | fix(centris): MFA SMS dégradation gracieuse + TOTP RFC 6238 |
+| `5ad69fb` | feat(pipedrive): SHAWN_GERE_SES_SUIVIS garde-fou + commentaires explicites |
+| `b19478a` | fix(crash): m is not defined — déplacer 'const m' au niveau setInterval |
+| `78c9c46` | feat(scraper): + playwright-extra + puppeteer-extra-plugin-stealth |
+| `b50857d` | feat(scraper): pdf_scraper.js — cascade 3 niveaux ULTIME |
+| `e0bb1a0` | fix(sync): loadSessionLiveContext lit AUTO les 2 repos |
+| `661812f` | feat(sync): SESSION_LIVE reload AUTO instantané |
+
+### 🛡️ Audit P0 — 3 bugs critiques fixés
+1. **Crash `m is not defined`** (5h59 ce matin) → `const m` au niveau setInterval ✅
+2. **Activités Pipedrive auto** → constante `SHAWN_GERE_SES_SUIVIS=true` + audit 3 fonctions ✅
+3. **Centris MFA SMS bloqué** → cascade TOTP/bridge/error gracieux ✅
+
+### 📦 Stack pipeline GitHub top 2026 (final)
+- `rebrowser-playwright` — anti-detect natif Chromium
+- `playwright-extra` + `puppeteer-extra-plugin-stealth` — Bot Fight bypass
+- `Browserless.io` (1000 min/mois free) — browser remote
+- `pdf-parse` + `pdf-lib` — PDF extraction/manipulation
+- `cheerio` + `got` — HTML/HTTP rapide
+- `lru-cache` + `p-limit` — perf
+- `otpauth` — TOTP RFC 6238 (alternative SMS)
+- `firecrawl_scraper` — sites statiques
+
+### 🔄 Sync auto SESSION_LIVE.md (no manual refresh)
+- Cron bot: 3 min (vs 30 min avant)
+- Git hook post-push: trigger /admin/reload-session immédiat
+- Dual-repo: bot-assistant + kira-bot (prend le plus récent)
+- Bot voit nouvelle info en 15-20s max
+
+### 🧰 Setup TOTP optionnel (recommandé pour 24/7 sans Mac)
+1. Logue Centris → MFA settings → générer nouveau QR
+2. Copie le **secret base32** (visible sous QR)
+3. Set Render env: `CENTRIS_TOTP_SECRET=BASE32_SECRET`
+4. Bot génère code à chaque login → marche sans bridge SMS
+
+---
+
 ## 🆕 2026-05-20 — Scraper PDF universel (commit e0bb1a0+)
 
 ### Solution scraping PDF n'importe quel site (3 niveaux)
