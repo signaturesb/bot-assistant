@@ -7198,6 +7198,8 @@ ${pjList}
       case 'analyser_zonage_adresse': {
         const { adresse, forward_email } = input || {};
         if (!adresse) return `❌ adresse requise`;
+        const _zT0 = Date.now();
+        log('INFO', 'ZONAGE', `[STEP 1/5] Parse ville depuis "${adresse}"`);
         // 1. Parse ville depuis l'adresse
         const villesSlug = {
           'sainte-julienne': /sainte[\s-]?julienne|st[\s-]?julienne/i,
@@ -7214,42 +7216,71 @@ ${pjList}
           if (re.test(adresse)) { ville = slug; break; }
         }
         if (!ville) return `❌ Ville non détectée dans "${adresse}". Villes supportées: ${Object.keys(villesSlug).join(', ')}`;
-        // 2. Scrape page urbanisme + extract PDFs zonage
-        if (!process.env.FIRECRAWL_API_KEY) return `❌ FIRECRAWL_API_KEY absent`;
+        log('INFO', 'ZONAGE', `[STEP 1/5] ville détectée: ${ville}`);
+        // 2. CASCADE 3 niveaux via pdf_scraper.js (HTTP direct → Firecrawl → Browserless stealth)
         const firecrawl = require('./firecrawl_scraper');
+        const muni = firecrawl.MUNICIPALITES?.[ville] || (firecrawl._MUNICIPALITES?.[ville]);
+        const urbanismeUrl = muni
+          ? `${muni.baseUrl}${muni.pages?.zonage || muni.pages?.urbanisme || ''}`
+          : null;
+        if (!urbanismeUrl) return `❌ Pas de config urbanisme pour ${ville}`;
+        log('INFO', 'ZONAGE', `[STEP 2/5] cascade scrape: ${urbanismeUrl}`);
         let pdfFound = null;
+        let scrapeMethod = '?';
+        let scrapeMsg = '';
         try {
-          const r = await firecrawl.scrapMunicipalite(ville, 'zonage');
-          if (!r?.success) return `❌ Scrape ${ville} échoué: ${r?.error || 'unknown'}`;
-          const html = r.markdown || r.contenu || '';
-          // Cherche liens PDF "zonage", "grille", "règlement"
-          const pdfRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+\.pdf[^\s)]*)\)/gi;
-          const matches = [...html.matchAll(pdfRegex)];
-          const zonagePdfs = matches.filter(m =>
-            /zonage|grille|règlement|usage/i.test(m[1] + ' ' + m[2])
-          );
-          pdfFound = (zonagePdfs[0] || matches[0]) || null;
-          if (!pdfFound) {
-            // Fallback: regex naked URLs
-            const naked = (html.match(/https?:\/\/[^\s<>"']+\.pdf\b/gi) || []);
-            const nakedZonage = naked.find(u => /zonage|grille|reglement/i.test(u));
-            if (nakedZonage) pdfFound = ['', 'Zonage', nakedZonage];
+          const pdfScraper = require('./pdf_scraper');
+          const r = await pdfScraper.scrapePDFUniversal(urbanismeUrl, {
+            motsCles: ['zonage', 'grille', 'règlement', 'usage', 'marge'],
+          });
+          scrapeMethod = r.method || '?';
+          if (!r.success) {
+            scrapeMsg = r.message || 'cascade failed';
+            log('WARN', 'ZONAGE', `[STEP 2/5] cascade ÉCHEC (${scrapeMethod}): ${scrapeMsg}`);
+            return `⚠️ Scrape ${ville} échoué (cascade L1+L2+L3): ${scrapeMsg}\nContact: ${muni.telephone}${muni.note_urbanisme ? ' ' + muni.note_urbanisme : ''}`;
           }
-        } catch (e) { return `❌ Scrape exception: ${e.message?.substring(0, 100)}`; }
-        if (!pdfFound) {
-          return `⚠️ Aucun PDF zonage trouvé sur le site de ${ville}.\nL'adresse: ${adresse}\nPour le récupérer manuellement, va sur la page urbanisme de la municipalité.`;
+          log('OK', 'ZONAGE', `[STEP 2/5] cascade OK via ${scrapeMethod} (${r.elapsed_ms || '?'}ms)`);
+          // R peut être: directDownload PDF (buffer) OU HTML avec pdf_links
+          if (r.buffer && r.method === 'direct-http') {
+            // PDF direct trouvé
+            pdfFound = { name: r.filename, url: urbanismeUrl, buffer: r.buffer };
+          } else {
+            // HTML scraped → cherche PDF link zonage
+            const pdfLinks = r.pdf_links || [];
+            log('INFO', 'ZONAGE', `[STEP 2/5] ${pdfLinks.length} PDF link(s) extraits`);
+            const zonagePdf = pdfLinks.find(l =>
+              /zonage|grille|règlement|usage|marge/i.test(l.text + ' ' + l.url)
+            ) || pdfLinks[0];
+            if (zonagePdf) {
+              pdfFound = { name: zonagePdf.text || 'Grille zonage', url: zonagePdf.url, buffer: null };
+            }
+          }
+        } catch (e) {
+          log('ERROR', 'ZONAGE', `[STEP 2/5] cascade exception: ${e.message}`);
+          return `❌ Scrape exception: ${e.message?.substring(0, 200)}`;
         }
-        const pdfUrl = pdfFound[2];
-        const pdfLabel = pdfFound[1] || 'Grille de zonage';
-        // 3. Download PDF
-        let pdfBuffer = null;
-        try {
-          const dl = await fetch(pdfUrl, { redirect: 'follow', signal: AbortSignal.timeout(60000), headers: { 'User-Agent': 'Mozilla/5.0 KiraBot/1.0' } });
-          if (!dl.ok) return `❌ Download PDF HTTP ${dl.status} pour ${pdfUrl}`;
-          pdfBuffer = Buffer.from(await dl.arrayBuffer());
-          if (pdfBuffer.length === 0) return `❌ PDF vide`;
-          if (pdfBuffer.length > 25 * 1024 * 1024) return `❌ PDF trop gros (${Math.round(pdfBuffer.length/1024/1024)}MB)`;
-        } catch (e) { return `❌ Download exception: ${e.message?.substring(0, 100)}`; }
+        if (!pdfFound) {
+          return `⚠️ Aucun PDF zonage trouvé sur le site de ${ville} (cascade L1+L2+L3 OK mais 0 PDF link).\nContact: ${muni.telephone}${muni.note_urbanisme ? ' ' + muni.note_urbanisme : ''}`;
+        }
+        const pdfUrl = pdfFound.url;
+        const pdfLabel = pdfFound.name || 'Grille de zonage';
+        log('INFO', 'ZONAGE', `[STEP 3/5] PDF trouvé: ${pdfLabel} → ${pdfUrl.substring(0,80)}`);
+        // 3. Download PDF (skip si déjà téléchargé via direct-http)
+        let pdfBuffer = pdfFound.buffer;
+        if (!pdfBuffer) {
+          try {
+            const pdfScraper = require('./pdf_scraper');
+            const dl = await pdfScraper.downloadDirectPDF(pdfUrl, 60000);
+            if (!dl.success) {
+              log('ERROR', 'ZONAGE', `[STEP 3/5] download fail: ${dl.message}`);
+              return `❌ Download PDF échoué: ${dl.message?.substring(0, 150)}\nURL: ${pdfUrl}`;
+            }
+            pdfBuffer = dl.buffer;
+            if (!pdfBuffer || pdfBuffer.length === 0) return `❌ PDF vide`;
+            if (pdfBuffer.length > 25 * 1024 * 1024) return `❌ PDF trop gros (${Math.round(pdfBuffer.length/1024/1024)}MB)`;
+            log('OK', 'ZONAGE', `[STEP 3/5] PDF téléchargé ${Math.round(pdfBuffer.length/1024)}KB`);
+          } catch (e) { return `❌ Download exception: ${e.message?.substring(0, 100)}`; }
+        }
         const filename = `Zonage_${ville}_${Date.now()}.pdf`;
         // 4. Envoyer dans Telegram (Shawn voit)
         if (ALLOWED_ID && chatId) {
