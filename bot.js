@@ -11673,6 +11673,67 @@ async function runSuiviQuotidien() {
   } catch (e) { log('ERR', 'CRON', `Suivi: ${e.message}`); }
 }
 
+// 📊 Briefing quotidien 7h30 — vue 360°: visites du jour + stagnants + prochaine campagne
+async function briefingMatin() {
+  if (!ALLOWED_ID) return;
+  try {
+    const today = new Date();
+    const todayStr = today.toDateString();
+    const dateStr = today.toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
+
+    // 1. Visites du jour
+    const visites = loadJSON(VISITES_FILE, []);
+    const visitesAujourdhui = visites.filter(v => new Date(v.date).toDateString() === todayStr);
+    let visitesBlock = '';
+    if (visitesAujourdhui.length === 0) {
+      visitesBlock = `📅 *Visites:* aucune aujourd'hui`;
+    } else {
+      const lignes = visitesAujourdhui
+        .sort((a, b) => new Date(a.date) - new Date(b.date))
+        .map(v => {
+          const h = new Date(v.date).toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Toronto' });
+          return `  • ${h} — ${v.nom}${v.adresse ? ' @ ' + v.adresse : ''}`;
+        });
+      visitesBlock = `📅 *Visites (${visitesAujourdhui.length}):*\n${lignes.join('\n')}`;
+    }
+
+    // 2. Prospects stagnants (3 jours sans action) — top 5
+    let stagnantsBlock = '';
+    try {
+      const stagText = await prospectStagnants(3);
+      // Extract just the count + top 5 lignes
+      const lignes = String(stagText || '').split('\n').filter(l => l.trim()).slice(0, 6);
+      stagnantsBlock = lignes.length ? `\n🐌 *Stagnants 3j+:*\n${lignes.slice(0, 6).join('\n')}` : '';
+    } catch (e) { /* silencieux */ }
+
+    // 3. Prochaine campagne mailing (depuis mailingPlanCache déjà refresh chaque heure)
+    let campagneBlock = '';
+    if (mailingPlanCache?.text) {
+      // Extract le 1er bullet "• #N Nom · date" du plan
+      const m = mailingPlanCache.text.match(/• #(\d+)\s+([^·]+)·\s*([^·]+)·\s*(✅[^\n]+|⏸[^\n]+)/);
+      if (m) {
+        campagneBlock = `\n📧 *Prochaine campagne:* #${m[1]} ${m[2].trim()} — ${m[3].trim()} ${m[4].trim()}`;
+      }
+    }
+
+    // 4. Construire et envoyer
+    const msg = [
+      `☀️ *Briefing — ${dateStr}*`,
+      ``,
+      visitesBlock,
+      stagnantsBlock,
+      campagneBlock,
+      ``,
+      `_7h30 · auto · /campaigns pour confirmer mailing · /pipeline pour stagnants détaillés_`,
+    ].filter(Boolean).join('\n');
+
+    await sendTelegramWithFallback(msg, { category: 'briefing-matin' }).catch(() => {});
+    log('OK', 'CRON', `Briefing 7h30 envoyé (${visitesAujourdhui.length} visites)`);
+  } catch (e) {
+    log('WARN', 'CRON', `briefingMatin: ${e.message}`);
+  }
+}
+
 // 🛡️ Cron 6h30 — purge auto activités génériques Pipedrive
 // (créées par workflow Pipedrive natif ou import externe — bot lui-même bloque déjà)
 async function pipedriveCleanupAuto() {
@@ -12081,6 +12142,11 @@ function startDailyTasks() {
     if (h === 6 && m >= 30 && lastCron.pdCleanup !== todayStr) {
       lastCron.pdCleanup = todayStr;
       pipedriveCleanupAuto().catch(e => log('WARN', 'CRON', `pdCleanup: ${e.message}`));
+    }
+    // 📊 Cron 7h30 — Briefing matin (visites + stagnants + prochaine campagne)
+    if (h === 7 && m >= 30 && lastCron.briefing !== todayStr) {
+      lastCron.briefing = todayStr;
+      briefingMatin().catch(e => log('WARN', 'CRON', `briefing: ${e.message}`));
     }
 
     // ── Market Intelligence refresh ──────────────────────────────────────────
