@@ -1611,19 +1611,44 @@ async function writeGitHubFile(repo, filePath, content, commitMsg) {
 }
 
 // ─── Sync Claude Code ↔ Bot (bidirectionnelle via GitHub) ────────────────────
+// Check BOTH repos (kira-bot historique + bot-assistant nouveau) — prend le plus récent
 async function loadSessionLiveContext() {
   if (!process.env.GITHUB_TOKEN) return;
-  try {
-    const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/kira-bot/contents/SESSION_LIVE.md`, {
-      headers: githubHeaders()
-    });
-    if (!res.ok) { log('WARN', 'SYNC', `SESSION_LIVE.md HTTP ${res.status}`); return; }
-    const data = await res.json();
-    if (data.content) {
-      sessionLiveContext = Buffer.from(data.content, 'base64').toString('utf8');
-      log('OK', 'SYNC', `SESSION_LIVE.md chargé (${Math.round(sessionLiveContext.length / 1024)}KB)`);
-    }
-  } catch (e) { log('WARN', 'SYNC', `Load session: ${e.message}`); }
+  const repos = ['bot-assistant', 'kira-bot']; // bot-assistant first (où Claude Code pushe maintenant)
+  let bestContent = '', bestUpdated = 0, bestRepo = '';
+  for (const repo of repos) {
+    try {
+      const res = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/SESSION_LIVE.md`, {
+        headers: githubHeaders(),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) { log('WARN', 'SYNC', `${repo}/SESSION_LIVE.md HTTP ${res.status}`); continue; }
+      const data = await res.json();
+      if (!data.content) continue;
+      // Get commit date to compare
+      const commitRes = await fetch(`https://api.github.com/repos/${GITHUB_USER}/${repo}/commits?path=SESSION_LIVE.md&per_page=1`, {
+        headers: githubHeaders(),
+        signal: AbortSignal.timeout(10000),
+      });
+      let updated = 0;
+      if (commitRes.ok) {
+        const commits = await commitRes.json();
+        const date = commits[0]?.commit?.committer?.date;
+        if (date) updated = new Date(date).getTime();
+      }
+      const content = Buffer.from(data.content, 'base64').toString('utf8');
+      if (updated > bestUpdated || (!bestUpdated && content.length > bestContent.length)) {
+        bestContent = content;
+        bestUpdated = updated;
+        bestRepo = repo;
+      }
+    } catch (e) { log('WARN', 'SYNC', `${repo}: ${e.message?.substring(0, 100)}`); }
+  }
+  if (bestContent) {
+    sessionLiveContext = bestContent;
+    const age = bestUpdated ? Math.round((Date.now() - bestUpdated) / 3600000) : '?';
+    log('OK', 'SYNC', `SESSION_LIVE.md chargé depuis ${bestRepo} (${Math.round(bestContent.length / 1024)}KB, age ${age}h)`);
+  }
 }
 
 async function writeBotActivity() {
