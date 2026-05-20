@@ -138,6 +138,13 @@ function getAnthropic() {
 function extractParagraphs(html) {
   if (!html) return [];
   const paragraphs = [];
+  // Patterns à EXCLURE (footer, signature, contacts — doivent rester intacts)
+  const FOOTER_PATTERNS = [
+    /shawn\s*barrette/i, /514[\s.\-]?927[\s.\-]?1340/, /signaturesb\.com/i,
+    /remax\s*prestige/i, /re\/?max\s*prestige/i, /se\s*désabonner|unsubscribe/i,
+    /tous\s*droits\s*réservés|all\s*rights\s*reserved/i,
+    /julie@signaturesb/i, /^bonjour\s*,?$/i,
+  ];
   // Match <p>...</p> avec contenu texte significatif
   const re = /<p[^>]*>([\s\S]*?)<\/p>/gi;
   let m;
@@ -145,13 +152,14 @@ function extractParagraphs(html) {
     const inner = m[1];
     // Strip nested tags pour mesurer texte pur
     const textOnly = inner.replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, ' ').trim();
-    if (textOnly.length >= 40 && /[a-zàâéèêëïîôöùûüç]{3,}/i.test(textOnly)) {
-      // C'est un paragraphe narratif (contient du texte FR/EN, pas juste un chiffre)
-      paragraphs.push({
-        html: m[0],
-        text: textOnly.substring(0, 500),
-      });
-    }
+    if (textOnly.length < 40 || !/[a-zàâéèêëïîôöùûüç]{3,}/i.test(textOnly)) continue;
+    // Skip si footer/contact/signature
+    if (FOOTER_PATTERNS.some(p => p.test(textOnly))) continue;
+    paragraphs.push({
+      html: m[0],
+      inner_text_html: inner.trim(), // contenu inner avec tags inline (br, strong, etc)
+      text: textOnly.substring(0, 500),
+    });
   }
   return paragraphs;
 }
@@ -182,7 +190,7 @@ async function generateVariation(audience, marketData = {}, options = {}) {
   // Extract paragraphes existants si HTML fourni (mode "rewrite zone par zone")
   const existingParagraphs = options.existingHtml ? extractParagraphs(options.existingHtml) : [];
   const paragraphsContext = existingParagraphs.length > 0
-    ? existingParagraphs.map((p, i) => `[P${i+1}] "${p.text.substring(0, 200)}"`).join('\n')
+    ? existingParagraphs.map((p, i) => `[P${i+1}] inner: "${p.inner_text_html.substring(0, 300)}"`).join('\n')
     : '';
 
   const prompt = `Tu réécris le texte d'un email de courtier immobilier au Québec (Lanaudière + Rive-Nord) — courtier: Shawn Barrette, RE/MAX PRESTIGE Rawdon, Signature SB.
@@ -197,7 +205,7 @@ HISTORIQUE RÉCENT À ÉVITER (pour différenciation):
 ${recentAngles || '(aucun)'}
 
 ${options.customNote ? `NOTE SHAWN: ${options.customNote}\n` : ''}
-${existingParagraphs.length > 0 ? `\nPARAGRAPHES EXISTANTS DANS L'EMAIL (à RÉÉCRIRE, garde le HTML wrapper):\n${paragraphsContext}\n` : ''}
+${existingParagraphs.length > 0 ? `\nPARAGRAPHES EXISTANTS DANS L'EMAIL — réécris UNIQUEMENT le contenu inner, le <p> wrapper extérieur EST DÉJÀ DANS LE HTML et reste intact:\n${paragraphsContext}\n` : ''}
 INSTRUCTIONS:
 - Ton chaleureux mais professionnel, tutoiement
 - Garde la MÊME LONGUEUR par paragraphe (±20%)
@@ -206,6 +214,7 @@ INSTRUCTIONS:
 - AUCUN mot-clé spam: "gratuit", "promo", "urgent" → utiliser "sans engagement", "stratégie", "consultation"
 - PAS de "Cher/Chère ${audience}" — direct "Bonjour,"
 - NE TOUCHE PAS aux chiffres exacts (taux, mensualités, prix) — réécris seulement les phrases d'enrobage
+- IMPORTANT: dans paragraphs_replacement, "old_inner" = exactement le inner du <p> (pas le <p> tag), "new_inner" = nouveau contenu inner SANS <p> tags (peut inclure <br>, <strong>, <em>)
 
 Retourne UNIQUEMENT ce JSON exactement:
 {
@@ -213,7 +222,7 @@ Retourne UNIQUEMENT ce JSON exactement:
   "intro_html": "<HTML fallback 3 paragraphes <p style='color:#cccccc;line-height:1.7'>...</p>>",
   "key_points": ["<point clé 1>", "<point clé 2>", "<point clé 3>"]${existingParagraphs.length > 0 ? `,
   "paragraphs_replacement": [
-    {"old_text": "<texte exact d'un paragraphe existant>", "new_text": "<nouveau texte HTML pour ce paragraphe — même longueur, nouveau angle>"}
+    {"old_inner": "<inner exact du <p> sans le wrapper>", "new_inner": "<nouveau inner SANS <p> tags — même longueur, nouveau angle>"}
   ]` : ''}
 }`;
 

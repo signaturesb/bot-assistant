@@ -13420,16 +13420,24 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       let newHtml = oldHtml;
       let replacements = [];
       if (variant.paragraphs_replacement && Array.isArray(variant.paragraphs_replacement)) {
-        // LLM a retourné liste {old_text, new_text} — on applique
+        // LLM a retourné liste {old_inner, new_inner} — on cherche dans <p>...</p>
+        // et on remplace UNIQUEMENT le inner (pas le wrapper)
         for (const r of variant.paragraphs_replacement) {
-          if (!r.old_text || !r.new_text) continue;
-          // Escape regex special chars dans old_text
-          const escaped = r.old_text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+          const oldInner = r.old_inner || r.old_text; // backward compat
+          const newInner = r.new_inner || r.new_text;
+          if (!oldInner || !newInner) continue;
+          // Strip <p> wrapper du new_inner si LLM en a mis un quand même
+          let cleanNew = String(newInner).trim();
+          if (/^<p[^>]*>[\s\S]*<\/p>$/i.test(cleanNew)) {
+            cleanNew = cleanNew.replace(/^<p[^>]*>/i, '').replace(/<\/p>$/i, '');
+          }
+          // Escape regex pour old_inner (tolère whitespace variants)
+          const escaped = String(oldInner).trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
           const re = new RegExp(escaped, 'g');
           const count = (newHtml.match(re) || []).length;
           if (count > 0) {
-            newHtml = newHtml.replace(re, r.new_text);
-            replacements.push({ from: r.old_text.substring(0, 60), to: r.new_text.substring(0, 60), count });
+            newHtml = newHtml.replace(re, cleanNew);
+            replacements.push({ from: oldInner.substring(0, 60), to: cleanNew.substring(0, 60), count });
           }
         }
       } else if (variant.intro_html && /<!--\s*INTRO_TEXTE\s*-->[\s\S]*?<!--\s*\/INTRO_TEXTE\s*-->/.test(oldHtml)) {
