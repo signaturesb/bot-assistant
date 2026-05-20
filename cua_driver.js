@@ -1701,7 +1701,7 @@ async function shareCentrisZoneDocuments(opts = {}) {
     }
 
     // 4. Click "Partager les documents"
-    await page.locator('button[aria-label="Partager les documents"]').click();
+    await page.locator('button[title="Partager les documents"]').click();
     await page.waitForTimeout(2000);
 
     // 5. Étape 1/2: garder defaults (Client + Impérial) → Suivant
