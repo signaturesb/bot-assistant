@@ -43,7 +43,7 @@ jobs:
           SEMGREP_RULES: p/javascript p/nodejs p/owasp-top-ten p/security-audit p/secrets
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep.sarif
         continue-on-error: true
