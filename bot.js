@@ -16437,7 +16437,9 @@ async function main() {
     log('OK', 'POLLER', `Intervalle polling: ${POLL_INTERVAL/1000}s (quasi-instantané)`);
     // Boot: nettoyer emails GitHub/CI 30s après démarrage (Shawn veut zéro spam)
     setTimeout(() => autoTrashGitHubNoise().catch(() => {}), 30000);
-    log('OK', 'BOOT', 'Gmail Lead Poller + auto-trash CI noise activés');
+    // Cron 2h — purge en temps quasi-réel pour ne pas laisser dormir CI fails 24h
+    setInterval(() => autoTrashGitHubNoise().catch(() => {}), 2 * 60 * 60 * 1000);
+    log('OK', 'BOOT', 'Gmail Lead Poller + auto-trash CI noise (boot+2h cycle) activés');
   } else if (!POLLER_ENABLED) {
     log('WARN', 'BOOT', '🛑 Gmail Lead Poller DÉSACTIVÉ (POLLER_ENABLED=false) — /checkemail pour scan manuel');
   } else {
