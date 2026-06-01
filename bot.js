@@ -582,7 +582,7 @@ const CONSENT_REQUIRED = true;
 const POLLER_ENABLED = process.env.POLLER_ENABLED !== 'false'; // kill switch via env
 let autoSendPaused = false; // toggle via /pauseauto command
 
-// ─── Mode réflexion (Opus 4.7 thinking) ──────────────────────────────────────
+// ─── Mode réflexion (Opus 4.8 thinking) ──────────────────────────────────────
 let thinkingMode = false; // toggle via /penser
 
 // ─── Mémoire persistante ──────────────────────────────────────────────────────
@@ -874,7 +874,7 @@ PDFs → extraire et analyser:
 Dès qu'une image/PDF arrive → analyser immédiatement avec le contexte immobilier Québec.
 Toujours conclure avec une recommandation actionnable pour Shawn.
 
-Mode réflexion (/penser): activé = Opus 4.7 raisonne en profondeur avant de répondre.
+Mode réflexion (/penser): activé = Opus 4.8 raisonne en profondeur avant de répondre.
 Idéal pour: stratégie de prix complexe, analyse marché multi-facteurs, négociation délicate.
 
 ════ PLAYBOOK VENTES (Signature SB doctrine) ════
@@ -1542,7 +1542,7 @@ function formatAPIError(err) {
     if (msg.includes('prefill') || msg.includes('prepend')) return '⚠️ Conversation corrompue — tape /reset puis réessaie.';
     if (msg.includes('max_tokens')) return '⚠️ Requête trop longue — simplifie ou /reset.';
     if (lower.includes('temperature') || lower.includes('top_p') || lower.includes('top_k')) {
-      return '🚨 Config bot — temperature/top_p/top_k rejetés par Opus 4.7.';
+      return '🚨 Config bot — temperature/top_p/top_k rejetés par Opus 4.8.';
     }
     return `⚠️ Requête invalide — /reset pour repartir. (${msg.substring(0, 80)})`;
   }
@@ -4637,7 +4637,7 @@ async function historiqueContact(terme) {
 }
 
 // ─── CERVEAU STRATÉGIQUE — analyseStrategique() ───────────────────────────
-// Utilise Claude Opus 4.7 (le modèle le plus intelligent) pour analyser
+// Utilise Claude Opus 4.8 (le modèle le plus intelligent) pour analyser
 // pipeline Pipedrive + audit log leads + mémoire stratégique + ventes passées.
 // Génère un rapport d'insights + 3-5 actions concrètes priorisées.
 // Cron dimanche 7am + ad-hoc via /analyse [question].
@@ -4726,7 +4726,7 @@ Sois DIRECT et concis. Pas de blabla. Format Markdown.`;
       method: 'POST', signal: ctrl.signal,
       headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-opus-4-7', // INTELLIGENCE MAXIMALE pour analyse stratégique
+        model: 'claude-opus-4-8', // INTELLIGENCE MAXIMALE pour analyse stratégique
         max_tokens: 2000,
         system: `Tu es l'analyste stratégique senior de ${AGENT.nom}, courtier RE/MAX en ${AGENT.region}. Tu connais le marché immobilier québécois (terrains, plexs, maisons usagées, construction neuve). Spécialités: ${AGENT.specialites}.\n\n${stageInfo}\n\nTu as accès à TOUTES les données du pipeline + leads récents + mémoire catégorisée. Ton job: identifier les patterns, prioriser les actions, augmenter les ventes. Sois direct, actionnable, précis. Tutoiement.`,
         messages: [
@@ -4740,7 +4740,7 @@ Sois DIRECT et concis. Pas de blabla. Format Markdown.`;
       return `❌ Opus ${res.status}: ${err.substring(0, 200)}`;
     }
     const data2 = await res.json();
-    if (data2.usage) trackCost('claude-opus-4-7', data2.usage);
+    if (data2.usage) trackCost('claude-opus-4-8', data2.usage);
     const reply = data2.content?.[0]?.text?.trim() || '(vide)';
     auditLogEvent('strategic-analysis', question ? 'ad-hoc' : 'weekly', { tokens_in: data2.usage?.input_tokens, tokens_out: data2.usage?.output_tokens });
     return reply;
@@ -7859,7 +7859,8 @@ async function backupBeforeAction(label, items) {
 // ─── Cost tracking Anthropic ─────────────────────────────────────────────────
 // Prix par million tokens (2026 pricing Anthropic)
 const PRICING = {
-  'claude-opus-4-7':    { in: 15.00, out: 75.00, cache_read: 1.50,  cache_write: 18.75 },
+  'claude-opus-4-8':    { in: 5.00,  out: 25.00, cache_read: 0.50,  cache_write: 6.25 },
+  'claude-opus-4-7':    { in: 5.00,  out: 25.00, cache_read: 0.50,  cache_write: 6.25 }, // legacy fallback
   'claude-sonnet-4-6':  { in:  3.00, out: 15.00, cache_read: 0.30,  cache_write:  3.75 },
   'claude-haiku-4-5':   { in:  1.00, out:  5.00, cache_read: 0.10,  cache_write:  1.25 },
 };
@@ -8080,7 +8081,7 @@ function trackCost(model, usage) {
 }
 
 // ─── Routing auto modèle selon type de tâche ─────────────────────────────────
-// Sonnet 4.6 par défaut (5x moins cher), switch Opus 4.7 auto sur mots-clés
+// Sonnet 4.6 par défaut (5x moins cher), switch Opus 4.8 auto sur mots-clés
 // qui indiquent recherche/analyse/stratégie/négociation/optimisation.
 // Shawn peut toujours forcer via /opus ou /sonnet ou /haiku.
 const OPUS_TRIGGERS = /\b(analys|optim|recherch|strat[eé]g|compar|[eé]val|n[eé]goci|estim|march[eé]\s+(?:immo|actuel)|rapport\s+(?:march[eé]|vente|pro)|plan\s+d['e]action|pr[eé]vis|penser|think|r[eé]fl[eé]ch|deep\s+dive|pourquoi|analys(?:e|er)\s+ce|regarde\s+(?:en\s+)?d[eé]tail|(?:quel|combien|calcul).*prix|prix\s+(?:du?\s*march|de\s+vente|[àa]\s+mettre|demand|conseil|juste)|conseil\s+prix)/i;
@@ -8091,11 +8092,11 @@ function pickModelForMessage(userMsg) {
   // Env var MODEL définie → respecter
   if (process.env.MODEL) return currentModel;
   // Thinking mode activé → toujours Opus (deep reasoning)
-  if (thinkingMode) return 'claude-opus-4-7';
+  if (thinkingMode) return 'claude-opus-4-8';
   // Mot-clé complexité/stratégie/analyse détecté → Opus pour CE message uniquement
   if (OPUS_TRIGGERS.test(userMsg || '')) {
-    log('INFO', 'ROUTER', `Complexité détectée → Opus 4.7 pour cette requête`);
-    return 'claude-opus-4-7';
+    log('INFO', 'ROUTER', `Complexité détectée → Opus 4.8 pour cette requête`);
+    return 'claude-opus-4-8';
   }
   // Défaut: Sonnet (envoi docs, emails, deals, conversation — 5x moins cher)
   return MODEL_DEFAULT;
@@ -9040,15 +9041,15 @@ function registerHandlers() {
     }
   });
 
-  // /analyse [question] — CERVEAU STRATÉGIQUE Opus 4.7 (analyse profonde + actions)
+  // /analyse [question] — CERVEAU STRATÉGIQUE Opus 4.8 (analyse profonde + actions)
   // Sans question → rapport hebdo complet. Avec question → réponse spécifique.
   // Latence ~30-60s (analyse profonde de tout le pipeline + audit + mémoire).
   bot.onText(/^\/analyse(?:\s+(.+))?/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const question = match[1]?.trim() || null;
     await bot.sendMessage(msg.chat.id, question
-      ? `🧠 *Analyse stratégique en cours...* (${question})\n_Opus 4.7 — 30-60s pour examiner pipeline + ventes + mémoire_`
-      : `🧠 *Rapport stratégique hebdo en cours...*\n_Opus 4.7 — analyse profonde de toutes tes données_`, { parse_mode: 'Markdown' });
+      ? `🧠 *Analyse stratégique en cours...* (${question})\n_Opus 4.8 — 30-60s pour examiner pipeline + ventes + mémoire_`
+      : `🧠 *Rapport stratégique hebdo en cours...*\n_Opus 4.8 — analyse profonde de toutes tes données_`, { parse_mode: 'Markdown' });
     bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
     const typing = setInterval(() => bot.sendChatAction(msg.chat.id, 'typing').catch(() => {}), 4500);
     try {
@@ -10712,8 +10713,8 @@ function registerHandlers() {
 
   bot.onText(/\/opus/, msg => {
     if (!isAllowed(msg)) return;
-    currentModel = 'claude-opus-4-7';
-    bot.sendMessage(msg.chat.id, '🚀 Mode Opus 4.7 activé — le plus puissant (défaut).');
+    currentModel = 'claude-opus-4-8';
+    bot.sendMessage(msg.chat.id, '🚀 Mode Opus 4.8 activé — le plus puissant (défaut).');
   });
 
   bot.onText(/\/sonnet/, msg => {
@@ -10732,7 +10733,7 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     thinkingMode = !thinkingMode;
     bot.sendMessage(msg.chat.id, thinkingMode
-      ? '🧠 *Mode réflexion ON* — Opus 4.7 pense en profondeur avant chaque réponse.\nIdéal: stratégie de prix, analyse marché complexe, négociation.\nPlus lent mais beaucoup plus précis.'
+      ? '🧠 *Mode réflexion ON* — Opus 4.8 pense en profondeur avant chaque réponse.\nIdéal: stratégie de prix, analyse marché complexe, négociation.\nPlus lent mais beaucoup plus précis.'
       : '⚡ *Mode réflexion OFF* — Réponses rapides.',
       { parse_mode: 'Markdown' }
     );
@@ -11130,7 +11131,7 @@ function registerHandlers() {
     }
   });
 
-  // ─── Photos (vision Opus 4.7) ────────────────────────────────────────────────
+  // ─── Photos (vision Opus 4.8) ────────────────────────────────────────────────
   bot.on('photo', async (msg) => {
     if (!isAllowed(msg)) return;
     const chatId = msg.chat.id;
@@ -12208,7 +12209,7 @@ function startDailyTasks() {
         getProactive()?.weeklyDigest?.().catch(e => log('WARN', 'PROACTIVE', `weekly: ${e.message}`));
       }
     }
-    // CERVEAU STRATÉGIQUE — rapport hebdo dimanche 7h (Opus 4.7 deep analysis)
+    // CERVEAU STRATÉGIQUE — rapport hebdo dimanche 7h (Opus 4.8 deep analysis)
     if (now.getDay() === 0 && h === 7 && lastCron.strategic !== todayStr) {
       lastCron.strategic = todayStr;
       analyseStrategique(null).then(report => {
