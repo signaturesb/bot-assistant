@@ -253,9 +253,16 @@ function clearSession() {
 // Le LaunchAgent Mac push les cookies fresh tous les 12h via /admin/centris-cookies
 function loadBotCentrisCookies() {
   try {
-    const botCookieFile = path.join(DATA_DIR, 'centris_cookies.json');
-    if (!fs.existsSync(botCookieFile)) return null;
+    // Le bot principal sauve dans centris_session.json (bot.js CENTRIS_SESSION_FILE).
+    // Fallback compat: ancien nom centris_cookies.json.
+    const candidates = [
+      path.join(DATA_DIR, 'centris_session.json'),
+      path.join(DATA_DIR, 'centris_cookies.json'),
+    ];
+    const botCookieFile = candidates.find(f => fs.existsSync(f));
+    if (!botCookieFile) return null;
     const data = JSON.parse(fs.readFileSync(botCookieFile, 'utf8'));
+    console.log(`[CUA] Loaded cookies from ${botCookieFile}`);
     // Format bot.js: { cookies: "name1=val1; name2=val2", expiry: timestamp }
     // Format Playwright requis: [{ name, value, domain, path }, ...]
     if (!data.cookies || typeof data.cookies !== 'string') return null;
