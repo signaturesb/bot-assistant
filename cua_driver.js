@@ -1964,34 +1964,59 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
 
     const page = await loginCentris(context);
 
-    // FORCE navigation Matrix home/search (cookies peuvent aboutir sur Dashboard, Zone, etc.)
-    console.log('[FICHE-PDF] Navigate to Matrix home');
-    await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2500);
-    // Wait for search field — fallback alternatives si #QueryText pas dispo
-    try {
-      await page.waitForSelector('#QueryText, input[id*="Query"], input[placeholder*="echerche" i]', { timeout: 15000 });
-    } catch {
-      // Try navigate to RechercheRapide page directly
-      console.log('[FICHE-PDF] #QueryText not found, try RechercheRapide');
-      await page.goto(`${MATRIX_BASE}/Matrix/Search/RechercheRapide`, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await page.waitForTimeout(2000);
+    // STRATÉGIE: URL directe Matrix listing detail (pas besoin de search field)
+    // Pattern URL connu: Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-{N}
+    console.log(`[FICHE-PDF] Navigate direct listing URL #${centrisNum}`);
+    const directUrls = [
+      `${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}`,
+      `${MATRIX_BASE}/Matrix/Search/Default.aspx?Class=DE&Number=${centrisNum}`,
+      `${MATRIX_BASE}/Matrix`,
+    ];
+    let navigatedOK = false;
+    for (const u of directUrls) {
+      try {
+        await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(3000);
+        const url = page.url();
+        // Si on a un # Centris dans le path/body → on est sur la fiche
+        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 5000));
+        if (bodyText.includes(String(centrisNum)) || /\/listing|\/property/i.test(url)) {
+          console.log(`[FICHE-PDF] Listing trouvé via ${u.substring(0, 80)}`);
+          navigatedOK = true;
+          break;
+        }
+      } catch (e) { console.warn(`[FICHE-PDF] URL fail ${u}: ${e.message.substring(0, 80)}`); }
     }
 
-    // 1. Search listing
-    console.log(`[FICHE-PDF] Search #${centrisNum}`);
-    const searchSelector = await page.evaluate(() => {
-      const candidates = ['#QueryText', 'input[id*="Query"]', 'input[placeholder*="echerche" i]', 'input[type=search]'];
-      for (const sel of candidates) {
-        const el = document.querySelector(sel);
-        if (el) return sel;
-      }
-      return null;
-    });
-    if (!searchSelector) throw new Error('Champ recherche Matrix introuvable après login');
-    await page.fill(searchSelector, String(centrisNum));
-    await page.locator(searchSelector).press('Enter');
-    await page.waitForTimeout(3500);
+    // FALLBACK: search via UI si direct URLs ratent
+    if (!navigatedOK) {
+      console.log('[FICHE-PDF] Direct URLs failed, fallback UI search');
+      try {
+        await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await page.waitForTimeout(2500);
+        const searchSelector = await page.evaluate(() => {
+          const cands = ['#QueryText', 'input[id*="Query"]', 'input[placeholder*="echerche" i]', 'input[type=search]'];
+          for (const sel of cands) { const el = document.querySelector(sel); if (el && el.offsetParent) return sel; }
+          return null;
+        });
+        if (searchSelector) {
+          await page.fill(searchSelector, String(centrisNum));
+          await page.locator(searchSelector).press('Enter');
+          await page.waitForTimeout(3500);
+          // Click le lien numéro Centris
+          const linkClicked = await page.evaluate((n) => {
+            const a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === String(n));
+            if (a) { a.click(); return true; }
+            return false;
+          }, centrisNum);
+          if (linkClicked) {
+            await page.waitForTimeout(3000);
+            navigatedOK = true;
+          }
+        }
+      } catch {}
+    }
+    if (!navigatedOK) throw new Error(`Impossible d'accéder à la fiche #${centrisNum} (toutes méthodes échouées)`);
 
     // 2. Click result link
     const clicked = await page.evaluate((n) => {
