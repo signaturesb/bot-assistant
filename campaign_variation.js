@@ -193,7 +193,7 @@ async function generateVariation(audience, marketData = {}, options = {}) {
     ? existingParagraphs.map((p, i) => `[P${i+1}] inner: "${p.inner_text_html.substring(0, 300)}"`).join('\n')
     : '';
 
-  const prompt = `Tu réécris le texte d'un email de courtier immobilier au Québec (Lanaudière + Rive-Nord) — courtier: Shawn Barrette, RE/MAX PRESTIGE Rawdon, Signature SB.
+  const prompt = `Tu réécris le texte d'un email de courtier immobilier au Québec (Lanaudière + Rive-Nord) — courtier: Shawn Barrette, RE/MAX PRESTIGE, Signature SB.
 
 AUDIENCE: ${audience}
 ANGLE À DÉVELOPPER: "${angle.tag}" — ${angle.focus}

@@ -83,7 +83,7 @@ const AGENT = {
   telephone:    process.env.AGENT_TEL       || '514-927-1340',
   email:        SHAWN_EMAIL,
   site:         process.env.AGENT_SITE      || 'signatureSB.com',
-  compagnie:    process.env.AGENT_COMPAGNIE || 'RE/MAX PRESTIGE Rawdon',
+  compagnie:    process.env.AGENT_COMPAGNIE || 'RE/MAX PRESTIGE',
   assistante:   process.env.AGENT_ASSIST    || 'Julie',
   ass_email:    JULIE_EMAIL,
   region:       process.env.AGENT_REGION    || 'Lanaudière · Rive-Nord',
@@ -1330,7 +1330,7 @@ async function summarizeOldHistory(chatId) {
       return `${m.role === 'user' ? AGENT.prenom : 'Bot'}: ${c.substring(0, 800)}`;
     }).join('\n').substring(0, 32000);
 
-    const prompt = `Conversation entre Shawn Barrette (courtier RE/MAX PRESTIGE Rawdon, shawn@signaturesb.com) et son assistant IA. Produis un RÉSUMÉ DENSE STRUCTURÉ en français organisé par sections (max 800 mots total).
+    const prompt = `Conversation entre Shawn Barrette (courtier RE/MAX PRESTIGE, shawn@signaturesb.com) et son assistant IA. Produis un RÉSUMÉ DENSE STRUCTURÉ en français organisé par sections (max 800 mots total).
 
 STRUCTURE OBLIGATOIRE:
 ## Prospects & clients
@@ -4956,7 +4956,7 @@ async function analyserAppelHaiku(transcription) {
   const dateLong = now.toLocaleDateString('fr-CA', { timeZone: TZ, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const dateISO  = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
 
-  const sys = `Tu analyses la transcription d'un appel téléphonique d'un courtier immobilier québécois (Shawn Barrette, RE/MAX PRESTIGE Rawdon, secteur Lanaudière).
+  const sys = `Tu analyses la transcription d'un appel téléphonique d'un courtier immobilier québécois (Shawn Barrette, RE/MAX PRESTIGE, secteur Lanaudière).
 
 Aujourd'hui: ${dateLong} (ISO ${dateISO}). Timezone: America/Toronto.
 
