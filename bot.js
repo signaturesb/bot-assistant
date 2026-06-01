@@ -15434,6 +15434,38 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     return;
   }
 
+  // ─── POST /admin/centris-storage-state — push storageState Playwright complet
+  // depuis Mac (cookies + localStorage + sessionStorage + UA). Plus fiable que
+  // juste cookies car Centris bind session à fingerprint complet.
+  if (req.method === 'POST' && url === '/admin/centris-storage-state') {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) {
+      res.writeHead(429); res.end('rate limit'); return;
+    }
+    if (req.headers['x-webhook-secret'] !== process.env.WEBHOOK_SECRET) {
+      res.writeHead(401); res.end('unauthorized'); return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 200000) req.destroy(); });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body || '{}');
+        const { storageState, userAgent } = payload;
+        if (!storageState || !storageState.cookies) {
+          res.writeHead(400); res.end('storageState manquant'); return;
+        }
+        const STATE_FILE = path.join(DATA_DIR, 'centris_storage_state.json');
+        const data = { storageState, userAgent, capturedAt: Date.now(), expiry: Date.now() + 25 * 24 * 3600 * 1000 };
+        safeWriteJSON(STATE_FILE, data);
+        auditLogEvent('centris', 'storage-state-captured', { cookies: storageState.cookies.length, origins: storageState.origins?.length || 0, ua: userAgent?.substring(0, 80) });
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, cookies: storageState.cookies.length, origins: storageState.origins?.length || 0, expiresInDays: 25 }));
+      } catch (e) {
+        res.writeHead(500); res.end(`error: ${e.message?.substring(0, 200)}`);
+      }
+    });
+    return;
+  }
+
   // ─── POST /admin/centris-cookies — push cookies depuis Mac (>4KB) ───────
   // Bypass Telegram 4096 char limit. Sécurité: bot teste les cookies contre
   // Centris AVANT de save — si ça marche pas, on save pas. Donc inutile pour

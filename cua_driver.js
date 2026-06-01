@@ -156,9 +156,12 @@ async function launchBrowser() {
 }
 
 // Crée un context stealth — réutilisable par cuaGetCentrisPDF / Annexes / Navigate
-async function newStealthContext(browser) {
-  const ua = pickUA();
-  const ctx = await browser.newContext({
+async function newStealthContext(browser, opts = {}) {
+  // PRIORITY: si storageState dispo (push depuis LaunchAgent Mac), l'utiliser
+  // → cookies + localStorage + sessionStorage + UA matching = session valide
+  const stored = opts.storageState ? null : loadBotCentrisStorageState();
+  const ua = (stored?.userAgent) || opts.userAgent || pickUA();
+  const contextOpts = {
     viewport: VIEWPORT,
     userAgent: ua,
     acceptDownloads: true,
@@ -183,7 +186,15 @@ async function newStealthContext(browser) {
       'sec-fetch-user': '?1',
       'upgrade-insecure-requests': '1',
     },
-  });
+  };
+  // Inject storageState si dispo (skip MFA, session valide direct)
+  if (stored?.storageState) {
+    contextOpts.storageState = stored.storageState;
+    console.log('[CUA] storageState applied to context — should skip MFA');
+  } else if (opts.storageState) {
+    contextOpts.storageState = opts.storageState;
+  }
+  const ctx = await browser.newContext(contextOpts);
   // Anti-detect script sur chaque page nouvelle
   await ctx.addInitScript(ANTI_DETECT_SCRIPT);
   return ctx;
@@ -251,6 +262,23 @@ function clearSession() {
 
 // Récupère cookies du bot principal (centris_cookies.json) si CUA n'a pas sa propre session
 // Le LaunchAgent Mac push les cookies fresh tous les 12h via /admin/centris-cookies
+// Charge storageState Playwright complet (cookies + localStorage + sessionStorage + UA)
+// Plus fiable que juste cookies. Source: LaunchAgent Mac centris-auto-login push.
+function loadBotCentrisStorageState() {
+  try {
+    const stateFile = path.join(DATA_DIR, 'centris_storage_state.json');
+    if (!fs.existsSync(stateFile)) return null;
+    const data = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (data.expiry && Date.now() > data.expiry) {
+      console.log('[CUA] storageState expiré');
+      return null;
+    }
+    if (!data.storageState || !data.storageState.cookies) return null;
+    console.log(`[CUA] storageState loaded: ${data.storageState.cookies.length} cookies + ${data.storageState.origins?.length || 0} origins, UA=${(data.userAgent||'').substring(0,80)}`);
+    return { storageState: data.storageState, userAgent: data.userAgent };
+  } catch (e) { console.warn('[CUA] loadBotCentrisStorageState:', e.message); return null; }
+}
+
 function loadBotCentrisCookies() {
   try {
     // Le bot principal sauve dans centris_session.json (bot.js CENTRIS_SESSION_FILE).
