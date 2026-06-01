@@ -15175,16 +15175,24 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
           }
         }
 
-        // Télécharge fiche descriptive PDF (Detaillé client avec album photos · Impérial)
-        out.steps.push(`télécharge fiche PDF Matrix...`);
-        if (cuaMod?.cuaGetCentrisPDF) {
-          const pdfResult = await cuaMod.cuaGetCentrisPDF(num);
+        // Télécharge fiche descriptive PDF via Matrix UI direct (PAS CUA agent — économique + plus fiable)
+        out.steps.push(`télécharge fiche PDF Matrix direct (timeout MFA 180s)...`);
+        if (cuaMod?.downloadCentrisFichePDF) {
+          const pdfResult = await cuaMod.downloadCentrisFichePDF(num);
           if (pdfResult.success && pdfResult.buffer && pdfResult.buffer.length > 5000) {
             pdfBuf = pdfResult.buffer;
             pdfFilename = pdfResult.filename || `Fiche_Centris_${num}.pdf`;
-            out.steps.push(`✅ fiche PDF ${Math.round(pdfBuf.length/1024)}KB${pdfResult.fromCache ? ' (cache)' : ''}`);
+            out.steps.push(`✅ fiche PDF ${Math.round(pdfBuf.length/1024)}KB${pdfResult.fromCache ? ' (cache)' : ''} via ${pdfResult.via || 'direct'}`);
           } else {
             out.steps.push(`⚠️ fiche PDF fail: ${pdfResult.message}. Email sans PJ.`);
+          }
+        } else if (cuaMod?.cuaGetCentrisPDF) {
+          // Fallback ancien CUA si nouvelle fonction pas dispo
+          const pdfResult = await cuaMod.cuaGetCentrisPDF(num);
+          if (pdfResult.success && pdfResult.buffer) {
+            pdfBuf = pdfResult.buffer;
+            pdfFilename = pdfResult.filename || `Fiche_Centris_${num}.pdf`;
+            out.steps.push(`✅ fiche PDF via CUA fallback ${Math.round(pdfBuf.length/1024)}KB`);
           }
         }
       }

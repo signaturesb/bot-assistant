@@ -358,9 +358,9 @@ Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accu
     const mfaVisible = await mfaField.isVisible().catch(() => false);
     if (!mfaVisible) break;
 
-    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — fetch code via Gmail (max 60s)...`);
-    const mfaCode = await fetchMFACodeFromBot(60000);
-    if (!mfaCode) throw new Error('MFA timeout — pas de code MFA reçu en 60s via Gmail/bot');
+    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — fetch code via Gmail (max 180s)...`);
+    const mfaCode = await fetchMFACodeFromBot(180000);
+    if (!mfaCode) throw new Error('MFA timeout — pas de code MFA reçu en 180s via Gmail/bot. Vérifier LaunchAgent sms-bridge actif sur Mac.');
     console.log(`[CUA] MFA code reçu: ${mfaCode.substring(0, 2)}****`);
 
     await mfaField.fill(mfaCode);
@@ -1893,8 +1893,156 @@ async function getCentrisListingPhotos(centrisNum) {
   }
 }
 
+/**
+ * Télécharge la fiche descriptive PDF officielle Centris (Detaillé client avec album photos · Impérial)
+ * Flow: Matrix UI direct (sans CUA agent — économique + fiable).
+ * Login → Search → Click result → Imprimer → format → "Imprimer en PDF" → capture download
+ *
+ * Anticipations proactives:
+ * - MFA timeout: 180s (vs 60s default cuaGetCentrisPDF)
+ * - Cache 24h: skip re-download si fichier récent dispo
+ * - Fallback: si "Imprimer en PDF" introuvable, use page.pdf() printBackground
+ *
+ * @param {string} centrisNum — # MLS (7-9 chiffres)
+ * @param {object} opts — { format='detaille_client_album_imperial' }
+ * @returns {Promise<{success, buffer, filename, fromCache, size, message}>}
+ */
+async function downloadCentrisFichePDF(centrisNum, opts = {}) {
+  if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
+  loadDeps();
+  initDirs();
+  const { format = 'detaille_client_album_imperial' } = opts;
+
+  // Cache 24h
+  const pdfCacheFile = path.join(PDF_DIR, `centris_${centrisNum}_fiche_${format}.pdf`);
+  if (fs.existsSync(pdfCacheFile)) {
+    const stat = fs.statSync(pdfCacheFile);
+    if (Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000 && stat.size > 10000) {
+      console.log(`[FICHE-PDF] Cache hit: ${pdfCacheFile} (${Math.round(stat.size/1024)}KB)`);
+      return {
+        success: true,
+        buffer: fs.readFileSync(pdfCacheFile),
+        filename: `Fiche_Centris_${centrisNum}.pdf`,
+        fromCache: true,
+        size: stat.size,
+      };
+    }
+  }
+
+  const FORMAT_TITLES = {
+    detaille_client_album_imperial: 'Detaillé client avec album de photos (Impérial)',
+    detaille_client_imperial: 'Detaillé client (Impérial)',
+    sommaire_imperial: 'Sommaire (Impérial)',
+  };
+  const formatTitle = FORMAT_TITLES[format] || FORMAT_TITLES.detaille_client_album_imperial;
+
+  let browser = null;
+  try {
+    browser = await launchBrowser();
+    const context = await newStealthContext(browser);
+    // Capture downloads
+    let downloadedBuffer = null;
+    let downloadedFilename = `Fiche_Centris_${centrisNum}.pdf`;
+    context.on('page', p => {
+      p.on('download', async (d) => {
+        try {
+          const tmpPath = path.join(PDF_DIR, `dl_${Date.now()}_${d.suggestedFilename()}`);
+          await d.saveAs(tmpPath);
+          downloadedBuffer = fs.readFileSync(tmpPath);
+          downloadedFilename = d.suggestedFilename() || downloadedFilename;
+          fs.unlinkSync(tmpPath);
+        } catch (e) { console.warn('[FICHE-PDF] download error:', e.message); }
+      });
+    });
+
+    const page = await loginCentris(context);
+
+    // 1. Search listing
+    console.log(`[FICHE-PDF] Search #${centrisNum}`);
+    await page.fill('#QueryText', String(centrisNum));
+    await page.locator('#QueryText').press('Enter');
+    await page.waitForTimeout(3000);
+
+    // 2. Click result link
+    const clicked = await page.evaluate((n) => {
+      const a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === String(n));
+      if (a) { a.click(); return true; }
+      return false;
+    }, centrisNum);
+    if (!clicked) throw new Error(`Listing #${centrisNum} non trouvé`);
+    await page.waitForTimeout(3000);
+
+    // 3. Click Imprimer
+    console.log('[FICHE-PDF] Click Imprimer');
+    await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('a,button,input')]
+        .find(b => /^imprimer$/i.test((b.textContent || b.value || '').trim()));
+      if (btn) btn.click();
+    });
+    await page.waitForURL(/PrintOptions/, { timeout: 20000 });
+    await page.waitForTimeout(2000);
+
+    // 4. Select format
+    console.log(`[FICHE-PDF] Format: ${formatTitle}`);
+    const formatSelected = await page.evaluate((title) => {
+      const li = [...document.querySelectorAll('li')].find(l => l.title === title);
+      const cb = li?.querySelector('input[type=checkbox]');
+      if (cb) { cb.checked = true; cb.click(); return true; }
+      return false;
+    }, formatTitle);
+    if (!formatSelected) throw new Error(`Format "${formatTitle}" non trouvé`);
+    await page.waitForTimeout(1000);
+
+    // 5. Click "Imprimer en PDF" (PAS "Envoyer par courriel")
+    console.log('[FICHE-PDF] Click Imprimer en PDF');
+    const printClicked = await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('a,button,input')]
+        .find(b => /imprimer\s+en\s+pdf/i.test((b.textContent || b.value || '').trim()));
+      if (btn) { btn.click(); return true; }
+      return false;
+    });
+    if (!printClicked) throw new Error('Bouton "Imprimer en PDF" non trouvé');
+
+    // 6. Wait for download
+    const startWait = Date.now();
+    while (!downloadedBuffer && (Date.now() - startWait) < 45000) {
+      await page.waitForTimeout(500);
+    }
+
+    if (!downloadedBuffer) {
+      // Fallback page.pdf() si pas de download capturé
+      console.log('[FICHE-PDF] Fallback page.pdf()');
+      try {
+        const pdfBuffer = await page.pdf({ format: 'Letter', printBackground: true });
+        if (pdfBuffer && pdfBuffer.length > 5000) {
+          fs.writeFileSync(pdfCacheFile, pdfBuffer);
+          return { success: true, buffer: pdfBuffer, filename: downloadedFilename, fromCache: false, size: pdfBuffer.length, via: 'page.pdf' };
+        }
+      } catch {}
+      throw new Error('Timeout download PDF (45s) + fallback page.pdf échoué');
+    }
+
+    fs.writeFileSync(pdfCacheFile, downloadedBuffer);
+    console.log(`[FICHE-PDF] ✅ ${Math.round(downloadedBuffer.length/1024)}KB`);
+    return {
+      success: true,
+      buffer: downloadedBuffer,
+      filename: downloadedFilename,
+      fromCache: false,
+      size: downloadedBuffer.length,
+      via: 'matrix-direct',
+    };
+  } catch (e) {
+    console.error('[FICHE-PDF] error:', e.message);
+    return { success: false, message: e.message?.substring(0, 200) };
+  } finally {
+    if (browser) try { await browser.close(); } catch {}
+  }
+}
+
 module.exports = {
   getCentrisListingPhotos,
+  downloadCentrisFichePDF,
   cuaGetCentrisPDF,
   cuaGetCentrisAnnexes,
   cuaNavigate,
