@@ -11949,8 +11949,9 @@ async function briefingMatin() {
   }
 }
 
-// 🛡️ Cron 6h30 — purge auto activités génériques Pipedrive
-// (créées par workflow Pipedrive natif ou import externe — bot lui-même bloque déjà)
+// 🛡️ Cron purge auto activités génériques Pipedrive — TOUTES LES HEURES
+// 2026-06-01: dealmonitor désactivé (vraie source). Cron horaire = filet sécurité.
+// Si > 0 détectées = une NOUVELLE source est apparue → ALERTE Telegram immédiate.
 async function pipedriveCleanupAuto() {
   if (!ALLOWED_ID || !process.env.WEBHOOK_SECRET) return;
   try {
@@ -11968,15 +11969,21 @@ async function pipedriveCleanupAuto() {
     const sh = out.shawn || {};
     const total = (g.deleted || 0) + (d.fermes || 0) + (nc.fermes || 0) + (sh.deleted || 0);
     if (total > 0) {
+      // 🚨 Si génériques > 0 = NOUVELLE source apparue (dealmonitor désactivé 2026-06-01)
+      // Alerte spéciale pour identifier le coupable
+      const alertGeneric = (g.deleted || 0) > 0
+        ? `\n🚨 *NOUVELLE SOURCE détectée!* ${g.deleted} activité(s) génériques créées depuis 1h.\nVérifie tes LaunchAgents Mac + Zapier/Make.com + autres scripts qui appellent l'API Pipedrive.\nLes 9 LaunchAgents historiques sont propres — c'est qqch de nouveau.\n`
+        : '';
       const msg = [
-        `🧼 *Pipedrive cleanup auto (6h30)*`,
+        `🧼 *Pipedrive cleanup cron horaire*`,
         ``,
         `✅ ${g.deleted || 0} activité(s) générique(s) supprimée(s)`,
         `✅ ${d.fermes || 0} doublon(s) fermé(s)`,
         `✅ ${nc.fermes || 0} activité(s) sans coordonnées fermée(s)`,
         `✅ ${sh.deleted || 0} activité(s) Shawn-as-contact supprimée(s)`,
         `📊 Scanné: ${out.total_scanned || '?'}`,
-        out.retards?.count > 0 ? `\n⚠️ ${out.retards.count} retard(s) (audit only)` : '',
+        alertGeneric,
+        out.retards?.count > 0 ? `⚠️ ${out.retards.count} retard(s) (audit only)` : '',
       ].filter(Boolean).join('\n');
       await sendTelegramWithFallback(msg, { category: 'pipedrive-cleanup-cron' }).catch(() => {});
     }
