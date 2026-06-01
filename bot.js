@@ -15293,6 +15293,29 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       out.success = true;
       out.finished = new Date().toISOString();
       out.elapsed_ms = Date.now() - new Date(out.started).getTime();
+
+      // 🔔 NOTIF TELEGRAM auto à chaque envoi white-label (intelligence proactive)
+      try {
+        const tgMsg = [
+          `📧 *Listing envoyé — ${listingData.adresse}*`,
+          ``,
+          `📬 À: ${toEmail}`,
+          `🏠 #${listingData.centrisNum} · ${listingData.type} · ${listingData.prix}`,
+          `📸 ${listingData.photos?.length || 0} photos extraites`,
+          pdfBuf ? `📄 Fiche PDF jointe (${Math.round(pdfBuf.length/1024)}KB)` : `⚠️ Fiche PDF non jointe (scraping Matrix échoué)`,
+          ``,
+          `⏱️ ${Math.round(out.elapsed_ms/1000)}s · Template SB v11`,
+        ].join('\n');
+        await sendTelegramWithFallback(tgMsg, { category: 'white-label-sent' }).catch(() => {});
+      } catch {}
+
+      // Audit log persistant
+      auditLogEvent('white-label', 'sent', {
+        to: toEmail, num: listingData.centrisNum, adresse: listingData.adresse,
+        photos: listingData.photos?.length || 0, pdf_attached: !!pdfBuf,
+        elapsed_ms: out.elapsed_ms,
+      });
+
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(out, null, 2));
     } catch (e) {
