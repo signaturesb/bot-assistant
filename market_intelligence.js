@@ -200,6 +200,27 @@ const SOURCES = {
       return { fixe_5ans: m5fix, variable_5ans: m5var, resume: md.substring(0, 1500), scraped_at: new Date().toISOString() };
     },
   },
+  dominion: {
+    label: 'Centres Hypothécaires Dominion — Taux',
+    url: 'https://hypothecairesdominion.ca/taux-et-preteurs',
+    keywords: ['taux', 'variable', 'préférentiel', '5 ans', '3 ans', 'fixe', 'paiement'],
+    fresh: true,
+    extract: (md) => {
+      const m5fix  = findRateNear(md, ['5 ans', '5-year'], { min: 2, max: 10 });
+      const m3fix  = findRateNear(md, ['3 ans', '3-year'], { min: 2, max: 10 });
+      const m2fix  = findRateNear(md, ['2 ans', '2-year'], { min: 2, max: 10 });
+      const mVar   = findRateNear(md, ['variable'], { min: 2, max: 10 });
+      const mPref  = findRateNear(md, ['préférentiel', 'prime'], { min: 2, max: 10 });
+      const m10ans = findRateNear(md, ['10 ans', '10-year'], { min: 2, max: 10 });
+      return {
+        fixe_5ans: m5fix, fixe_3ans: m3fix, fixe_2ans: m2fix,
+        variable: mVar, prime: mPref, fixe_10ans: m10ans,
+        resume: md.substring(0, 1500),
+        scraped_at: new Date().toISOString(),
+        notes: 'Source officielle Dominion. Le courtier peut négocier 0.30-0.60 bps sous ces taux.',
+      };
+    },
+  },
   // === STATS MARCHÉ QC ===
   apciq: {
     label: 'APCIQ — Statistiques marché QC',
