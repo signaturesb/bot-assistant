@@ -3886,6 +3886,188 @@ function firePreviewDocs({ email, nom, centris, deal, match }) {
   });
 }
 
+// ─── Template HTML v11 — Envoi listing white-label Signature SB ──────────────
+// Validé après 11 itérations Shawn (2026-06-01). Référence:
+// memory/reference_template_white_label_listing_v11_FINAL.md
+function buildWhiteLabelHTMLv11(data) {
+  const d = data || {};
+  const e = s => escapeHtml(String(s || ''));
+  const renderPhotosThumbs = () => {
+    const photos = d.photos || []; // array d'URLs
+    let html = '';
+    for (let i = 0; i < 6; i++) {
+      const url = photos[i];
+      const cell = url
+        ? `<img src="${e(url)}" alt="" style="display:block;width:100%;height:100px;object-fit:cover;border-radius:4px;">`
+        : `<div class="photo-thumb" style="background:#1a1a1a;height:100px;border-radius:4px;text-align:center;line-height:100px;color:#666;font-size:10px;">photo ${i+2}</div>`;
+      const padR = i % 3 === 2 ? 0 : 4;
+      const padL = i % 3 === 0 ? 0 : 4;
+      const padB = i < 3 ? 8 : 0;
+      html += `<td width="33%" style="padding:0 ${padR}px ${padB}px ${padL}px;">${cell}</td>`;
+      if (i % 3 === 2 && i < 5) html += '</tr><tr>';
+    }
+    return html;
+  };
+  const photoMainHTML = d.photoMainUrl
+    ? `<img src="${e(d.photoMainUrl)}" alt="${e(d.adresse)}" style="display:block;width:100%;height:auto;border-radius:8px;border:1px solid #1e1e1e;">`
+    : `<div class="photo-main" style="background:linear-gradient(135deg,#1a1a1a,#0d0d0d);border:1px solid #1e1e1e;border-radius:8px;height:340px;text-align:center;color:#666;font-size:13px;letter-spacing:2px;text-transform:uppercase;padding:140px 0;">[PHOTO PRINCIPALE HAUTE RÉS]<br><span style="color:#888;font-size:11px;">scrapée Centris auto</span></div>`;
+
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=yes">
+<meta name="color-scheme" content="dark">
+<meta name="format-detection" content="telephone=no,date=no,address=no,email=no">
+<meta name="x-apple-disable-message-reformatting">
+<title>Voici la propriété</title>
+<style>
+  body{margin:0!important;padding:0!important;background:#060606;font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',Arial,sans-serif;width:100%;-webkit-text-size-adjust:100%;}
+  table{border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;}
+  img{display:block;border:0;outline:none;text-decoration:none;-ms-interpolation-mode:bicubic;max-width:100%;height:auto;}
+  a{color:#aa0721;text-decoration:none;}
+  .container{max-width:720px;width:100%;}
+  .outer-pad{padding:24px 16px;}
+  @media only screen and (max-width:680px){
+    .outer-pad{padding:0!important;}
+    .container{width:100%!important;max-width:100%!important;border-radius:0!important;}
+    .hero-prix{font-size:44px!important;}
+    .hero-titre{font-size:32px!important;}
+    .pad{padding:20px 16px!important;}
+    .pad-top{padding-top:32px!important;}
+    .photo-main{height:220px!important;}
+    .photo-thumb{height:74px!important;line-height:74px!important;}
+    .ref-prix{font-size:48px!important;}
+    .cta-btn{padding:14px 24px!important;font-size:12px!important;}
+    .header-right{display:none!important;}
+    .logo-sb{width:260px!important;max-width:260px!important;}
+    .slogan-sb{font-size:11px!important;}
+    .site-btn{padding:13px 24px!important;font-size:12px!important;}
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background:#060606;">
+<table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#060606">
+<tr><td align="center" bgcolor="#060606" class="outer-pad" style="padding:24px 16px;">
+<table class="container" width="720" cellpadding="0" cellspacing="0" border="0" bgcolor="#0a0a0a" style="max-width:720px;width:100%;border-radius:8px;overflow:hidden;">
+  <tr><td style="background:#aa0721;padding:12px 24px;">
+    <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+      <td style="color:#fff;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;">Propriété sélectionnée pour vous</td>
+      <td align="right" class="header-right" style="color:rgba(255,255,255,0.85);font-size:11px;letter-spacing:1px;">${e(new Date().toLocaleDateString('fr-CA', { month: 'long', year: 'numeric', timeZone: 'America/Toronto' }))}</td>
+    </tr></table>
+  </td></tr>
+  <tr><td class="pad" style="background:#0d0d0d;padding:32px 24px 28px;text-align:center;">
+    <a href="https://www.signaturesb.com" target="_blank" rel="noopener" style="text-decoration:none;"><img src="https://signaturesb-bot-s272.onrender.com/logo/sb" alt="Signature SB · Groupe Immobilier" width="300" class="logo-sb" style="display:block;max-width:300px;height:auto;margin:0 auto 14px;border:0;"></a>
+    <div style="width:80px;height:1px;background:#aa0721;margin:0 auto 14px;"></div>
+    <div class="slogan-sb" style="color:#aa0721;font-size:12px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;line-height:1.4;">Spécialiste résidentiel &amp; terrains</div>
+  </td></tr>
+  <tr><td style="height:2px;background:linear-gradient(90deg,#aa0721,transparent);"></td></tr>
+  <tr><td class="pad pad-top" style="padding:40px 24px 28px;text-align:center;">
+    <div style="color:#888;font-size:12px;letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;">Bonjour,</div>
+    <div class="hero-titre" style="font-family:Georgia,serif;font-size:40px;font-weight:800;color:#f5f5f7;line-height:1.1;letter-spacing:-1px;">Voici la propriété<span style="color:#aa0721;">!</span></div>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 20px;">${photoMainHTML}</td></tr>
+  <tr><td class="pad" style="padding:0 24px 14px;text-align:center;">
+    <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">📍 Adresse</div>
+    <div style="color:#f5f5f7;font-size:22px;font-weight:700;line-height:1.3;">${e(d.adresse)}</div>
+  </td></tr>
+  <tr><td class="pad" style="padding:20px 24px 28px;text-align:center;">
+    <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;">💰 Prix demandé</div>
+    <div class="hero-prix" style="font-family:Georgia,serif;font-size:60px;font-weight:800;color:#aa0721;line-height:1;letter-spacing:-2px;white-space:nowrap;">${e(d.prix).replace(/ /g, '&nbsp;')}</div>
+    <div style="color:#888;font-size:13px;margin-top:10px;">N° Centris ${e(d.centrisNum)} · ${e(d.type)} · ${e(d.statut)}</div>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 24px;">
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td width="33%" style="padding:16px 10px;background:#0d0d0d;border:1px solid #1a1a1a;border-radius:6px 0 0 6px;text-align:center;">
+          <div style="color:#666;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">🛏 Chambres</div>
+          <div style="color:#f5f5f7;font-size:24px;font-weight:800;">${e(d.chambres)}</div>
+        </td>
+        <td width="33%" style="padding:16px 10px;background:#0d0d0d;border:1px solid #1a1a1a;border-left:none;text-align:center;">
+          <div style="color:#666;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">🛁 SDB</div>
+          <div style="color:#f5f5f7;font-size:24px;font-weight:800;">${e(d.sdb)}</div>
+        </td>
+        <td width="34%" style="padding:16px 10px;background:#0d0d0d;border:1px solid #1a1a1a;border-left:none;border-radius:0 6px 6px 0;text-align:center;">
+          <div style="color:#666;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">📅 Année</div>
+          <div style="color:#f5f5f7;font-size:24px;font-weight:800;">${e(d.annee)}</div>
+        </td>
+      </tr>
+      <tr><td colspan="3" style="height:8px;"></td></tr>
+      <tr>
+        <td width="50%" style="padding:16px 12px;background:#0d0d0d;border:1px solid #1a1a1a;border-radius:6px 0 0 6px;text-align:center;">
+          <div style="color:#666;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">🏠 Superficie</div>
+          <div style="color:#f5f5f7;font-size:18px;font-weight:700;white-space:nowrap;">${e(d.superficie).replace(/ /g, '&nbsp;')}</div>
+        </td>
+        <td colspan="2" width="50%" style="padding:16px 12px;background:#0d0d0d;border:1px solid #1a1a1a;border-left:none;border-radius:0 6px 6px 0;text-align:center;">
+          <div style="color:#666;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px;">🌳 Terrain</div>
+          <div style="color:#f5f5f7;font-size:18px;font-weight:700;white-space:nowrap;">${e(d.terrain).replace(/ /g, '&nbsp;')}</div>
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 24px;">
+    <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">📝 Description</div>
+    <div style="color:#cccccc;font-size:14px;line-height:1.7;background:#0d0d0d;border:1px solid #1a1a1a;border-radius:8px;padding:20px;">${e(d.description)}</div>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 24px;">
+    <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;">📸 Album photos (${e(d.nbPhotos || 12)})</div>
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>${renderPhotosThumbs()}</tr></table>
+    <div style="color:#888;font-size:12px;text-align:center;margin-top:10px;">Album complet dans la fiche descriptive jointe ↓</div>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 24px;">
+    <div style="background:#0d0d0d;border:1px solid #1e1e1e;border-radius:8px;padding:20px;">
+      <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;">📎 Pièces jointes</div>
+      <div style="color:#f5f5f7;font-size:14px;line-height:1.9;">
+        <strong style="color:#aa0721;">📄 Fiche descriptive Centris officielle</strong><br>
+        <span style="color:#888;font-size:12px;">Detaillé client avec album photos · Impérial</span><br><br>
+        <span style="color:#999;">📄 Déclaration du vendeur (DV signée)</span><br>
+        <span style="color:#999;">📄 Facture taxes municipales</span><br>
+        <span style="color:#999;">📄 Facture taxes scolaires</span><br>
+        <span style="color:#999;">📄 Certificat de localisation</span><br>
+        <span style="color:#999;">📄 Plans cadastraux</span>
+      </div>
+    </div>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 24px;">
+    <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:6px;padding:36px 24px;text-align:center;">
+      <div style="font-family:Georgia,serif;font-size:26px;font-style:italic;color:#f5f5f7;margin-bottom:12px;line-height:1.3;">Vous voulez visiter?</div>
+      <div style="color:#888;font-size:14px;margin-bottom:24px;line-height:1.6;">Appelez-moi directement, je coordonne avec le vendeur.</div>
+      <a href="tel:+15149271340" class="cta-btn" style="display:inline-block;background:#aa0721;color:#fff;font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:16px 28px;border-radius:3px;text-decoration:none;white-space:nowrap;">📞 514-927-1340</a>
+      <div style="color:#444;font-size:11px;margin-top:16px;">Shawn Barrette · RE/MAX PRESTIGE</div>
+    </div>
+  </td></tr>
+  <tr><td class="pad" style="padding:0 24px 28px;">
+    <div style="background:#0d0d0d;border:1px solid #1e1e1e;border-top:4px solid #aa0721;border-radius:4px;padding:36px 24px;text-align:center;">
+      <div style="color:#aa0721;font-size:10px;font-weight:700;letter-spacing:3px;text-transform:uppercase;margin-bottom:14px;">💰 Programme référence</div>
+      <div style="font-family:Georgia,serif;font-size:20px;color:#f5f5f7;line-height:1.3;margin-bottom:32px;">Vous connaissez quelqu'un<br>qui veut acheter ou vendre?</div>
+      <div style="margin-bottom:24px;"><div class="ref-prix" style="font-family:Georgia,serif;font-size:60px;font-weight:800;color:#aa0721;line-height:1;letter-spacing:-2px;white-space:nowrap;">500$</div></div>
+      <div style="width:50px;height:2px;background:linear-gradient(90deg,transparent,#aa0721,transparent);margin:0 auto 24px;"></div>
+      <div style="margin-bottom:32px;"><div class="ref-prix" style="font-family:Georgia,serif;font-size:60px;font-weight:800;color:#aa0721;line-height:1;letter-spacing:-2px;white-space:nowrap;">1&nbsp;000$</div></div>
+      <div style="color:#cccccc;font-size:13px;line-height:1.7;margin-bottom:24px;">Pour chaque référence conclue.<br>Pas de paperasse — juste un appel.<br>Payé à la signature chez le notaire.</div>
+      <a href="tel:+15149271340" class="cta-btn" style="display:inline-block;background:#aa0721;color:#fff;font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:14px 28px;border-radius:3px;text-decoration:none;white-space:nowrap;">Référer quelqu'un</a>
+    </div>
+  </td></tr>
+  <tr><td class="pad" style="background:#080808;padding:28px 24px 24px;border-top:1px solid #111;">
+    <img src="https://signaturesb-bot-s272.onrender.com/logo/remax" alt="RE/MAX" width="140" style="display:block;max-width:140px;height:auto;margin-bottom:18px;">
+    <div style="color:#cccccc;font-size:14px;line-height:1.9;margin-bottom:22px;">
+      <strong style="color:#f5f5f7;font-size:16px;display:block;margin-bottom:4px;">Shawn Barrette</strong>
+      <span style="color:#888;font-size:13px;">Courtier immobilier · RE/MAX PRESTIGE</span><br><br>
+      <table cellpadding="0" cellspacing="0" border="0" style="margin-top:4px;">
+        <tr><td style="padding:3px 0;">📞 <a href="tel:+15149271340" style="color:#aa0721;text-decoration:none;font-weight:600;white-space:nowrap;">514-927-1340</a></td></tr>
+        <tr><td style="padding:3px 0;">✉️ <a href="mailto:shawn@signaturesb.com" style="color:#aa0721;text-decoration:none;font-weight:600;">shawn@signaturesb.com</a></td></tr>
+        <tr><td style="padding:3px 0;">🌐 <a href="https://www.signaturesb.com" target="_blank" rel="noopener" style="color:#aa0721;text-decoration:underline;font-weight:600;">www.signaturesb.com</a></td></tr>
+      </table>
+    </div>
+    <a href="https://www.signaturesb.com" target="_blank" rel="noopener" class="site-btn" style="display:inline-block;background:#1a1a1a;border:1px solid #aa0721;color:#aa0721;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:14px 28px;border-radius:3px;text-decoration:none;">🌐 Voir mes inscriptions →</a>
+    <div style="color:#444;font-size:10px;line-height:1.6;margin-top:20px;border-top:1px solid #111;padding-top:14px;">Signature SB · Groupe Immobilier · RE/MAX PRESTIGE</div>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>`;
+}
+
 async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   const _t0 = Date.now();
   log('INFO', 'DOCS', `[STEP 1/9] envoyerDocsProspect START — terme="${terme}" email="${emailDest||'(none)'}" fichier="${fichier||'TOUS'}" opts=${JSON.stringify({dealHint:!!opts.dealHint,centrisHint:opts.centrisHint||null,folderHint:opts.folderHint?.name||null,preview:!!opts.preview,cc:opts.cc||null})}`);
@@ -14935,6 +15117,131 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     out.elapsed_ms = Date.now() - new Date(out.started).getTime();
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  // ─── GET /admin/test-white-label?to=email — envoi test template v11 réel + PDFs
+  // Génère HTML template v11 Saint-Esprit, attache PDFs exemple Dropbox, envoie Gmail OAuth.
+  // Use case: test final avant tool envoyer_listing_white_label complet (avec scraping).
+  if (req.method === 'GET' && url.startsWith('/admin/test-white-label')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const tok = u.searchParams.get('token') || '';
+    if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
+    const toEmail = u.searchParams.get('to') || AGENT.email;
+    if (!/@/.test(toEmail)) { res.writeHead(400); res.end(JSON.stringify({error: 'to=email requis'})); return; }
+    const out = { to: toEmail, started: new Date().toISOString(), steps: [] };
+    try {
+      // 1. Build HTML v11 (data Saint-Esprit hardcoded pour test)
+      out.steps.push('build HTML v11');
+      const htmlV11 = buildWhiteLabelHTMLv11({
+        adresse: '280 Rang Montcalm, Saint-Esprit',
+        prix: '799 000$',
+        centrisNum: '18366287',
+        type: 'Fermette',
+        statut: 'En vigueur',
+        chambres: '4', sdb: '2', annee: '1985',
+        superficie: '2 240 pc', terrain: '5 384 545 pc',
+        description: 'Magnifique fermette sur 124 acres avec maison ancestrale entièrement rénovée, grande grange double, étang naturel, terre cultivable et boisé mature. Vue imprenable sur les Laurentides. Idéale pour fermette d\'agrément, équestre ou projet de développement.',
+        nbPhotos: 12,
+      });
+      out.steps.push(`HTML built (${htmlV11.length} chars)`);
+
+      // 2. Get Gmail token
+      const token = await getGmailToken();
+      if (!token) {
+        out.error = 'Gmail token absent';
+        res.writeHead(503); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      out.steps.push('Gmail token OK');
+
+      // 3. Build MIME multipart avec HTML + PJ exemple (1 PDF placeholder)
+      // Pour le vrai test: scraper Matrix PDF officielle + annexes Dropbox.
+      // Ici: placeholder PDF généré inline (just for test).
+      const pdfPlaceholder = Buffer.from(
+        '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n' +
+        '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n' +
+        '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>>>>>>>endobj\n' +
+        '4 0 obj<</Length 100>>stream\nBT /F1 18 Tf 100 700 Td (Fiche descriptive Centris - TEST PLACEHOLDER) Tj ET\nendstream\nendobj\n' +
+        'xref\n0 5\n0000000000 65535 f\n0000000009 00000 n\n0000000058 00000 n\n0000000110 00000 n\n0000000235 00000 n\ntrailer<</Size 5/Root 1 0 R>>\nstartxref\n400\n%%EOF'
+      );
+
+      const outer = `wlOut${Date.now()}`;
+      const inner = `wlAlt${Date.now()}`;
+      const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+      const subject = `Voici la propriété! — 280 Rang Montcalm, Saint-Esprit`;
+
+      const lines = [
+        `From: ${AGENT.nom} · Signature SB <${AGENT.email}>`,
+        `To: ${toEmail}`,
+        `Reply-To: ${AGENT.email}`,
+        `Subject: ${enc(subject)}`,
+        'MIME-Version: 1.0',
+        `Content-Type: multipart/mixed; boundary="${outer}"`,
+        '',
+        `--${outer}`,
+        `Content-Type: multipart/alternative; boundary="${inner}"`,
+        '',
+        `--${inner}`,
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: 8bit',
+        '',
+        `Voici la propriété!\n\n280 Rang Montcalm, Saint-Esprit\n799 000$\nN° Centris 18366287 · Fermette · En vigueur\n\nAppelez-moi: 514-927-1340\n${AGENT.email}\nhttps://www.signaturesb.com`,
+        '',
+        `--${inner}`,
+        'Content-Type: text/html; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        Buffer.from(htmlV11, 'utf-8').toString('base64'),
+        `--${inner}--`,
+        '',
+        `--${outer}`,
+        'Content-Type: application/pdf',
+        'Content-Disposition: attachment; filename="Fiche_descriptive_Saint-Esprit_TEST.pdf"',
+        'Content-Transfer-Encoding: base64',
+        '',
+        pdfPlaceholder.toString('base64'),
+        '',
+        `--${outer}--`,
+      ];
+      const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+      out.steps.push(`MIME built (raw ${Math.round(raw.length/1024)}KB)`);
+
+      // 4. Send via sendEmailLogged
+      const logged = await sendEmailLogged({
+        via: 'gmail',
+        to: toEmail,
+        cc: [],
+        subject,
+        category: 'test-white-label',
+        shawnConsent: true,
+        sendFn: async () => {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 30000);
+          try {
+            return await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+              method: 'POST', signal: ctrl.signal,
+              headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ raw }),
+            });
+          } finally { clearTimeout(t); }
+        },
+      });
+      if (!logged.ok) {
+        out.error = `Gmail send fail ${logged.status}: ${(logged.error||'').substring(0,200)}`;
+        res.writeHead(500); res.end(JSON.stringify(out, null, 2)); return;
+      }
+      out.steps.push('✅ Gmail envoyé');
+      out.success = true;
+      out.finished = new Date().toISOString();
+      out.elapsed_ms = Date.now() - new Date(out.started).getTime();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(out, null, 2));
+    } catch (e) {
+      out.exception = e.message;
+      out.stack = (e.stack || '').split('\n').slice(0, 5);
+      res.writeHead(500); res.end(JSON.stringify(out, null, 2));
+    }
     return;
   }
 
