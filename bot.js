@@ -12351,11 +12351,12 @@ function startDailyTasks() {
     if (h === 6  && lastCron.trashCI !== todayStr)  { lastCron.trashCI = todayStr; autoTrashGitHubNoise(); }
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
-    // 🛡️ Cron 6h30 — purge Pipedrive auto (activités génériques "appeler contact/prospect"
-    // créées par workflow Pipedrive natif ou autre source externe — bot lui-même bloque déjà
-    // via SHAWN_GERE_SES_SUIVIS, mais les imports externes/règles Pipedrive ne respectent pas).
-    if (h === 6 && m >= 30 && lastCron.pdCleanup !== todayStr) {
-      lastCron.pdCleanup = todayStr;
+    // 🛡️ Cron purge Pipedrive — TOUTES LES HEURES (pas juste 6h30)
+    // Pipedrive workflow automation natif recrée ces activités constamment.
+    // En attendant que Shawn désactive le workflow dans Pipedrive UI:
+    // → cleanup horaire pour éviter accumulation
+    if (m === 30 && lastCron.pdCleanupHour !== `${todayStr}_${h}`) {
+      lastCron.pdCleanupHour = `${todayStr}_${h}`;
       pipedriveCleanupAuto().catch(e => log('WARN', 'CRON', `pdCleanup: ${e.message}`));
     }
     // 📊 Cron 7h30 — Briefing matin (visites + stagnants + prochaine campagne)
