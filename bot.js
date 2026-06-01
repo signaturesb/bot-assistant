@@ -15120,21 +15120,28 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     return;
   }
 
-  // ─── GET /admin/test-white-label?to=email — envoi test template v11 réel + PDFs
-  // Génère HTML template v11 Saint-Esprit, attache PDFs exemple Dropbox, envoie Gmail OAuth.
-  // Use case: test final avant tool envoyer_listing_white_label complet (avec scraping).
+  // ─── GET /admin/test-white-label?to=email&num=N — envoi listing white-label réel
+  // Si num= fourni: scrape photos publiques + télécharge fiche PDF Centris + envoie HTML v11
+  // Si num= absent: data Saint-Esprit hardcoded + PDF placeholder (test design only)
   if (req.method === 'GET' && url.startsWith('/admin/test-white-label')) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
     const tok = u.searchParams.get('token') || '';
     if (tok !== process.env.WEBHOOK_SECRET) { res.writeHead(401); res.end('unauthorized'); return; }
     const toEmail = u.searchParams.get('to') || AGENT.email;
-    if (!/@/.test(toEmail)) { res.writeHead(400); res.end(JSON.stringify({error: 'to=email requis'})); return; }
-    const out = { to: toEmail, started: new Date().toISOString(), steps: [] };
+    const num = (u.searchParams.get('num') || '').replace(/\D/g, '').trim();
+    // PRE-FLIGHT 1: validate email format
+    if (!/@/.test(toEmail) || !/^[^@]+@[^@]+\.[^@]+$/.test(toEmail)) {
+      res.writeHead(400); res.end(JSON.stringify({error: 'to=email valide requis'})); return;
+    }
+    // PRE-FLIGHT 2: validate centris num format si fourni
+    if (num && !/^\d{7,9}$/.test(num)) {
+      res.writeHead(400); res.end(JSON.stringify({error: 'num=N invalide (7-9 chiffres)'})); return;
+    }
+    const out = { to: toEmail, num: num || null, started: new Date().toISOString(), steps: [] };
     try {
-      // 1. Build HTML v11 (data Saint-Esprit hardcoded pour test)
-      out.steps.push('build HTML v11');
-      const htmlV11 = buildWhiteLabelHTMLv11({
+      // 1. Si num: scrape photos + télécharge fiche PDF
+      let listingData = {
         adresse: '280 Rang Montcalm, Saint-Esprit',
         prix: '799 000$',
         centrisNum: '18366287',
@@ -15144,7 +15151,48 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         superficie: '2 240 pc', terrain: '5 384 545 pc',
         description: 'Magnifique fermette sur 124 acres avec maison ancestrale entièrement rénovée, grande grange double, étang naturel, terre cultivable et boisé mature. Vue imprenable sur les Laurentides. Idéale pour fermette d\'agrément, équestre ou projet de développement.',
         nbPhotos: 12,
-      });
+        photos: [],
+        photoMainUrl: null,
+      };
+      let pdfBuf = null;
+      let pdfFilename = 'Fiche_descriptive_Centris.pdf';
+
+      if (num) {
+        // Scrape photos publiques (rapide, no login)
+        out.steps.push(`scrape photos publiques #${num}`);
+        const cuaMod = getCUA();
+        if (cuaMod?.getCentrisListingPhotos) {
+          const photoResult = await cuaMod.getCentrisListingPhotos(num);
+          if (photoResult.success) {
+            listingData.photos = photoResult.photos;
+            listingData.photoMainUrl = photoResult.main;
+            listingData.nbPhotos = photoResult.count;
+            listingData.centrisNum = num;
+            if (photoResult.adresse) listingData.adresse = photoResult.adresse;
+            if (photoResult.prix) listingData.prix = photoResult.prix;
+            out.steps.push(`✅ ${photoResult.count} photos extraites + adresse "${photoResult.adresse || '?'}"`);
+          } else {
+            out.steps.push(`⚠️ photos publiques fail: ${photoResult.message}`);
+          }
+        }
+
+        // Télécharge fiche descriptive PDF (Detaillé client avec album photos · Impérial)
+        out.steps.push(`télécharge fiche PDF Matrix...`);
+        if (cuaMod?.cuaGetCentrisPDF) {
+          const pdfResult = await cuaMod.cuaGetCentrisPDF(num);
+          if (pdfResult.success && pdfResult.buffer && pdfResult.buffer.length > 5000) {
+            pdfBuf = pdfResult.buffer;
+            pdfFilename = pdfResult.filename || `Fiche_Centris_${num}.pdf`;
+            out.steps.push(`✅ fiche PDF ${Math.round(pdfBuf.length/1024)}KB${pdfResult.fromCache ? ' (cache)' : ''}`);
+          } else {
+            out.steps.push(`⚠️ fiche PDF fail: ${pdfResult.message}. Email sans PJ.`);
+          }
+        }
+      }
+
+      // 2. Build HTML v11 avec data (réelle ou test)
+      out.steps.push('build HTML v11');
+      const htmlV11 = buildWhiteLabelHTMLv11(listingData);
       out.steps.push(`HTML built (${htmlV11.length} chars)`);
 
       // 2. Get Gmail token
@@ -15155,22 +15203,20 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       }
       out.steps.push('Gmail token OK');
 
-      // 3. Build MIME multipart avec HTML + PJ exemple (1 PDF placeholder)
-      // Pour le vrai test: scraper Matrix PDF officielle + annexes Dropbox.
-      // Ici: placeholder PDF généré inline (just for test).
-      const pdfPlaceholder = Buffer.from(
-        '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n' +
-        '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n' +
-        '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>>>>>>>endobj\n' +
-        '4 0 obj<</Length 100>>stream\nBT /F1 18 Tf 100 700 Td (Fiche descriptive Centris - TEST PLACEHOLDER) Tj ET\nendstream\nendobj\n' +
-        'xref\n0 5\n0000000000 65535 f\n0000000009 00000 n\n0000000058 00000 n\n0000000110 00000 n\n0000000235 00000 n\ntrailer<</Size 5/Root 1 0 R>>\nstartxref\n400\n%%EOF'
-      );
-
+      // 3. Build MIME multipart avec HTML + PJ (vraie fiche PDF si scraping OK, sinon sans PJ)
       const outer = `wlOut${Date.now()}`;
       const inner = `wlAlt${Date.now()}`;
       const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
-      const subject = `Voici la propriété! — 280 Rang Montcalm, Saint-Esprit`;
+      const subject = `Voici la propriété! — ${listingData.adresse}`;
 
+      // PRE-FLIGHT: vérifier que MIME total < 24MB (Gmail limit 25MB)
+      const pdfSize = pdfBuf ? pdfBuf.length : 0;
+      if (pdfSize > 24 * 1024 * 1024) {
+        out.error = `PDF trop gros (${Math.round(pdfSize/1024/1024)}MB > 24MB Gmail limit)`;
+        res.writeHead(413); res.end(JSON.stringify(out, null, 2)); return;
+      }
+
+      const textBody = `Voici la propriété!\n\n${listingData.adresse}\n${listingData.prix}\nN° Centris ${listingData.centrisNum} · ${listingData.type} · ${listingData.statut}\n\nAppelez-moi: 514-927-1340\n${AGENT.email}\nhttps://www.signaturesb.com`;
       const lines = [
         `From: ${AGENT.nom} · Signature SB <${AGENT.email}>`,
         `To: ${toEmail}`,
@@ -15186,7 +15232,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         'Content-Type: text/plain; charset=UTF-8',
         'Content-Transfer-Encoding: 8bit',
         '',
-        `Voici la propriété!\n\n280 Rang Montcalm, Saint-Esprit\n799 000$\nN° Centris 18366287 · Fermette · En vigueur\n\nAppelez-moi: 514-927-1340\n${AGENT.email}\nhttps://www.signaturesb.com`,
+        textBody,
         '',
         `--${inner}`,
         'Content-Type: text/html; charset=UTF-8',
@@ -15195,15 +15241,20 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         Buffer.from(htmlV11, 'utf-8').toString('base64'),
         `--${inner}--`,
         '',
-        `--${outer}`,
-        'Content-Type: application/pdf',
-        'Content-Disposition: attachment; filename="Fiche_descriptive_Saint-Esprit_TEST.pdf"',
-        'Content-Transfer-Encoding: base64',
-        '',
-        pdfPlaceholder.toString('base64'),
-        '',
-        `--${outer}--`,
       ];
+      // Attach PDF si scraping a réussi
+      if (pdfBuf && pdfBuf.length > 5000) {
+        lines.push(
+          `--${outer}`,
+          'Content-Type: application/pdf',
+          `Content-Disposition: attachment; filename="${enc(pdfFilename)}"`,
+          'Content-Transfer-Encoding: base64',
+          '',
+          pdfBuf.toString('base64'),
+          '',
+        );
+      }
+      lines.push(`--${outer}--`);
       const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
       out.steps.push(`MIME built (raw ${Math.round(raw.length/1024)}KB)`);
 

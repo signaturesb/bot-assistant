@@ -1785,7 +1785,72 @@ async function shareCentrisZoneDocuments(opts = {}) {
   }
 }
 
+/**
+ * Extract photos URLs haute-résolution depuis page publique Centris.
+ * Source: www.centris.ca/fr/properties~a-vendre/{N} (zero login, fetch HTTP simple).
+ * Returns: { success, photos: [urls...], main: url, count, broker_info: {} }
+ *
+ * Anticipations proactives:
+ * - 404 si listing pas en ligne / retiré → return success:false
+ * - Photos URL pattern Centris CDN: mspublic.centris.ca/media.ashx?id=X&t=pi&sm=l&w=1024
+ * - Fallback: si pas de photos extraites, return [] (HTML email garde placeholders)
+ */
+async function getCentrisListingPhotos(centrisNum) {
+  try {
+    const url = `https://www.centris.ca/fr/properties~a-vendre/${centrisNum}`;
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'fr-CA,fr;q=0.9',
+      },
+      signal: AbortSignal.timeout(15000),
+      redirect: 'follow',
+    });
+    if (!r.ok) return { success: false, message: `HTTP ${r.status} pour listing #${centrisNum}` };
+    const html = await r.text();
+
+    // Extract photos URLs — Centris pattern: mspublic.centris.ca/media.ashx?id=X
+    const photoRegex = /(https?:\/\/[^"'\s]*centris[^"'\s]*\.(?:ashx|jpg|jpeg|png|webp)[^"'\s]*)/gi;
+    const allMatches = [...html.matchAll(photoRegex)].map(m => m[1]);
+    // Dedupe + filter to keep only photo URLs (not videos/tracking)
+    const seen = new Set();
+    const photos = [];
+    for (const u of allMatches) {
+      const clean = u.replace(/&amp;/g, '&');
+      if (seen.has(clean)) continue;
+      seen.add(clean);
+      // Skip if too small (thumbnail) or non-photo
+      if (/\.(svg|gif|ico)/i.test(clean)) continue;
+      // Préfère les grandes versions (sm=l/m/big, w=>=800)
+      if (/sm=(t|s|xs)/i.test(clean)) continue; // skip thumbnails
+      photos.push(clean);
+    }
+
+    // Extract broker name from page (souvent dans og:description ou meta)
+    const ogDesc = html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)/i)?.[1] || '';
+    const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i)?.[1] || '';
+    const adresseMatch = ogTitle.match(/^([^|]+)/)?.[1]?.trim() || '';
+    const prixMatch = ogDesc.match(/(\d[\d\s]*\$)/)?.[1] || '';
+
+    return {
+      success: photos.length > 0,
+      photos: photos.slice(0, 50), // cap à 50
+      main: photos[0] || null,
+      count: photos.length,
+      url_source: url,
+      og_title: ogTitle.substring(0, 200),
+      og_description: ogDesc.substring(0, 500),
+      adresse: adresseMatch,
+      prix: prixMatch,
+    };
+  } catch (e) {
+    return { success: false, message: `Exception getCentrisListingPhotos: ${e.message?.substring(0, 200)}` };
+  }
+}
+
 module.exports = {
+  getCentrisListingPhotos,
   cuaGetCentrisPDF,
   cuaGetCentrisAnnexes,
   cuaNavigate,
