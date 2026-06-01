@@ -4009,10 +4009,9 @@ function buildWhiteLabelHTMLv11(data) {
     <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;">📝 Description</div>
     <div style="color:#cccccc;font-size:14px;line-height:1.7;background:#0d0d0d;border:1px solid #1a1a1a;border-radius:8px;padding:20px;">${e(d.description)}</div>
   </td></tr>
-  <tr><td class="pad" style="padding:0 24px 24px;">
-    <div style="color:#aa0721;font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;">📸 Album photos (${e(d.nbPhotos || 12)})</div>
-    <table width="100%" cellpadding="0" cellspacing="0"><tr>${renderPhotosThumbs()}</tr></table>
-    <div style="color:#888;font-size:12px;text-align:center;margin-top:10px;">Album complet dans la fiche descriptive jointe ↓</div>
+  <!-- Section album RETIRÉE — photo principale en haut + album dans la fiche descriptive PJ -->
+  <tr><td class="pad" style="padding:0 24px 14px;text-align:center;">
+    <div style="color:#888;font-size:12px;line-height:1.5;">📸 Album complet de ${e(d.nbPhotos || '?')} photos dans la fiche descriptive jointe ↓</div>
   </td></tr>
   <tr><td class="pad" style="padding:0 24px 24px;">
     <div style="background:#0d0d0d;border:1px solid #1e1e1e;border-radius:8px;padding:20px;">

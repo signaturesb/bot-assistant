@@ -1810,28 +1810,69 @@ async function getCentrisListingPhotos(centrisNum) {
     if (!r.ok) return { success: false, message: `HTTP ${r.status} pour listing #${centrisNum}` };
     const html = await r.text();
 
-    // Extract photos URLs — Centris pattern: mspublic.centris.ca/media.ashx?id=X
-    const photoRegex = /(https?:\/\/[^"'\s]*centris[^"'\s]*\.(?:ashx|jpg|jpeg|png|webp)[^"'\s]*)/gi;
+    // Extract photos URLs — Centris CDN pattern: mspublic.centris.ca/media.ashx?id=X&t=pi
+    // FILTRE STRICT: garder UNIQUEMENT t=pi (type photo listing), exclure boutons/icônes
+    const photoRegex = /(https?:\/\/mspublic\.centris\.ca\/media\.ashx\?[^"'\s]+)/gi;
     const allMatches = [...html.matchAll(photoRegex)].map(m => m[1]);
-    // Dedupe + filter to keep only photo URLs (not videos/tracking)
     const seen = new Set();
     const photos = [];
     for (const u of allMatches) {
       const clean = u.replace(/&amp;/g, '&');
       if (seen.has(clean)) continue;
       seen.add(clean);
-      // Skip if too small (thumbnail) or non-photo
-      if (/\.(svg|gif|ico)/i.test(clean)) continue;
-      // Préfère les grandes versions (sm=l/m/big, w=>=800)
-      if (/sm=(t|s|xs)/i.test(clean)) continue; // skip thumbnails
-      photos.push(clean);
+      // GARDER UNIQUEMENT les photos du listing (t=pi = property image)
+      if (!/[?&]t=pi(?:&|$)/i.test(clean)) continue;
+      // Préférer grandes versions (w=1024 ou plus) — upgrade URL si possible
+      let upgraded = clean;
+      if (!/[?&]w=/i.test(upgraded)) upgraded += '&w=1024';
+      else upgraded = upgraded.replace(/([?&])w=\d+/i, '$1w=1024');
+      photos.push(upgraded);
     }
 
     // Extract broker name from page (souvent dans og:description ou meta)
     const ogDesc = html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)/i)?.[1] || '';
     const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i)?.[1] || '';
-    const adresseMatch = ogTitle.match(/^([^|]+)/)?.[1]?.trim() || '';
+    // Decode HTML entities (à é è ô etc.) — anti-fragilité Shawn 2026-06-01
+    const decodeEntities = s => String(s||'')
+      .replace(/&#x([0-9A-Fa-f]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, ' ');
+    // Extract adresse complète — chercher dans body HTML (h1, h2, address tags + structured data)
+    // Priorité: JSON-LD > h1/h2 > og:title fallback
+    let adresseRaw = '';
+    // 1. JSON-LD structured data
+    const jsonLdMatch = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/i);
+    if (jsonLdMatch) {
+      try {
+        const ld = JSON.parse(jsonLdMatch[1]);
+        const addr = ld.address || ld.location?.address || (Array.isArray(ld) ? ld[0]?.address : null);
+        if (addr) {
+          adresseRaw = [addr.streetAddress, addr.addressLocality, addr.addressRegion].filter(Boolean).join(', ');
+        } else if (ld.name) {
+          adresseRaw = ld.name;
+        }
+      } catch {}
+    }
+    // 2. h1/h2 avec une adresse type "XXX Rue/Ch/Av/Boul ..., Ville"
+    if (!adresseRaw) {
+      const h1Match = html.match(/<h[12][^>]*>([^<]*(?:Rue|Ch\.|Chemin|Av\.|Avenue|Boul|Rang|Route|Mont[ée]e|Place|Cr\.|Croissant)[^<]*)<\/h[12]>/i);
+      if (h1Match) adresseRaw = h1Match[1];
+    }
+    // 3. Span/div avec class adresse
+    if (!adresseRaw) {
+      const spanMatch = html.match(/<(?:span|div)[^>]*class=["'][^"']*(?:address|adresse)[^"']*["'][^>]*>([^<]+)<\/(?:span|div)>/i);
+      if (spanMatch) adresseRaw = spanMatch[1];
+    }
+    // 4. Fallback og:title
+    if (!adresseRaw) adresseRaw = ogTitle.match(/^([^|]+)/)?.[1]?.trim() || '';
+    const adresseMatch = decodeEntities(adresseRaw.replace(/\s+/g, ' ').trim());
     const prixMatch = ogDesc.match(/(\d[\d\s]*\$)/)?.[1] || '';
+    // Extract description (souvent dans og:description après le prix)
+    const descMatch = decodeEntities(ogDesc.replace(/^\d[\d\s]*\$\s*/, '').substring(0, 1000));
+    // Extract specs si visible (chambres, sdb)
+    const chambresMatch = html.match(/(\d+)\s*chambres?/i)?.[1] || '';
+    const sdbMatch = html.match(/(\d+)\s*salles?\s+de\s+bain/i)?.[1] || '';
 
     return {
       success: photos.length > 0,
@@ -1839,10 +1880,13 @@ async function getCentrisListingPhotos(centrisNum) {
       main: photos[0] || null,
       count: photos.length,
       url_source: url,
-      og_title: ogTitle.substring(0, 200),
-      og_description: ogDesc.substring(0, 500),
+      og_title: decodeEntities(ogTitle.substring(0, 200)),
+      og_description: decodeEntities(ogDesc.substring(0, 500)),
       adresse: adresseMatch,
       prix: prixMatch,
+      description: descMatch,
+      chambres: chambresMatch,
+      sdb: sdbMatch,
     };
   } catch (e) {
     return { success: false, message: `Exception getCentrisListingPhotos: ${e.message?.substring(0, 200)}` };
