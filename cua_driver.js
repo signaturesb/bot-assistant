@@ -1964,11 +1964,34 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
 
     const page = await loginCentris(context);
 
+    // FORCE navigation Matrix home/search (cookies peuvent aboutir sur Dashboard, Zone, etc.)
+    console.log('[FICHE-PDF] Navigate to Matrix home');
+    await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2500);
+    // Wait for search field — fallback alternatives si #QueryText pas dispo
+    try {
+      await page.waitForSelector('#QueryText, input[id*="Query"], input[placeholder*="echerche" i]', { timeout: 15000 });
+    } catch {
+      // Try navigate to RechercheRapide page directly
+      console.log('[FICHE-PDF] #QueryText not found, try RechercheRapide');
+      await page.goto(`${MATRIX_BASE}/Matrix/Search/RechercheRapide`, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+
     // 1. Search listing
     console.log(`[FICHE-PDF] Search #${centrisNum}`);
-    await page.fill('#QueryText', String(centrisNum));
-    await page.locator('#QueryText').press('Enter');
-    await page.waitForTimeout(3000);
+    const searchSelector = await page.evaluate(() => {
+      const candidates = ['#QueryText', 'input[id*="Query"]', 'input[placeholder*="echerche" i]', 'input[type=search]'];
+      for (const sel of candidates) {
+        const el = document.querySelector(sel);
+        if (el) return sel;
+      }
+      return null;
+    });
+    if (!searchSelector) throw new Error('Champ recherche Matrix introuvable après login');
+    await page.fill(searchSelector, String(centrisNum));
+    await page.locator(searchSelector).press('Enter');
+    await page.waitForTimeout(3500);
 
     // 2. Click result link
     const clicked = await page.evaluate((n) => {
