@@ -1992,59 +1992,65 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
 
     const page = await loginCentris(context);
 
-    // STRATÉGIE: URL directe Matrix listing detail (pas besoin de search field)
-    // Pattern URL connu: Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-{N}
-    console.log(`[FICHE-PDF] Navigate direct listing URL #${centrisNum}`);
-    const directUrls = [
-      `${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}`,
-      `${MATRIX_BASE}/Matrix/Search/Default.aspx?Class=DE&Number=${centrisNum}`,
-      `${MATRIX_BASE}/Matrix`,
-    ];
-    let navigatedOK = false;
-    for (const u of directUrls) {
-      try {
-        await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(3000);
-        const url = page.url();
-        // Si on a un # Centris dans le path/body → on est sur la fiche
-        const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 5000));
-        if (bodyText.includes(String(centrisNum)) || /\/listing|\/property/i.test(url)) {
-          console.log(`[FICHE-PDF] Listing trouvé via ${u.substring(0, 80)}`);
-          navigatedOK = true;
-          break;
-        }
-      } catch (e) { console.warn(`[FICHE-PDF] URL fail ${u}: ${e.message.substring(0, 80)}`); }
-    }
+    // STRATÉGIE OPTIMALE: navigate Matrix Home (SPA JS-rendered) + wait JS hydrate + use search
+    console.log(`[FICHE-PDF] Navigate Matrix Home (networkidle)`);
+    await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'networkidle', timeout: 45000 }).catch(async () => {
+      // Fallback si networkidle timeout (Matrix peut avoir des long-polling)
+      await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'load', timeout: 30000 });
+    });
+    await page.waitForTimeout(5000); // JS hydrate SPA
 
-    // FALLBACK: search via UI si direct URLs ratent
-    if (!navigatedOK) {
-      console.log('[FICHE-PDF] Direct URLs failed, fallback UI search');
-      try {
-        await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(2500);
-        const searchSelector = await page.evaluate(() => {
-          const cands = ['#QueryText', 'input[id*="Query"]', 'input[placeholder*="echerche" i]', 'input[type=search]'];
-          for (const sel of cands) { const el = document.querySelector(sel); if (el && el.offsetParent) return sel; }
-          return null;
-        });
-        if (searchSelector) {
-          await page.fill(searchSelector, String(centrisNum));
-          await page.locator(searchSelector).press('Enter');
-          await page.waitForTimeout(3500);
-          // Click le lien numéro Centris
-          const linkClicked = await page.evaluate((n) => {
-            const a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === String(n));
-            if (a) { a.click(); return true; }
-            return false;
-          }, centrisNum);
-          if (linkClicked) {
-            await page.waitForTimeout(3000);
-            navigatedOK = true;
-          }
-        }
-      } catch {}
+    // Wait for search field — Matrix SPA peut prendre du temps à render
+    console.log('[FICHE-PDF] Wait search field (up to 30s)');
+    let searchSelector = null;
+    try {
+      await page.waitForFunction(() => {
+        const cands = ['#QueryText', 'input[id*="Query"]', 'input[id*="Search"]', 'input[placeholder*="echerche" i]', 'input[placeholder*="Centris" i]', 'input[placeholder*="MLS" i]', 'input[type=search]'];
+        for (const sel of cands) { const el = document.querySelector(sel); if (el && el.offsetParent && !el.disabled) return true; }
+        return false;
+      }, { timeout: 30000 });
+      searchSelector = await page.evaluate(() => {
+        const cands = ['#QueryText', 'input[id*="Query"]', 'input[id*="Search"]', 'input[placeholder*="echerche" i]', 'input[placeholder*="Centris" i]', 'input[placeholder*="MLS" i]', 'input[type=search]'];
+        for (const sel of cands) { const el = document.querySelector(sel); if (el && el.offsetParent && !el.disabled) return sel; }
+        return null;
+      });
+    } catch (e) {
+      console.warn('[FICHE-PDF] Search field timeout, screenshot current state');
+      const bodyText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '');
+      console.log(`[FICHE-PDF] Body preview: ${bodyText.substring(0, 300)}`);
     }
-    if (!navigatedOK) throw new Error(`Impossible d'accéder à la fiche #${centrisNum} (toutes méthodes échouées)`);
+    if (!searchSelector) throw new Error('Champ recherche Matrix introuvable (Matrix SPA pas chargé ou UI changée)');
+    console.log(`[FICHE-PDF] Search field found: ${searchSelector}`);
+
+    // Search le listing
+    console.log(`[FICHE-PDF] Search #${centrisNum}`);
+    await page.fill(searchSelector, String(centrisNum));
+    await page.locator(searchSelector).press('Enter');
+    await page.waitForTimeout(5000);
+
+    // Click le lien result (numéro Centris)
+    const linkClicked = await page.evaluate((n) => {
+      // Multiple stratégies pour trouver le lien
+      const numStr = String(n);
+      // 1. <a> avec text exact = numéro
+      let a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === numStr);
+      // 2. <a> avec text contenant le numéro
+      if (!a) a = [...document.querySelectorAll('a')].find(x => x.textContent.includes(numStr) && x.href && /listing|property|detail/i.test(x.href));
+      // 3. Row TR avec data-mls/data-num
+      if (!a) {
+        const row = document.querySelector(`[data-mls="${numStr}"], [data-listingid="${numStr}"], [data-num="${numStr}"]`);
+        if (row) { row.click(); return 'row-click'; }
+      }
+      if (a) { a.click(); return 'link-click'; }
+      return null;
+    }, centrisNum);
+    if (!linkClicked) {
+      const bodyText = await page.evaluate(() => document.body?.innerText?.substring(0, 1000) || '');
+      throw new Error(`Listing #${centrisNum} non trouvé dans résultats search. Body: ${bodyText.substring(0, 200)}`);
+    }
+    console.log(`[FICHE-PDF] Result clicked (${linkClicked})`);
+    await page.waitForTimeout(5000);
+    const navigatedOK = true;
 
     // 2. Click result link
     const clicked = await page.evaluate((n) => {
