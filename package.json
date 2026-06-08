@@ -22,12 +22,12 @@
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.100.1",
+    "@anthropic-ai/sdk": "^0.102.0",
     "better-sqlite3": "^12.10.0",
     "cheerio": "^1.2.0",
     "compression": "^1.8.1",
     "dotenv": "^16.0.0",
-    "fuse.js": "^7.4.1",
+    "fuse.js": "^7.4.2",
     "got": "^15.0.5",
     "helmet": "^8.2.0",
     "lru-cache": "^11.5.1",
