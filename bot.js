@@ -70,7 +70,7 @@ const SHAWN_EMAIL = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
 const JULIE_EMAIL = process.env.JULIE_EMAIL || 'julie@signaturesb.com';
 // Default Sonnet 4.6 — 5x moins cher qu'Opus pour 95% de la qualité sur ce use case.
 // Shawn peut switch à la volée via /opus (deep reasoning) ou /haiku (rapide, ultra-économique).
-let   currentModel = process.env.MODEL || 'claude-fable-5';
+let   currentModel = process.env.MODEL || 'claude-sonnet-4-6';
 
 // ─── AGENT_CONFIG — Foundation SaaS multi-courtier ───────────────────────────
 // Toutes les valeurs courtier-spécifiques ici. Pour un autre courtier: changer
@@ -8300,10 +8300,11 @@ function trackCost(model, usage) {
 // Sonnet 4.6 par défaut (5x moins cher), switch Opus 4.8 auto sur mots-clés
 // qui indiquent recherche/analyse/stratégie/négociation/optimisation.
 // Shawn peut toujours forcer via /opus ou /sonnet ou /haiku.
-const OPUS_TRIGGERS = /\b(analys|optim|recherch|strat[eé]g|compar|[eé]val|n[eé]goci|estim|march[eé]\s+(?:immo|actuel)|rapport\s+(?:march[eé]|vente|pro)|plan\s+d['e]action|pr[eé]vis|penser|think|r[eé]fl[eé]ch|deep\s+dive|pourquoi|analys(?:e|er)\s+ce|regarde\s+(?:en\s+)?d[eé]tail|(?:quel|combien|calcul).*prix|prix\s+(?:du?\s*march|de\s+vente|[àa]\s+mettre|demand|conseil|juste)|conseil\s+prix)/i;
-// FABLE 5 triggers — top-tier reasoning (2× coût Opus, à utiliser seulement si vraiment requis)
-const FABLE_TRIGGERS = /\b(ultra|fable|mythos|maximum|le\s+meilleur\s+mod[eè]le|le\s+plus\s+puissant|top.tier|profondeur\s+max|analyse\s+ultime|strat[eé]gie\s+majeure)/i;
-const MODEL_DEFAULT = 'claude-fable-5';
+// OPUS 4.8 triggers — analyses + recherches + comparaisons (cas standards)
+const OPUS_TRIGGERS = /\b(analys|optim|recherch|compar|[eé]val|estim|march[eé]\s+(?:immo|actuel)|rapport\s+(?:march[eé]|vente|pro)|plan\s+d['e]action|pr[eé]vis|penser|think|r[eé]fl[eé]ch|deep\s+dive|pourquoi|analys(?:e|er)\s+ce|regarde\s+(?:en\s+)?d[eé]tail|(?:quel|combien|calcul).*prix|prix\s+(?:du?\s*march|de\s+vente|[àa]\s+mettre|demand|conseil|juste)|conseil\s+prix)/i;
+// FABLE 5 triggers — ANALYSES / STRATÉGIES / NÉGOCIATIONS (préférence Shawn 2026-06-09: mode hybride)
+const FABLE_TRIGGERS = /\b(strat[eé]g|n[eé]goci|ultra|fable|mythos|maximum|le\s+meilleur\s+mod[eè]le|le\s+plus\s+puissant|top.tier|profondeur\s+max|analyse\s+ultime|strat[eé]gie\s+majeure|cerveau|rapport\s+annuel|portefeuille\s+complet)/i;
+const MODEL_DEFAULT = 'claude-sonnet-4-6';
 function pickModelForMessage(userMsg) {
   // Shawn a explicitement forcé un modèle non-default (/opus, /fable, /haiku) → respecter
   if (currentModel !== MODEL_DEFAULT) return currentModel;
