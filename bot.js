@@ -6777,13 +6777,15 @@ async function executeTool(name, input, chatId) {
       case 'repondre_vite':           return await repondreVite(chatId, input.terme, input.message);
       case 'modifier_deal':           return await modifierDeal(input.terme, input);
       case 'creer_activite':          return await creerActivite(input);
-      case 'supprimer_activite':      return await supprimerActivite(input);
+      // 🛑 SHAWN 2026-06-09 RÈGLE ABSOLUE: bot a SEULEMENT droit CREATE deal + CREATE activité.
+      // JAMAIS DELETE Pipedrive. Si vraiment nécessaire → Shawn fait dans Pipedrive UI directement.
+      case 'supprimer_activite':      return `🛑 BLOQUÉ — Shawn 2026-06-09: le bot n'a plus le droit de supprimer dans Pipedrive. Fais-le dans Pipedrive UI.`;
       case 'deplacer_activite':       return await deplacerActivite(input);
-      case 'fusionner_deals':         return await fusionnerDeals(input.deal_garder, input.deal_supprimer);
-      case 'fusionner_personnes':     return await fusionnerPersonnes(input.personne_garder, input.personne_supprimer);
-      case 'supprimer_deal':          return await supprimerDeal(input.deal_id);
-      case 'supprimer_personne':      return await supprimerPersonne(input.personne_id);
-      case 'supprimer_note':          return await supprimerNote(input);
+      case 'fusionner_deals':         return `🛑 BLOQUÉ — fusion = suppression d'un deal. Fais dans Pipedrive UI.`;
+      case 'fusionner_personnes':     return `🛑 BLOQUÉ — fusion = suppression. Fais dans Pipedrive UI.`;
+      case 'supprimer_deal':          return `🛑 BLOQUÉ — Shawn 2026-06-09: bot ne supprime pas dans Pipedrive. Fais dans Pipedrive UI.`;
+      case 'supprimer_personne':      return `🛑 BLOQUÉ — bot ne supprime pas dans Pipedrive. Fais dans Pipedrive UI.`;
+      case 'supprimer_note':          return `🛑 BLOQUÉ — bot ne supprime pas dans Pipedrive. Fais dans Pipedrive UI.`;
       case 'modifier_personne':       return await modifierPersonne(input);
       case 'marquer_gagne':           return await marquerGagne(input);
       case 'classer_deal':            return await classerDeal(input);
@@ -12375,13 +12377,15 @@ function startDailyTasks() {
     if (h === 7  && lastCron.visites !== todayStr)  { lastCron.visites = todayStr; rappelVisitesMatin(); }
     if (h === 8  && lastCron.digest  !== todayStr)  { lastCron.digest  = todayStr; runDigestJulie(); }
     // 🛡️ Cron purge Pipedrive — TOUTES LES HEURES (pas juste 6h30)
-    // Pipedrive workflow automation natif recrée ces activités constamment.
-    // En attendant que Shawn désactive le workflow dans Pipedrive UI:
-    // → cleanup horaire pour éviter accumulation
-    if (m === 30 && lastCron.pdCleanupHour !== `${todayStr}_${h}`) {
-      lastCron.pdCleanupHour = `${todayStr}_${h}`;
-      pipedriveCleanupAuto().catch(e => log('WARN', 'CRON', `pdCleanup: ${e.message}`));
-    }
+    // 🛑 SHAWN 2026-06-09 RÈGLE ABSOLUE: PAS de suppression Pipedrive auto.
+    // 5h du matin = cron a supprimé des activités sans son consentement. Plus jamais.
+    // L'automation Pipedrive doit partir DIRECTEMENT de Pipedrive UI (Workflow Automation).
+    // Le bot a SEULEMENT le droit de CREATE deal + CREATE activité — JAMAIS DELETE.
+    // Cron pipedriveCleanupAuto DÉSACTIVÉ (pour réactiver: retirer ce commentaire).
+    // if (m === 30 && lastCron.pdCleanupHour !== `${todayStr}_${h}`) {
+    //   lastCron.pdCleanupHour = `${todayStr}_${h}`;
+    //   pipedriveCleanupAuto().catch(e => log('WARN', 'CRON', `pdCleanup: ${e.message}`));
+    // }
     // 📊 Cron 7h30 — Briefing matin (visites + stagnants + prochaine campagne)
     if (h === 7 && m >= 30 && lastCron.briefing !== todayStr) {
       lastCron.briefing = todayStr;
@@ -13370,16 +13374,19 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
-  // ─── GET /admin/pipedrive-cleanup — Clean global Pipedrive
-  // Combine 4 opérations + 1 audit (règle Shawn 2026-05-13):
-  //   (A) Supprime activités "suivi/appeler contact/prospect" (sujets génériques) → DELETE
-  //   (B) Pour chaque deal qui a >1 activité OPEN: garde la + récente, ferme le reste → MARK DONE
-  //   (C) Activités OPEN sur deals dont la person n'a NI email NI téléphone → MARK DONE
-  //   (D) Activités OPEN où la person = Shawn lui-même (emails + tel) → DELETE
-  //   (E) AUDIT retards (overdue) — liste seulement, pas d'action
-  //
-  // Query: ?dry=1 (DRY-RUN défaut) · ?dry=0 (exécute) · ?notify=0 (skip Telegram)
+  // ─── GET /admin/pipedrive-cleanup — DÉSACTIVÉ Shawn 2026-06-09
+  // Règle absolue: bot n'a PAS le droit de supprimer dans Pipedrive.
+  // Si Shawn veut nettoyer son Pipedrive, il le fait DIRECTEMENT dans Pipedrive UI.
+  // Pour réactiver: retirer le bloc 403 ci-dessous.
   if (req.method === 'GET' && url.startsWith('/admin/pipedrive-cleanup')) {
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'BLOQUÉ',
+      reason: 'Shawn 2026-06-09: aucune suppression/modification Pipedrive auto. Le bot a seulement le droit de CREATE deal + CREATE activité.',
+      action: 'Faire le nettoyage directement dans Pipedrive UI (app.pipedrive.com)',
+    }, null, 2));
+    return;
+    // Code original commenté:
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
     const dry = u.searchParams.get('dry') !== '0';
