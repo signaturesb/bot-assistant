@@ -1027,7 +1027,7 @@ créer de nouveaux fichiers/outils pour ça — dis simplement "c'est déjà là
 🔹 creerDeal(): Pipedrive avec dédup smart (email→tel→nom) + UPDATE auto si infos manquent
 🔹 envoyerDocsAuto() avec seuils 90/80: ≥90 auto, 80-89 attend "envoie", <80 brouillon
 🔹 Commandes Telegram: /checkemail, /forcelead <id>, /baseline, /pending, /cout,
-   /pauseauto, /opus, /sonnet, /haiku, envoie les docs à X, annule X
+   /pauseauto, /opus, /sonnet, /haiku, /fable (top-tier 2× coût), envoie les docs à X, annule X
 🔹 Webhook auto-heal Telegram (check toutes 2min + escalation Brevo fallback)
 🔹 Cost tracker avec alertes $10/jour et $100/mois
 🔹 Autres: consent required, dédup leads 7j persistée Gist, audit log, baseline silent
@@ -8071,10 +8071,12 @@ async function backupBeforeAction(label, items) {
 }
 
 // ─── Cost tracking Anthropic ─────────────────────────────────────────────────
-// Prix par million tokens (2026 pricing Anthropic)
+// Prix par million tokens (2026 pricing Anthropic — confirmed docs.claude.com 2026-06-09)
 const PRICING = {
-  'claude-opus-4-8':    { in: 5.00,  out: 25.00, cache_read: 0.50,  cache_write: 6.25 },
-  'claude-opus-4-7':    { in: 5.00,  out: 25.00, cache_read: 0.50,  cache_write: 6.25 }, // legacy fallback
+  'claude-fable-5':     { in: 10.00, out: 50.00, cache_read: 1.00,  cache_write: 12.50 }, // GA 2026-06-09 — Mythos-class, top-tier
+  'claude-mythos-5':    { in: 10.00, out: 50.00, cache_read: 1.00,  cache_write: 12.50 }, // Invitation-only Glasswing
+  'claude-opus-4-8':    { in:  5.00, out: 25.00, cache_read: 0.50,  cache_write:  6.25 },
+  'claude-opus-4-7':    { in:  5.00, out: 25.00, cache_read: 0.50,  cache_write:  6.25 }, // legacy fallback
   'claude-sonnet-4-6':  { in:  3.00, out: 15.00, cache_read: 0.30,  cache_write:  3.75 },
   'claude-haiku-4-5':   { in:  1.00, out:  5.00, cache_read: 0.10,  cache_write:  1.25 },
 };
@@ -8299,12 +8301,19 @@ function trackCost(model, usage) {
 // qui indiquent recherche/analyse/stratégie/négociation/optimisation.
 // Shawn peut toujours forcer via /opus ou /sonnet ou /haiku.
 const OPUS_TRIGGERS = /\b(analys|optim|recherch|strat[eé]g|compar|[eé]val|n[eé]goci|estim|march[eé]\s+(?:immo|actuel)|rapport\s+(?:march[eé]|vente|pro)|plan\s+d['e]action|pr[eé]vis|penser|think|r[eé]fl[eé]ch|deep\s+dive|pourquoi|analys(?:e|er)\s+ce|regarde\s+(?:en\s+)?d[eé]tail|(?:quel|combien|calcul).*prix|prix\s+(?:du?\s*march|de\s+vente|[àa]\s+mettre|demand|conseil|juste)|conseil\s+prix)/i;
+// FABLE 5 triggers — top-tier reasoning (2× coût Opus, à utiliser seulement si vraiment requis)
+const FABLE_TRIGGERS = /\b(ultra|fable|mythos|maximum|le\s+meilleur\s+mod[eè]le|le\s+plus\s+puissant|top.tier|profondeur\s+max|analyse\s+ultime|strat[eé]gie\s+majeure)/i;
 const MODEL_DEFAULT = 'claude-sonnet-4-6';
 function pickModelForMessage(userMsg) {
-  // Shawn a explicitement forcé un modèle non-default (/opus ou /haiku) → respecter
+  // Shawn a explicitement forcé un modèle non-default (/opus, /fable, /haiku) → respecter
   if (currentModel !== MODEL_DEFAULT) return currentModel;
   // Env var MODEL définie → respecter
   if (process.env.MODEL) return currentModel;
+  // FABLE 5 — top-tier sur demande explicite seulement (2× coût Opus)
+  if (FABLE_TRIGGERS.test(userMsg || '')) {
+    log('INFO', 'ROUTER', `Fable 5 demandé explicitement → top-tier ($10/$50)`);
+    return 'claude-fable-5';
+  }
   // Thinking mode activé → toujours Opus (deep reasoning)
   if (thinkingMode) return 'claude-opus-4-8';
   // Mot-clé complexité/stratégie/analyse détecté → Opus pour CE message uniquement
@@ -10929,6 +10938,12 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     currentModel = 'claude-opus-4-8';
     bot.sendMessage(msg.chat.id, '🚀 Mode Opus 4.8 activé — le plus puissant (défaut).');
+  });
+
+  bot.onText(/\/fable/, msg => {
+    if (!isAllowed(msg)) return;
+    currentModel = 'claude-fable-5';
+    bot.sendMessage(msg.chat.id, '🔮 *Mode Fable 5 activé* — Mythos-class top-tier\n\n⚠️ Coût: $10/$50 par MTok (2× plus cher qu\'Opus 4.8)\nÀ utiliser pour analyse ultime / stratégie majeure / reasoning complexe\n\nRevenir au défaut: /sonnet', { parse_mode: 'Markdown' });
   });
 
   bot.onText(/\/sonnet/, msg => {
