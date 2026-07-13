@@ -22,15 +22,15 @@
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.110.0",
+    "@anthropic-ai/sdk": "^0.111.0",
     "better-sqlite3": "^12.11.1",
     "cheerio": "^1.2.0",
     "compression": "^1.8.1",
     "dotenv": "^16.0.0",
     "fuse.js": "^7.4.2",
     "got": "^15.1.0",
-    "helmet": "^8.2.0",
-    "lru-cache": "^11.5.1",
+    "helmet": "^8.3.0",
+    "lru-cache": "^11.5.2",
     "node-telegram-bot-api": "^0.67.0",
     "otpauth": "^9.5.1",
     "p-limit": "^7.3.0",
