@@ -22,7 +22,7 @@
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.115.0",
+    "@anthropic-ai/sdk": "^0.117.1",
     "better-sqlite3": "^12.11.1",
     "cheerio": "^1.2.0",
     "compression": "^1.8.1",
