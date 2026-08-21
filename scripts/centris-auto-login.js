@@ -30,12 +30,17 @@ console.log = (...args) => {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch {}
 };
 
-const USER = '110509';
-const PASS = 'Milf1340@';
-const WEBHOOK_SECRET = execSync(`grep -E "^WEBHOOK_SECRET=" /Users/signaturesb/Documents/github/_CORE/config/.env.shared | cut -d= -f2- | tr -d '"'`).toString().trim();
+const USER = process.env.CENTRIS_USER;
+const PASS = process.env.CENTRIS_PASS;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const missingEnv = ['CENTRIS_USER', 'CENTRIS_PASS', 'WEBHOOK_SECRET'].filter(name => !process.env[name]);
+if (missingEnv.length) {
+  console.error(`❌ Variables d'environnement manquantes: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
 
 // Pin existing chromium-1217 binary (MCP installed it)
-const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME_PATH = process.env.CENTRIS_CHROME_PATH || '/Users/signaturesb/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
 
 (async () => {
   console.log('🚀 Centris auto-login...');
@@ -203,7 +208,7 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
     console.error(`❌ ${e.message}`);
     // Telegram alert via bot API direct (besoin TELEGRAM_BOT_TOKEN)
     try {
-      const tgToken = process.env.TELEGRAM_BOT_TOKEN || execSync('grep TELEGRAM_BOT_TOKEN /Users/signaturesb/Documents/github/_CORE/config/.env.shared 2>/dev/null | cut -d= -f2-').toString().trim();
+      const tgToken = process.env.TELEGRAM_BOT_TOKEN;
       const userId = process.env.TELEGRAM_ALLOWED_USER_ID || '5261213272';
       if (tgToken && tgToken.length > 20) {
         await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
