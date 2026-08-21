@@ -3757,7 +3757,7 @@ let autoEnvoiState = loadJSON(AUTOENVOI_FILE, { sent: {}, log: [], totalAuto: 0,
 async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match, _shawnConsent }) {
   // 🔒 KILLSWITCH consent — si CONSENT_REQUIRED, refuse tout envoi sauf si
   // l'appelant a explicitement attesté que Shawn a confirmé via Telegram
-  // (ex: handler "envoie les docs à X" passe _shawnConsent: true).
+  // (ex: handler "envoie les docs à X" passe _shawnConsent: false /* legacy consent disabled; one-shot required */).
   if (CONSENT_REQUIRED && !_shawnConsent) {
     log('WARN', 'AUTOENVOI', `BLOQUÉ — envoi sans consent Shawn pour ${email}`);
     return { sent: false, skipped: true, reason: 'CONSENT_REQUIRED — confirmation Shawn manquante', match };
@@ -3787,7 +3787,7 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match, _shaw
         dealHint: deal,
         folderHint: match.folder,
         centrisHint: centris,
-        _shawnConsent: true, // arrivés ici = caller a déjà attesté consent
+        _shawnConsent: false /* legacy consent disabled; one-shot required */, // arrivés ici = caller a déjà attesté consent
       });
       const ms = Date.now() - t0;
 
@@ -6090,7 +6090,7 @@ async function _envoyerListingPubliqueLink({ num, email_destination, cc, message
   const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
   const sent = await sendEmailLogged({
     via: 'gmail', to: email_destination, cc: ccFinal, subject,
-    category: 'centris-fiche-public-link', shawnConsent: true,
+    category: 'centris-fiche-public-link', shawnConsent: false /* legacy consent disabled; one-shot required */,
     sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -6312,7 +6312,7 @@ async function telechargerFicheCentris({ centris_num, email_destination, cc, mes
   const sent = await sendEmailLogged({
     via: 'gmail', to: email_destination, cc: ccFinal, subject,
     category: 'centris-fiche-download',
-    shawnConsent: true, // consent attesté par la commande explicite
+    shawnConsent: false /* legacy consent disabled; one-shot required */, // consent attesté par la commande explicite
     sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -6717,8 +6717,43 @@ const TOOLS_WITH_CACHE = TOOLS.map((t, i, arr) => i === arr.length - 1
   ? { ...t, cache_control: { type: 'ephemeral' } }
   : t);
 
-async function executeTool(name, input, chatId) {
+const PIPEDRIVE_WRITE_TOOL_ACTIONS = Object.freeze({
+  marquer_perdu: 'update',
+  ajouter_note: 'create',
+  creer_deal: 'create',
+  planifier_visite: 'create',
+  changer_etape: 'move',
+  creer_activite: 'create',
+  completer_activite: 'update',
+  fusionner_personnes: 'merge',
+  fusionner_deals: 'merge',
+  supprimer_activite: 'delete',
+  supprimer_deal: 'delete',
+  supprimer_personne: 'delete',
+  supprimer_note: 'delete',
+  modifier_personne: 'update',
+  marquer_gagne: 'update',
+  classer_deal: 'move',
+  classer_activite: 'update',
+});
+
+async function executeTool(name, input, chatId, userMessage = '') {
   try {
+    const pdAction = PIPEDRIVE_WRITE_TOOL_ACTIONS[name];
+    if (pdAction) {
+      // The model/tool input is NEVER proof of authorization. Only the exact current
+      // Telegram user message is considered. Delete/merge stay blocked until a
+      // separate confirmation transaction is implemented.
+      requirePipedriveWriteIntent({
+        message: userMessage,
+        action: pdAction,
+        source: 'telegram-current-message',
+        confirmed: false,
+      });
+      auditLogEvent('pipedrive-write', 'authorized-by-current-message', {
+        tool: name, action: pdAction, chatId,
+      });
+    }
     switch (name) {
       case 'voir_pipeline':        return await getPipeline();
       case 'chercher_prospect':    return await chercherProspect(input.terme);
@@ -7367,7 +7402,7 @@ ${pjList}
             const raw = Buffer.from(parts.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
             const sent = await sendEmailLogged({
               via: 'gmail', to: email_destination, cc: [AGENT.email], subject,
-              category: 'centris-annexes-forward', shawnConsent: true,
+              category: 'centris-annexes-forward', shawnConsent: false /* legacy consent disabled; one-shot required */,
               sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -7536,7 +7571,7 @@ ${pjList}
               const sent = await sendEmailLogged({
                 via: 'gmail', to: forward_email, cc: [AGENT.email], subject,
                 category: 'zonage-forward',
-                shawnConsent: true,
+                shawnConsent: false /* legacy consent disabled; one-shot required */,
                 sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
                   method: 'POST',
                   headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -7664,9 +7699,9 @@ ${pjList}
 }
 
 // ─── Helper: exécuter un outil avec timeout 30s ───────────────────────────────
-async function executeToolSafe(name, input, chatId) {
+async function executeToolSafe(name, input, chatId, userMessage = '') {
   return Promise.race([
-    executeTool(name, input, chatId),
+    executeTool(name, input, chatId, userMessage),
     new Promise((_, rej) => setTimeout(() => rej(new Error(`Timeout outil ${name}`)), 30000))
   ]);
 }
@@ -8363,7 +8398,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
           const results = await Promise.all(toolBlocks.map(async b => {
             log('INFO', 'TOOL', `${b.name}(${JSON.stringify(b.input).substring(0, 80)})`);
             mTick('tools', b.name);
-            const result = await executeToolSafe(b.name, b.input, chatId);
+            const result = await executeToolSafe(b.name, b.input, chatId, userMsg);
             return { type: 'tool_result', tool_use_id: b.id, content: String(result), _toolName: b.name };
           }));
           // Détecter pattern: même outil fail 3× consécutifs → abort
@@ -8487,7 +8522,7 @@ async function callClaudeVision(chatId, content, contextLabel) {
         const toolBlocks = res.content.filter(b => b.type === 'tool_use');
         const results = await Promise.all(toolBlocks.map(async b => {
           log('INFO', 'TOOL', `vision:${b.name}(${JSON.stringify(b.input).substring(0, 60)})`);
-          const result = await executeToolSafe(b.name, b.input, chatId);
+          const result = await executeToolSafe(b.name, b.input, chatId, '');
           return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
         }));
         messages.push({ role: 'user', content: results });
@@ -8639,7 +8674,7 @@ function registerHandlers() {
           await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '⏳ Envoi en cours...', callback_data: 'noop' }]] },
             { chat_id: chatId, message_id: msgId }).catch(() => {});
         }
-        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: false /* legacy consent disabled; one-shot required */ });
         if (r.sent) {
           pendingDocSends.delete(arg);
           await bot.sendMessage(chatId, `✅ *Envoyé* à ${arg}\n${pending.match?.pdfs?.length || '?'} docs · ${Math.round((r.deliveryMs||0)/1000)}s`, { parse_mode: 'Markdown' });
@@ -8908,7 +8943,7 @@ function registerHandlers() {
     await bot.sendMessage(msg.chat.id, `📤 Envoi docs à ${pending.email}...`);
     pending._shawnConsent = true; // attestation pour auto-recovery futur
     try {
-      const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
+      const r = await envoyerDocsAuto({ ...pending, _shawnConsent: false /* legacy consent disabled; one-shot required */ });
       if (r.sent) {
         await bot.sendMessage(msg.chat.id, `✅ Envoyé · ${pending.match.pdfs.length} PDFs · ${Math.round(r.deliveryMs/1000)}s`);
         auditLogEvent('manual-send', 'docs-sent', { email: pending.email, confirmed: true });
@@ -9194,7 +9229,7 @@ function registerHandlers() {
       '`/retry-email <email>` — équivalent par email',
       '`/forcelead <msgId>` — force traitement Gmail msg',
       '`/test-email <#> [email]` — simule lead factice',
-      '`/flush-pending` — retry tous pendings (avec consent)',
+      '`/flush-pending` — retry tous pendings (avec approval-disabled)',
       '`nom Prénom Nom` — complète pending lead',
       '`envoie les docs à <email>` — confirme envoi',
       '`annule <email>` — annule pending',
@@ -10201,12 +10236,12 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     const n = pendingDocSends.size;
     if (n === 0) return bot.sendMessage(msg.chat.id, '✅ Aucun pending à flush.');
-    await bot.sendMessage(msg.chat.id, `⚡ Flush ${n} pending doc-sends (force retry — consent Shawn)...`);
+    await bot.sendMessage(msg.chat.id, `⚡ Flush ${n} pending doc-sends (force retry — approval-disabled Shawn)...`);
     let sent = 0, failed = 0;
     for (const [email, pending] of [...pendingDocSends.entries()]) {
       try {
-        // Shawn a tapé /flush-pending = consent explicit pour TOUS les pending
-        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
+        // Shawn a tapé /flush-pending = autorisation distincte requise pour chaque envoi les pending
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: false /* legacy consent disabled; one-shot required */ });
         if (r.sent) { pendingDocSends.delete(email); sent++; }
         else if (r.skipped) log('INFO', 'FLUSH', `${email}: ${r.reason}`);
         else failed++;
@@ -12302,7 +12337,7 @@ function startDailyTasks() {
           );
           continue; // pas de retry sans accord explicite
         }
-        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: false /* legacy consent disabled; one-shot required */ });
         if (r.sent) {
           pendingDocSends.delete(email);
           await sendTelegramWithFallback(
@@ -13171,8 +13206,8 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     const results = [];
     for (const [email, pending] of [...pendingDocSends.entries()]) {
       try {
-        // Admin token = Shawn's authorized tool → consent implicite
-        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: true });
+        // Admin token = Shawn's authorized tool → approval-disabled
+        const r = await envoyerDocsAuto({ ...pending, _shawnConsent: false /* legacy consent disabled; one-shot required */ });
         if (r.sent) { pendingDocSends.delete(email); results.push({ email, sent: true }); }
         else results.push({ email, sent: false, reason: r.reason || r.error });
       } catch (e) { results.push({ email, sent: false, error: e.message.substring(0, 150) }); }
@@ -15276,7 +15311,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         cc: [],
         subject,
         category: 'test-white-label',
-        shawnConsent: true,
+        shawnConsent: false /* legacy consent disabled; one-shot required */,
         sendFn: async () => {
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), 30000);
@@ -15981,7 +16016,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       const dealForSend = dealFullObj || { id: dealId, title: nom || email, [PD_FIELD_CENTRIS]: centris || '' };
       const autoRes = await envoyerDocsAuto({
         email, nom, centris, dealId, deal: dealForSend, match: dbxMatch,
-        _shawnConsent: true, // attesté par AUTO_SAFE = tous critères stricts validés
+        _shawnConsent: false /* legacy consent disabled; one-shot required */, // attesté par AUTO_SAFE = tous critères stricts validés
       });
       if (autoRes.sent) {
         leadAudit.decision = 'auto_sent';
@@ -16172,7 +16207,7 @@ async function sendTelegramWithFallback(msg, ctx = {}) {
           await sendEmailLogged({
             via: 'gmail', to: AGENT.email, subject: subj,
             category: 'sendTelegramFallback-' + (ctx.category || 'unknown'),
-            shawnConsent: true,
+            shawnConsent: false /* legacy consent disabled; one-shot required */,
             sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
               method: 'POST',
               headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -17148,7 +17183,7 @@ async function main() {
     try {
       if (process.env.GITHUB_TOKEN) {
         const content = `# ✅ Boot réussi\n_${new Date().toLocaleString('fr-CA',{timeZone:'America/Toronto'})}_\n\n- Modèle: ${currentModel}\n- Outils: ${TOOLS.length}\n- Uptime: ${Math.floor(process.uptime())}s\n- Centris: ${centrisSession.authenticated?'✅':'⏳'}\n- Dropbox: ${dropboxToken?'✅':'❌'}\n\n## Logs boot (150 dernières lignes)\n\`\`\`\n${(bootLogsCapture||[]).slice(-150).join('\n')}\n\`\`\`\n`;
-        const url = `https://api.github.com/repos/signaturesb/kira-bot/contents/BOOT_REPORT.md`;
+        const url = `https://api.github.com/repos/signaturesb/bot-assistant/contents/BOOT_REPORT.md`;
         const getRes = await fetch(url, { headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' } });
         const sha = getRes.ok ? (await getRes.json()).sha : undefined;
         await fetch(url, {

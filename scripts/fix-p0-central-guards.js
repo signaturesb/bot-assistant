@@ -6,6 +6,7 @@ let code = fs.readFileSync(path, 'utf8');
 const original = code;
 
 function mustReplace(label, from, to) {
+  if (code.includes(to)) return;
   if (!code.includes(from)) throw new Error(`P0 central patch aborted: expected block missing: ${label}`);
   code = code.replace(from, to);
 }
@@ -45,7 +46,6 @@ const handlerStart = code.indexOf('async function handleEmailConfirmation(chatId
 const handlerEndMarker = '\n// ─── Handlers Telegram';
 const handlerEnd = code.indexOf(handlerEndMarker, handlerStart);
 if (handlerStart < 0 || handlerEnd < 0) throw new Error('P0 central patch aborted: email confirmation handler not found');
-const oldHandler = code.slice(handlerStart, handlerEnd);
 const newHandler = `async function handleEmailConfirmation(chatId, text) {\n  if (!CONFIRM_REGEX.test(text.trim())) return false;\n  const pending = pendingEmails.get(chatId);\n  if (!pending) return false;\n\n  // Une confirmation = UNE tentative Gmail précise. Aucune réutilisation, aucun fallback automatique.\n  let authorization;\n  try {\n    authorization = createOneShotAuthorization({\n      message: text,\n      via: 'gmail',\n      to: pending.to,\n      cc: [],\n      bcc: [AGENT.email],\n      subject: pending.sujet,\n      body: pending.texte,\n      attachments: [],\n    });\n  } catch (e) {\n    log('WARN', 'EMAIL', \`Confirmation bloquée: \${e.code || e.message}\`);\n    await send(chatId, '❌ Envoi bloqué — confirmation explicite requise pour cet email précis.');\n    return true;\n  }\n\n  try {\n    await envoyerEmailGmail({ ...pending, authorization });\n  } catch (e) {\n    log('ERR', 'EMAIL', \`Gmail fail après autorisation one-shot: \${e.message}\`);\n    // L'autorisation est consommée même si le provider échoue. Nouveau "envoie" requis.\n    await send(chatId, \`❌ Email non envoyé par Gmail: \${String(e.message || e).substring(0, 180)}\\n_Brouillon conservé. Dis "envoie" de nouveau pour une nouvelle tentative._\`);\n    return true;\n  }\n\n  pendingEmails.delete(chatId);\n  logActivity(\`Email envoyé (Gmail) → \${pending.to} — "\${pending.sujet.substring(0,60)}"\`);\n  mTick('emailsSent', 0); metrics.emailsSent++;\n  await send(chatId, \`✅ *Email envoyé* (Gmail)\\nÀ: \${pending.toName || pending.to}\\nObjet: \${pending.sujet}\`);\n  return true;\n}\n`;
 code = code.slice(0, handlerStart) + newHandler + code.slice(handlerEnd);
 

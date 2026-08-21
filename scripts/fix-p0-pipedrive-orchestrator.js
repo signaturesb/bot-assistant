@@ -6,6 +6,7 @@ let code = fs.readFileSync(path, 'utf8');
 const original = code;
 
 function mustReplace(label, from, to) {
+  if (code.includes(to)) return;
   if (!code.includes(from)) throw new Error(`P0 Pipedrive patch aborted: expected block missing: ${label}`);
   code = code.replace(from, to);
 }
