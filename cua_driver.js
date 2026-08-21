@@ -41,6 +41,46 @@ const VIEWPORT       = { width: 1280, height: 900 };
 const CENTRIS_BASE   = 'https://matrix.centris.ca';
 const MATRIX_BASE    = 'https://matrix.centris.ca';
 const PUBLIC_BASE    = 'https://www.centris.ca';
+const MANUAL_MFA_TTL = 2 * 60 * 1000;
+
+// Pont MFA en mémoire entre Telegram (/mfa) et la session Playwright active.
+// Le code est accepté uniquement pendant une attente MFA, consommé une fois,
+// puis oublié. Il n'est jamais écrit sur disque ni journalisé.
+let centrisMFAWaiting = false;
+let pendingManualMFACode = null;
+
+function isAwaitingCentrisMFA() {
+  return centrisMFAWaiting;
+}
+
+function ingestManualMFACode(code) {
+  const normalized = String(code || '').trim();
+  if (!centrisMFAWaiting || !/^\d{6}$/.test(normalized)) return false;
+  pendingManualMFACode = { code: normalized, receivedAt: Date.now() };
+  return true;
+}
+
+function takeManualMFACode() {
+  const pending = pendingManualMFACode;
+  pendingManualMFACode = null;
+  if (!pending || Date.now() - pending.receivedAt > MANUAL_MFA_TTL) return null;
+  return pending.code;
+}
+
+function browserlessEndpointWithTimeout(endpoint, timeoutMs = 180000) {
+  let url;
+  try { url = new URL(endpoint); }
+  catch { throw new Error('BROWSERLESS_WS invalide'); }
+  const safeTimeout = Math.max(60000, Math.min(Number(timeoutMs) || 180000, 300000));
+  url.searchParams.set('timeout', String(safeTimeout));
+  return url.toString();
+}
+
+function safeErrorMessage(error) {
+  return String(error?.message || error || 'erreur inconnue')
+    .replace(/([?&](?:token|api[_-]?key)=)[^&\s]+/gi, '$1[REDACTED]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
+}
 
 // Lazy-load Playwright — Préférence: rebrowser-playwright (anti-detect natif)
 // > playwright-core > playwright (fallback)
@@ -116,9 +156,11 @@ WebGLRenderingContext.prototype.getParameter = function (p) {
 // Sinon → launch local (nécessite Chromium installé).
 async function launchBrowser() {
   loadDeps();
-  const wsEndpoint = process.env.BROWSERLESS_WS;
-  if (wsEndpoint) {
+  const configuredEndpoint = process.env.BROWSERLESS_WS;
+  if (configuredEndpoint) {
     console.log('[CUA] Mode Browserless externe (WS)');
+    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 180000;
+    const wsEndpoint = browserlessEndpointWithTimeout(configuredEndpoint, sessionTimeoutMs);
     // Audit P3 #10: retry 3× avec backoff 3s/8s/20s
     let lastErr = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -132,14 +174,14 @@ async function launchBrowser() {
         lastErr = e;
         if (attempt < 3) {
           const delay = [3000, 8000, 20000][attempt - 1];
-          console.warn(`[CUA] Browserless connect échoué (attempt ${attempt}/${3}, retry ${delay}ms): ${e.message}`);
+          console.warn(`[CUA] Browserless connect échoué (attempt ${attempt}/${3}, retry ${delay}ms): ${safeErrorMessage(e)}`);
           await new Promise(r => setTimeout(r, delay));
         }
       }
     }
     // 3 fails → reset cache disponibilité pour forcer re-check au prochain appel
     _cuaAvailable = null;
-    throw new Error(`Browserless WS connect échoué 3× — last: ${lastErr?.message}. Vérifie BROWSERLESS_WS / quota.`);
+    throw new Error(`Browserless WS connect échoué 3× — last: ${safeErrorMessage(lastErr)}. Vérifie BROWSERLESS_WS / quota.`);
   }
   console.log('[CUA] Mode local Chromium');
   return await playwright.chromium.launch({
@@ -365,26 +407,20 @@ async function loginCentris(context) {
     await page.waitForTimeout(4500);
     loginDeterministicOK = true;
   } catch (e) {
-    console.warn(`[CUA] Login deterministic échoué: ${e.message}. Fallback CUA visuel...`);
+    console.warn(`[CUA] Login deterministic échoué: ${safeErrorMessage(e)}. Fallback DOM...`);
   }
 
-  // FALLBACK CUA — si selectors deterministic ratent (UI change), Claude voit l'écran et décide
+  // Fallback DOM large — les identifiants restent dans Playwright et ne sont
+  // jamais envoyés à un modèle externe.
   if (!loginDeterministicOK) {
-    console.log('[CUA] Activation CUA pour login visuel...');
-    const loginTask = `Tu es sur la page de login Centris/Matrix. Mes credentials:
-- UserCode/Username: "${user}"
-- Password: "${pass}"
-
-Étapes:
-1. Trouve le champ UserCode/Username et entre "${user}"
-2. Trouve le champ Password et entre "${pass}"
-3. Clique le bouton Connect/Connexion/Sign In/Log In
-4. Attends que la page suivante charge
-
-Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accueil Matrix.`;
-    const visualResult = await runCUATask(page, loginTask);
-    if (!visualResult.success) throw new Error(`CUA visual login échec: ${visualResult.message}`);
-    console.log('[CUA] Login visuel réussi ✅');
+    console.log('[CUA] Fallback DOM pour login...');
+    const passField = page.locator('input[type="password"]:visible').first();
+    const userField = page.locator('input:visible:not([type="password"]):not([type="hidden"]):not([type="submit"]):not([type="button"])').first();
+    await userField.fill(user);
+    await passField.fill(pass);
+    await page.locator('button[type="submit"], input[type="submit"]').first().click();
+    await page.waitForTimeout(4500);
+    console.log('[CUA] Login DOM fallback soumis ✅');
   }
 
   // Handle MFA (Email ou SMS) — Centris envoie code par email après login basic
@@ -425,7 +461,7 @@ Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accu
   const cookies = await context.cookies();
   saveSession(cookies);
   // Push aussi vers bot principal pour partage
-  try { pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', e.message); }
+  try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
   console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', finalUrl.substring(0, 80));
   return page;
 }
@@ -437,53 +473,75 @@ async function fetchMFACodeFromBot(timeoutMs) {
   const botUrl = process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com';
   const token = process.env.WEBHOOK_SECRET;
   if (!token) {
-    console.warn('[CUA] WEBHOOK_SECRET manquant — fallback file /data/centris_mfa.txt');
-    return await waitForMFACode(timeoutMs);
+    console.warn('[CUA] WEBHOOK_SECRET manquant — MFA manuel/fichier seulement');
   }
   const start = Date.now();
   let alertSent = false;
-  while (Date.now() - start < timeoutMs) {
-    try {
-      // 1. Try Gmail via bot endpoint
-      const r = await fetch(`${botUrl}/admin/centris-mfa-code?token=${encodeURIComponent(token)}`, {
-        signal: AbortSignal.timeout(15000),
-      });
-      if (r.ok) {
-        const d = await r.json();
-        if (d.code && /^\d{4,8}$/.test(d.code)) {
-          console.log(`[CUA] MFA from Gmail (${d.emails_checked} emails scanned, subject="${d.subject?.substring(0,40)}")`);
-          return d.code;
+  centrisMFAWaiting = true;
+  pendingManualMFACode = null;
+  try {
+    while (Date.now() - start < timeoutMs) {
+      try {
+        // 1. Code envoyé manuellement par /mfa dans Telegram.
+        const manualCode = takeManualMFACode();
+        if (manualCode) {
+          console.log('[CUA] MFA reçu depuis Telegram');
+          return manualCode;
         }
-      }
-      // 2. Try local file (Mac LaunchAgent sms-bridge)
-      const mfaFile = path.join(DATA_DIR, 'centris_mfa.txt');
-      if (fs.existsSync(mfaFile)) {
-        const code = fs.readFileSync(mfaFile, 'utf8').trim();
-        if (code && /^\d{4,8}$/.test(code)) {
-          fs.unlinkSync(mfaFile);
-          console.log('[CUA] MFA from local file (sms-bridge)');
-          return code;
+
+        // 2. Gmail via l'endpoint interne authentifié du bot.
+        if (token) {
+          const r = await fetch(`${botUrl}/admin/centris-mfa-code`, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15000),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            if (d.code && /^\d{4,8}$/.test(d.code)) {
+              console.log(`[CUA] MFA from Gmail (${d.emails_checked} emails scanned)`);
+              return d.code;
+            }
+          }
         }
-      }
-      // 3. Après 30s, alerter Shawn sur Telegram (1 fois)
-      if (!alertSent && Date.now() - start > 30000) {
-        alertSent = true;
-        await alertShawnMFA(botUrl, token).catch(() => {});
-      }
-    } catch (e) { console.warn('[CUA] fetchMFA loop:', e.message); }
-    await new Promise(r => setTimeout(r, 3000));
+
+        // 3. Fichier local écrit par le bridge SMS.
+        const mfaFile = path.join(DATA_DIR, 'centris_mfa.txt');
+        if (fs.existsSync(mfaFile)) {
+          const code = fs.readFileSync(mfaFile, 'utf8').trim();
+          if (code && /^\d{4,8}$/.test(code)) {
+            fs.unlinkSync(mfaFile);
+            console.log('[CUA] MFA from local file (sms-bridge)');
+            return code;
+          }
+        }
+
+        // 4. Alerte immédiatement l'utilisateur: Browserless peut avoir une
+        // limite de session courte et il faut laisser le maximum de temps utile.
+        if (!alertSent && token) {
+          alertSent = true;
+          await alertShawnMFA(botUrl, token, timeoutMs).catch(() => {});
+        }
+      } catch (e) { console.warn('[CUA] fetchMFA loop:', safeErrorMessage(e)); }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    return null;
+  } finally {
+    centrisMFAWaiting = false;
+    pendingManualMFACode = null;
   }
-  return null;
 }
 
 // Alerte Telegram à Shawn quand MFA tarde — il peut envoyer code via /mfa CMD
-async function alertShawnMFA(botUrl, token) {
+async function alertShawnMFA(botUrl, token, timeoutMs) {
   try {
-    await fetch(`${botUrl}/admin/notify?token=${encodeURIComponent(token)}`, {
+    await fetch(`${botUrl}/admin/notify`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
-        text: '🔐 *CUA Centris* attend code MFA\n\nCode pas trouvé dans Gmail en 30s.\n\n👉 Envoie le code via `/mfa 123456` ou réponds avec le code seul.\n\n_(timeout 60s total)_',
+        text: `🔐 *CUA Centris* attend le code MFA\n\n👉 Envoie immédiatement le code via \`/mfa 123456\`.\n\n_(fenêtre maximale: ${Math.round(timeoutMs / 1000)}s)_`,
         parse_mode: 'Markdown',
       }),
       signal: AbortSignal.timeout(8000),
@@ -504,9 +562,12 @@ async function pushCookiesToBot(playwrightCookies) {
     .join('; ');
   if (!cookieStr) return;
   try {
-    await fetch(`${botUrl}/admin/centris-cookies?token=${encodeURIComponent(token)}`, {
+    await fetch(`${botUrl}/admin/centris-cookies`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({ cookies: cookieStr, source: 'cua', ts: Date.now() }),
       signal: AbortSignal.timeout(10000),
     });
@@ -2150,4 +2211,7 @@ module.exports = {
   _runCUATask: runCUATask,
   _executeCUAAction: executeCUAAction,
   _newStealthContext: newStealthContext,
+  _browserlessEndpointWithTimeout: browserlessEndpointWithTimeout,
+  ingestManualMFACode,
+  isAwaitingCentrisMFA,
 };
