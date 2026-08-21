@@ -18,6 +18,7 @@
     "doctor": "node scripts/doctor.js",
     "audit-history": "bash scripts/audit-history.sh",
     "audit-memory": "node scripts/audit-memory.js",
+    "audit-dangerous-surfaces": "node scripts/audit-dangerous-surfaces.js",
     "brevo:diagnose": "node scripts/brevo_readonly_diagnostic.js",
     "test-brevo-readonly": "node test_brevo_readonly_diagnostic.js",
     "test": "node test_all.js",
@@ -27,7 +28,7 @@
     "test-cua": "node test_cua.js",
     "test-email-guard": "node test_email_send_guard.js",
     "test-pipedrive-guard": "node test_pipedrive_write_guard.js",
-    "preflight": "npm run validate && npm run audit-memory && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-brevo-readonly && npm run security-status"
+    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-brevo-readonly && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
