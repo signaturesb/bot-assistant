@@ -1,5 +1,6 @@
 'use strict';
 
+// Deterministic audit-branch autofix for unreachable memory compaction defaults.
 const fs = require('fs');
 const path = 'bot.js';
 let code = fs.readFileSync(path, 'utf8');
