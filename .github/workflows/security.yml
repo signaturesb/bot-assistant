@@ -33,16 +33,19 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: true
 
   validate:
-    name: Validate bot.js
+    name: Validate + persistence invariants
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: '20'
+          cache: 'npm'
       - run: npm ci
       - name: Syntax + validations
-        run: node validate.js
+        run: npm run validate
+      - name: Memory + persistence audit
+        run: npm run audit-memory
 
   audit:
     name: npm audit — vulnérabilités dépendances
@@ -52,6 +55,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '20'
+          cache: 'npm'
       - run: npm ci --ignore-scripts
       - name: Audit high/critical
         run: npm audit --audit-level=high
