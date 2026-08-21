@@ -56,6 +56,8 @@ jobs:
         run: npm run test-admin-auth
       - name: Brevo diagnostics must remain read-only
         run: npm run test-brevo-readonly
+      - name: Telegram v1.2 transport compatibility regression test
+        run: npm run test-telegram-compat
 
   audit:
     name: npm audit — vulnérabilités dépendances
