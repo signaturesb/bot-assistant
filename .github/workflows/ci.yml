@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, audit/telegram-history-and-hardening]
   pull_request:
-    branches: [main]
+    branches: [main, audit/telegram-history-and-hardening]
 
 jobs:
   syntax-check:
@@ -36,6 +36,7 @@ jobs:
           npm run test-runtime-safety
           npm run test-calendar-guard
           npm run test-centris-query
+          npm run test-centris-auth-bridge
           npm run test-telegram-compat
       - name: Security status
         run: npm run security-status
