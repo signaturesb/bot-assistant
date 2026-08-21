@@ -1,0 +1,45 @@
+name: Final Security Gates Autofix (audit branch only)
+
+on:
+  push:
+    branches:
+      - audit/telegram-history-and-hardening
+    paths:
+      - 'scripts/fix-security-gates-final.js'
+      - '.github/workflows/final-security-gates-autofix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit/telegram-history-and-hardening
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Apply deterministic final security patch
+        run: node scripts/fix-security-gates-final.js
+      - name: Validate all safety gates
+        run: |
+          npm ci --ignore-scripts
+          npm run validate
+          npm run audit-memory
+          npm run audit-dangerous-surfaces
+          npm run test-email-guard
+          npm run test-pipedrive-guard
+          npm run test-brevo-readonly
+      - name: Commit bot.js fix if needed
+        run: |
+          if git diff --quiet -- bot.js; then
+            echo 'No bot.js change required.'
+            exit 0
+          fi
+          git config user.name 'signatureSB-hardening-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add bot.js
+          git commit -m 'fix: close legacy email consent and CRM write bypasses'
+          git push origin HEAD:audit/telegram-history-and-hardening
