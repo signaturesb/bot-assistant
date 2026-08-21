@@ -3,11 +3,29 @@
 const fs = require('fs');
 
 const code = fs.readFileSync('bot.js', 'utf8');
+const lines = code.split('\n');
 const errors = [];
 const warnings = [];
 
 function count(re) {
   return (code.match(re) || []).length;
+}
+
+function locations(re, label) {
+  const out = [];
+  lines.forEach((line, idx) => {
+    const test = new RegExp(re.source, re.flags.replace('g', ''));
+    if (test.test(line)) {
+      out.push({ line: idx + 1, text: line.trim().slice(0, 220), label });
+    }
+  });
+  return out;
+}
+
+function reportLocations(title, entries) {
+  if (!entries.length) return;
+  console.log(`\n-- ${title} (${entries.length}) --`);
+  for (const e of entries) console.log(`L${e.line}: ${e.text}`);
 }
 
 // EMAIL CONSENT — vague confirmations must never authorize sends.
@@ -16,14 +34,15 @@ if (/(?:parfait|oui|\bok\b|\bgo\b|ça marche|d'accord|c'est bon)/i.test(confirmL
   errors.push('CONFIRM_REGEX contient encore des confirmations vagues pour email.');
 }
 
-// Hard-coded consent is forbidden. A caller cannot self-attest consent.
-const hardcodedConsent = count(/shawnConsent\s*:\s*true/g);
-if (hardcodedConsent > 0) {
-  errors.push(`${hardcodedConsent} occurrence(s) de shawnConsent:true détectée(s). Remplacer par une autorisation one-shot vérifiable.`);
+const hardcodedConsentRe = /shawnConsent\s*:\s*true/;
+const hardcodedPrivateConsentRe = /_shawnConsent\s*:\s*true/;
+const hardcodedConsentLocs = locations(hardcodedConsentRe, 'shawnConsent:true');
+const hardcodedPrivateConsentLocs = locations(hardcodedPrivateConsentRe, '_shawnConsent:true');
+if (hardcodedConsentLocs.length > 0) {
+  errors.push(`${hardcodedConsentLocs.length} occurrence(s) de shawnConsent:true détectée(s). Remplacer par une autorisation one-shot vérifiable.`);
 }
-const hardcodedPrivateConsent = count(/_shawnConsent\s*:\s*true/g);
-if (hardcodedPrivateConsent > 0) {
-  errors.push(`${hardcodedPrivateConsent} occurrence(s) de _shawnConsent:true détectée(s). Un caller ne doit pas pouvoir attester le consentement lui-même.`);
+if (hardcodedPrivateConsentLocs.length > 0) {
+  errors.push(`${hardcodedPrivateConsentLocs.length} occurrence(s) de _shawnConsent:true détectée(s). Un caller ne doit pas pouvoir attester le consentement lui-même.`);
 }
 
 // Bulk/reusable consent is explicitly forbidden: one confirmation = one email.
@@ -39,7 +58,6 @@ for (const re of bulkConsentPatterns) {
 }
 
 // Prompt/model instructions must never instruct autonomous CRM writes.
-// The model may propose a write, but only the current explicit user request can authorize it.
 const autonomousCrmPatterns = [
   /nouveau prospect[^\n]{0,140}creer_deal\s+auto/i,
   /nouveau[^\n]{0,120}creer_deal\s+immédiatement/i,
@@ -65,14 +83,17 @@ if (!code.includes('requirePipedriveWriteIntent(')) {
 }
 
 // Inventory direct provider send surfaces. Every occurrence must be wrapped centrally.
-const gmailDirect = count(/gmail\.googleapis\.com\/gmail\/v1\/users\/me\/messages\/send/g);
-const brevoDirect = count(/api\.brevo\.com\/v3\/(?:smtp\/email|emailCampaigns)/g);
-if (gmailDirect > 0) warnings.push(`${gmailDirect} surface(s) Gmail messages/send directe(s) détectée(s) — vérifier wrapper central.`);
-if (brevoDirect > 0) warnings.push(`${brevoDirect} surface(s) Brevo potentiellement mutative(s) détectée(s) — vérifier wrapper central.`);
+const gmailRe = /gmail\.googleapis\.com\/gmail\/v1\/users\/me\/messages\/send/;
+const brevoRe = /api\.brevo\.com\/v3\/(?:smtp\/email|emailCampaigns)/;
+const gmailLocs = locations(gmailRe, 'gmail send');
+const brevoLocs = locations(brevoRe, 'brevo mutative');
+if (gmailLocs.length > 0) warnings.push(`${gmailLocs.length} surface(s) Gmail messages/send directe(s) détectée(s) — vérifier wrapper central.`);
+if (brevoLocs.length > 0) warnings.push(`${brevoLocs.length} surface(s) Brevo potentiellement mutative(s) détectée(s) — vérifier wrapper central.`);
 
-// Inventory Pipedrive mutating helpers/endpoints for manual review until guard is fully centralized.
-const pdMutations = count(/(?:pdPost|pdPut|pdDelete)\s*\(/g);
-if (pdMutations > 0) warnings.push(`${pdMutations} appel(s) helper Pipedrive mutatif(s) détecté(s) — tous doivent passer par le write guard.`);
+// Inventory Pipedrive mutating helpers/endpoints.
+const pdMutationRe = /(?:pdPost|pdPut|pdDelete)\s*\(/;
+const pdMutationLocs = locations(pdMutationRe, 'Pipedrive mutation');
+if (pdMutationLocs.length > 0) warnings.push(`${pdMutationLocs.length} appel(s) helper Pipedrive mutatif(s) détecté(s) — tous doivent passer par le write guard.`);
 
 // Persistence: /tmp may exist as emergency fallback, but business state must not silently rely on it.
 if (/const\s+DATA_DIR\s*=\s*fs\.existsSync\('\/data'\)\s*\?\s*'\/data'\s*:\s*'\/tmp'/.test(code)) {
@@ -92,6 +113,12 @@ if (/searchParams\.get\('token'\)/.test(code)) {
 console.log('=== KIRA DANGEROUS SURFACE AUDIT ===');
 for (const w of warnings) console.log(`WARN: ${w}`);
 for (const e of errors) console.error(`ERROR: ${e}`);
+
+reportLocations('HARDCODED EMAIL CONSENT', hardcodedConsentLocs);
+reportLocations('HARDCODED PRIVATE EMAIL CONSENT', hardcodedPrivateConsentLocs);
+reportLocations('DIRECT GMAIL SEND SURFACES', gmailLocs);
+reportLocations('BREVO MUTATIVE SURFACES', brevoLocs);
+reportLocations('PIPEDRIVE MUTATIONS', pdMutationLocs);
 
 if (errors.length) process.exit(1);
 console.log('OK: aucune violation critique détectée');
