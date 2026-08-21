@@ -46,6 +46,8 @@ jobs:
         run: npm run validate
       - name: Memory + persistence audit
         run: npm run audit-memory
+      - name: Dangerous surface audit
+        run: npm run audit-dangerous-surfaces
       - name: Email one-shot consent regression tests
         run: npm run test-email-guard
       - name: Pipedrive write guard regression tests
