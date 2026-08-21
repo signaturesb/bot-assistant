@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const assert = require('assert');
+const vm = require('vm');
 const { hasExplicitWriteIntent, requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 
 assert.strictEqual(hasExplicitWriteIntent('analyse mes leads aujourd hui', 'create'), false);
@@ -58,6 +59,23 @@ assert.ok(
   'activity reads must use the current Pipedrive v2 API'
 );
 assert.ok(botCode.includes('async function pdGetActivities('), 'central filtered Pipedrive activity reader missing');
+assert.ok(
+  botCode.includes("if (raw === null || raw === undefined || raw === '') return null;"),
+  'Pipedrive relation IDs must reject empty values instead of converting null to 0'
+);
+assert.ok(
+  botCode.includes('Number.isSafeInteger(id) && id > 0 ? id : null'),
+  'Pipedrive relation IDs must be positive safe integers'
+);
+const normalizeSource = botCode.match(/function normalizePipedriveRelationId\(value\) \{[\s\S]*?\n\}/)?.[0];
+assert.ok(normalizeSource, 'Pipedrive relation ID normalizer must be testable');
+const normalizePipedriveRelationId = vm.runInNewContext(`(${normalizeSource})`);
+for (const emptyValue of [null, undefined, '', 0, '0', -1, 'abc', 1.5]) {
+  assert.strictEqual(normalizePipedriveRelationId(emptyValue), null, `invalid Pipedrive ID accepted: ${String(emptyValue)}`);
+}
+assert.strictEqual(normalizePipedriveRelationId(1358), 1358);
+assert.strictEqual(normalizePipedriveRelationId('2506'), 2506);
+assert.strictEqual(normalizePipedriveRelationId({ value: 5251 }), 5251);
 assert.ok(
   !/pdGet\(`\/deals\/\$\{[^}]+\}\/activities/.test(botCode),
   'retired nested deal activities endpoint is still used'
