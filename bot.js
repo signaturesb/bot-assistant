@@ -3849,44 +3849,12 @@ async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match, _shaw
 // Dédup 1h par (clientEmail + folderPath) — évite spam si lead re-traité
 const previewSent = new Map(); // key → timestamp ms
 function firePreviewDocs({ email, nom, centris, deal, match }) {
+  // P0: aucun email, même un preview à Shawn, sans confirmation explicite one-shot.
+  // Les données restent disponibles dans pendingDocSends/Telegram pour inspection.
   if (!email || !match?.folder) return;
-  const key = `${email}|${match.folder.path || ''}`;
-  const last = previewSent.get(key);
-  if (last && (Date.now() - last) < 60 * 60 * 1000) {
-    log('INFO', 'DOCS', `PREVIEW skip dédup 1h (client: ${email})`);
-    return;
-  }
-  previewSent.set(key, Date.now());
-  // Nettoyage: garder max 200 entrées
-  if (previewSent.size > 200) {
-    const keys = [...previewSent.keys()].slice(0, previewSent.size - 200);
-    for (const k of keys) previewSent.delete(k);
-  }
-
-  setImmediate(async () => {
-    try {
-      const res = await envoyerDocsProspect(nom || email, email, null, {
-        dealHint: deal, folderHint: match.folder, centrisHint: centris,
-        preview: { clientEmail: email, clientName: nom || '' },
-      });
-      if (typeof res === 'string' && res.startsWith('✅')) {
-        log('OK', 'DOCS', `PREVIEW → ${AGENT.email} (client: ${email})`);
-      } else {
-        log('WARN', 'DOCS', `PREVIEW échec: ${String(res).substring(0, 120)}`);
-        sendTelegramWithFallback(
-          `⚠️ *Preview email ÉCHOUÉ* pour ${email}\n${String(res).substring(0, 200)}\n\nLe doc-send reste en attente — tu peux quand même dire \`envoie les docs à ${email}\`.`,
-          { category: 'preview-failed', email }
-        ).catch(() => {});
-      }
-    } catch (e) {
-      log('WARN', 'DOCS', `PREVIEW exception: ${e.message}`);
-      sendTelegramWithFallback(
-        `⚠️ *Preview email exception* pour ${email}\n${e.message.substring(0, 200)}`,
-        { category: 'preview-exception', email }
-      ).catch(() => {});
-    }
-  });
+  log('INFO', 'DOCS', `PREVIEW EMAIL BLOQUÉ par règle de consentement — docs préparables pour ${email}`);
 }
+
 
 // ─── Template HTML v11 — Envoi listing white-label Signature SB ──────────────
 // Validé après 11 itérations Shawn (2026-06-01). Référence:
@@ -9121,7 +9089,7 @@ function registerHandlers() {
       lines.push(`  Aucun lead traité dans les 24h`);
     } else {
       const decisionEmoji = {
-        auto_sent: '🚀', pending_preview_sent: '📦', pending_invalid_name: '⚠️',
+        auto_sent: '🚀', pending_no_email_sent: '📦', pending_invalid_name: '⚠️',
         dedup_skipped: '♻️', auto_failed: '❌', auto_exception: '❌',
         auto_skipped: '⏭', no_dropbox_match: '🔍', blocked_suspect_name: '🛑',
         multiple_candidates: '🔀', max_retries_exhausted: '💀',
@@ -9483,7 +9451,7 @@ function registerHandlers() {
       }
       lines.push(`*🎯 Leads (${leadEvents.length}):*`);
       const decEmoji = {
-        auto_sent: '🚀', pending_preview_sent: '📦', pending_invalid_name: '⚠️',
+        auto_sent: '🚀', pending_no_email_sent: '📦', pending_invalid_name: '⚠️',
         dedup_skipped: '♻️', auto_failed: '❌', auto_skipped: '⏭',
         no_dropbox_match: '🔍', blocked_suspect_name: '🛑',
         skipped_no_email_or_deal: '📭', noSource_suspect: '🤔',
@@ -15847,59 +15815,27 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   }
   // ─── FIN P1 ────────────────────────────────────────────────────────────────
 
-  // 1. Créer deal Pipedrive
-  let dealTxt = '';
+  // 1. Pipedrive READ-ONLY — un lead entrant ne constitue JAMAIS une autorisation d'écriture
+  let dealTxt = 'ℹ️ Pipedrive lecture seule — aucune création/modification automatique';
   let dealId  = null;
   if (PD_KEY) {
     try {
-      const noteBase = [
-        `Lead ${source.label} reçu le ${new Date().toLocaleString('fr-CA', { timeZone: 'America/Toronto' })}`,
-        adresse ? `Propriété: ${adresse}` : '',
-        centris ? `Centris: #${centris}` : '',
-        `Email source: ${from}`,
-        `Sujet: ${subject}`,
-      ].filter(Boolean).join('\n');
-
-      // Fallback nom: si nom extrait est vide ou suspect, utilise "Madame/Monsieur"
-      // ou l'email local-part. Le deal Pipedrive sera créé avec un label utilisable.
-      const nomFinal = nom || (email ? email.split('@')[0].replace(/[._-]/g, ' ') : 'Prospect Centris');
-      // Retry 3× Pipedrive (backoff 0/2s/5s) — si API down, on essaie plusieurs fois
-      const maxDealRetries = 3;
-      const dealDelays = [0, 2000, 5000];
-      for (let attempt = 0; attempt < maxDealRetries && !dealId; attempt++) {
-        if (dealDelays[attempt]) await new Promise(r => setTimeout(r, dealDelays[attempt]));
-        try {
-          dealTxt = await creerDeal({
-            prenom: nomFinal.split(' ')[0] || nomFinal,
-            nom:    nomFinal.split(' ').slice(1).join(' ') || '',
-            telephone, email, type, source: source.source, centris,
-            note: noteBase,
-          });
-          const sr = await pdGet(`/deals/search?term=${encodeURIComponent(nomFinal || email || telephone)}&limit=1`);
-          dealId = sr?.data?.items?.[0]?.item?.id;
-          if (dealId) break;
-        } catch (e) {
-          dealTxt = `⚠️ Deal attempt ${attempt + 1}/${maxDealRetries}: ${e.message.substring(0, 80)}`;
-          if (attempt === maxDealRetries - 1) log('WARN', 'POLLER', `Deal Pipedrive échoué après ${maxDealRetries} tentatives: ${e.message}`);
+      const lookupTerm = email || telephone || nom || centris || '';
+      if (lookupTerm) {
+        const sr = await pdGet(`/deals/search?term=${encodeURIComponent(lookupTerm)}&limit=3`);
+        const existing = sr?.data?.items?.[0]?.item || null;
+        if (existing) {
+          dealId = existing.id;
+          dealTxt = `🔎 Deal existant trouvé (lecture seule): ${existing.title || lookupTerm} #${existing.id}`;
         }
       }
-    } catch (e) { dealTxt = `⚠️ Deal: ${e.message.substring(0, 80)}`; }
+    } catch (e) {
+      dealTxt = `⚠️ Lecture Pipedrive: ${e.message.substring(0, 80)}`;
+      log('WARN', 'POLLER', dealTxt);
+    }
   }
 
-  // 1.5. ANTI-DOUBLONS — Cleanup + auto-complete ancien AVANT toute création
-  // Règle Shawn: 1 deal + 1 activité active. Ancien complété au nouveau suivi.
-  if (dealId) {
-    try {
-      const cleanup = await nettoyerDoublonsActivites(dealId);
-      if (cleanup.supprimees > 0) {
-        log('OK', 'POLLER', `🧹 Anti-doublons deal ${dealId}: ${cleanup.supprimees} doublon(s) supprimé(s)`);
-      }
-      const completed = await completerAnciennesActivites(dealId);
-      if (completed > 0) {
-        log('OK', 'POLLER', `✅ ${completed} ancienne(s) activité(s) complétée(s) sur deal ${dealId}`);
-      }
-    } catch (e) { log('WARN', 'POLLER', `Cleanup deal ${dealId}: ${e.message}`); }
-  }
+  // AUCUN cleanup/complete/create/update d'activité ici. Le poller analyse et notifie seulement.
 
   // 2. Matching Dropbox AVANCÉ (4 stratégies) + auto-envoi si score ≥90
   let docsTxt = '';
@@ -15962,7 +15898,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     msgId, at: new Date().toISOString(),
     source: source?.label, subject: subject?.substring(0, 100), from: from?.substring(0, 120),
     extracted: { nom, telephone, email, centris, adresse, type },
-    dealId, dealCreated: !!dealId,
+    dealId, dealCreated: false, existingDealFound: !!dealId,
     match: {
       found: !!hasMatch,
       score: dbxMatch?.score || 0,
@@ -16015,7 +15951,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       pendingDocSends.set(email, { email, nom: '', centris, dealId, deal: dealFullObj, match: dbxMatch });
       firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
     }
-    autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Preview envoyé sur ${AGENT.email} pour validation visuelle.`;
+    autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Aucun email preview envoyé — validation dans Telegram requise.`;
     return { decision: 'blocked_suspect_name', dealId };
   }
 
@@ -16037,7 +15973,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   const sourceTrusted = /^(centris|remax|realtor|duproprio)$/i.test(source?.source || '');
   const exactMatch = dbxMatch?.score === 100;
   const completeContact = !!(email && (telephone || centris));
-  const AUTO_SAFE = exactMatch && aiValidated && completeContact && sourceTrusted && hasMatch && !!dealId && !autoSendPaused && isValidProspectName(nom);
+  const AUTO_SAFE = false; // P0: aucune donnée/score/source ne remplace le consentement explicite de Shawn
 
   if (AUTO_SAFE) {
     // Auto-envoi avec consent attesté par critères stricts
@@ -16070,7 +16006,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     }
   } else if (email && hasMatch) {
     // Mode preview + pending (consent click obligatoire)
-    leadAudit.decision = 'pending_preview_sent';
+    leadAudit.decision = 'pending_no_email_sent';
     pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
     firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
     // Explique POURQUOI ce n'est pas auto-safe (transparence pour Shawn)
@@ -16086,7 +16022,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     autoEnvoiMsg = `\n📦 *Docs prêts — attend ton OK* (${why})\n` +
                    `   Dossier: *${dbxMatch.folder.adresse || dbxMatch.folder.name}*\n` +
                    `   ${dbxMatch.pdfs.length} docs:\n${docsList}\n` +
-                   `   📧 Preview envoyé sur ${AGENT.email}\n` +
+                   `   🔒 Preview email désactivé — aucun email envoyé\n` +
                    `   ✅ Click le bouton ci-dessous OU dis \`envoie les docs à ${email}\``;
   } else if (email && dbxMatch?.candidates?.length) {
     leadAudit.decision = 'multiple_candidates';
@@ -16117,7 +16053,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
       dropbox_match: dbxMatch?.score || 0,
       dropbox_dossier: dbxMatch?.folder?.name || null,
       envoi: leadAudit.decision === 'auto_sent' ? 'auto'
-           : leadAudit.decision === 'pending_preview_sent' ? 'pending'
+           : leadAudit.decision === 'pending_no_email_sent' ? 'pending'
            : leadAudit.decision === 'blocked_suspect_name' ? 'skip_name'
            : leadAudit.decision === 'no_dropbox_match' ? 'brouillon'
            : leadAudit.decision,
