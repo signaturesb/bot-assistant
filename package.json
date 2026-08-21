@@ -33,7 +33,8 @@
     "test-runtime-safety": "node test_runtime_safety.js",
     "test-telegram-compat": "node test_telegram_compat.js",
     "test-calendar-guard": "node test_calendar_guard.js",
-    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-brevo-readonly && npm run security-status"
+    "test-centris-query": "node test_centris_query.js",
+    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-centris-query && npm run test-brevo-readonly && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

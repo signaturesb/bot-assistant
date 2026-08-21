@@ -29,7 +29,14 @@ jobs:
         continue-on-error: false
       - name: Validate
         run: npm run validate
-        continue-on-error: true
+        continue-on-error: false
+      - name: Consent, runtime and Centris API guards
+        run: |
+          npm run test-admin-auth
+          npm run test-runtime-safety
+          npm run test-calendar-guard
+          npm run test-centris-query
+          npm run test-telegram-compat
       - name: Security status
         run: npm run security-status
         continue-on-error: true

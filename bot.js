@@ -22,6 +22,7 @@ const {
   retryReadOnly,
 } = require('./lib/runtime_safety');
 const { gistWritesEnabled, shouldRestoreFromGist } = require('./lib/persistence_policy');
+const { parseCentrisComparableQuery, publicComparableListing } = require('./lib/centris_query');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🛡️ RÈGLE ABSOLUE — Shawn gère SES suivis lui-même
@@ -66,6 +67,29 @@ function requireAdmin(req, res) {
     }
     return true;
   } catch { res.writeHead(400); res.end('bad request'); return false; }
+}
+
+// Clé distincte et à privilège minimal pour le Custom GPT Centris.
+// Ne jamais réutiliser WEBHOOK_SECRET: cette action est strictement read-only.
+function requireCentrisAction(req, res) {
+  try {
+    const expected = process.env.CENTRIS_ACTION_API_KEY || '';
+    if (!expected) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'CENTRIS_ACTION_NOT_CONFIGURED' }));
+      return false;
+    }
+    if (!isAdminAuthorized(req.headers, expected)) {
+      res.writeHead(401, { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer' });
+      res.end(JSON.stringify({ ok: false, error: 'UNAUTHORIZED' }));
+      return false;
+    }
+    return true;
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'BAD_REQUEST' }));
+    return false;
+  }
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -6004,7 +6028,25 @@ loadCentrisSessionFromDisk();
 // ─── MFA Bridge — coordination Mac SMS bridge ↔ Centris OAuth flow ────────
 let pendingMFACode = null;       // dernier code reçu non consommé
 let mfaWaiters = [];             // resolveurs Promise en attente d'un code
+let centrisLoginInProgress = false;
 const smsBridgeHealth = { alive: false, lastHeartbeat: 0, lastCodeAt: 0, totalCodes: 0 };
+
+function ingestCentrisMFACode(code, sender = 'unknown', text = '') {
+  const normalized = String(code || '').trim();
+  if (!/^\d{4,8}$/.test(normalized)) return false;
+
+  pendingMFACode = {
+    code: normalized,
+    receivedAt: Date.now(),
+    sender: String(sender || 'unknown').substring(0, 80),
+    text: String(text || '').substring(0, 200),
+  };
+  const waiters = mfaWaiters.splice(0);
+  for (const resolver of waiters) {
+    try { resolver(normalized); } catch {}
+  }
+  return true;
+}
 
 // Erreur spécifique MFA — l'appelant doit la catch pour fallback dégradé propre
 class MFARequiredError extends Error {
@@ -6062,11 +6104,12 @@ async function awaitMFACode(timeoutMs = 120000) {
   }
 
   return new Promise((resolve, reject) => {
+    let wrappedResolve;
     const t = setTimeout(() => {
-      mfaWaiters = mfaWaiters.filter(r => r !== resolve);
+      mfaWaiters = mfaWaiters.filter(r => r !== wrappedResolve);
       reject(new MFARequiredError(`timeout ${timeoutMs/1000}s — aucun code via bridge SMS + pas de TOTP`));
     }, timeoutMs);
-    const wrappedResolve = (code) => {
+    wrappedResolve = (code) => {
       clearTimeout(t);
       pendingMFACode = null; // consommé
       resolve(code);
@@ -10575,6 +10618,23 @@ function registerHandlers() {
     );
   });
 
+  // /mfa 123456 — secours manuel à usage unique lorsque le bridge Mac est indisponible.
+  // Le code n'est accepté que pendant une tentative Centris active et n'est jamais journalisé.
+  bot.onText(/^\/mfa(?:@\w+)?(?:\s+(\d{6}))?\s*$/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const code = match?.[1];
+    if (!code) {
+      return bot.sendMessage(msg.chat.id, 'Usage: /mfa 123456 — seulement après /login_centris et après réception du SMS.');
+    }
+    if (!centrisLoginInProgress) {
+      return bot.sendMessage(msg.chat.id, '⚠️ Aucune connexion Centris active. Lance /login_centris avant d’envoyer le code.');
+    }
+    if (!ingestCentrisMFACode(code, 'telegram-manual')) {
+      return bot.sendMessage(msg.chat.id, '❌ Code MFA invalide. Le code doit contenir exactement 6 chiffres.');
+    }
+    await bot.sendMessage(msg.chat.id, '✅ Code MFA reçu et consommé une seule fois. Je termine la connexion Centris…');
+  });
+
   // /login_centris — déclenche login OAuth complet avec injection MFA auto
   // Coordonné avec le bridge Mac sms-bridge.js qui forward le code SMS au bot.
   bot.onText(/^\/login[-_]?centris\b/i, async msg => {
@@ -10582,11 +10642,16 @@ function registerHandlers() {
     if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) {
       return bot.sendMessage(msg.chat.id, '❌ CENTRIS_USER/CENTRIS_PASS manquants dans Render env vars');
     }
+    if (centrisLoginInProgress) {
+      return bot.sendMessage(msg.chat.id, '⏳ Une connexion Centris est déjà en cours. Attends son résultat ou envoie le code reçu avec /mfa 123456.');
+    }
+    centrisLoginInProgress = true;
     const bridgeAlive = smsBridgeHealth.alive && (Date.now() - smsBridgeHealth.lastHeartbeat) < 10 * 60 * 1000;
     await bot.sendMessage(msg.chat.id,
       `🔐 *Login Centris OAuth + MFA*\n` +
       `Bridge Mac SMS: ${bridgeAlive ? '🟢 actif' : '⚠️ pas de heartbeat <10min'}\n` +
-      `_Le bot va recevoir un SMS code → bridge forward → injection auto._\n` +
+      `_Le bot va recevoir le code automatiquement si le bridge est actif._\n` +
+      `Sinon, après réception du SMS, envoie immédiatement: \`/mfa 123456\`\n` +
       `_Patience ~30-60s, surtout pour le SMS_`,
       { parse_mode: 'Markdown' }
     );
@@ -10594,7 +10659,6 @@ function registerHandlers() {
     const stopTyping = startTypingIndicator(msg.chat.id);
     try {
       const result = await centrisOAuthLoginWithMFA({ mfaTimeoutMs: 120000 });
-      stopTyping();
       if (result.ok) {
         await bot.sendMessage(msg.chat.id,
           `✅ *Login Centris OK*\n` +
@@ -10608,8 +10672,11 @@ function registerHandlers() {
         auditLogEvent('centris', 'oauth-login-failed', { error: result.error });
       }
     } catch (e) {
-      stopTyping();
       await bot.sendMessage(msg.chat.id, `❌ Exception: ${e.message?.substring(0, 200)}`);
+    } finally {
+      stopTyping();
+      centrisLoginInProgress = false;
+      pendingMFACode = null;
     }
   });
 
@@ -13843,6 +13910,83 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // Lecture seule des comparables Centris. Endpoint privé: le secret passe
+  // uniquement dans Authorization: Bearer (jamais dans l'URL ou les logs).
+  if (req.method === 'GET' && url === '/centris/comparables') {
+    if (!requireCentrisAction(req, res)) return;
+    const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
+    if (!webhookRateOK(ip, url, 10)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+      res.end(JSON.stringify({ ok: false, error: 'RATE_LIMITED' }));
+      return;
+    }
+
+    const query = parseCentrisComparableQuery(req.url);
+    if (!query.ok) {
+      res.writeHead(query.status || 400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: query.error, detail: query.detail || null }, null, 2));
+      return;
+    }
+
+    const startedAt = Date.now();
+    const { ville, type, jours, statut } = query.value;
+    try {
+      const timeout = new Promise((_, reject) => {
+        const error = new Error('CENTRIS_TIMEOUT');
+        error.code = 'CENTRIS_TIMEOUT';
+        setTimeout(() => reject(error), 45000).unref?.();
+      });
+      const result = await Promise.race([
+        chercherComparablesVendus({ ville, type, jours, statut }),
+        timeout,
+      ]);
+
+      if (typeof result === 'string') {
+        const noResults = result.startsWith('Aucun résultat Centris');
+        auditLogEvent('centris', 'comparables-api-read', {
+          ville, type, jours, statut, count: 0, durationMs: Date.now() - startedAt,
+          outcome: noResults ? 'empty' : 'auth-unavailable',
+        });
+        res.writeHead(noResults ? 200 : 503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: noResults,
+          query: { ville, type, jours, statut },
+          count: 0,
+          results: [],
+          ...(noResults ? { message: result } : { error: 'CENTRIS_UNAVAILABLE', nextAction: '/login_centris dans Telegram' }),
+        }, null, 2));
+        return;
+      }
+
+      const results = result.map(publicComparableListing);
+      auditLogEvent('centris', 'comparables-api-read', {
+        ville, type, jours, statut, count: results.length, durationMs: Date.now() - startedAt,
+        outcome: 'ok',
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store' });
+      res.end(JSON.stringify({
+        ok: true,
+        query: { ville, type, jours, statut },
+        count: results.length,
+        results,
+        meta: { source: 'Centris', readOnly: true, durationMs: Date.now() - startedAt },
+      }, null, 2));
+    } catch (error) {
+      const timedOut = error?.code === 'CENTRIS_TIMEOUT';
+      auditLogEvent('centris', 'comparables-api-failed', {
+        ville, type, jours, statut, durationMs: Date.now() - startedAt,
+        error: timedOut ? 'timeout' : String(error?.message || 'unknown').substring(0, 120),
+      });
+      res.writeHead(timedOut ? 504 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: false,
+        error: timedOut ? 'CENTRIS_TIMEOUT' : 'CENTRIS_UNAVAILABLE',
+        nextAction: '/login_centris dans Telegram',
+      }, null, 2));
+    }
+    return;
+  }
+
   // ── Admin endpoints — Bearer WEBHOOK_SECRET, contrôle unique et obligatoire
   if (url.startsWith('/admin/') && !requireAdmin(req, res)) return;
 
@@ -16470,12 +16614,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         }
         // Code MFA reçu
         if (data.code && /^\d{4,8}$/.test(String(data.code))) {
-          pendingMFACode = { code: String(data.code), receivedAt: Date.now(), sender: data.sender, text: data.text?.substring(0, 200) };
-          // Notifie tous les waiters MFA (résolveurs en attente)
-          for (const resolver of mfaWaiters) {
-            try { resolver(pendingMFACode.code); } catch {}
-          }
-          mfaWaiters = [];
+          ingestCentrisMFACode(data.code, data.sender, data.text);
           smsBridgeHealth.lastCodeAt = Date.now();
           smsBridgeHealth.totalCodes = (smsBridgeHealth.totalCodes || 0) + 1;
           log('OK', 'SMS-BRIDGE', `Code MFA reçu (${data.sender || '?'})`);
