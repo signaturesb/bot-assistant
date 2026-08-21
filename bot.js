@@ -7,6 +7,8 @@ const fs          = require('fs');
 const path        = require('path');
 const crypto      = require('crypto');
 const leadParser  = require('./lead_parser');
+const { createOneShotAuthorization, consumeOneShotAuthorization } = require('./lib/email_send_guard');
+const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🛡️ RÈGLE ABSOLUE — Shawn gère SES suivis lui-même
@@ -166,11 +168,11 @@ async function reportCrashToGitHub(title, details) {
       `- Env vars présents: ${Object.keys(process.env).filter(k => !k.startsWith('npm_')).length}`,
       ``,
       `**Claude Code peut lire ce fichier avec:**`,
-      `\`read_github_file(repo='kira-bot', path='CRASH_REPORT.md')\``,
+      `\`read_github_file(repo='bot-assistant', path='CRASH_REPORT.md')\``,
     ].join('\n');
 
     // Essayer GitHub API directement (fetch)
-    const url = `https://api.github.com/repos/signaturesb/kira-bot/contents/CRASH_REPORT.md`;
+    const url = `https://api.github.com/repos/signaturesb/bot-assistant/contents/CRASH_REPORT.md`;
     const getRes = await fetch(url, { headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' } });
     const sha = getRes.ok ? (await getRes.json()).sha : undefined;
     await fetch(url, {
@@ -178,7 +180,7 @@ async function reportCrashToGitHub(title, details) {
       headers: { 'Authorization': `token ${process.env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: `Crash report ${now.toISOString()}`, content: Buffer.from(content).toString('base64'), ...(sha ? { sha } : {}) })
     });
-    console.log('[CRASH REPORT] Écrit dans GitHub → kira-bot/CRASH_REPORT.md');
+    console.log('[CRASH REPORT] Écrit dans GitHub → bot-assistant/CRASH_REPORT.md');
   } catch (e) { console.error('[CRASH REPORT FAIL]', e.message); }
 }
 
@@ -4720,7 +4722,7 @@ async function voirConversation(terme) {
   }
 }
 
-async function envoyerEmailGmail({ to, toName, sujet, texte }) {
+async function envoyerEmailGmail({ to, toName, sujet, texte, authorization }) {
   const token = await getGmailToken();
   if (!token) throw new Error('Gmail non configuré — vérifier GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN dans Render');
 
@@ -4768,6 +4770,11 @@ ${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` :
 
   const raw = Buffer.from(msgLines.join('\r\n'), 'utf-8')
     .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  // P0: one explicit confirmation = exactly one Gmail attempt.
+  consumeOneShotAuthorization(authorization, {
+    via: 'gmail', to, cc: [], bcc: [AGENT.email], subject: sujet, body: texte, attachments: []
+  });
   await gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
 }
 
@@ -8582,7 +8589,11 @@ async function send(chatId, text) {
 // ─── Guard ────────────────────────────────────────────────────────────────────
 function isAllowed(msg) {
   if (!msg.from) return false;
-  return !ALLOWED_ID || msg.from.id === ALLOWED_ID;
+  if (!Number.isInteger(ALLOWED_ID) || ALLOWED_ID <= 0) {
+    log('ERR', 'AUTH', 'TELEGRAM_ALLOWED_USER_ID absent/invalide — action Telegram bloquée (fail-closed)');
+    return false;
+  }
+  return Number(msg.from.id) === ALLOWED_ID;
 }
 
 // ─── Confirmation envoi email ─────────────────────────────────────────────────
@@ -8592,43 +8603,38 @@ async function handleEmailConfirmation(chatId, text) {
   const pending = pendingEmails.get(chatId);
   if (!pending) return false;
 
-  let sent = false;
-  let method = '';
-
-  // 1. Essayer Gmail (priorité)
+  // Une confirmation = UNE tentative Gmail précise. Aucune réutilisation, aucun fallback automatique.
+  let authorization;
   try {
-    const token = await getGmailToken(); // retourne string ou null — jamais throw ici
-    if (token) {
-      await envoyerEmailGmail(pending);
-      sent = true;
-      method = 'Gmail';
-    }
+    authorization = createOneShotAuthorization({
+      message: text,
+      via: 'gmail',
+      to: pending.to,
+      cc: [],
+      bcc: [AGENT.email],
+      subject: pending.sujet,
+      body: pending.texte,
+      attachments: [],
+    });
   } catch (e) {
-    log('WARN', 'EMAIL', `Gmail fail: ${e.message} — tentative Brevo`);
-  }
-
-  // 2. Fallback Brevo si Gmail a échoué ou non configuré
-  if (!sent) {
-    try {
-      if (!BREVO_KEY) throw new Error('BREVO_API_KEY manquant dans Render');
-      const ok = await envoyerEmailBrevo({ to: pending.to, toName: pending.toName, subject: pending.sujet, textContent: pending.texte });
-      if (!ok) throw new Error('Brevo HTTP error');
-      sent = true;
-      method = 'Brevo';
-    } catch (e) {
-      log('ERR', 'EMAIL', `Brevo fail: ${e.message}`);
-    }
-  }
-
-  if (!sent) {
-    await send(chatId, `❌ Email non envoyé — Gmail et Brevo en échec.\n_Brouillon conservé — dis "envoie" pour réessayer ou vérifie /status._`);
+    log('WARN', 'EMAIL', `Confirmation bloquée: ${e.code || e.message}`);
+    await send(chatId, '❌ Envoi bloqué — confirmation explicite requise pour cet email précis.');
     return true;
   }
 
-  pendingEmails.delete(chatId); // supprimer SEULEMENT après succès confirmé
-  logActivity(`Email envoyé (${method}) → ${pending.to} — "${pending.sujet.substring(0,60)}"`);
+  try {
+    await envoyerEmailGmail({ ...pending, authorization });
+  } catch (e) {
+    log('ERR', 'EMAIL', `Gmail fail après autorisation one-shot: ${e.message}`);
+    // L'autorisation est consommée même si le provider échoue. Nouveau "envoie" requis.
+    await send(chatId, `❌ Email non envoyé par Gmail: ${String(e.message || e).substring(0, 180)}\n_Brouillon conservé. Dis "envoie" de nouveau pour une nouvelle tentative._`);
+    return true;
+  }
+
+  pendingEmails.delete(chatId);
+  logActivity(`Email envoyé (Gmail) → ${pending.to} — "${pending.sujet.substring(0,60)}"`);
   mTick('emailsSent', 0); metrics.emailsSent++;
-  await send(chatId, `✅ *Email envoyé* (${method})\nÀ: ${pending.toName || pending.to}\nObjet: ${pending.sujet}`);
+  await send(chatId, `✅ *Email envoyé* (Gmail)\nÀ: ${pending.toName || pending.to}\nObjet: ${pending.sujet}`);
   return true;
 }
 
