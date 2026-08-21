@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const assert = require('assert');
 const { hasExplicitWriteIntent, requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 
@@ -26,4 +27,16 @@ assert.doesNotThrow(() => requirePipedriveWriteIntent({
   message: 'supprime le deal Jean', action: 'delete', source: 'telegram', confirmed: true
 }));
 
-console.log('✅ Pipedrive write guard tests OK');
+// Integration test: a standalone guard module is NOT enough. The production bot
+// must import and invoke it before any Pipedrive write path can be considered safe.
+const botCode = fs.readFileSync('bot.js', 'utf8');
+assert.ok(
+  botCode.includes("require('./lib/pipedrive_write_guard')") || botCode.includes('require("./lib/pipedrive_write_guard")'),
+  'bot.js must import lib/pipedrive_write_guard'
+);
+assert.ok(
+  botCode.includes('requirePipedriveWriteIntent('),
+  'bot.js must invoke requirePipedriveWriteIntent before Pipedrive writes'
+);
+
+console.log('✅ Pipedrive write guard tests OK — module + bot.js integration');
