@@ -59,6 +59,8 @@ assert.match(botSource, /if \(!centrisLoginInProgress\)/, 'MFA manuel doit être
 assert.match(botSource, /mfaWaiters = mfaWaiters\.filter\(r => r !== wrappedResolve\)/, 'écouteur MFA expiré doit être retiré');
 assert.match(botSource, /if \(centrisLoginInProgress\)/, 'les connexions Centris simultanées doivent être bloquées');
 assert.doesNotMatch(botSource, /Code MFA reçu \([^)]*\).*\$\{(?:code|data\.code)\}/, 'le code MFA ne doit jamais être journalisé');
+assert.match(botSource, /successfulRequests === 0 && lastError/, 'une panne Centris ne doit pas devenir un faux résultat vide');
+assert.match(botSource, /if \(\/cookies\|mfa\|re-login\|auth\/i\.test/, 'une session invalide doit arrêter les tentatives OAuth répétées');
 
 const openapi = fs.readFileSync('docs/centris_action_openapi.yaml', 'utf8');
 assert.match(openapi, /https:\/\/signaturesb-bot-s272\.onrender\.com/, 'URL Render de production incorrecte');

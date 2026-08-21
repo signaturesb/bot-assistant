@@ -6904,16 +6904,26 @@ async function centrisSearchVendus(type, ville, jours) {
     `/fr/${ti.slug}~vendu~${vs}?view=Vg==`,
     `/fr/${ti.slug}~vendue~${vs}?view=Vg==`,
   ];
+  let successfulRequests = 0;
+  let lastError = null;
   for (const p of paths) {
     try {
       const res = await centrisGet(p);
+      successfulRequests += 1;
       if (!res.ok) continue;
       const html = await res.text();
       if (html.length < 1000) continue;
       const list = parseCentrisHTML(html, ville, jours);
       if (list.length) { log('OK', 'CENTRIS', `${list.length} vendus: ${p}`); return list; }
-    } catch (e) { log('WARN', 'CENTRIS', `${p}: ${e.message}`); }
+    } catch (e) {
+      lastError = e;
+      log('WARN', 'CENTRIS', `${p}: ${e.message}`);
+      // Un échec de session ne dépend pas du chemin essayé: arrêter ici évite
+      // quatre tentatives OAuth/MFA identiques et un faux « aucun résultat ».
+      if (/cookies|mfa|re-login|auth/i.test(String(e.message || ''))) throw e;
+    }
   }
+  if (successfulRequests === 0 && lastError) throw lastError;
   return [];
 }
 
@@ -6925,16 +6935,24 @@ async function centrisSearchActifs(type, ville) {
     `/fr/${ti.slug}~a-vendre~${vs}?view=Vg==&uc=1`,
     `/fr/${ti.slug}~a-vendre~${vs}`,
   ];
+  let successfulRequests = 0;
+  let lastError = null;
   for (const p of paths) {
     try {
       const res = await centrisGet(p);
+      successfulRequests += 1;
       if (!res.ok) continue;
       const html = await res.text();
       if (html.length < 1000) continue;
       const list = parseCentrisHTML(html, ville, 9999); // pas de filtre date pour actifs
       if (list.length) { log('OK', 'CENTRIS', `${list.length} actifs: ${p}`); return list; }
-    } catch (e) { log('WARN', 'CENTRIS', `${p}: ${e.message}`); }
+    } catch (e) {
+      lastError = e;
+      log('WARN', 'CENTRIS', `${p}: ${e.message}`);
+      if (/cookies|mfa|re-login|auth/i.test(String(e.message || ''))) throw e;
+    }
   }
+  if (successfulRequests === 0 && lastError) throw lastError;
   return [];
 }
 
