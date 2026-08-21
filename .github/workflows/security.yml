@@ -33,7 +33,7 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: true
 
   validate:
-    name: Validate + persistence + write guard
+    name: Validate + safety guards
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -46,8 +46,12 @@ jobs:
         run: npm run validate
       - name: Memory + persistence audit
         run: npm run audit-memory
+      - name: Email one-shot consent regression tests
+        run: npm run test-email-guard
       - name: Pipedrive write guard regression tests
         run: npm run test-pipedrive-guard
+      - name: Brevo diagnostics must remain read-only
+        run: npm run test-brevo-readonly
 
   audit:
     name: npm audit — vulnérabilités dépendances
