@@ -2,7 +2,7 @@ name: Security
 
 on:
   push:
-    branches: [main]
+    branches: [main, audit/telegram-history-and-hardening]
     paths-ignore:
       - 'BOT_STATUS.md'
       - 'BOT_ACTIVITY.md'
@@ -33,16 +33,31 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: true
 
   validate:
-    name: Validate bot.js
+    name: Validate + safety guards
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
+          cache: 'npm'
       - run: npm ci
       - name: Syntax + validations
-        run: node validate.js
+        run: npm run validate
+      - name: Memory + persistence audit
+        run: npm run audit-memory
+      - name: Dangerous surface audit
+        run: npm run audit-dangerous-surfaces
+      - name: Email one-shot consent regression tests
+        run: npm run test-email-guard
+      - name: Pipedrive write guard regression tests
+        run: npm run test-pipedrive-guard
+      - name: Admin Bearer authentication regression tests
+        run: npm run test-admin-auth
+      - name: Brevo diagnostics must remain read-only
+        run: npm run test-brevo-readonly
+      - name: Telegram v1.2 transport compatibility regression test
+        run: npm run test-telegram-compat
 
   audit:
     name: npm audit — vulnérabilités dépendances
@@ -51,7 +66,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
+          cache: 'npm'
       - run: npm ci --ignore-scripts
       - name: Audit high/critical
         run: npm audit --audit-level=high

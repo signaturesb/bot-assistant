@@ -2,7 +2,7 @@ name: Semgrep — Patterns sécurité
 
 on:
   push:
-    branches: [main]
+    branches: [main, audit/telegram-history-and-hardening]
     paths:
       - '**/*.js'
       - '.github/workflows/semgrep.yml'

@@ -1,0 +1,40 @@
+name: P0 Safety Autofix (audit branch only)
+
+on:
+  push:
+    branches:
+      - audit/telegram-history-and-hardening
+    paths:
+      - 'scripts/fix-p0-consent-and-pipedrive-prompt.js'
+      - '.github/workflows/p0-safety-autofix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  p0-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit/telegram-history-and-hardening
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Apply deterministic P0 safety fix
+        run: node scripts/fix-p0-consent-and-pipedrive-prompt.js
+      - name: Validate syntax before commit
+        run: |
+          npm ci --ignore-scripts
+          npm run validate
+      - name: Commit bot.js fix if needed
+        run: |
+          if git diff --quiet -- bot.js; then
+            echo 'No bot.js P0 change required.'
+            exit 0
+          fi
+          git config user.name 'signatureSB-hardening-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add bot.js
+          git commit -m 'fix: enforce explicit consent and no automatic Pipedrive prompt writes'
+          git push origin HEAD:audit/telegram-history-and-hardening
