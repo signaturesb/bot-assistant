@@ -1,0 +1,41 @@
+name: P0 Pipedrive Orchestrator Autofix (audit branch only)
+
+on:
+  push:
+    branches:
+      - audit/telegram-history-and-hardening
+    paths:
+      - 'scripts/fix-p0-pipedrive-orchestrator.js'
+      - '.github/workflows/p0-pipedrive-orchestrator-autofix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  pipedrive-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: audit/telegram-history-and-hardening
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Apply request-scoped Pipedrive guard patch
+        run: node scripts/fix-p0-pipedrive-orchestrator.js
+      - name: Validate syntax before commit
+        run: |
+          npm ci --ignore-scripts
+          npm run validate
+          npm run test-pipedrive-guard
+      - name: Commit bot.js fix if needed
+        run: |
+          if git diff --quiet -- bot.js; then
+            echo 'No Pipedrive orchestrator change required.'
+            exit 0
+          fi
+          git config user.name 'signatureSB-hardening-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add bot.js
+          git commit -m 'fix: scope Pipedrive writes to explicit current user request'
+          git push origin HEAD:audit/telegram-history-and-hardening
