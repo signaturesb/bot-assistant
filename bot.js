@@ -1241,7 +1241,7 @@ function getSystem() {
 // 3. Gist backup: sauvé toutes les 30s après modif → survit aux redeploys Render
 // 4. Auto-facts: après chaque échange significatif, Haiku extrait les faits
 //    durables (prospect mentionné, email envoyé, config demandée) → kiramem
-const MAX_HIST = parseInt(process.env.MAX_HIST || '500');
+const MAX_HIST = parseInt(process.env.MAX_HIST || '1200');
 const SUMMARY_AT = parseInt(process.env.SUMMARY_AT || '600');
 const SUMMARY_KEEP = parseInt(process.env.SUMMARY_KEEP || '300'); // garder les 300 plus récents quand on résume
 const rawChats = loadJSON(HIST_FILE, {});
