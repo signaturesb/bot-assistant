@@ -1,27 +1,28 @@
 'use strict';
 
 // Deterministic audit-branch autofix for unreachable memory compaction defaults.
+// Uses regexes so formatting changes in bot.js do not silently break the fixer.
 const fs = require('fs');
 const path = 'bot.js';
 let code = fs.readFileSync(path, 'utf8');
 
-const replacements = [
-  ["const MAX_HIST       = parseInt(process.env.MAX_HIST || '500');", "const MAX_HIST       = parseInt(process.env.MAX_HIST || '1200');"],
-  ["const SUMMARY_AT     = parseInt(process.env.SUMMARY_AT || '600');", "const SUMMARY_AT     = parseInt(process.env.SUMMARY_AT || '600');"],
-  ["const SUMMARY_KEEP   = parseInt(process.env.SUMMARY_KEEP || '300');", "const SUMMARY_KEEP   = parseInt(process.env.SUMMARY_KEEP || '300');"],
-];
+const before = code;
 
-let changed = false;
-for (const [from, to] of replacements) {
-  if (from === to) continue;
-  if (!code.includes(from)) {
-    throw new Error(`Expected memory config not found: ${from}`);
+function replaceDefault(name, fromValue, toValue) {
+  const re = new RegExp(`const\\s+${name}\\s*=\\s*parseInt\\(process\\.env\\.${name}\\s*\\|\\|\\s*['\"]${fromValue}['\"]\\);`);
+  if (!re.test(code)) {
+    const already = new RegExp(`const\\s+${name}\\s*=\\s*parseInt\\(process\\.env\\.${name}\\s*\\|\\|\\s*['\"]${toValue}['\"]\\);`);
+    if (already.test(code)) return;
+    throw new Error(`Expected ${name} default ${fromValue} not found and target ${toValue} not already present`);
   }
-  code = code.replace(from, to);
-  changed = true;
+  code = code.replace(re, `const ${name} = parseInt(process.env.${name} || '${toValue}');`);
 }
 
-if (!changed) {
+replaceDefault('MAX_HIST', '500', '1200');
+replaceDefault('SUMMARY_AT', '600', '600');
+replaceDefault('SUMMARY_KEEP', '300', '300');
+
+if (code === before) {
   console.log('Memory defaults already compliant; no change.');
   process.exit(0);
 }
