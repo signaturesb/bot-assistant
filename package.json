@@ -14,12 +14,13 @@
     "security-status": "node scripts/security-status.js",
     "doctor": "node scripts/doctor.js",
     "audit-history": "bash scripts/audit-history.sh",
+    "audit-memory": "node scripts/audit-memory.js",
     "test": "node test_all.js",
     "test-smoke": "node test_all.js --smoke",
     "test-parser": "node test_parser.js",
     "test-firecrawl": "node test_firecrawl.js",
     "test-cua": "node test_cua.js",
-    "preflight": "npm run validate && npm run security-status"
+    "preflight": "npm run validate && npm run audit-memory && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
