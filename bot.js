@@ -10644,10 +10644,17 @@ function registerHandlers() {
     if (!code) {
       return bot.sendMessage(msg.chat.id, 'Usage: /mfa 123456 — seulement après /login_centris et après réception du SMS.');
     }
+    const cua = getCUA();
+    const cuaAwaitingMFA = Boolean(cua?.isAwaitingCentrisMFA?.());
     if (!centrisLoginInProgress) {
-      return bot.sendMessage(msg.chat.id, '⚠️ Aucune connexion Centris active. Lance /login_centris avant d’envoyer le code.');
+      if (!cuaAwaitingMFA) {
+        return bot.sendMessage(msg.chat.id, '⚠️ Aucune connexion Centris active. Lance /login_centris ou une recherche Centris avant d’envoyer le code.');
+      }
     }
-    if (!ingestCentrisMFACode(code, 'telegram-manual')) {
+    let accepted = false;
+    if (centrisLoginInProgress) accepted = ingestCentrisMFACode(code, 'telegram-manual') || accepted;
+    if (cuaAwaitingMFA) accepted = cua.ingestManualMFACode(code) || accepted;
+    if (!accepted) {
       return bot.sendMessage(msg.chat.id, '❌ Code MFA invalide. Le code doit contenir exactement 6 chiffres.');
     }
     await bot.sendMessage(msg.chat.id, '✅ Code MFA reçu et consommé une seule fois. Je termine la connexion Centris…');
