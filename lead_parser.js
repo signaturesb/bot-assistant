@@ -106,11 +106,18 @@ function isJunkLeadEmail(subject, from, body) {
     || f.includes('notifications@centris') || f.includes('@mlsmatrix') || f.includes('centris@');
   if (isCentrisAuto) {
     if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|d[eé]couvrez-les|inscriptions?\s+(correspondantes|matching|nouvelles)|une\s+ou\s+plusieurs\s+nouvelles\s+propri[eé]t[eé]s|voir\s+les\s+inscriptions/i.test(sb)) return true;
+    // Messages de compte/authentification et rappels de messagerie Centris.
+    // Ils proviennent des mêmes domaines que les leads, mais ne contiennent
+    // jamais une demande immobilière exploitable.
+    if (/code\s+(?:de\s+)?(?:v[eé]rification|s[eé]curit[eé]|authentification)|verification\s+code|one[- ]time\s+(?:code|password)|\bMFA\b|double\s+authentification|tentative\s+de\s+connexion|connexion\s+à\s+votre\s+compte/i.test(sb)) return true;
+    if (/(?:conversation|message)[^\n]{0,50}non\s+lu|vous\s+avez[^\n]{0,40}(?:conversation|message)|rappel[^\n]{0,40}(?:conversation|message)/i.test(sb)) return true;
   }
   // Pattern sujet saved-search typique: "[Nom, Prénom] Maison X et moins" ou "[Client] Critères"
   if (/^\[[^\]]+\]\s+(maison|terrain|plex|condo|chalet)\b/i.test(s)) return true;
   // Newsletters / promotions / marketing
   if (/(newsletter|infolettre|promotion|offre\s+sp[eé]ciale|super\s+promo|last\s+call|ending\s+soon|spring\s+sale|votre\s+campagne)/i.test(s)) return true;
+  const isRemaxSender = /@[^>\s]*remax|re\/max|remax[-.]/i.test(f);
+  if (isRemaxSender && /\b(?:webinaire|formation|magazine|actualit[eé]s?|bulletin|concours|rabais)\b|offre\s+exclusive|outils?\s+marketing|r[eé]seau\s+re\/max/i.test(sb)) return true;
   // Brevo / marketing tool notifications
   if (f.includes('brevo') || f.includes('brevosend')) return true;
   // Confirmations/annulations de visite entre courtiers (pas des leads, notifications internes)

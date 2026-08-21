@@ -62,5 +62,25 @@ assert.ok(
   !/const\s+CONFIRM_REGEX\s*=.*(?:parfait|oui|\bok\b|\bgo\b|ça marche|d'accord|c'est bon)/i.test(botCode),
   'bot.js still treats vague words as email-send confirmation'
 );
+assert.ok(!botCode.includes('_shawnConsent'), 'legacy reusable consent flag must be completely absent');
+assert.match(botCode, /const\s+maxRetries\s*=\s*1\s*;/, 'one confirmation must authorize one provider attempt only');
+assert.match(
+  botCode,
+  /async function envoyerDocsProspect[\s\S]*?createOneShotAuthorization[\s\S]*?consumeOneShotAuthorization/,
+  'document send path must create and consume a content-bound authorization'
+);
+
+const telegramFlush = botCode.match(/\/\/ \/flush-pending[\s\S]*?bot\.onText\(\/\\\/backup\//)?.[0] || '';
+assert.ok(telegramFlush, 'Telegram /flush-pending handler must remain auditable');
+assert.ok(!telegramFlush.includes('envoyerDocsAuto('), '/flush-pending must never bulk-send client emails');
+
+const adminFlush = botCode.match(/\/\/ POST \/admin\/flush-pending[\s\S]*?\/\/ POST \/admin\/test-email/)?.[0] || '';
+assert.ok(adminFlush, 'admin flush compatibility route must remain auditable');
+assert.ok(!adminFlush.includes('envoyerDocsAuto('), 'admin token must never bulk-authorize client emails');
+assert.ok(adminFlush.includes('BULK_EMAIL_CONFIRMATION_FORBIDDEN'), 'admin bulk-send route must fail closed explicitly');
+
+const pendingReminder = botCode.match(/\/\/ RAPPEL pendingDocSends[\s\S]*?\/\/ \(pendingDocSends\.set wrappé/)?.[0] || '';
+assert.ok(pendingReminder, 'pending reminder block must remain auditable');
+assert.ok(!pendingReminder.includes('envoyerDocsAuto('), 'background reminders must never retry a client email');
 
 console.log('✅ Email one-shot guard tests OK');

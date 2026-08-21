@@ -29,7 +29,8 @@
     "test-email-guard": "node test_email_send_guard.js",
     "test-pipedrive-guard": "node test_pipedrive_write_guard.js",
     "test-admin-auth": "node test_admin_auth.js",
-    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-brevo-readonly && npm run security-status"
+    "test-runtime-safety": "node test_runtime_safety.js",
+    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-runtime-safety && npm run test-brevo-readonly && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

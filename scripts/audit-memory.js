@@ -35,7 +35,16 @@ if (/DATA_DIR\s*=\s*fs\.existsSync\('\/data'\)\s*\?\s*'\/data'\s*:\s*'\/tmp'/.te
 }
 
 if (/saveHistoryToGist\s*\(/.test(code)) {
-  warnings.push('L’historique Telegram est sauvegardé vers GitHub Gist. À remplacer par un stockage business privé/persistant avant archivage complet.');
+  if (!/GIST_WRITES_ENABLED/.test(code) || !/if \(!GIST_WRITES_ENABLED \|\| !gistId/.test(code)) {
+    issues.push('Les écritures GitHub Gist ne sont pas protégées par la politique disque-first.');
+  } else {
+    console.log('INFO: Gist est en récupération seulement quand /data est attaché; écriture sur override explicite.');
+  }
+}
+
+if (!/shouldRestoreFromGist\(kiramem\.facts/.test(code) ||
+    !/shouldRestoreFromGist\(recentLeadsByKey\.size/.test(code)) {
+  issues.push('Une restauration Gist pourrait encore écraser la mémoire ou la dédup locale.');
 }
 
 if (!/SIGTERM/.test(code)) {

@@ -12,6 +12,8 @@ assert.strictEqual(hasExplicitWriteIntent('mets-moi un suivi demain pour Jean', 
 assert.strictEqual(hasExplicitWriteIntent('supprime le deal Jean', 'delete'), true);
 assert.strictEqual(hasExplicitWriteIntent('fusionne les deux deals Jean', 'merge'), true);
 assert.strictEqual(hasExplicitWriteIntent('email entrant nouveau prospect Jean', 'create'), false);
+assert.strictEqual(hasExplicitWriteIntent('enregistre ce résumé d appel dans Pipedrive', 'create'), true);
+assert.strictEqual(hasExplicitWriteIntent('je viens de parler avec Jean', 'create'), false);
 
 assert.throws(
   () => requirePipedriveWriteIntent({ message: 'email entrant nouveau prospect Jean', action: 'create', source: 'gmail' }),
@@ -38,5 +40,8 @@ assert.ok(
   botCode.includes('requirePipedriveWriteIntent('),
   'bot.js must invoke requirePipedriveWriteIntent before Pipedrive writes'
 );
+for (const tool of ['modifier_deal', 'deplacer_activite', 'enregistrer_resume_appel']) {
+  assert.ok(new RegExp(`${tool}:\\s*['\"](?:create|update|move)['\"]`).test(botCode), `${tool} must be guarded`);
+}
 
 console.log('✅ Pipedrive write guard tests OK — module + bot.js integration');

@@ -35,14 +35,14 @@ if (/(?:parfait|oui|\bok\b|\bgo\b|ça marche|d'accord|c'est bon)/i.test(confirmL
 }
 
 const hardcodedConsentRe = /shawnConsent\s*:\s*true/;
-const hardcodedPrivateConsentRe = /_shawnConsent\s*:\s*true/;
+const hardcodedPrivateConsentRe = /_shawnConsent\b/;
 const hardcodedConsentLocs = locations(hardcodedConsentRe, 'shawnConsent:true');
-const hardcodedPrivateConsentLocs = locations(hardcodedPrivateConsentRe, '_shawnConsent:true');
+const hardcodedPrivateConsentLocs = locations(hardcodedPrivateConsentRe, '_shawnConsent');
 if (hardcodedConsentLocs.length > 0) {
   errors.push(`${hardcodedConsentLocs.length} occurrence(s) de shawnConsent:true détectée(s). Remplacer par une autorisation one-shot vérifiable.`);
 }
 if (hardcodedPrivateConsentLocs.length > 0) {
-  errors.push(`${hardcodedPrivateConsentLocs.length} occurrence(s) de _shawnConsent:true détectée(s). Un caller ne doit pas pouvoir attester le consentement lui-même.`);
+  errors.push(`${hardcodedPrivateConsentLocs.length} occurrence(s) de _shawnConsent détectée(s). Le booléen hérité est interdit, quelle que soit sa valeur.`);
 }
 
 // Bulk/reusable consent is explicitly forbidden: one confirmation = one email.
@@ -82,6 +82,20 @@ if (!code.includes('requirePipedriveWriteIntent(')) {
   errors.push('bot.js n’invoque pas requirePipedriveWriteIntent avant les écritures Pipedrive.');
 }
 
+const webhookBlock = code.match(/async function handleWebhook[\s\S]*?\/\/ ─── Arrêt propre/)?.[0] || '';
+if (/\b(?:pdPost|pdPut|pdDelete)\s*\(/.test(webhookBlock)) {
+  errors.push('Un webhook entrant effectue encore une mutation Pipedrive automatique.');
+}
+const leadPollerBlock = code.match(/async function traiterNouveauLead[\s\S]*?async function sendTelegramWithFallback/)?.[0] || '';
+if (/\b(?:pdPost|pdPut|pdDelete)\s*\(/.test(leadPollerBlock)) {
+  errors.push('Le poller de leads effectue encore une mutation Pipedrive automatique.');
+}
+const callResumeStart = code.indexOf('async function enregistrerResumeAppel');
+const callResumeGuarded = callResumeStart >= 0 && code.slice(callResumeStart, callResumeStart + 900).includes('requirePipedriveWriteIntent(');
+if (!callResumeGuarded) {
+  errors.push('enregistrerResumeAppel n’est pas protégé localement par le current-message guard.');
+}
+
 // Inventory direct provider send surfaces. Every occurrence must be wrapped centrally.
 const gmailRe = /gmail\.googleapis\.com\/gmail\/v1\/users\/me\/messages\/send/;
 const brevoRe = /api\.brevo\.com\/v3\/(?:smtp\/email|emailCampaigns)/;
@@ -89,6 +103,14 @@ const gmailLocs = locations(gmailRe, 'gmail send');
 const brevoLocs = locations(brevoRe, 'brevo mutative');
 if (gmailLocs.length > 0) warnings.push(`${gmailLocs.length} surface(s) Gmail messages/send directe(s) détectée(s) — vérifier wrapper central.`);
 if (brevoLocs.length > 0) warnings.push(`${brevoLocs.length} surface(s) Brevo potentiellement mutative(s) détectée(s) — vérifier wrapper central.`);
+
+// Tous les MIME Gmail construits par le bot doivent être attribuables. Le cron
+// Sent-folder ignore volontairement les courriels manuels sans ce marqueur.
+const mimeCount = count(/MIME-Version: 1\.0/g);
+const automationMarkerCount = count(/X-SignatureSB-Automation: kira-bot/g);
+if (mimeCount !== automationMarkerCount) {
+  errors.push(`Attribution Gmail incomplète: ${mimeCount} MIME mais ${automationMarkerCount} marqueur(s) kira-bot.`);
+}
 
 // Inventory Pipedrive mutating helpers/endpoints.
 const pdMutationRe = /(?:pdPost|pdPut|pdDelete)\s*\(/;

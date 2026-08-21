@@ -45,6 +45,20 @@ const samples = [
     junk: true,
   },
   {
+    name: 'Centris MFA — code de vérification (JUNK)',
+    subject: `Votre code de vérification Centris`,
+    from: 'no-reply@centris.ca',
+    body: `Votre code de sécurité à usage unique est 123456. Il expire bientôt.`,
+    junk: true,
+  },
+  {
+    name: 'Centris conversation non lue (JUNK)',
+    subject: `Vous avez une conversation non lue`,
+    from: 'notifications@centris.ca',
+    body: `Rappel: vous avez un message non lu dans votre compte Centris.`,
+    junk: true,
+  },
+  {
     name: 'RE/MAX Québec — lead direct avec info complète',
     subject: `Demande d'information pour la propriété MLS #12345678`,
     from: 'alerts@remax-quebec.com',
@@ -71,6 +85,13 @@ const samples = [
     subject: `⏳ Last Call: The Spring Sale ends at midnight!`,
     from: 'newsletters@mail.healthyplanet.com',
     body: `Last chance for spring promotion...`,
+    junk: true,
+  },
+  {
+    name: 'RE/MAX webinaire promotionnel (JUNK)',
+    subject: `Webinaire exclusif pour le réseau RE/MAX`,
+    from: 'communications@remax-quebec.com',
+    body: `Découvrez notre prochaine formation et les nouveaux outils marketing.`,
     junk: true,
   },
   {
