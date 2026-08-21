@@ -2751,6 +2751,7 @@ async function saveMemoryToGist() {
 
 // ─── Pipedrive ────────────────────────────────────────────────────────────────
 const PD_BASE   = 'https://api.pipedrive.com/v1';
+const PD_V2_BASE = 'https://api.pipedrive.com/api/v2';
 const PD_STAGES = { 49:'🆕 Nouveau lead', 50:'📞 Contacté', 51:'💬 En discussion', 52:'🗓 Visite prévue', 53:'🏡 Visite faite', 54:'📝 Offre déposée', 55:'✅ Gagné' };
 const pipedriveWriteScope = new AsyncLocalStorage();
 
@@ -2825,6 +2826,69 @@ function pipedriveUserFailure(action = 'Action Pipedrive') {
 
 async function pdGet(endpoint) {
   return pdRequest('GET', endpoint);
+}
+
+// Pipedrive a retiré les routes imbriquées /deals/{id}/activities de sa
+// documentation courante. Les lectures d'activités utilisent maintenant
+// l'endpoint v2 officiel avec filtres deal_id/person_id. Les mutations restent
+// sur les routes v1 déjà éprouvées et protégées par pipedriveWriteScope.
+async function pdGetV2(endpoint) {
+  if (!PD_KEY) return pipedriveFailure('GET', endpoint, 0, { error: 'PIPEDRIVE_API_KEY absent' });
+  const sep = endpoint.includes('?') ? '&' : '?';
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(`${PD_V2_BASE}${endpoint}${sep}api_token=${encodeURIComponent(PD_KEY)}`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let payload = {};
+    try { payload = text ? JSON.parse(text) : {}; } catch { payload = { error: text || `HTTP ${res.status}` }; }
+    if (!res.ok || payload?.success === false) return pipedriveFailure('GET', endpoint, res.status, payload);
+    lastPipedriveError = null;
+    return payload;
+  } catch (e) {
+    const detail = e?.name === 'AbortError' ? 'délai API dépassé (8s)' : e.message;
+    return pipedriveFailure('GET', endpoint, 0, { error: detail });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function normalizePipedriveRelationId(value) {
+  const raw = value && typeof value === 'object' ? value.value : value;
+  const id = Number(raw);
+  return Number.isFinite(id) ? id : null;
+}
+
+async function pdGetActivities({ dealId = null, personId = null, done, limit = 100 } = {}) {
+  const params = new URLSearchParams();
+  const normalizedDealId = normalizePipedriveRelationId(dealId);
+  const normalizedPersonId = normalizePipedriveRelationId(personId);
+  if (normalizedDealId !== null) params.set('deal_id', String(normalizedDealId));
+  if (normalizedPersonId !== null) params.set('person_id', String(normalizedPersonId));
+  if (done !== undefined && done !== null) {
+    const isDone = done === true || done === 1 || done === '1' || done === 'true';
+    params.set('done', isDone ? 'true' : 'false');
+  }
+  params.set('limit', String(Math.max(1, Math.min(500, Number(limit) || 100))));
+
+  const payload = await pdGetV2(`/activities?${params.toString()}`);
+  if (payload?.success === false) return payload;
+  if (!Array.isArray(payload?.data)) {
+    return pipedriveFailure('GET', '/activities', 200, { error: 'réponse v2 activités invalide' });
+  }
+
+  // Défense en profondeur: même si l'API ignore un filtre, ne jamais laisser
+  // passer une activité appartenant à une autre fiche.
+  const filtered = payload.data.filter(activity => {
+    if (!activity || !activity.id) return false;
+    if (normalizedDealId !== null && normalizePipedriveRelationId(activity.deal_id) !== normalizedDealId) return false;
+    if (normalizedPersonId !== null && normalizePipedriveRelationId(activity.person_id) !== normalizedPersonId) return false;
+    return true;
+  });
+  return { ...payload, data: filtered };
 }
 async function pdPost(endpoint, body) {
   return pdRequest('POST', endpoint, body);
@@ -2933,7 +2997,7 @@ async function voirProspectComplet(terme) {
   const [fullDeal, notes, activities, personData] = await Promise.all([
     pdGet(`/deals/${deal.id}`),
     pdGet(`/notes?deal_id=${deal.id}&limit=10`),
-    pdGet(`/deals/${deal.id}/activities?limit=10&done=0`),
+    pdGetActivities({ dealId: deal.id, done: false, limit: 10 }),
     deal.person_id ? pdGet(`/persons/${deal.person_id}`) : Promise.resolve(null),
   ]);
 
@@ -3078,7 +3142,7 @@ async function modifierDeal(terme, { valeur, titre, dateClose, raison }) {
 async function completerAnciennesActivites(dealId) {
   if (!dealId) return 0;
   try {
-    const r = await pdGet(`/deals/${dealId}/activities?limit=50`);
+    const r = await pdGetActivities({ dealId, limit: 50 });
     const acts = r?.data || [];
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -3121,7 +3185,7 @@ async function activiteExisteDeja(dealId, type, date = null) {
   if (!dealId) return null;
   try {
     // 1. Check level deal: any open activity on this deal
-    const dealActs = await pdGet(`/deals/${dealId}/activities?limit=50`);
+    const dealActs = await pdGetActivities({ dealId, limit: 50 });
     const anyOpenInDeal = (dealActs?.data || []).find(a => !a.done);
     if (anyOpenInDeal) return anyOpenInDeal.id;
 
@@ -3129,7 +3193,7 @@ async function activiteExisteDeja(dealId, type, date = null) {
     const dealRes = await pdGet(`/deals/${dealId}`);
     const personId = typeof dealRes?.data?.person_id === 'object' ? dealRes.data.person_id?.value : dealRes?.data?.person_id;
     if (!personId) return null;
-    const personActs = await pdGet(`/persons/${personId}/activities?done=0&limit=20`);
+    const personActs = await pdGetActivities({ personId, done: false, limit: 20 });
     const anyOpenForPerson = (personActs?.data || []).find(a => !a.done);
     if (anyOpenForPerson) {
       log('INFO', 'DEDUP', `Person #${personId} a déjà activité open #${anyOpenForPerson.id} sur deal #${anyOpenForPerson.deal_id}`);
@@ -3150,7 +3214,7 @@ async function activiteExisteDeja(dealId, type, date = null) {
 async function nettoyerDoublonsActivites(dealId) {
   if (!dealId) return { gardees: 0, supprimees: 0 };
   try {
-    const r = await pdGet(`/deals/${dealId}/activities?limit=100`);
+    const r = await pdGetActivities({ dealId, limit: 100 });
     const acts = r?.data || [];
 
     // Grouper par (type + due_date) — uniquement non-complétées
@@ -3260,7 +3324,7 @@ async function supprimerActivite({ activity_id, terme }) {
   const deals = sr?.data?.items || [];
   if (!deals.length) return `Aucun deal: "${terme}"`;
   const deal = deals[0].item;
-  const acts = await pdGet(`/deals/${deal.id}/activities?limit=20`);
+  const acts = await pdGetActivities({ dealId: deal.id, limit: 20 });
   if (!acts?.data?.length) return `Aucune activité sur deal #${deal.id} (${deal.title})`;
   let msg = `📋 Activités du deal #${deal.id} *${deal.title}*\n\n`;
   for (const a of acts.data) {
@@ -3808,7 +3872,7 @@ async function voirActivitesDeal(terme) {
   const deals = s?.data?.items || [];
   if (!deals.length) return `Aucun deal: "${terme}"`;
   const deal = deals[0].item;
-  const acts = await pdGet(`/deals/${deal.id}/activities?limit=100&done=0`);
+  const acts = await pdGetActivities({ dealId: deal.id, done: false, limit: 100 });
   const list = acts?.data || [];
   if (!list.length) return `*${deal.title}* — aucune activité à venir.`;
   const now = Date.now();
@@ -5204,7 +5268,7 @@ async function historiqueContact(terme) {
 
   const [notes, activities, person] = await Promise.all([
     pdGet(`/notes?deal_id=${deal.id}&limit=20`),
-    pdGet(`/deals/${deal.id}/activities?limit=20`),
+    pdGetActivities({ dealId: deal.id, limit: 20 }),
     deal.person_id ? pdGet(`/persons/${deal.person_id}`) : Promise.resolve(null),
   ]);
 
@@ -8603,7 +8667,7 @@ let healthState = loadJSON(HEALTH_FILE, { lastRun: null, checks: {}, history: []
 async function testApisHealth() {
   const results = {};
   const fail = [];
-  // 1. Pipedrive — vérifie que /deals/{id}/activities filtre correctement
+  // 1. Pipedrive — vérifie que /api/v2/activities?deal_id filtre correctement
   try {
     if (PD_KEY) {
       const r = await pdGet('/deals?limit=1');
@@ -8614,16 +8678,16 @@ async function testApisHealth() {
         fail.push(`Pipedrive HTTP ${status || '?'}: ${detail}`);
       } else if (r.data[0]) {
         const oneDeal = r.data[0];
-        const acts = await pdGet(`/deals/${oneDeal.id}/activities?limit=20`);
+        const acts = await pdGetActivities({ dealId: oneDeal.id, limit: 20 });
         if (acts?.success === false || !Array.isArray(acts?.data)) {
           const status = acts?._httpStatus || lastPipedriveError?.status || 0;
           results.pipedrive = { ok: false, status, error: acts?.error || 'activities illisibles' };
           fail.push(`Pipedrive activities HTTP ${status || '?'}`);
         } else {
           const list = acts.data;
-          const allBelongToDeal = list.every(a => a.deal_id === oneDeal.id || a.deal_id == null);
+          const allBelongToDeal = list.every(a => normalizePipedriveRelationId(a.deal_id) === Number(oneDeal.id));
           results.pipedrive = { ok: allBelongToDeal, sample_deal: oneDeal.id, returned: list.length, all_filtered: allBelongToDeal };
-          if (!allBelongToDeal) fail.push('Pipedrive: /deals/{id}/activities returns wrong deals');
+          if (!allBelongToDeal) fail.push('Pipedrive: /api/v2/activities ignore le filtre deal_id');
         }
       } else { results.pipedrive = { ok: true, note: 'no deals' }; }
     } else { results.pipedrive = { ok: false, error: 'PIPEDRIVE_API_KEY missing' }; fail.push('Pipedrive key missing'); }
@@ -10757,7 +10821,7 @@ function registerHandlers() {
 
     try {
       if (dealArg) {
-        const acts = (await pdGet(`/deals/${dealArg}/activities?limit=100`))?.data || [];
+        const acts = (await pdGetActivities({ dealId: dealArg, limit: 100 }))?.data || [];
         const groups = new Map();
         for (const a of acts.filter(a => !a.done)) {
           const key = `${String(a.subject || '').trim().toLowerCase()}|${a.due_date || ''}|${a.due_time || ''}`;
@@ -15705,7 +15769,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         for (const d of allDeals) {
           try {
             // ALSO delete all open activities first to avoid orphans (proper API)
-            const acts = await pdGet(`/deals/${d.id}/activities?done=0&limit=200`);
+            const acts = await pdGetActivities({ dealId: d.id, done: false, limit: 200 });
             for (const a of (acts?.data || []).filter(a => a.deal_id === d.id || a.deal_id == null)) {
               await fetch(`https://api.pipedrive.com/v1/activities/${a.id}?api_token=${process.env.PIPEDRIVE_API_KEY}`, { method: 'DELETE' }).catch(() => {});
             }
@@ -15749,13 +15813,11 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         }
       }
       out.deals_scanned = allDeals.length;
-      // 2. Pour chaque deal: lister activités open via endpoint /deals/{id}/flow ou /deals/{id}/activities
-      // BUG FIX 2026-05-05: l'endpoint /activities?deal_id=X ne filtrait PAS correctement —
-      // il retournait toutes les activités du compte (30k+), pas celles du deal seul.
-      // L'endpoint /deals/{id}/activities est l'API correcte pour filtrer.
+      // 2. Pour chaque deal: endpoint v2 officiel /activities?deal_id=X.
+      // Le helper refiltre aussi localement par deal_id (défense en profondeur).
       for (const deal of allDeals) {
         try {
-          const acts = await pdGet(`/deals/${deal.id}/activities?done=0&limit=200`);
+          const acts = await pdGetActivities({ dealId: deal.id, done: false, limit: 200 });
           const list = (acts?.data || []).filter(a => a && a.id && (a.deal_id === deal.id || a.deal_id == null));
           if (list.length <= 1) continue; // 0 ou 1 activité = OK
           out.deals_with_dups++;

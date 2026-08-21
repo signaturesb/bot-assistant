@@ -66,6 +66,11 @@ requireText('pendingPipedriveActivityActions', 'Transaction de confirmation des 
 requireText('pipedriveActionSnapshot', 'Aperçu Pipedrive non lié au contenu exact.');
 requireText('normalizeScheduledAction', 'Garde calendrier Pipedrive absent.');
 requireText('PIPEDRIVE_ACTIVITY_CONFIRM_REGEX', 'Confirmation exacte des activités Pipedrive absente.');
+requireText("const PD_V2_BASE = 'https://api.pipedrive.com/api/v2'", 'Lectures activités Pipedrive v2 absentes.');
+requireText('async function pdGetActivities(', 'Helper central activités Pipedrive absent.');
+if (/pdGet\(`\/deals\/\$\{[^}]+\}\/activities|pdGet\(`\/persons\/\$\{[^}]+\}\/activities/.test(bot)) {
+  errors.push('Ancien endpoint imbriqué Pipedrive activities encore utilisé.');
+}
 
 // Les routines Pipedrive de fond doivent être 100 % lecture seule.
 const pdAudit = block('async function auditPipedriveUltra()', '// ─── Audit hebdo doublons');

@@ -53,6 +53,19 @@ assert.ok(botCode.includes('pendingPipedriveActivityActions'), 'scheduled CRM ac
 assert.ok(botCode.includes('pipedriveActionSnapshot'), 'scheduled CRM preview must be content-bound');
 assert.ok(botCode.includes('normalizeScheduledAction'), 'scheduled CRM actions need deterministic calendar validation');
 assert.ok(botCode.includes('PIPEDRIVE_ACTIVITY_CONFIRM_REGEX'), 'scheduled CRM actions need exact separate confirmation');
+assert.ok(
+  botCode.includes("const PD_V2_BASE = 'https://api.pipedrive.com/api/v2'"),
+  'activity reads must use the current Pipedrive v2 API'
+);
+assert.ok(botCode.includes('async function pdGetActivities('), 'central filtered Pipedrive activity reader missing');
+assert.ok(
+  !/pdGet\(`\/deals\/\$\{[^}]+\}\/activities/.test(botCode),
+  'retired nested deal activities endpoint is still used'
+);
+assert.ok(
+  !/pdGet\(`\/persons\/\$\{[^}]+\}\/activities/.test(botCode),
+  'retired nested person activities endpoint is still used'
+);
 for (const tool of ['modifier_deal', 'deplacer_activite', 'enregistrer_resume_appel']) {
   assert.ok(new RegExp(`${tool}:\\s*['\"](?:create|update|move)['\"]`).test(botCode), `${tool} must be guarded`);
 }
