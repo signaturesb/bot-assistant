@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const assert = require('assert');
 const {
   isExplicitEmailConfirmation,
@@ -30,6 +31,17 @@ assert.throws(
 assert.throws(
   () => createOneShotAuthorization({ message: 'ok', ...email }),
   e => e && e.code === 'EMAIL_SEND_CONFIRM_REQUIRED'
+);
+
+// Integration guard: the real bot must use the central module before this PR can pass.
+const botCode = fs.readFileSync('bot.js', 'utf8');
+assert.ok(
+  botCode.includes("require('./lib/email_send_guard')"),
+  'bot.js must import lib/email_send_guard before merge'
+);
+assert.ok(
+  !/const\s+CONFIRM_REGEX\s*=.*(?:parfait|oui|\bok\b|\bgo\b|ça marche)/i.test(botCode),
+  'bot.js still treats vague words as email-send confirmation'
 );
 
 console.log('✅ Email one-shot guard tests OK');
