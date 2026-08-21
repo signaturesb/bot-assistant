@@ -7,6 +7,7 @@ const { hasExplicitWriteIntent, requirePipedriveWriteIntent } = require('./lib/p
 assert.strictEqual(hasExplicitWriteIntent('analyse mes leads aujourd hui', 'create'), false);
 assert.strictEqual(hasExplicitWriteIntent('qu est-ce que je devrais faire avec Jean?', 'update'), false);
 assert.strictEqual(hasExplicitWriteIntent('crée le lead Jean Tremblay', 'create'), true);
+assert.strictEqual(hasExplicitWriteIntent('/lead Jean Tremblay 514-555-1212', 'create'), true);
 assert.strictEqual(hasExplicitWriteIntent('ajoute une activité pour Jean demain', 'create'), true);
 assert.strictEqual(hasExplicitWriteIntent('mets-moi un suivi demain pour Jean', 'create'), true);
 assert.strictEqual(hasExplicitWriteIntent('supprime le deal Jean', 'delete'), true);
@@ -40,6 +41,18 @@ assert.ok(
   botCode.includes('requirePipedriveWriteIntent('),
   'bot.js must invoke requirePipedriveWriteIntent before Pipedrive writes'
 );
+assert.ok(
+  botCode.includes('const pipedriveWriteScope = new AsyncLocalStorage()'),
+  'Pipedrive writes need a central async authorization scope'
+);
+assert.ok(
+  botCode.includes("err.code = 'PIPEDRIVE_WRITE_SCOPE_REQUIRED'"),
+  'pdRequest must fail closed outside the authorized scope'
+);
+assert.ok(botCode.includes('pendingPipedriveActivityActions'), 'scheduled CRM actions need a persisted confirmation transaction');
+assert.ok(botCode.includes('pipedriveActionSnapshot'), 'scheduled CRM preview must be content-bound');
+assert.ok(botCode.includes('normalizeScheduledAction'), 'scheduled CRM actions need deterministic calendar validation');
+assert.ok(botCode.includes('PIPEDRIVE_ACTIVITY_CONFIRM_REGEX'), 'scheduled CRM actions need exact separate confirmation');
 for (const tool of ['modifier_deal', 'deplacer_activite', 'enregistrer_resume_appel']) {
   assert.ok(new RegExp(`${tool}:\\s*['\"](?:create|update|move)['\"]`).test(botCode), `${tool} must be guarded`);
 }

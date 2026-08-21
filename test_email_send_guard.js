@@ -62,13 +62,25 @@ assert.ok(
   !/const\s+CONFIRM_REGEX\s*=.*(?:parfait|oui|\bok\b|\bgo\b|ça marche|d'accord|c'est bon)/i.test(botCode),
   'bot.js still treats vague words as email-send confirmation'
 );
-assert.ok(!botCode.includes('_shawnConsent'), 'legacy reusable consent flag must be completely absent');
+assert.ok(!botCode.includes('shawnConsent'), 'legacy caller-asserted consent flag must be completely absent');
 assert.match(botCode, /const\s+maxRetries\s*=\s*1\s*;/, 'one confirmation must authorize one provider attempt only');
 assert.match(
   botCode,
-  /async function envoyerDocsProspect[\s\S]*?createOneShotAuthorization[\s\S]*?consumeOneShotAuthorization/,
-  'document send path must create and consume a content-bound authorization'
+  /async function sendEmailLogged[\s\S]*?consumeOneShotAuthorization\(opts\.authorization, emailPayload\)[\s\S]*?entry\.outcome = 'blocked'/,
+  'central email wrapper must consume content-bound authorization and fail closed'
 );
+assert.match(
+  botCode,
+  /async function envoyerDocsProspect[\s\S]*?createOneShotAuthorization[\s\S]*?authorization: emailAuthorization/,
+  'document send path must create and pass a content-bound authorization'
+);
+assert.ok(botCode.includes('pendingExternalEmailActions'), 'external provider actions need a two-step pending confirmation');
+assert.ok(botCode.includes('if (external.inFlight)'), 'external email confirmation must suppress concurrent duplicate attempts');
+assert.ok(botCode.includes('PENDING_EMAILS_FILE'), 'pending drafts must survive a Render restart');
+assert.ok(botCode.includes('queuePendingEmailDraft'), 'automatic drafts must use a non-overwriting queue');
+assert.ok(botCode.includes('deliveryUncertain'), 'provider uncertainty must block duplicate retries');
+assert.ok(!/pendingEmails\.set\(ALLOWED_ID/.test(botCode), 'automatic lead drafts must never overwrite the active draft');
+assert.ok(botCode.includes("name === 'telecharger_docs_centris_complet'"), 'multi-email action must be blocked under one-shot policy');
 
 const telegramFlush = botCode.match(/\/\/ \/flush-pending[\s\S]*?bot\.onText\(\/\\\/backup\//)?.[0] || '';
 assert.ok(telegramFlush, 'Telegram /flush-pending handler must remain auditable');

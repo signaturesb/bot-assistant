@@ -39,6 +39,12 @@ runScript('Parser tests', path.join(__dirname, 'test_parser.js'));
 // Runtime safety: crons non chevauchants, Telegram, HMAC et persistance.
 runScript('Runtime safety', path.join(__dirname, 'test_runtime_safety.js'));
 
+// Dates/heures Toronto: calcul déterministe et contradictions bloquées.
+runScript('Calendar guard', path.join(__dirname, 'test_calendar_guard.js'));
+
+// Boucles, consentement CRM/campagnes et snapshots de persistance.
+runScript('Workflow/backups audit', path.join(__dirname, 'scripts/audit-runtime-workflows.js'));
+
 // 2. Firecrawl tests
 runScript('Firecrawl tests', path.join(__dirname, 'test_firecrawl.js'));
 
