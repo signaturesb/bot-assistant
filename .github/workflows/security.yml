@@ -52,6 +52,8 @@ jobs:
         run: npm run test-email-guard
       - name: Pipedrive write guard regression tests
         run: npm run test-pipedrive-guard
+      - name: Admin Bearer authentication regression tests
+        run: npm run test-admin-auth
       - name: Brevo diagnostics must remain read-only
         run: npm run test-brevo-readonly
 

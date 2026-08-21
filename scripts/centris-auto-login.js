@@ -121,7 +121,9 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
       await page.waitForTimeout(5000);
       for (let i = 0; i < 45; i++) {
         try {
-          const r = await fetch(`https://signaturesb-bot-s272.onrender.com/admin/centris-mfa-code?token=${WEBHOOK_SECRET}`);
+          const r = await fetch('https://signaturesb-bot-s272.onrender.com/admin/centris-mfa-code', {
+            headers: { Authorization: `Bearer ${WEBHOOK_SECRET}` },
+          });
           if (r.ok) {
             const j = await r.json();
             if (j.ok && j.code) {
@@ -172,7 +174,7 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
 
     console.log('6. Push cookies au bot');
     const r = await fetch('https://signaturesb-bot-s272.onrender.com/admin/centris-cookies', {
-      method: 'POST', headers: { 'Content-Type': 'text/plain', 'X-Webhook-Secret': WEBHOOK_SECRET }, body: cs,
+      method: 'POST', headers: { 'Content-Type': 'text/plain', Authorization: `Bearer ${WEBHOOK_SECRET}` }, body: cs,
     });
     console.log(`   Bot cookies: ${r.status} ${(await r.text()).substring(0, 200)}`);
 
@@ -180,7 +182,7 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
     try {
       const r2 = await fetch('https://signaturesb-bot-s272.onrender.com/admin/centris-storage-state', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': WEBHOOK_SECRET },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WEBHOOK_SECRET}` },
         body: JSON.stringify({ storageState, userAgent }),
       });
       console.log(`   Bot storageState: ${r2.status} ${(await r2.text()).substring(0, 200)}`);
