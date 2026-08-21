@@ -1,6 +1,7 @@
 'use strict';
 require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
+const TelegramModule = require('node-telegram-bot-api');
+const TelegramBot = TelegramModule.TelegramBot || TelegramModule;
 const Anthropic   = require('@anthropic-ai/sdk');
 const http        = require('http');
 const fs          = require('fs');
@@ -1843,7 +1844,7 @@ function notifyShawnOnce(key, text, cooldownMs = 30 * 60 * 1000) {
   if (now - (apiErrorState[key] || 0) < cooldownMs) return;
   apiErrorState[key] = now;
   if (!ALLOWED_ID || typeof bot?.sendMessage !== 'function') return;
-  bot.sendMessage(ALLOWED_ID, text, { parse_mode: 'Markdown', disable_web_page_preview: false }).catch(() => {
+  bot.sendMessage(ALLOWED_ID, text, { parse_mode: 'Markdown', link_preview_options: { is_disabled: false } }).catch(() => {
     bot.sendMessage(ALLOWED_ID, text.replace(/[*_`]/g, '')).catch(() => {});
   });
 }
@@ -9335,9 +9336,9 @@ function stripMarkdown(s) {
 }
 async function sendChunk(chatId, chunk) {
   try {
-    return await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    return await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } });
   } catch {
-    return bot.sendMessage(chatId, stripMarkdown(chunk), { disable_web_page_preview: true });
+    return bot.sendMessage(chatId, stripMarkdown(chunk), { link_preview_options: { is_disabled: true } });
   }
 }
 
@@ -11203,7 +11204,7 @@ function registerHandlers() {
   // ─── /business — coût total de la business (fixes + variables) ──────────
   bot.onText(/\/business|\/abonnements|\/couts_business/, msg => {
     if (!isAllowed(msg)) return;
-    bot.sendMessage(msg.chat.id, formatBusinessReport(), { parse_mode: 'Markdown', disable_web_page_preview: true });
+    bot.sendMessage(msg.chat.id, formatBusinessReport(), { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } });
   });
 
   // ─── /sub_set <id> <prix> [USD|CAD] — ajuster prix abonnement
@@ -11948,7 +11949,7 @@ function registerHandlers() {
       `🔒 Ton message est auto-supprimé après save (la clé reste pas visible dans le chat).`;
     bot.sendMessage(msg.chat.id, text, {
       parse_mode: 'Markdown',
-      disable_web_page_preview: true,
+      link_preview_options: { is_disabled: true },
       reply_markup: {
         inline_keyboard: [[
           { text: '🔗 Ouvrir OpenAI API Keys', url: 'https://platform.openai.com/api-keys' }
@@ -12081,7 +12082,7 @@ function registerHandlers() {
   // ─── /dashboard — URL signée vers /admin/dashboard ──────────────────────
   bot.onText(/\/dashboard/, msg => {
     if (!isAllowed(msg)) return;
-    bot.sendMessage(msg.chat.id, `📊 *Dashboard admin*\n\nhttps://signaturesb-bot-s272.onrender.com/admin/dashboard\n\n_Tout en un coup d'œil: health, coûts, campagnes, audit, abonnements._`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+    bot.sendMessage(msg.chat.id, `📊 *Dashboard admin*\n\nhttps://signaturesb-bot-s272.onrender.com/admin/dashboard\n\n_Tout en un coup d'œil: health, coûts, campagnes, audit, abonnements._`, { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } });
   });
 
   // ─── /dernier_appel — re-affiche le dernier résumé d'appel + lien Pipedrive
@@ -12107,7 +12108,7 @@ function registerHandlers() {
       d.analyseErr ? `\n⚠️ Haiku partiel: ${d.analyseErr.substring(0, 80)}` : '',
       dealUrl ? `\n🔗 ${dealUrl}` : '',
     ].filter(Boolean);
-    await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown', disable_web_page_preview: true });
+    await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } });
   });
 
   // ─── /test_appel <texte> — preview analyse Haiku SANS écrire dans Pipedrive
@@ -12268,7 +12269,7 @@ function registerHandlers() {
           body: buffer,
         });
         const saved = up.ok;
-        await bot.sendMessage(chatId, `🎙 Vocal reçu (${msg.voice.duration}s) — Whisper KO\n\n${saved ? `✅ Audio sauvé Dropbox: \`${dbxPath}\`` : '❌ Backup Dropbox aussi échoué'}\n\n*Pour activer transcription auto:*\nVa sur https://platform.openai.com/api-keys → crée une clé → tape \`/setsecret OPENAI_API_KEY sk-proj-...\`\n_~$1/mois pour 30 appels × 5min._`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+        await bot.sendMessage(chatId, `🎙 Vocal reçu (${msg.voice.duration}s) — Whisper KO\n\n${saved ? `✅ Audio sauvé Dropbox: \`${dbxPath}\`` : '❌ Backup Dropbox aussi échoué'}\n\n*Pour activer transcription auto:*\nVa sur https://platform.openai.com/api-keys → crée une clé → tape \`/setsecret OPENAI_API_KEY sk-proj-...\`\n_~$1/mois pour 30 appels × 5min._`, { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } });
       } catch (e) { await bot.sendMessage(chatId, `⚠️ Whisper KO + sauvegarde échoué: ${e.message.substring(0,100)}`); }
       return;
     }
