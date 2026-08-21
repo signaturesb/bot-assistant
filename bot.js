@@ -2858,8 +2858,9 @@ async function pdGetV2(endpoint) {
 
 function normalizePipedriveRelationId(value) {
   const raw = value && typeof value === 'object' ? value.value : value;
+  if (raw === null || raw === undefined || raw === '') return null;
   const id = Number(raw);
-  return Number.isFinite(id) ? id : null;
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 async function pdGetActivities({ dealId = null, personId = null, done, limit = 100 } = {}) {
