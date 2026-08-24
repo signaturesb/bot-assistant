@@ -73,11 +73,14 @@ function hasExplicitCentrisSendConfirmation(value) {
   return EXPLICIT_CENTRIS_SEND_RE.test(String(value || '').trim());
 }
 
-function browserlessEndpointWithTimeout(endpoint, timeoutMs = 180000) {
+function browserlessEndpointWithTimeout(endpoint, timeoutMs = 60000) {
   let url;
   try { url = new URL(endpoint); }
   catch { throw new Error('BROWSERLESS_WS invalide'); }
-  const safeTimeout = Math.max(60000, Math.min(Number(timeoutMs) || 180000, 300000));
+  // Browserless production currently rejects values above 60,000 ms.
+  // Clamp locally so a stale environment value cannot prevent Chrome from
+  // opening before the Centris/MFA flow even starts.
+  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 60000, 60000));
   url.searchParams.set('timeout', String(safeTimeout));
   return url.toString();
 }
@@ -165,7 +168,7 @@ async function launchBrowser() {
   const configuredEndpoint = process.env.BROWSERLESS_WS;
   if (configuredEndpoint) {
     console.log('[CUA] Mode Browserless externe (WS)');
-    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 180000;
+    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 60000;
     const wsEndpoint = browserlessEndpointWithTimeout(configuredEndpoint, sessionTimeoutMs);
     // Audit P3 #10: retry 3× avec backoff 3s/8s/20s
     let lastErr = null;
