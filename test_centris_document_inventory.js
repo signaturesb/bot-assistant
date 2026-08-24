@@ -31,7 +31,21 @@ const botCode = fs.readFileSync('bot.js', 'utf8');
 const cuaCode = fs.readFileSync('cua_driver.js', 'utf8');
 assert.ok(botCode.includes('expectedManifestId: preview.manifest_id'), 'l’envoi doit être lié au dry-run');
 assert.ok(cuaCode.includes('expectedManifestId !== inventory.manifest_id'), 'un inventaire changé doit bloquer');
-assert.ok(cuaCode.includes('if (!dry_run && !cb.checked) cb.click()'), 'le dry-run ne doit pas cocher les documents');
+assert.ok(cuaCode.includes('if (!isDryRun && !cb.checked) cb.click()'), 'le dry-run doit être transmis explicitement au contexte navigateur');
+
+assert.strictEqual(cua._classifyZonePageSnapshot({
+  url: 'https://accounts.centris.ca/Account/Login', text: 'Connexion', passwordInputs: 1,
+}, '28936167').code, 'ZONE_AUTH_REQUIRED');
+assert.strictEqual(cua._classifyZonePageSnapshot({
+  url: 'https://zone.centris.ca/Listings/28936167/Documents', text: 'Inscription 28936167 Aucun document disponible', checkboxCount: 0,
+}, '28936167').code, 'ZONE_NO_DOCUMENTS');
+assert.strictEqual(cua._classifyZonePageSnapshot({
+  url: 'https://zone.centris.ca/Listings/28936167/Documents', text: 'Inscription 28936167 Documents', checkboxCount: 3,
+}, '28936167').code, 'ZONE_DOCUMENTS_READY');
+assert.strictEqual(cua._classifyZonePageSnapshot({
+  url: 'https://zone.centris.ca/Dashboard', text: 'Bienvenue', checkboxCount: 0,
+}, '28936167').code, 'ZONE_NAVIGATION_UNVERIFIED');
+assert.ok(botCode.includes('JAMAIS inventer, corriger ou suggérer un autre numéro Centris'), 'le bot ne doit jamais halluciner un numéro alternatif');
 
 assert.deepStrictEqual(
   cua._extractTaxCandidatesFromText('Taxes municipales : 2 345 $\nTaxes scolaires : 412 $', 'taxes?\\s*municipal(?:e|es|aux)?'),

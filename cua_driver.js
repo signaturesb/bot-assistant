@@ -51,6 +51,7 @@ const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
 let centrisMFAWaiting = false;
 let pendingManualMFACode = null;
 let activeCentrisLoginPromise = null;
+const zonePreviewInFlight = new Map();
 
 function isAwaitingCentrisMFA() {
   return centrisMFAWaiting;
@@ -108,6 +109,108 @@ function buildCentrisDocumentInventory(centrisNum, docs = []) {
     missing,
     manifest_id: nodeCrypto.createHash('sha256').update(manifestPayload).digest('hex'),
   };
+}
+
+function classifyZonePageSnapshot(snapshot = {}, centrisNum = '') {
+  const url = String(snapshot.url || '');
+  const title = String(snapshot.title || '');
+  const text = String(snapshot.text || '');
+  const combined = `${title}\n${text}`;
+  const num = String(centrisNum || '').replace(/\D/g, '');
+  const listingMentioned = num ? new RegExp(`(^|\\D)${num}(\\D|$)`).test(combined) : false;
+
+  if (/accounts\.centris\.ca|\/signin|\/login/i.test(url) || snapshot.passwordInputs > 0 ||
+      /connectez-vous|ouvrir une session|mot de passe/i.test(combined)) {
+    return { code: 'ZONE_AUTH_REQUIRED', listingMentioned };
+  }
+  if (/acc[eè]s refus[ée]|non autoris[ée]|forbidden|permission insuffisante/i.test(combined)) {
+    return { code: 'ZONE_FORBIDDEN', listingMentioned };
+  }
+  if (/page introuvable|listing introuvable|inscription introuvable|aucun r[ée]sultat|not found|erreur 404/i.test(combined)) {
+    return { code: 'ZONE_LISTING_NOT_FOUND', listingMentioned };
+  }
+  if ((snapshot.checkboxCount > 0 || snapshot.shareButtonCount > 0) &&
+      (listingMentioned || /\/Listings\//i.test(url))) {
+    return { code: 'ZONE_DOCUMENTS_READY', listingMentioned };
+  }
+  if (/aucun document|pas de document|no documents/i.test(combined) &&
+      (listingMentioned || /\/Listings\//i.test(url))) {
+    return { code: 'ZONE_NO_DOCUMENTS', listingMentioned };
+  }
+  return { code: 'ZONE_NAVIGATION_UNVERIFIED', listingMentioned };
+}
+
+async function inspectZonePage(page, centrisNum) {
+  const snapshot = await page.evaluate(() => ({
+    url: location.href,
+    title: document.title,
+    text: String(document.body?.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 1200),
+    passwordInputs: document.querySelectorAll('input[type=password]').length,
+    checkboxCount: document.querySelectorAll('input[type=checkbox]:not([disabled])').length,
+    shareButtonCount: [...document.querySelectorAll('button,a')]
+      .filter((el) => /partager les documents/i.test(el.textContent || el.getAttribute('title') || '')).length,
+  }));
+  return { ...snapshot, ...classifyZonePageSnapshot(snapshot, centrisNum) };
+}
+
+async function navigateToZoneDocuments(page, centrisNum) {
+  const attempts = [];
+  const inspect = async (label) => {
+    const state = await inspectZonePage(page, centrisNum);
+    attempts.push({ label, code: state.code, url: state.url, title: state.title });
+    console.log(`[ZONE-NAV] ${label}: ${state.code} url=${String(state.url).substring(0, 140)}`);
+    return state;
+  };
+
+  const directUrl = `https://zone.centris.ca/Listings/${centrisNum}/Documents`;
+  const response = await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2500);
+  let state = await inspect('direct-documents');
+  state.httpStatus = response?.status?.() || null;
+  if (['ZONE_DOCUMENTS_READY', 'ZONE_NO_DOCUMENTS', 'ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN'].includes(state.code)) {
+    return { state, attempts };
+  }
+
+  // If a bookmarked route changed, use Zone's own Dashboard search and follow
+  // the exact listing instead of guessing alternate Centris numbers.
+  await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(2000);
+  state = await inspect('dashboard');
+  if (['ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN'].includes(state.code)) return { state, attempts };
+
+  const search = page.locator([
+    'input[type=search]',
+    'input[placeholder*="recherch" i]',
+    'input[placeholder*="centris" i]',
+    'input[placeholder*="inscription" i]',
+    'input[name*="search" i]',
+  ].join(',')).first();
+  if (!(await search.isVisible({ timeout: 2500 }).catch(() => false))) {
+    return { state: { ...state, code: 'ZONE_SEARCH_CONTROL_MISSING' }, attempts };
+  }
+  await search.fill(String(centrisNum));
+  await search.press('Enter');
+  await page.waitForTimeout(3000);
+  state = await inspect('dashboard-search');
+  if (['ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN', 'ZONE_LISTING_NOT_FOUND'].includes(state.code)) return { state, attempts };
+
+  const exactListingLink = page.locator(`a[href*="/Listings/${centrisNum}"]`).first();
+  if (await exactListingLink.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await exactListingLink.click();
+    await page.waitForTimeout(2500);
+    state = await inspect('exact-listing');
+  } else if (!state.listingMentioned) {
+    return { state: { ...state, code: 'ZONE_LISTING_NOT_FOUND' }, attempts };
+  }
+
+  const documentsTab = page.locator('a[href*="/Documents"], a:has-text("Documents"), button:has-text("Documents")').first();
+  if (!(await documentsTab.isVisible({ timeout: 2500 }).catch(() => false))) {
+    return { state: { ...state, code: 'ZONE_DOCUMENTS_TAB_MISSING' }, attempts };
+  }
+  await documentsTab.click();
+  await page.waitForTimeout(2500);
+  state = await inspect('documents-tab');
+  return { state, attempts };
 }
 
 function extractTaxCandidatesFromText(text, labelPattern) {
@@ -1816,7 +1919,8 @@ async function loginCentrisZone(context) {
       await context.addCookies(savedCookies);
       await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 });
       const u = page.url();
-      if (/Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u)) {
+      const state = await inspectZonePage(page, '');
+      if (/Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u) && state.code !== 'ZONE_AUTH_REQUIRED') {
         console.log('[ZONE] Session cachée valide ✅');
         return page;
       }
@@ -1854,7 +1958,8 @@ async function loginCentrisZone(context) {
   }
 
   // Vérif logged
-  if (!/Dashboard|Directory|Listings/i.test(page.url())) {
+  const loggedState = await inspectZonePage(page, '');
+  if (!/Dashboard|Directory|Listings/i.test(page.url()) || loggedState.code === 'ZONE_AUTH_REQUIRED') {
     throw new Error(`Zone login échoué — URL: ${page.url().substring(0, 100)}`);
   }
   console.log('[ZONE] Logged ✅');
@@ -1940,7 +2045,7 @@ async function getListingBroker(centrisNum, opts = {}) {
  * @param {string} [opts.expectedManifestId] — empreinte du dry-run; requise pour lier l'envoi au même dossier
  * @returns {Promise<{success, broker_info, docs_shared, docs_list?, sent_to, listing_url, dry_run?}>}
  */
-async function shareCentrisZoneDocuments(opts = {}) {
+async function runCentrisZoneDocuments(opts = {}) {
   if (!opts.dry_run && !hasExplicitCentrisSendConfirmation(opts.confirmationMessage)) {
     return { success: false, blocked: true, message: 'Partage Zone bloqué: confirmation exacte « envoie » requise' };
   }
@@ -1961,13 +2066,24 @@ async function shareCentrisZoneDocuments(opts = {}) {
     const broker = await getListingBroker(centris_num, { page });
     console.log(`[ZONE${dry_run?'-DRY':''}] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'}) source=${broker.source}`);
 
-    // 2. URL directe page Documents
-    console.log(`[ZONE${dry_run?'-DRY':''}] Navigate /Listings/${centris_num}/Documents`);
-    await page.goto(`https://zone.centris.ca/Listings/${centris_num}/Documents`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3500);
+    // 2. Navigation vérifiée. Zéro document n'est jamais interprété comme
+    // listing inexistant sans un état explicite rendu par Zone.
+    const navigation = await navigateToZoneDocuments(page, centris_num);
+    const zoneState = navigation.state;
+    if (zoneState.code !== 'ZONE_DOCUMENTS_READY' && zoneState.code !== 'ZONE_NO_DOCUMENTS') {
+      return {
+        success: false,
+        error_code: zoneState.code,
+        message: `Accès Zone non confirmé (${zoneState.code}). Aucun envoi effectué.`,
+        broker_info: broker,
+        listing_public_found: broker.source === 'centris.ca-public',
+        final_url: zoneState.url,
+        navigation_attempts: navigation.attempts,
+      };
+    }
 
     // 3. Liste les docs (et coche pour count) — capture noms+tailles
-    const docsInfo = await page.evaluate(() => {
+    const docsInfo = await page.evaluate((isDryRun) => {
       const rows = [...document.querySelectorAll('tr, [role=row], li')].filter(r => r.querySelector('input[type=checkbox]'));
       const docs = [];
       for (const row of rows) {
@@ -1982,7 +2098,7 @@ async function shareCentrisZoneDocuments(opts = {}) {
         // Skip ligne sans contenu utile
         if (!name || name.toLowerCase().includes('description')) continue;
         docs.push({ name: name.trim(), size: sizeMatch?.[0] || null });
-        if (!dry_run && !cb.checked) cb.click();
+        if (!isDryRun && !cb.checked) cb.click();
       }
       return docs;
     }, dry_run);
@@ -1990,7 +2106,17 @@ async function shareCentrisZoneDocuments(opts = {}) {
     const inventory = buildCentrisDocumentInventory(centris_num, docsInfo);
     console.log(`[ZONE${dry_run?'-DRY':''}] ${checkedCount} documents listés${dry_run?' (DRY-RUN)':' cochés'}`);
     if (checkedCount === 0) {
-      return { success: false, message: `Aucun document trouvé pour #${centris_num} (listing inexistant ou pas de docs)`, broker_info: broker };
+      return {
+        success: false,
+        error_code: zoneState.code === 'ZONE_NO_DOCUMENTS' ? 'ZONE_NO_DOCUMENTS' : 'ZONE_DOCUMENT_SELECTORS_CHANGED',
+        message: zoneState.code === 'ZONE_NO_DOCUMENTS'
+          ? `Listing #${centris_num} trouvé dans Zone, mais aucun document n’y est disponible.`
+          : `Page Documents trouvée pour #${centris_num}, mais l’inventaire n’a pas pu être lu. Aucun envoi effectué.`,
+        broker_info: broker,
+        listing_public_found: broker.source === 'centris.ca-public',
+        final_url: zoneState.url,
+        navigation_attempts: navigation.attempts,
+      };
     }
 
     // DRY-RUN: short-circuit ici, pas d'envoi
@@ -2078,6 +2204,21 @@ async function shareCentrisZoneDocuments(opts = {}) {
   } finally {
     if (browser) try { await browser.close(); } catch {}
   }
+}
+
+async function shareCentrisZoneDocuments(opts = {}) {
+  if (!opts.dry_run && !hasExplicitCentrisSendConfirmation(opts.confirmationMessage)) {
+    return { success: false, blocked: true, message: 'Partage Zone bloqué: confirmation exacte « envoie » requise' };
+  }
+  if (!opts.dry_run) return runCentrisZoneDocuments(opts);
+  const key = String(opts.centris_num || '').replace(/\D/g, '');
+  if (zonePreviewInFlight.has(key)) {
+    console.log(`[ZONE-DRY] Preview #${key} déjà en cours — résultat partagé`);
+    return zonePreviewInFlight.get(key);
+  }
+  const task = runCentrisZoneDocuments(opts).finally(() => zonePreviewInFlight.delete(key));
+  zonePreviewInFlight.set(key, task);
+  return task;
 }
 
 /**
@@ -2415,6 +2556,7 @@ module.exports = {
   _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
   _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
   _buildCentrisDocumentInventory: buildCentrisDocumentInventory,
+  _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   cuaLoginCentris,
   ingestManualMFACode,

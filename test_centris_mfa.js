@@ -6,6 +6,7 @@ assert.strictEqual(extractCentrisMfaCode({ from: 'Centris <no-reply@centris.ca>'
 assert.strictEqual(extractCentrisMfaCode({ from: 'shop@example.com', subject: 'Votre code', body: 'Code: 111222' }), null);
 assert.strictEqual(extractCentrisMfaCode({ from: 'news@centris.ca', subject: 'Nouveautés Centris', body: 'Propriété 28936167' }), null);
 assert.strictEqual(extractCentrisMfaCode({ from: 'alerts@example.com', subject: 'Centris', body: 'Listing 123456 disponible' }), null);
+assert.strictEqual(extractCentrisMfaCode({ from: 'julie@agence-partenaire.example', subject: 'Question sur le Centris #1234567', body: 'Le code client du dossier est 445566' }), null);
 const nested = gmailBodyText({ parts: [{ parts: [{ body: { data: Buffer.from('Code de vérification: 333444').toString('base64url') } }] }] }, 'intro');
 assert(nested.includes('333444'));
 console.log('✅ MFA Centris: contexte, proximité du code et MIME imbriqué validés');

@@ -1405,6 +1405,7 @@ GESTION D'ERREURS (non négociable):
 • Session expirée → re-login auto déjà câblé (TOTP→SMS→Email Gmail cascade)
 • Bot detection → escalade Browserless stealth (rebrowser-playwright)
 • JAMAIS de succès simulé. ÉCHEC = cause technique précise + suggestion fix.
+• JAMAIS inventer, corriger ou suggérer un autre numéro Centris. Réutiliser uniquement le numéro exact fourni par Shawn.
 
 WORKFLOW AVANT ENVOI (préférer dry-run):
 1. Sur "envoie docs/fiche #N" → SUGGÈRE d'abord verifier_listing_centris pour
@@ -7783,7 +7784,13 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         log('INFO', 'CENTRIS-ZONE-DRY', `Preview docs #${num}`);
         try {
           const r = await cuaMod.shareCentrisZoneDocuments({ centris_num: num, dry_run: true });
-          if (!r.success) return `❌ Preview Zone échoué: ${r.message}`;
+          if (!r.success) {
+            const code = r.error_code || 'ZONE_TECHNICAL_ERROR';
+            const publicSignal = r.listing_public_found
+              ? `\n✅ Le listing #${num} existe dans la source publique Centris; ce résultat ne signifie pas qu’il est inexistant.`
+              : '';
+            return `❌ Preview Zone #${num} non complété [${code}]\n${r.message}${publicSignal}\nAucun document envoyé. Le bot ne remplacera jamais ce numéro par un autre.`;
+          }
           const b = r.broker_info || {};
           const docsTxt = (r.docs_list || []).map((d, i) => `  ${i+1}. ${d.name}${d.size?` (${d.size})`:''}`).join('\n');
           const missingDocs = r.document_inventory?.missing || [];
