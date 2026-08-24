@@ -18,6 +18,9 @@ assert(cuaSource.includes('function isAwaitingCentrisMFA'), 'L’état d’atten
 assert(cuaSource.includes('async function cuaLoginCentris()'), 'La connexion Playwright explicite doit être exposée');
 assert(botSource.includes('cua?.isAwaitingCentrisMFA?.()'), 'Telegram doit détecter une attente MFA Playwright');
 assert(botSource.includes('cua.ingestManualMFACode(code)'), 'Telegram doit transmettre le code à Playwright');
+assert(botSource.includes('cua.ingestManualMFACode(data.code)'), 'Le pont Messages doit transmettre automatiquement le code à Playwright');
+assert(botSource.includes('playwrightAccepted'), 'Le webhook SMS doit auditer si Playwright a consommé le code');
+assert(cuaSource.includes('process.env.BROWSERLESS_WS ? 40000 : 180000'), 'L’attente MFA doit respecter la limite de session Browserless');
 assert(botSource.includes('const result = await centrisLoginDetailed();'), 'La commande Telegram doit utiliser la connexion Playwright vérifiée');
 assert(botSource.includes('await cua.cuaLoginCentris()'), 'Le runtime Centris doit utiliser Playwright comme source unique');
 assert.strictEqual((botSource.match(/centrisOAuthLoginWithMFA\(/g) || []).length, 1, 'L’ancien parseur OAuth ne doit plus être appelé');

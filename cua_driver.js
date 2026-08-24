@@ -499,9 +499,12 @@ async function loginCentris(context) {
     const mfaVisible = await mfaField.isVisible().catch(() => false);
     if (!mfaVisible) break;
 
-    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — Gmail ou /mfa (max 180s)...`);
-    const mfaCode = await fetchMFACodeFromBot(180000);
-    if (!mfaCode) throw new Error('MFA timeout — aucun code reçu en 180s via Gmail, Telegram ou bridge SMS.');
+    // Browserless limite la session Playwright à 60 s. Conserver une marge
+    // pour soumettre le code et vérifier Matrix avant la fermeture du socket.
+    const mfaWaitMs = process.env.BROWSERLESS_WS ? 40000 : 180000;
+    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — Gmail, pont Messages ou /mfa (max ${Math.round(mfaWaitMs / 1000)}s)...`);
+    const mfaCode = await fetchMFACodeFromBot(mfaWaitMs);
+    if (!mfaCode) throw new Error(`MFA timeout — aucun code reçu en ${Math.round(mfaWaitMs / 1000)}s via Gmail, Telegram ou pont Messages.`);
     console.log(`[CUA] MFA code reçu: ${mfaCode.substring(0, 2)}****`);
 
     await mfaField.fill(mfaCode);

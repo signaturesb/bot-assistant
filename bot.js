@@ -16582,11 +16582,23 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         }
         // Code MFA reçu
         if (data.code && /^\d{4,8}$/.test(String(data.code))) {
-          ingestCentrisMFACode(data.code, data.sender, data.text);
+          // Alimenter les deux chemins légitimes pouvant être en attente:
+          // l'ancien flux OAuth et la session Chrome/Playwright courante.
+          // Le code reste en mémoire, à usage unique, et n'est jamais loggé.
+          const oauthAccepted = ingestCentrisMFACode(data.code, data.sender, data.text);
+          const cua = getCUA();
+          const playwrightAccepted = Boolean(cua?.isAwaitingCentrisMFA?.())
+            ? Boolean(cua.ingestManualMFACode(data.code))
+            : false;
           smsBridgeHealth.lastCodeAt = Date.now();
           smsBridgeHealth.totalCodes = (smsBridgeHealth.totalCodes || 0) + 1;
-          log('OK', 'SMS-BRIDGE', `Code MFA reçu (${data.sender || '?'})`);
-          auditLogEvent('sms-bridge', 'code_received', { sender: data.sender, masked: data.code.substring(0,2)+'****' });
+          log('OK', 'SMS-BRIDGE', `Code MFA reçu (${data.sender || '?'}) — oauth=${oauthAccepted ? 'accepted' : 'idle'} playwright=${playwrightAccepted ? 'accepted' : 'idle'}`);
+          auditLogEvent('sms-bridge', 'code_received', {
+            sender: data.sender,
+            masked: data.code.substring(0,2)+'****',
+            oauthAccepted,
+            playwrightAccepted,
+          });
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, type: 'code-ingested' }));
           return;
