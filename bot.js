@@ -23,6 +23,13 @@ const {
 } = require('./lib/runtime_safety');
 const { gistWritesEnabled, shouldRestoreFromGist } = require('./lib/persistence_policy');
 const { parseCentrisComparableQuery, publicComparableListing } = require('./lib/centris_query');
+const { gmailBodyText, extractCentrisMfaCode } = require('./lib/centris_mfa');
+const {
+  assertPublicHttpsUrl,
+  validateCentrisSessionUrl,
+  secretTestTarget,
+  fetchWithValidatedRedirects,
+} = require('./lib/outbound_url_guard');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 🛡️ RÈGLE ABSOLUE — Shawn gère SES suivis lui-même
@@ -14757,7 +14764,7 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         }
         const payload = JSON.parse(body || '{}');
         const { audio_url, caller_name, caller_phone, duration_sec, source } = payload;
-        if (!audio_url || !/^https?:\/\//.test(audio_url)) {
+        if (!audio_url) {
           res.writeHead(400); res.end(JSON.stringify({error:'audio_url (https) requis'})); return;
         }
         // Audit avant traitement
@@ -14766,7 +14773,11 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         // Download audio
         let buffer;
         try {
-          const r = await fetch(audio_url, { signal: AbortSignal.timeout(60000) });
+          await assertPublicHttpsUrl(audio_url);
+          const r = await fetchWithValidatedRedirects(
+            audio_url, fetch, { signal: AbortSignal.timeout(60000) },
+            candidate => assertPublicHttpsUrl(candidate),
+          );
           if (!r.ok) throw new Error(`Download HTTP ${r.status}`);
           buffer = Buffer.from(await r.arrayBuffer());
           if (buffer.length > 25 * 1024 * 1024) throw new Error(`Audio trop gros: ${(buffer.length/1024/1024).toFixed(1)} MB (max 25)`);
@@ -14831,15 +14842,14 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         if (!key || !value) { res.writeHead(400); res.end(JSON.stringify({error:'key et value requis'})); return; }
         if (!/^[A-Z0-9_]+$/.test(key)) { res.writeHead(400); res.end(JSON.stringify({error:'key invalide (A-Z0-9_)'})); return; }
         if (value.length < 8) { res.writeHead(400); res.end(JSON.stringify({error:'value trop courte'})); return; }
-        // Auth déjà validée par le garde central; test_url ne confère jamais d'accès.
-        // Test optionnel
+        // Test optionnel limité à une cible canonique par type de clé. Une URL ou
+        // un header arbitraire pourrait autrement exfiltrer le secret neuf.
         let tested = null;
         if (test_url) {
-          const headers = test_auth_header
-            ? { [test_auth_header]: value }
-            : { 'Authorization': `Bearer ${value}` };
           try {
-            const tr = await fetch(test_url, { headers, signal: AbortSignal.timeout(10000) });
+            const target = secretTestTarget(key, test_url, test_auth_header);
+            const headers = { [target.header]: `${target.prefix}${value}` };
+            const tr = await fetch(target.url, { headers, signal: AbortSignal.timeout(10000), redirect: 'error' });
             tested = { status: tr.status, ok: tr.ok };
             if (!tr.ok) {
               res.writeHead(400); res.end(JSON.stringify({ error: `Test URL fail: HTTP ${tr.status}`, tested })); return;
@@ -16382,18 +16392,22 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     if (!webhookRateOK(req.socket.remoteAddress, url, 20)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
     const targetUrl = u.searchParams.get('url') || '';
-    if (!targetUrl || !targetUrl.startsWith('http')) { res.writeHead(400); res.end('url required'); return; }
+    let safeTarget;
+    try { safeTarget = validateCentrisSessionUrl(targetUrl); }
+    catch (error) {
+      res.writeHead(400, {'content-type':'application/json'});
+      res.end(JSON.stringify({ error: error.message })); return;
+    }
     if (!centrisSession?.cookies) { res.writeHead(503); res.end(JSON.stringify({error:'no centris session'})); return; }
     try {
-      const r = await fetch(targetUrl, {
+      const r = await fetchWithValidatedRedirects(safeTarget.toString(), fetch, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
           'Cookie': centrisSession.cookies,
           'Referer': 'https://matrix.centris.ca/Matrix/Home',
         },
         signal: AbortSignal.timeout(30000),
-        redirect: 'follow',
-      });
+      }, validateCentrisSessionUrl);
       const buf = Buffer.from(await r.arrayBuffer());
       const ct = r.headers.get('content-type') || '';
       const isPdf = buf.length > 100 && buf.slice(0, 4).toString() === '%PDF';
@@ -16424,7 +16438,13 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       res.writeHead(429); res.end('rate limit'); return;
     }
     const u = new URL(req.url, 'http://x');
-    const afterMs = Math.max(0, Number(u.searchParams.get('after') || 0));
+    const cua = getCUA();
+    if (!centrisLoginInProgress && !cua?.isAwaitingCentrisMFA?.()) {
+      res.writeHead(409, {'content-type':'application/json'});
+      res.end(JSON.stringify({ ok: false, error: 'AUCUNE_CONNEXION_MFA_ACTIVE' })); return;
+    }
+    const rawAfter = Number(u.searchParams.get('after') || 0);
+    const afterMs = Number.isFinite(rawAfter) ? Math.max(0, rawAfter) : 0;
     try {
       const gmailTok = await getGmailToken();
       if (!gmailTok) { res.writeHead(500); res.end(JSON.stringify({error:'no gmail token'})); return; }
@@ -16447,22 +16467,13 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         const internalDate = Number(msg.internalDate || 0);
         if (afterMs && internalDate && internalDate < afterMs - 30000) continue;
         const headers = msg.payload?.headers || [];
-        const subject = headers.find(h => h.name === 'Subject')?.value || '';
+        const subject = headers.find(h => h.name.toLowerCase() === 'subject')?.value || '';
+        const from = headers.find(h => h.name.toLowerCase() === 'from')?.value || '';
         const snippet = msg.snippet || '';
-        // Parse body parts for full text
-        let bodyText = snippet;
-        const parts = msg.payload?.parts || [msg.payload];
-        for (const p of parts) {
-          if (p?.body?.data) {
-            try {
-              bodyText += ' ' + Buffer.from(p.body.data, 'base64').toString('utf8');
-            } catch {}
-          }
-        }
-        // Match 6-digit code
-        const codeMatch = bodyText.match(/\b(\d{6})\b/);
-        if (codeMatch) {
-          foundCode = codeMatch[1];
+        const bodyText = gmailBodyText(msg.payload, snippet);
+        const code = extractCentrisMfaCode({ from, subject, body: bodyText });
+        if (code) {
+          foundCode = code;
           foundSubject = subject;
           break;
         }

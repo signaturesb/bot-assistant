@@ -30,12 +30,14 @@
     "test-email-guard": "node test_email_send_guard.js",
     "test-pipedrive-guard": "node test_pipedrive_write_guard.js",
     "test-admin-auth": "node test_admin_auth.js",
+    "test-outbound-url-guard": "node test_outbound_url_guard.js",
     "test-runtime-safety": "node test_runtime_safety.js",
     "test-telegram-compat": "node test_telegram_compat.js",
     "test-calendar-guard": "node test_calendar_guard.js",
     "test-centris-query": "node test_centris_query.js",
     "test-centris-auth-bridge": "node test_centris_playwright_auth.js",
-    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-centris-query && npm run test-centris-auth-bridge && npm run test-brevo-readonly && npm run security-status"
+    "test-centris-mfa": "node test_centris_mfa.js",
+    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-outbound-url-guard && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-centris-query && npm run test-centris-auth-bridge && npm run test-centris-mfa && npm run test-brevo-readonly && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

@@ -21,5 +21,12 @@ assert(!/searchParams\.get\(['"]token['"]\)/.test(botSource), 'admin secret foun
 assert(!/[?&]token=/.test(botSource), 'admin secret found in bot URL');
 assert(!/[?&]token=/.test(centrisSource), 'admin secret found in Centris URL');
 assert(botSource.includes("if (url.startsWith('/admin/') && !requireAdmin(req, res)) return;"), 'central admin gate missing');
+assert(botSource.includes("AUCUNE_CONNEXION_MFA_ACTIVE"), 'MFA Gmail endpoint must be closed outside an active login');
+assert(botSource.includes('validateCentrisSessionUrl(targetUrl)'), 'Centris cookie fetch must validate its destination');
+assert(!botSource.includes('fetch(targetUrl, {'), 'Centris cookies must never be sent by a raw arbitrary fetch');
+assert(botSource.includes('secretTestTarget(key, test_url, test_auth_header)'), 'secret tests must use canonical targets');
+for (const route of ['/admin/brevo-send-now', '/admin/pipedrive-cleanup', '/admin/preview-via-gmail']) {
+  assert(botSource.includes(`'${route}'`), `${route} must remain in the blocked legacy mutation list`);
+}
 
 console.log('✅ Admin Bearer auth: tests passed');

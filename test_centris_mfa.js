@@ -1,0 +1,11 @@
+'use strict';
+const assert = require('assert');
+const { gmailBodyText, extractCentrisMfaCode } = require('./lib/centris_mfa');
+assert.strictEqual(extractCentrisMfaCode({ from: 'Centris <no-reply@accounts.centris.ca>', subject: 'Votre code MFA pour Centris', body: 'Votre code de vérification est 123456.' }), '123456');
+assert.strictEqual(extractCentrisMfaCode({ from: 'Centris <no-reply@centris.ca>', subject: 'Matrix — authentification', body: '987654 — code authentification' }), '987654');
+assert.strictEqual(extractCentrisMfaCode({ from: 'shop@example.com', subject: 'Votre code', body: 'Code: 111222' }), null);
+assert.strictEqual(extractCentrisMfaCode({ from: 'news@centris.ca', subject: 'Nouveautés Centris', body: 'Propriété 28936167' }), null);
+assert.strictEqual(extractCentrisMfaCode({ from: 'alerts@example.com', subject: 'Centris', body: 'Listing 123456 disponible' }), null);
+const nested = gmailBodyText({ parts: [{ parts: [{ body: { data: Buffer.from('Code de vérification: 333444').toString('base64url') } }] }] }, 'intro');
+assert(nested.includes('333444'));
+console.log('✅ MFA Centris: contexte, proximité du code et MIME imbriqué validés');
