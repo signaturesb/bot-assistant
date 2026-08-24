@@ -52,6 +52,13 @@ const samples = [
     junk: true,
   },
   {
+    name: 'Centris MFA — sujet production exact (JUNK)',
+    subject: `Votre code MFA pour Centris`,
+    from: 'Centris.ca <no-reply@centris.ca>',
+    body: `Utilisez le code 123456 pour terminer votre connexion. Ce code expirera bientôt.`,
+    junk: true,
+  },
+  {
     name: 'Centris conversation non lue (JUNK)',
     subject: `Vous avez une conversation non lue`,
     from: 'notifications@centris.ca',

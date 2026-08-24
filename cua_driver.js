@@ -25,6 +25,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const nodeCrypto = require('crypto');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -71,6 +72,59 @@ function takeManualMFACode() {
 
 function hasExplicitCentrisSendConfirmation(value) {
   return EXPLICIT_CENTRIS_SEND_RE.test(String(value || '').trim());
+}
+
+const CENTRIS_STANDARD_DOCUMENTS = Object.freeze([
+  { key: 'fiche_detaillee', label: 'Fiche détaillée', patterns: [/fiche/i, /descriptive/i, /detail/i] },
+  { key: 'declaration_vendeur', label: 'Déclaration du vendeur (DV)', patterns: [/d[ée]claration.*vendeur/i, /\bDV\b/i] },
+  { key: 'taxes_municipales', label: 'Taxes municipales', patterns: [/taxe.*municip/i] },
+  { key: 'taxes_scolaires', label: 'Taxes scolaires', patterns: [/taxe.*scolair/i] },
+  { key: 'certificat_localisation', label: 'Certificat de localisation', patterns: [/certificat.*localisation/i, /\bcert\.?\s*loc/i] },
+  { key: 'plans', label: 'Plans', patterns: [/\bplan/i, /implantation/i, /cadastr/i] },
+]);
+
+function buildCentrisDocumentInventory(centrisNum, docs = []) {
+  const normalizedDocs = (Array.isArray(docs) ? docs : [])
+    .map((doc) => ({
+      name: String(doc?.name || '').trim(),
+      size: doc?.size ? String(doc.size).trim() : null,
+    }))
+    .filter((doc) => doc.name)
+    .sort((a, b) => `${a.name}|${a.size || ''}`.localeCompare(`${b.name}|${b.size || ''}`, 'fr'));
+  const present = [];
+  const missing = [];
+  for (const expected of CENTRIS_STANDARD_DOCUMENTS) {
+    const matches = normalizedDocs.filter((doc) => expected.patterns.some((pattern) => pattern.test(doc.name)));
+    (matches.length ? present : missing).push({
+      key: expected.key,
+      label: expected.label,
+      matches: matches.map((doc) => doc.name),
+    });
+  }
+  const manifestPayload = JSON.stringify({ centris_num: String(centrisNum || ''), docs: normalizedDocs });
+  return {
+    docs: normalizedDocs,
+    present,
+    missing,
+    manifest_id: nodeCrypto.createHash('sha256').update(manifestPayload).digest('hex'),
+  };
+}
+
+function extractTaxCandidatesFromText(text, labelPattern) {
+  const source = String(text || '');
+  const candidates = [];
+  const labelRegex = new RegExp(labelPattern, 'i');
+  for (const line of source.split(/\r?\n/)) {
+    if (!labelRegex.test(line)) continue;
+    const afterLabel = line.replace(labelRegex, ' ');
+    const dollarMatches = [...afterLabel.matchAll(/(?:\$\s*([0-9][0-9 \,\.]*))|(?:([0-9][0-9 \,\.]*)\s*\$)/g)];
+    const lastAmount = dollarMatches[dollarMatches.length - 1];
+    const raw = String(lastAmount?.[1] || lastAmount?.[2] || '').trim();
+    if (!raw) continue;
+    const value = Number(raw.replace(/\s/g, '').replace(/,/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, ''));
+    if (Number.isFinite(value) && value >= 0 && value < 1000000 && !candidates.includes(value)) candidates.push(value);
+  }
+  return candidates;
 }
 
 function browserlessEndpointWithTimeout(endpoint, timeoutMs = 60000) {
@@ -1270,12 +1324,16 @@ async function extractCentrisPDFData(pdfBuffer) {
   // Adresse (heuristique: ligne avec numéro civique)
   const adrM = text.match(/(\d{1,5}[A-Za-z]?[,\s]+(?:rue|avenue|av\.|boul\.|boulevard|chemin|ch\.|route|rang|rte)\s+[^\n]{3,80})/i);
   if (adrM) data.adresse = adrM[1].trim().substring(0, 200);
-  // Taxes municipales (annuelles)
-  const taxMuniM = text.match(/taxes?\s*municipal[ea]s?\s*[:\s]*\$?\s*([\d\s,]+)/i);
-  if (taxMuniM) data.taxes_municipales = parseFloat(taxMuniM[1].replace(/[\s,]/g, ''));
-  // Taxes scolaires
-  const taxScolM = text.match(/taxes?\s*scolair[es]+\s*[:\s]*\$?\s*([\d\s,]+)/i);
-  if (taxScolM) data.taxes_scolaires = parseFloat(taxScolM[1].replace(/[\s,]/g, ''));
+  // Taxes: PDF texte = fallback seulement. Ne jamais choisir arbitrairement
+  // entre plusieurs montants (année courante, historique, estimé, etc.).
+  const municipalCandidates = extractTaxCandidatesFromText(text, 'taxes?\\s*municipal(?:e|es|aux)?');
+  const schoolCandidates = extractTaxCandidatesFromText(text, 'taxes?\\s*scolair(?:e|es)?');
+  data.taxes_provenance = 'pdf-text-fallback';
+  data.taxes_municipales_candidates = municipalCandidates;
+  data.taxes_scolaires_candidates = schoolCandidates;
+  if (municipalCandidates.length === 1) data.taxes_municipales = municipalCandidates[0];
+  if (schoolCandidates.length === 1) data.taxes_scolaires = schoolCandidates[0];
+  data.taxes_ambiguous = municipalCandidates.length > 1 || schoolCandidates.length > 1;
   // Année construction
   const yearM = text.match(/(?:ann[ée]?e?\s*(?:de\s*)?construction|built|construit)\s*[:\s]*(\d{4})/i);
   if (yearM) data.year_built = parseInt(yearM[1]);
@@ -1879,6 +1937,7 @@ async function getListingBroker(centrisNum, opts = {}) {
  * @param {string} [opts.langue] — 'fr' (défaut) | 'en'
  * @param {string} [opts.message] — message custom (sinon défaut Centris)
  * @param {string} [opts.confirmationMessage] — requis pour tout envoi réel
+ * @param {string} [opts.expectedManifestId] — empreinte du dry-run; requise pour lier l'envoi au même dossier
  * @returns {Promise<{success, broker_info, docs_shared, docs_list?, sent_to, listing_url, dry_run?}>}
  */
 async function shareCentrisZoneDocuments(opts = {}) {
@@ -1888,7 +1947,7 @@ async function shareCentrisZoneDocuments(opts = {}) {
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
-  const { centris_num, email, dry_run = false, sendSelfCopy = false, langue = 'fr', message } = opts;
+  const { centris_num, email, dry_run = false, sendSelfCopy = false, langue = 'fr', message, expectedManifestId } = opts;
   if (!centris_num) return { success: false, message: 'centris_num requis' };
   if (!dry_run && !email) return { success: false, message: 'email requis (sauf dry_run=true)' };
 
@@ -1923,11 +1982,12 @@ async function shareCentrisZoneDocuments(opts = {}) {
         // Skip ligne sans contenu utile
         if (!name || name.toLowerCase().includes('description')) continue;
         docs.push({ name: name.trim(), size: sizeMatch?.[0] || null });
-        if (!cb.checked) cb.click();
+        if (!dry_run && !cb.checked) cb.click();
       }
       return docs;
-    });
+    }, dry_run);
     const checkedCount = docsInfo.length;
+    const inventory = buildCentrisDocumentInventory(centris_num, docsInfo);
     console.log(`[ZONE${dry_run?'-DRY':''}] ${checkedCount} documents listés${dry_run?' (DRY-RUN)':' cochés'}`);
     if (checkedCount === 0) {
       return { success: false, message: `Aucun document trouvé pour #${centris_num} (listing inexistant ou pas de docs)`, broker_info: broker };
@@ -1940,9 +2000,29 @@ async function shareCentrisZoneDocuments(opts = {}) {
         dry_run: true,
         broker_info: broker,
         docs_count: checkedCount,
-        docs_list: docsInfo,
+        docs_list: inventory.docs,
+        document_inventory: inventory,
+        manifest_id: inventory.manifest_id,
         listing_url: `https://zone.centris.ca/Listings/${centris_num}/Documents`,
         message: `PREVIEW — ${checkedCount} docs prêts à partager. Confirme avec envoyer_tous_documents_zone pour livrer.`,
+      };
+    }
+
+    if (!expectedManifestId) {
+      return {
+        success: false,
+        blocked: true,
+        message: 'Partage Zone bloqué: inventaire dry-run manquant. Relance verifier_listing_centris.',
+      };
+    }
+    if (expectedManifestId !== inventory.manifest_id) {
+      return {
+        success: false,
+        blocked: true,
+        message: 'Partage Zone bloqué: la liste des documents a changé depuis l’aperçu. Une nouvelle vérification est requise.',
+        expected_manifest_id: expectedManifestId,
+        actual_manifest_id: inventory.manifest_id,
+        document_inventory: inventory,
       };
     }
 
@@ -1983,6 +2063,9 @@ async function shareCentrisZoneDocuments(opts = {}) {
       success: true,
       broker_info: broker,
       docs_shared: checkedCount,
+      docs_list: inventory.docs,
+      document_inventory: inventory,
+      manifest_id: inventory.manifest_id,
       sent_to: email,
       send_self_copy: sendSelfCopy,
       langue,
@@ -2331,6 +2414,8 @@ module.exports = {
   _isAuthenticatedCentrisUrl: isAuthenticatedCentrisUrl,
   _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
   _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
+  _buildCentrisDocumentInventory: buildCentrisDocumentInventory,
+  _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   cuaLoginCentris,
   ingestManualMFACode,
   isAwaitingCentrisMFA,
