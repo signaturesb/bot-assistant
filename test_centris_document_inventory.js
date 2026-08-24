@@ -49,6 +49,10 @@ assert.ok(botCode.includes('JAMAIS inventer, corriger ou suggérer un autre num�
 assert.ok(botCode.includes('verifier_listing_centris: 120000'), 'le preview Centris doit couvrir connexion + MFA + navigation');
 assert.ok(botCode.includes('if (timer) clearTimeout(timer)'), 'le timeout outil doit être nettoyé après résolution');
 assert.ok(cuaCode.includes('[ZONE-DIAG]'), 'une navigation Zone inconnue doit produire un diagnostic sûr');
+assert.ok(cuaCode.includes('waitForZoneAppReady'), 'Zone doit attendre le rendu de son application JavaScript');
+assert.ok(cuaCode.includes("code: 'ZONE_APP_BLANK'"), 'une coquille Zone vide doit être distinguée d’un listing absent');
+assert.ok(!cuaCode.includes("'sec-fetch-dest': 'document'"), 'les sous-ressources Zone ne doivent pas recevoir des en-têtes de navigation forcés');
+assert.ok(botCode.includes('enforceCentrisNumberFidelity'), 'la réponse ne doit jamais suggérer un autre numéro Centris');
 
 assert.deepStrictEqual(
   cua._extractTaxCandidatesFromText('Taxes municipales : 2 345 $\nTaxes scolaires : 412 $', 'taxes?\\s*municipal(?:e|es|aux)?'),

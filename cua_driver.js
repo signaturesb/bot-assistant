@@ -166,6 +166,21 @@ async function inspectZonePage(page, centrisNum) {
   return { ...snapshot, ...classifyZonePageSnapshot(snapshot, centrisNum) };
 }
 
+async function waitForZoneAppReady(page, timeoutMs = 15000) {
+  try {
+    await page.waitForFunction(() => {
+      const body = document.body;
+      if (!body) return false;
+      const textReady = String(body.innerText || '').trim().length > 0;
+      const uiReady = !!body.querySelector('input, button, a, table, [role="button"], [role="row"], [role="main"]');
+      return textReady || uiReady;
+    }, null, { timeout: timeoutMs, polling: 250 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function navigateToZoneDocuments(page, centrisNum) {
   const attempts = [];
   const inspect = async (label) => {
@@ -186,9 +201,10 @@ async function navigateToZoneDocuments(page, centrisNum) {
 
   const directUrl = `https://zone.centris.ca/Listings/${centrisNum}/Documents`;
   const response = await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(2500);
+  const directReady = await waitForZoneAppReady(page);
   let state = await inspect('direct-documents');
   state.httpStatus = response?.status?.() || null;
+  if (!directReady) state = { ...state, code: 'ZONE_APP_BLANK' };
   if (['ZONE_DOCUMENTS_READY', 'ZONE_NO_DOCUMENTS', 'ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN'].includes(state.code)) {
     return { state, attempts };
   }
@@ -196,8 +212,11 @@ async function navigateToZoneDocuments(page, centrisNum) {
   // If a bookmarked route changed, use Zone's own Dashboard search and follow
   // the exact listing instead of guessing alternate Centris numbers.
   await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(2000);
+  const dashboardReady = await waitForZoneAppReady(page);
   state = await inspect('dashboard');
+  if (!dashboardReady) {
+    return { state: { ...state, code: 'ZONE_APP_BLANK' }, attempts };
+  }
   if (['ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN'].includes(state.code)) return { state, attempts };
 
   const search = page.locator([
@@ -404,17 +423,6 @@ async function newStealthContext(browser, opts = {}) {
     bypassCSP: true,
     extraHTTPHeaders: {
       'Accept-Language': 'fr-CA,fr;q=0.9,en-CA;q=0.8,en;q=0.7',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'no-cache',
-      'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': ua.includes('Macintosh') ? '"macOS"' : '"Windows"',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'none',
-      'sec-fetch-user': '?1',
-      'upgrade-insecure-requests': '1',
     },
   };
   // Inject storageState si dispo (skip MFA, session valide direct)
@@ -1940,9 +1948,10 @@ async function loginCentrisZone(context) {
     try {
       await context.addCookies(savedCookies);
       await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const appReady = await waitForZoneAppReady(page);
       const u = page.url();
       const state = await inspectZonePage(page, '');
-      if (/Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u) && state.code !== 'ZONE_AUTH_REQUIRED') {
+      if (appReady && /Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u) && state.code !== 'ZONE_AUTH_REQUIRED') {
         console.log('[ZONE] Session cachée valide ✅');
         return page;
       }
@@ -1979,8 +1988,13 @@ async function loginCentrisZone(context) {
     await page.waitForTimeout(4000);
   }
 
-  // Vérif logged
+  // Vérif logged: une URL Dashboard avec une application vide n'est pas une
+  // session valide. Attendre le rendu réel de Zone avant de continuer.
+  const appReady = await waitForZoneAppReady(page);
   const loggedState = await inspectZonePage(page, '');
+  if (!appReady) {
+    throw new Error(`ZONE_APP_BLANK — Centris Zone n'a rendu aucun contrôle après la connexion`);
+  }
   if (!/Dashboard|Directory|Listings/i.test(page.url()) || loggedState.code === 'ZONE_AUTH_REQUIRED') {
     throw new Error(`Zone login échoué — URL: ${page.url().substring(0, 100)}`);
   }
@@ -1988,6 +2002,7 @@ async function loginCentrisZone(context) {
   // Save cookies pour reuse
   try {
     const cookies = await context.cookies();
+    await saveBrowserStorageState(context, page);
     pushCookiesToBot(cookies).catch(() => {});
   } catch {}
   return page;

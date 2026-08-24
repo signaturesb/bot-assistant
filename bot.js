@@ -8516,6 +8516,27 @@ async function executeToolSafe(name, input, chatId, userMessage = '', actionCont
   }
 }
 
+const CENTRIS_NUMBER_LOCK_TOOLS = new Set([
+  'verifier_listing_centris',
+  'envoyer_tous_documents_zone',
+  'telecharger_annexes_centris',
+]);
+
+function enforceCentrisNumberFidelity(reply, userMessage, usedTools) {
+  if (![...usedTools].some((name) => CENTRIS_NUMBER_LOCK_TOOLS.has(name))) return reply;
+  const allowed = new Set(String(userMessage || '').match(/\b\d{7,9}\b/g) || []);
+  if (!allowed.size) return reply;
+  let removed = 0;
+  const clean = String(reply || '').split('\n').filter((line) => {
+    const numbers = line.match(/\b\d{7,9}\b/g) || [];
+    const invalid = numbers.some((number) => !allowed.has(number));
+    if (invalid) removed++;
+    return !invalid;
+  }).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (removed) log('WARN', 'CENTRIS-NUMBER-GUARD', `${removed} ligne(s) retirée(s): numéro non demandé`);
+  return clean || `❌ Résultat Centris non fiable retiré. Le numéro exact demandé reste #${[...allowed][0]}. Aucun envoi effectué.`;
+}
+
 // ─── Health score dynamique 0-100 + anomaly detection ───────────────────────
 function computeHealthScore() {
   let score = 100;
@@ -9194,6 +9215,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
       }
       let finalReply = null;
       let allMemos   = [];
+      const usedTools = new Set();
       // BUDGET GUARD (audit P0 #3): cap par conversation
       // Empêche les boucles tool_use coûteuses (Opus = $15/M output → 12 rounds × 16k = ~$3)
       const CONV_BUDGET_USD = parseFloat(process.env.CONV_BUDGET_USD || '2.50');
@@ -9224,6 +9246,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
         if (res.stop_reason === 'tool_use') {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
+          toolBlocks.forEach((b) => usedTools.add(b.name));
           const results = await Promise.all(toolBlocks.map(async b => {
             log('INFO', 'TOOL', `${b.name}(${JSON.stringify(b.input).substring(0, 80)})`);
             mTick('tools', b.name);
@@ -9257,6 +9280,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
       }
       if (convCostUSD > 0) log('INFO', 'CLAUDE', `Conversation coût: $${convCostUSD.toFixed(3)}`);
       if (!finalReply) finalReply = '_(délai dépassé — réessaie)_';
+      finalReply = enforceCentrisNumberFidelity(finalReply, userMsg, usedTools);
       addMsg(chatId, 'assistant', finalReply);
       return { reply: finalReply, memos: allMemos };
     } catch (err) {
