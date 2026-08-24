@@ -42,12 +42,14 @@ const CENTRIS_BASE   = 'https://matrix.centris.ca';
 const MATRIX_BASE    = 'https://matrix.centris.ca';
 const PUBLIC_BASE    = 'https://www.centris.ca';
 const MANUAL_MFA_TTL = 2 * 60 * 1000;
+const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
 
 // Pont MFA en mémoire entre Telegram (/mfa) et la session Playwright active.
 // Le code est accepté uniquement pendant une attente MFA, consommé une fois,
 // puis oublié. Il n'est jamais écrit sur disque ni journalisé.
 let centrisMFAWaiting = false;
 let pendingManualMFACode = null;
+let activeCentrisLoginPromise = null;
 
 function isAwaitingCentrisMFA() {
   return centrisMFAWaiting;
@@ -65,6 +67,10 @@ function takeManualMFACode() {
   pendingManualMFACode = null;
   if (!pending || Date.now() - pending.receivedAt > MANUAL_MFA_TTL) return null;
   return pending.code;
+}
+
+function hasExplicitCentrisSendConfirmation(value) {
+  return EXPLICIT_CENTRIS_SEND_RE.test(String(value || '').trim());
 }
 
 function browserlessEndpointWithTimeout(endpoint, timeoutMs = 180000) {
@@ -298,6 +304,45 @@ function saveSession(cookies) {
   } catch (e) { console.warn('[CUA] session save error:', e.message); }
 }
 
+function isAuthenticatedCentrisUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+    if (!/(^|\.)centris\.ca$/.test(host) || host === 'accounts.centris.ca') return false;
+    return !/\/(?:login|auth|signin)(?:[/.?]|$)|LoginIntermediate/i.test(`${url.pathname}${url.search}`);
+  } catch {
+    return false;
+  }
+}
+
+function cookieHeaderFromPlaywrightCookies(cookies, targetHost = 'matrix.centris.ca') {
+  const host = String(targetHost || '').toLowerCase();
+  return (Array.isArray(cookies) ? cookies : [])
+    .filter(c => {
+      const domain = String(c.domain || '').replace(/^\./, '').toLowerCase();
+      return /(?:^|\.)centris\.ca$/.test(domain)
+        && (host === domain || host.endsWith(`.${domain}`));
+    })
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
+}
+
+async function saveBrowserStorageState(context, page) {
+  try {
+    const storageState = await context.storageState();
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => null);
+    const stateFile = path.join(DATA_DIR, 'centris_storage_state.json');
+    fs.writeFileSync(stateFile, JSON.stringify({
+      storageState,
+      userAgent,
+      capturedAt: Date.now(),
+      expiry: Date.now() + SESSION_TTL,
+    }));
+  } catch (e) {
+    console.warn('[CUA] storageState save error:', safeErrorMessage(e));
+  }
+}
+
 function clearSession() {
   try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch {}
 }
@@ -374,7 +419,7 @@ async function loginCentris(context) {
       await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 20000 });
       await page.waitForTimeout(2000);
       const url = page.url();
-      if (!/\/login|\/auth|signin|LoginIntermediate|accounts\.centris/i.test(url)) {
+      if (isAuthenticatedCentrisUrl(url)) {
         console.log('[CUA] Session cachée valide ✅', url.substring(0, 80));
         return page;
       }
@@ -423,21 +468,43 @@ async function loginCentris(context) {
     console.log('[CUA] Login DOM fallback soumis ✅');
   }
 
-  // Handle MFA (Email ou SMS) — Centris envoie code par email après login basic
+  // Si Centris propose le courriel, le privilégier: le bot peut lire le code
+  // automatiquement dans Gmail. Sinon, le SMS reste disponible via /mfa.
+  if (/mfa-sms-challenge/i.test(page.url())) {
+    try {
+      const changeMethod = page.locator('a,button').filter({
+        hasText: /changer.*méthode|change.*method|autre.*méthode|another.*method|try another/i,
+      }).first();
+      if (await changeMethod.isVisible().catch(() => false)) {
+        await changeMethod.click();
+        await page.waitForTimeout(1200);
+        const emailMethod = page.locator('a,button,label').filter({ hasText: /courriel|e-?mail/i }).first();
+        if (await emailMethod.isVisible().catch(() => false)) {
+          await emailMethod.click();
+          await page.waitForTimeout(1800);
+          console.log('[CUA] MFA basculé vers courriel');
+        }
+      }
+    } catch (e) {
+      console.warn('[CUA] MFA courriel indisponible, conserve SMS:', safeErrorMessage(e));
+    }
+  }
+
+  // Handle MFA (Email ou SMS)
   for (let mfaAttempt = 0; mfaAttempt < 2; mfaAttempt++) {
-    const mfaField = page.locator('input[name*="ode"], input[id*="ode"], input[placeholder*="code" i], input[placeholder*="vérif" i], input[type="tel"]').first();
+    const mfaField = page.locator('input[autocomplete="one-time-code"], input[name="code"], input[id="code"], input[name*="verification" i], input[id*="verification" i], input[placeholder*="code" i], input[placeholder*="vérif" i], input[type="tel"]').first();
     const mfaVisible = await mfaField.isVisible().catch(() => false);
     if (!mfaVisible) break;
 
-    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — fetch code via Gmail (max 180s)...`);
+    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — Gmail ou /mfa (max 180s)...`);
     const mfaCode = await fetchMFACodeFromBot(180000);
-    if (!mfaCode) throw new Error('MFA timeout — pas de code MFA reçu en 180s via Gmail/bot. Vérifier LaunchAgent sms-bridge actif sur Mac.');
+    if (!mfaCode) throw new Error('MFA timeout — aucun code reçu en 180s via Gmail, Telegram ou bridge SMS.');
     console.log(`[CUA] MFA code reçu: ${mfaCode.substring(0, 2)}****`);
 
     await mfaField.fill(mfaCode);
     const mfaSubmit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Vérif"), button:has-text("Submit"), button:has-text("Confirmer")').first();
     await mfaSubmit.click();
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(4500);
   }
 
   // Handle disclaimers "I've Read This" / "Continue"
@@ -445,7 +512,8 @@ async function loginCentris(context) {
     const url = page.url();
     if (!/LoginIntermediate|Disclaimer|Consent/i.test(url)) break;
     console.log('[CUA] Disclaimer detected, clicking continue...');
-    const continueBtn = page.locator('button:has-text("Continue"), input[type="submit"][value*="Continue"], button:has-text("I.?ve Read")').first();
+    const continueBtn = page.locator('button,a').filter({ hasText: /continue|i.?ve read|j.?ai lu|accepter/i }).first()
+      .or(page.locator('input[type="submit"][value*="Continue" i], input[type="submit"][value*="Accept" i]')).first();
     const visible = await continueBtn.isVisible().catch(() => false);
     if (!visible) break;
     await continueBtn.click();
@@ -453,13 +521,14 @@ async function loginCentris(context) {
   }
 
   const finalUrl = page.url();
-  if (/\/login|\/auth|signin|accounts\.centris/i.test(finalUrl)) {
+  if (!isAuthenticatedCentrisUrl(finalUrl)) {
     throw new Error(`Login Centris échoué — URL finale: ${finalUrl.substring(0, 200)}`);
   }
 
   // Sauvegarder session pour reuse 12h
   const cookies = await context.cookies();
   saveSession(cookies);
+  await saveBrowserStorageState(context, page);
   // Push aussi vers bot principal pour partage
   try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
   console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', finalUrl.substring(0, 80));
@@ -491,7 +560,7 @@ async function fetchMFACodeFromBot(timeoutMs) {
 
         // 2. Gmail via l'endpoint interne authentifié du bot.
         if (token) {
-          const r = await fetch(`${botUrl}/admin/centris-mfa-code`, {
+          const r = await fetch(`${botUrl}/admin/centris-mfa-code?after=${start}`, {
             headers: { Authorization: `Bearer ${token}` },
             signal: AbortSignal.timeout(15000),
           });
@@ -556,23 +625,56 @@ async function pushCookiesToBot(playwrightCookies) {
   const token = process.env.WEBHOOK_SECRET;
   if (!token) return;
   // Convert Playwright format → Cookie header string
-  const cookieStr = playwrightCookies
-    .filter(c => /centris\.ca$/i.test(c.domain || ''))
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+  const cookieStr = cookieHeaderFromPlaywrightCookies(playwrightCookies);
   if (!cookieStr) return;
   try {
     await fetch(`${botUrl}/admin/centris-cookies`, {
       method: 'POST',
       headers: {
-        'content-type': 'application/json',
+        'content-type': 'text/plain; charset=utf-8',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({ cookies: cookieStr, source: 'cua', ts: Date.now() }),
+      body: cookieStr,
       signal: AbortSignal.timeout(10000),
     });
     console.log('[CUA] Cookies pushed to bot ✅');
   } catch (e) { console.warn('[CUA] pushCookies failed:', e.message); }
+}
+
+// Connexion Playwright explicite pour Telegram et les appels Centris du bot.
+// Les appels concurrents partagent la même tentative pour éviter plusieurs SMS.
+async function cuaLoginCentris() {
+  if (activeCentrisLoginPromise) return activeCentrisLoginPromise;
+  activeCentrisLoginPromise = (async () => {
+    if (!CUA_AVAILABLE()) return { ok: false, error: 'Playwright non disponible' };
+    initDirs();
+    let browser = null;
+    try {
+      browser = await launchBrowser();
+      const context = await newStealthContext(browser);
+      const page = await loginCentris(context);
+      const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+      if (passwordVisible || !isAuthenticatedCentrisUrl(page.url())) {
+        throw new Error('Vérification de session Centris échouée après le login');
+      }
+      const cookies = await context.cookies();
+      const cookieHeader = cookieHeaderFromPlaywrightCookies(cookies);
+      if (cookieHeader.length < 100) throw new Error('Session Centris créée sans cookies suffisants');
+      await saveBrowserStorageState(context, page);
+      return {
+        ok: true,
+        cookieCount: cookieHeader.split(';').filter(Boolean).length,
+        cookieHeader,
+        expiresAt: Date.now() + SESSION_TTL,
+      };
+    } catch (e) {
+      return { ok: false, error: safeErrorMessage(e).substring(0, 240) };
+    } finally {
+      if (browser) try { await browser.close(); } catch {}
+    }
+  })();
+  try { return await activeCentrisLoginPromise; }
+  finally { activeCentrisLoginPromise = null; }
 }
 
 // Attendre code MFA dans /data/centris_mfa.txt (écrit par sms-bridge LaunchAgent)
@@ -1223,9 +1325,13 @@ function cuaCleanup() {
  * @param {string} [opts.sujet] — défaut auto-généré
  * @param {string} [opts.message] — défaut message standard
  * @param {string} [opts.format] — 'detaille_client_album_imperial' (défaut), 'detaille_client_imperial', etc
+ * @param {string} opts.confirmationMessage — confirmation exacte et courante de Shawn
  * @returns {Promise<{success, message, email_sent_to, cc, listing_url, screenshots?}>}
  */
 async function sendCentrisListingByEmail(opts) {
+  if (!hasExplicitCentrisSendConfirmation(opts?.confirmationMessage)) {
+    return { success: false, blocked: true, message: 'Envoi Centris bloqué: confirmation exacte « envoie » requise' };
+  }
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
@@ -1766,9 +1872,13 @@ async function getListingBroker(centrisNum, opts = {}) {
  * @param {boolean} [opts.sendSelfCopy] — défaut false
  * @param {string} [opts.langue] — 'fr' (défaut) | 'en'
  * @param {string} [opts.message] — message custom (sinon défaut Centris)
+ * @param {string} [opts.confirmationMessage] — requis pour tout envoi réel
  * @returns {Promise<{success, broker_info, docs_shared, docs_list?, sent_to, listing_url, dry_run?}>}
  */
 async function shareCentrisZoneDocuments(opts = {}) {
+  if (!opts.dry_run && !hasExplicitCentrisSendConfirmation(opts.confirmationMessage)) {
+    return { success: false, blocked: true, message: 'Partage Zone bloqué: confirmation exacte « envoie » requise' };
+  }
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
@@ -2212,6 +2322,10 @@ module.exports = {
   _executeCUAAction: executeCUAAction,
   _newStealthContext: newStealthContext,
   _browserlessEndpointWithTimeout: browserlessEndpointWithTimeout,
+  _isAuthenticatedCentrisUrl: isAuthenticatedCentrisUrl,
+  _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
+  _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
+  cuaLoginCentris,
   ingestManualMFACode,
   isAwaitingCentrisMFA,
 };

@@ -57,6 +57,7 @@ assert.throws(
 
 // Integration guards: the real bot must use the central module before this PR can pass.
 const botCode = fs.readFileSync('bot.js', 'utf8');
+const cuaCode = fs.readFileSync('cua_driver.js', 'utf8');
 assert.ok(botCode.includes("require('./lib/email_send_guard')"), 'bot.js must import lib/email_send_guard before merge');
 assert.ok(
   !/const\s+CONFIRM_REGEX\s*=.*(?:parfait|oui|\bok\b|\bgo\b|ça marche|d'accord|c'est bon)/i.test(botCode),
@@ -81,6 +82,20 @@ assert.ok(botCode.includes('queuePendingEmailDraft'), 'automatic drafts must use
 assert.ok(botCode.includes('deliveryUncertain'), 'provider uncertainty must block duplicate retries');
 assert.ok(!/pendingEmails\.set\(ALLOWED_ID/.test(botCode), 'automatic lead drafts must never overwrite the active draft');
 assert.ok(botCode.includes("name === 'telecharger_docs_centris_complet'"), 'multi-email action must be blocked under one-shot policy');
+assert.match(
+  cuaCode,
+  /async function sendCentrisListingByEmail\(opts\)[\s\S]*?hasExplicitCentrisSendConfirmation\(opts\?\.confirmationMessage\)/,
+  'Matrix native send must fail closed without its own explicit confirmation'
+);
+assert.match(
+  cuaCode,
+  /async function shareCentrisZoneDocuments\(opts = \{\}\)[\s\S]*?!opts\.dry_run && !hasExplicitCentrisSendConfirmation\(opts\.confirmationMessage\)/,
+  'Zone share must fail closed without its own explicit confirmation'
+);
+assert.ok(
+  (botCode.match(/confirmationMessage: userMessage/g) || []).length >= 2,
+  'Both Centris provider send paths must receive the current confirmation message'
+);
 
 const telegramFlush = botCode.match(/\/\/ \/flush-pending[\s\S]*?bot\.onText\(\/\\\/backup\//)?.[0] || '';
 assert.ok(telegramFlush, 'Telegram /flush-pending handler must remain auditable');
