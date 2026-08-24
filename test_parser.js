@@ -59,6 +59,20 @@ const samples = [
     junk: true,
   },
   {
+    name: 'Centris MFA — sous-domaine accounts (JUNK)',
+    subject: `Votre code MFA pour Centris`,
+    from: 'Centris.ca <no-reply@accounts.centris.ca>',
+    body: `Utilisez le code 654321 pour terminer votre connexion.`,
+    junk: true,
+  },
+  {
+    name: 'Centris MFA — expéditeur masqué par Gmail (JUNK)',
+    subject: `Votre code MFA pour Centris`,
+    from: 'Centris.ca',
+    body: `Utilisez le code 654321 pour terminer votre connexion.`,
+    junk: true,
+  },
+  {
     name: 'Centris conversation non lue (JUNK)',
     subject: `Vous avez une conversation non lue`,
     from: 'notifications@centris.ca',

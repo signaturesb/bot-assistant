@@ -46,6 +46,9 @@ assert.strictEqual(cua._classifyZonePageSnapshot({
   url: 'https://zone.centris.ca/Dashboard', text: 'Bienvenue', checkboxCount: 0,
 }, '28936167').code, 'ZONE_NAVIGATION_UNVERIFIED');
 assert.ok(botCode.includes('JAMAIS inventer, corriger ou suggérer un autre numéro Centris'), 'le bot ne doit jamais halluciner un numéro alternatif');
+assert.ok(botCode.includes('verifier_listing_centris: 120000'), 'le preview Centris doit couvrir connexion + MFA + navigation');
+assert.ok(botCode.includes('if (timer) clearTimeout(timer)'), 'le timeout outil doit être nettoyé après résolution');
+assert.ok(cuaCode.includes('[ZONE-DIAG]'), 'une navigation Zone inconnue doit produire un diagnostic sûr');
 
 assert.deepStrictEqual(
   cua._extractTaxCandidatesFromText('Taxes municipales : 2 345 $\nTaxes scolaires : 412 $', 'taxes?\\s*municipal(?:e|es|aux)?'),

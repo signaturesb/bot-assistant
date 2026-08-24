@@ -8490,12 +8490,30 @@ ${pjList}
   }
 }
 
-// ─── Helper: exécuter un outil avec timeout 30s ───────────────────────────────
+// ─── Helper: exécuter un outil avec délai adapté à son workflow ──────────────
+// Centris peut inclure connexion Browserless + MFA Gmail + navigation Zone.
+// Ces outils ont donc une enveloppe explicite supérieure au délai générique.
+// Le timer est toujours nettoyé quand l'outil termine afin d'éviter les faux
+// timeouts tardifs et les handles inutiles.
+const TOOL_TIMEOUT_MS = Object.freeze({
+  verifier_listing_centris: 120000,
+  envoyer_tous_documents_zone: 180000,
+  telecharger_annexes_centris: 180000,
+});
+
 async function executeToolSafe(name, input, chatId, userMessage = '', actionContext = {}) {
-  return Promise.race([
-    executeTool(name, input, chatId, userMessage, actionContext),
-    new Promise((_, rej) => setTimeout(() => rej(new Error(`Timeout outil ${name}`)), 30000))
-  ]);
+  const timeoutMs = TOOL_TIMEOUT_MS[name] || 30000;
+  let timer;
+  try {
+    return await Promise.race([
+      executeTool(name, input, chatId, userMessage, actionContext),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timeout outil ${name} après ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // ─── Health score dynamique 0-100 + anomaly detection ───────────────────────

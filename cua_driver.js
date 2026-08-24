@@ -149,6 +149,19 @@ async function inspectZonePage(page, centrisNum) {
     checkboxCount: document.querySelectorAll('input[type=checkbox]:not([disabled])').length,
     shareButtonCount: [...document.querySelectorAll('button,a')]
       .filter((el) => /partager les documents/i.test(el.textContent || el.getAttribute('title') || '')).length,
+    controls: [...document.querySelectorAll('input,button,a')]
+      .filter((el) => {
+        const style = getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      })
+      .slice(0, 40)
+      .map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type') || '',
+        text: String(el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim().substring(0, 80),
+        href: String(el.getAttribute('href') || '').substring(0, 120),
+      })),
   }));
   return { ...snapshot, ...classifyZonePageSnapshot(snapshot, centrisNum) };
 }
@@ -159,6 +172,15 @@ async function navigateToZoneDocuments(page, centrisNum) {
     const state = await inspectZonePage(page, centrisNum);
     attempts.push({ label, code: state.code, url: state.url, title: state.title });
     console.log(`[ZONE-NAV] ${label}: ${state.code} url=${String(state.url).substring(0, 140)}`);
+    if (state.code === 'ZONE_NAVIGATION_UNVERIFIED') {
+      // Diagnostic sans secret: seulement titre, extrait de texte et contrôles
+      // visibles. Permet d'adapter les sélecteurs si Centris change son UI.
+      console.log(`[ZONE-DIAG] ${label}: ${JSON.stringify({
+        title: state.title,
+        text: String(state.text || '').substring(0, 500),
+        controls: state.controls,
+      })}`);
+    }
     return state;
   };
 

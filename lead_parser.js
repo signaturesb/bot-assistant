@@ -102,8 +102,16 @@ function isJunkLeadEmail(subject, from, body) {
   const b = (body || '').toLowerCase();
   const sb = s + ' ' + b;
   // Notifications Centris / saved search alerts (tous les domaines Centris)
-  const isCentrisAuto = f.includes('no-reply@centris') || f.includes('noreply@centris')
-    || f.includes('notifications@centris') || f.includes('@mlsmatrix') || f.includes('centris@');
+  // Tous les sous-domaines officiels sont valides ici (ex. accounts.centris.ca).
+  // L'ancien test `no-reply@centris` manquait no-reply@accounts.centris.ca et
+  // laissait un vrai courriel MFA entrer dans le pipeline de leads.
+  const isCentrisDomain = /@(?:[a-z0-9-]+\.)*centris\.ca\b/i.test(f);
+  const isCentrisAuto = isCentrisDomain || f.includes('@mlsmatrix') || f.includes('centris@');
+  const isCentrisAuthMessage = /centris/i.test(sb) &&
+    /code\s+(?:de\s+)?(?:v[eé]rification|s[eé]curit[eé]|authentification)|verification\s+code|one[- ]time\s+(?:code|password)|\bMFA\b|double\s+authentification|tentative\s+de\s+connexion|connexion\s+à\s+votre\s+compte/i.test(sb);
+  // Un sujet d'authentification Centris explicite n'est jamais un prospect,
+  // même si Gmail reformate ou masque l'adresse From.
+  if (isCentrisAuthMessage) return true;
   if (isCentrisAuto) {
     if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|d[eé]couvrez-les|inscriptions?\s+(correspondantes|matching|nouvelles)|une\s+ou\s+plusieurs\s+nouvelles\s+propri[eé]t[eé]s|voir\s+les\s+inscriptions/i.test(sb)) return true;
     // Messages de compte/authentification et rappels de messagerie Centris.
