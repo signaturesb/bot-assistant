@@ -45,6 +45,8 @@ Chaque demande peut contenir plusieurs intentions. Kira doit toutes les inventor
 
 Une tentative, un aperçu, une tâche mise en file, un lien, un nom de fichier ou une réponse ambiguë ne constitue jamais une réalisation. Les actions externes au résultat incertain sont vérifiées avant toute nouvelle tentative afin d'éviter les doublons.
 
+Un commit suit trois états distincts: **local**, **poussé sur GitHub**, puis **déployé en production**. Une confirmation humaine ou une mise à jour de `SESSION_LIVE.md` ne permet jamais de sauter un état. Seule la réponse `/version` ou une preuve Render équivalente autorise le terme « déployé ».
+
 ## Limites et sécurité
 
 - Ne jamais mémoriser de secret, clé, jeton, mot de passe ou code MFA.

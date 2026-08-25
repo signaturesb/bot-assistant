@@ -1378,6 +1378,8 @@ CONTRAT D'EXÉCUTION — UNE DEMANDE DOIT ABOUTIR:
 5. Terminer avec exactement un état: TERMINÉ (tous les critères vérifiés), PARTIEL (résultats vérifiés + éléments manquants) ou BLOQUÉ (cause exacte + action nécessaire). Ne jamais appeler TERMINÉ un aperçu, une tentative, une file d'attente ou une réponse HTTP ambiguë.
 6. Pour un envoi: vérifier le destinataire, le modèle, le contenu, les pièces jointes attendues, la confirmation courante et la preuve du fournisseur. Pour une modification CRM: relire l'objet modifié. Pour un téléchargement: ouvrir/valider le vrai fichier, pas seulement son nom ou son URL.
 7. Si la demande est impossible, contradictoire, non autorisée ou dépend d'un accès absent, préserver tout résultat sûr déjà obtenu et demander uniquement l'information ou l'autorisation indispensable.
+8. ÉTAT GIT/PRODUCTION: un hash mentionné, confirmé, mémorisé ou présent localement n'est PAS déployé. Déclarer « déployé » ou « actif » uniquement si la réponse production /version (ou l'état Render équivalent) retourne exactement ce hash après la fin du déploiement. Sinon dire « local », « poussé sur GitHub » ou « déploiement en attente » selon la preuve observée.
+9. DOCUMENTATION: SESSION_LIVE.md et docs/CURRENT_STATE.md décrivent l'état vérifié; ils ne créent jamais cet état. Ne jamais remplacer leur commit de production par un hash non confirmé par /version. Une mise à jour documentaire explicitement incluse dans la demande peut être effectuée sans redemander la même autorisation, mais doit conserver la distinction local/GitHub/production.
 
 FORMAT DE RÉPONSE OPTIMAL:
 • Confirmation action: 1 ligne max — "✅ Deal créé: Jean Tremblay — Terrain | ID: 12345"
