@@ -1719,6 +1719,12 @@ async function loginCentris(context) {
       await page.waitForTimeout(1200);
       console.log('[CUA] Session Matrix persistée fermée avant renouvellement unique');
     }
+    // Le storageState peut contenir un cookie Auth0 partiellement renouvelé:
+    // Matrix est déconnecté, mais /connect/authorize reste alors vide sans
+    // formulaire. Nettoyer seulement le contexte temporaire force un login
+    // frais; le fichier persistant n'est remplacé qu'après validation Matrix.
+    await context.clearCookies();
+    console.log('[CUA] Cookies du contexte périmé nettoyés avant login frais');
   } catch (e) {
     console.warn('[CUA] Vérification session échouée:', safeErrorMessage(e));
   }

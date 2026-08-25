@@ -132,6 +132,8 @@ assert.match(cuaSource, /await submitMatrixGlobalSearch\(page, search, exactNum\
   'une collision déclenchée après le clic de recherche doit être signalée explicitement');
 assert.match(cuaSource, /Session persistante non vérifiée[\s\S]*?\/Matrix\/Logout\.aspx[\s\S]*?Login Centris matrix \(fresh\)/,
   'une session Matrix persistée non vérifiée doit être fermée avant le renouvellement frais');
+assert.match(cuaSource, /Session Matrix persistée fermée[\s\S]*?context\.clearCookies\(\)[\s\S]*?Login Centris matrix \(fresh\)/,
+  'un état Auth0 partiel doit être nettoyé dans le contexte temporaire avant le login frais');
 
 assert.strictEqual(_safeCentrisPageLocation(
   'https://accounts.centris.ca/Account/Login?ReturnUrl=%2Fconnect%2Fauthorize%3Fstate%3Dsecret'
