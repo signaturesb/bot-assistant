@@ -123,6 +123,12 @@ const renderedDuplicates = cua._buildCentrisDocumentInventory('X', [
 assert.strictEqual(renderedDuplicates.docs.length, 2);
 assert.strictEqual(new Set(renderedDuplicates.docs.map((doc) => doc.id)).size, 2);
 
+const publicInventory = cua._redactCentrisDocumentInventory(renderedDuplicates);
+assert.ok(renderedDuplicates.docs.some((doc) => doc.url), 'la navigation interne doit conserver les URL nécessaires au téléchargement');
+assert.ok(publicInventory.docs.every((doc) => !Object.prototype.hasOwnProperty.call(doc, 'url')), 'le preview public ne doit jamais exposer une URL de session Matrix');
+assert.ok(publicInventory.docs.every((doc) => !Object.prototype.hasOwnProperty.call(doc, 'action_id')), 'le preview public ne doit jamais exposer un identifiant de postback Matrix');
+assert.ok(publicInventory.present.every((entry) => entry.docs.every((doc) => !Object.prototype.hasOwnProperty.call(doc, 'match_key'))), 'les catégories publiques doivent aussi être nettoyées');
+
 // La DV principale peut vivre dans le frame parent tandis que les documents
 // additionnels sont dans un iframe. L'inventaire final doit unir les deux.
 const mergedFrames = cua._mergeMatrixDocumentSnapshots([
