@@ -27,6 +27,17 @@ assert.match(handler, /const clientInstruction = String\(messagePerso/,
   'les informations données après le numéro doivent devenir le message client');
 assert.match(handler, /escapeHtml\(introText\)/,
   'le message personnalisé doit être échappé dans le template HTML');
+assert.match(handler, /const listingAddress = \/\^\\d\{1,6\}/,
+  'l’adresse affichée doit provenir d’une valeur Matrix structurellement valide');
+assert.match(handler, /TERRITOIRES: listingAddress \? `Centris #\$\{num\} ·/,
+  'l’adresse doit apparaître à côté du numéro Centris dans l’en-tête');
+assert.match(handler, /TITRE_SECTION_1: 'Dossier complet et vérifié'/);
+assert.match(handler, /PRIX_MEDIAN: `\$\{documents\.length\} PDF`/);
+assert.match(handler, /VARIATION_PRIX: totalPages \? `\$\{totalPages\} pages validées`/);
+assert.match(handler, /TABLEAU_STATS_HTML: verificationHtml/);
+assert.match(handler, /CONTENU_STRATEGIE: guidanceHtml/);
+assert.match(handler, /01\\s\*·\\s\*Données du marché[\s\S]*?01 · Dossier documentaire/,
+  'les intitulés génériques vides doivent devenir des sections documentaires utiles');
 assert.match(code, /UN SEUL courriel avec le modèle officiel SignatureSB/,
   'le routage doit demander un seul courriel contenant tous les PDF');
 
