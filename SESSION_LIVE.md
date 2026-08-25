@@ -1,4 +1,4 @@
-# SESSION LIVE - 2026-08-21 - ÉTAT VÉRIFIÉ
+# SESSION LIVE - 2026-08-25 - ÉTAT VÉRIFIÉ
 
 ## Source de vérité
 
@@ -17,10 +17,10 @@ Les anciennes conversations, anciens commits, Gist et handoffs ne doivent jamais
 - Service: `signaturesb-bot`
 - Repo: `signaturesb/bot-assistant`
 - Branche Render: `audit/telegram-history-and-hardening`
-- Commit applicatif déployé: `89190ac71559f40dbeb817ca0ff8ac907c05e934`
+- Commit applicatif déployé: `5ab4a365e3e8ff368536c4670c9c46c2ce30f646`
 - Runtime: Node.js 22, une instance Render Starter, disque 1 Go sur `/data`
 - Santé externe: `/healthz` = `OK`, `/readyz` = `READY`
-- Prévol: 11/11 OK
+- Suite locale: 18/18 suites OK
 - Pipedrive, Brevo, Dropbox, Anthropic et transcription: verts
 - Build: 0 vulnérabilité npm
 - Aucun journal applicatif `error` observé depuis le dernier déploiement
@@ -77,14 +77,17 @@ Les anciennes conversations, anciens commits, Gist et handoffs ne doivent jamais
 - Le disque impose une seule instance et une courte interruption lors d'un remplacement.
 - Ne jamais retirer le disque sans migration et restauration testées.
 
-## Centris / Matrix - correction importante
+## Centris / Matrix - état vérifié le 25 août 2026
 
-- L'ancienne affirmation de contournement du MFA Centris est invalide et ne doit plus être utilisée.
-- Le parcours actuel atteint le défi SMS MFA Auth0 et s'arrête correctement.
-- Le fallback form-based ne crée pas une session Matrix valide.
-- Ne jamais contourner le MFA.
-- Une intervention MFA autorisée de Shawn est requise avant le prochain test réel.
-- Les anciens LaunchAgents Mac ne constituent pas une garantie server-side et ne doivent pas être considérés comme actifs sans vérification.
+- La recherche canonique utilise la barre globale Matrix et le numéro Centris exact; Zone Courtier ne doit jamais être le chemin principal pour les inscriptions d'autres courtiers.
+- Cas de non-régression: `28936167` doit être recherché dans Matrix global, sans inventer ni substituer un autre numéro.
+- Le MFA n'est jamais contourné. Le code est récupéré par Gmail, Telegram `/mfa` ou le pont Messages autorisé.
+- Panne réelle corrigée: après réception du MFA, l'endpoint OAuth `accounts.centris.ca/connect/authorize` pouvait rester affiché brièvement; le bot déclarait alors un faux échec et fermait le navigateur.
+- Correctif production: attendre la redirection OAuth, puis vérifier directement `/Matrix/Recherche` une seule fois avant de déclarer l'échec.
+- Recherche exacte, session chiffrée, MFA, inventaire documentaire, validation PDF, aperçu figé et courriel MIME: tests verts.
+- Un document visible sans URL ou téléchargement valide doit produire une erreur explicite; il ne doit jamais disparaître silencieusement.
+- L'envoi client reste protégé par un aperçu figé et une confirmation one-shot liée au destinataire, au contenu et aux PDF exacts.
+- Production vérifiée: `/version` = `5ab4a36`, `/healthz` = `OK`, `/readyz` = `READY`.
 
 ## White-label et documents
 
