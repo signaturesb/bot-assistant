@@ -168,6 +168,30 @@ assert.strictEqual(cua._classifyZonePageSnapshot({
   url: 'https://zone.centris.ca/Dashboard', text: 'Bienvenue', checkboxCount: 0,
 }, '28936167').code, 'ZONE_NAVIGATION_UNVERIFIED');
 
+// La recherche globale Matrix est le chemin obligatoire pour les listings
+// d'autres courtiers. Le numéro exact doit être présent; aucune suggestion de
+// numéro voisin ne peut transformer une page en résultat valide.
+assert.strictEqual(cua._classifyMatrixPageSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/Results.aspx',
+  text: 'No Centris 28936167 (En vigueur) Document(s) additionnel(s)',
+  mediaLinkCount: 8,
+  passwordInputs: 0,
+}, '28936167').code, 'MATRIX_DOCUMENTS_READY');
+assert.strictEqual(cua._classifyMatrixPageSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/Results.aspx',
+  text: 'No Centris 28939185 (En vigueur) Document(s) additionnel(s)',
+  mediaLinkCount: 8,
+  passwordInputs: 0,
+}, '28936167').code, 'MATRIX_NAVIGATION_UNVERIFIED');
+assert.strictEqual(cua._classifyMatrixPageSnapshot({
+  url: 'https://accounts.centris.ca/Account/Login',
+  text: 'Connectez-vous', mediaLinkCount: 0, passwordInputs: 1,
+}, '28936167').code, 'MATRIX_AUTH_REQUIRED');
+assert.strictEqual(cua._classifyMatrixPageSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/Results.aspx',
+  text: 'Aucun résultat', mediaLinkCount: 0, passwordInputs: 0,
+}, '28936167').code, 'MATRIX_LISTING_NOT_FOUND');
+
 assert.ok(botCode.includes('JAMAIS inventer, corriger ou suggérer un autre numéro Centris'));
 assert.ok(botCode.includes('verifier_listing_centris: 120000'));
 assert.ok(botCode.includes('if (timer) clearTimeout(timer)'));
@@ -176,6 +200,11 @@ assert.ok(cuaCode.includes('waitForZoneAppReady'));
 assert.ok(cuaCode.includes("code: 'ZONE_APP_BLANK'"));
 assert.ok(!cuaCode.includes("'sec-fetch-dest': 'document'"));
 assert.ok(botCode.includes('enforceCentrisNumberFidelity'));
+assert.ok(botCode.includes('previewCentrisMatrixDocuments({ centris_num: num })'), 'le preview doit utiliser Matrix global, pas Zone Courtier');
+assert.ok(cuaCode.includes('Recherche globale exacte'), 'le chemin Matrix global doit journaliser la recherche exacte');
+assert.ok(!cuaCode.includes('cb.checked = true; cb.click()'), 'sélectionner un format ne doit pas cocher puis décocher la case');
+assert.ok(!cuaCode.includes('const navigatedOK = true'), 'le téléchargement de fiche ne doit pas cliquer deux fois le même résultat');
+assert.ok(cuaCode.includes("normalize('NFD')"), 'le format Détaillé doit être reconnu avec ou sans accent');
 
 assert.deepStrictEqual(
   cua._extractTaxCandidatesFromText('Taxes municipales : 2 345 $\nTaxes scolaires : 412 $', 'taxes?\\s*municipal(?:e|es|aux)?'),

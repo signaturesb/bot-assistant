@@ -455,6 +455,151 @@ async function navigateToZoneDocuments(page, centrisNum) {
   return { state, attempts };
 }
 
+function classifyMatrixPageSnapshot(snapshot = {}, centrisNum = '') {
+  const url = String(snapshot.url || '');
+  const text = String(snapshot.text || '');
+  const num = String(centrisNum || '').replace(/\D/g, '');
+  const exactListingMentioned = num ? new RegExp(`(^|\\D)${num}(\\D|$)`).test(text) : false;
+  if (/accounts\.centris\.ca|\/signin|\/login/i.test(url) || snapshot.passwordInputs > 0) {
+    return { code: 'MATRIX_AUTH_REQUIRED', exactListingMentioned };
+  }
+  if (/aucun r[ée]sultat|no results|inscription introuvable/i.test(text)) {
+    return { code: 'MATRIX_LISTING_NOT_FOUND', exactListingMentioned };
+  }
+  if (exactListingMentioned && snapshot.mediaLinkCount > 0) {
+    return { code: 'MATRIX_DOCUMENTS_READY', exactListingMentioned };
+  }
+  if (exactListingMentioned && /document\(s\) additionnel\(s\)|d[ée]claration du vendeur/i.test(text)) {
+    return { code: 'MATRIX_LISTING_READY_NO_DOCUMENTS', exactListingMentioned };
+  }
+  return { code: 'MATRIX_NAVIGATION_UNVERIFIED', exactListingMentioned };
+}
+
+async function findMatrixGlobalSearch(page) {
+  const selectors = [
+    '#QueryText',
+    'input[id*="Query"]',
+    'input[type="search"]',
+    'input[placeholder*="recherch" i]',
+    'input[placeholder*="centris" i]',
+    'input[placeholder*="mls" i]',
+  ];
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (await locator.isVisible({ timeout: 1500 }).catch(() => false)) return locator;
+  }
+  return null;
+}
+
+async function inspectMatrixListingPage(page, centrisNum) {
+  const snapshot = await page.evaluate((expectedNum) => {
+    const clean = (value) => String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
+    const bodyText = clean(document.body?.innerText || '');
+    const allElements = [...document.querySelectorAll('h1,h2,h3,h4,h5,div,span,strong')];
+    const additionalHeading = allElements.find((el) => /^document\(s\) additionnel\(s\)$/i.test(clean(el.textContent)));
+    const afterHeading = (element) => !!additionalHeading &&
+      !!(additionalHeading.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const mediaAnchors = [...document.querySelectorAll('a[href*="media.ashx" i]')];
+    const seen = new Set();
+    const docs = [];
+    for (const anchor of mediaAnchors) {
+      const href = anchor.href || anchor.getAttribute('href') || '';
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || '');
+      if (!href || !label) continue;
+      const row = anchor.closest('tr,li,[role="row"]') || anchor.parentElement?.parentElement || anchor.parentElement;
+      const rowText = clean(row?.innerText || row?.textContent || label);
+      const sizeMatch = rowText.match(/([0-9]+(?:[.,][0-9]+)?)\s*([kmg])(?:o|b)?\b/i);
+      const key = `${label}|${sizeMatch?.[0] || ''}|${href}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const additional = afterHeading(anchor);
+      docs.push({
+        name: label,
+        size: sizeMatch?.[0] || null,
+        url: href,
+        provenance: additional ? 'matrix_additional_documents' : 'matrix_principal_dv',
+        source_section: additional ? 'additional_documents' : 'principal_dv',
+      });
+    }
+    const principalMatch = bodyText.match(/D[ée]claration du vendeur\s+(?:Oui\s+)?(DV[-\s]?\d+)/i);
+    if (principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))) {
+      docs.unshift({
+        name: principalMatch[1].replace(/\s+/g, ''), size: null, url: null,
+        provenance: 'matrix_principal_dv', source_section: 'principal_dv',
+      });
+    }
+    const price = bodyText.match(/(?:^|\s)([0-9][0-9\s]*\$)(?:\s|$)/)?.[1] || null;
+    const address = bodyText.match(/\b\d{1,6}\s+(?:rue|avenue|boulevard|chemin|rang|route)\s+[^\n]{3,100}/i)?.[0] || null;
+    return {
+      url: location.href, title: document.title, text: bodyText.substring(0, 4000),
+      passwordInputs: document.querySelectorAll('input[type=password]').length,
+      mediaLinkCount: mediaAnchors.length, docs,
+      listing: { centris_num: expectedNum, price: clean(price), address: clean(address) },
+    };
+  }, String(centrisNum));
+  return { ...snapshot, ...classifyMatrixPageSnapshot(snapshot, centrisNum) };
+}
+
+// Recherche globale Matrix: fonctionne aussi pour les inscriptions d'autres
+// courtiers. Zone Courtier demeure un chemin séparé pour l'inventaire de Shawn.
+async function previewCentrisMatrixDocuments(opts = {}) {
+  if (!CUA_AVAILABLE()) return { success: false, error_code: 'MATRIX_PLAYWRIGHT_UNAVAILABLE', message: 'Playwright non disponible' };
+  loadDeps();
+  initDirs();
+  const centrisNum = String(opts.centris_num || '').replace(/\D/g, '');
+  if (!/^\d{7,9}$/.test(centrisNum)) {
+    return { success: false, error_code: 'MATRIX_INVALID_CENTRIS_NUMBER', message: 'Numéro Centris invalide (7-9 chiffres)' };
+  }
+  let browser = null;
+  try {
+    browser = await launchBrowser();
+    const context = await newStealthContext(browser);
+    const page = await loginCentris(context);
+    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(2500);
+    const search = await findMatrixGlobalSearch(page);
+    if (!search) return { success: false, error_code: 'MATRIX_SEARCH_CONTROL_MISSING', message: 'Barre de recherche globale Matrix introuvable. Aucun envoi effectué.' };
+
+    console.log(`[MATRIX-PREVIEW] Recherche globale exacte #${centrisNum}`);
+    await search.fill(centrisNum);
+    await search.press('Enter');
+    await page.waitForTimeout(3500);
+    const exactResult = page.locator('a').filter({ hasText: new RegExp(`^\\s*${centrisNum}\\s*$`) }).first();
+    if (!(await exactResult.isVisible({ timeout: 5000 }).catch(() => false))) {
+      const state = await inspectMatrixListingPage(page, centrisNum);
+      return {
+        success: false,
+        error_code: state.code === 'MATRIX_AUTH_REQUIRED' ? state.code : 'MATRIX_LISTING_NOT_FOUND',
+        message: `Le résultat exact #${centrisNum} n'a pas été trouvé dans Matrix. Aucun numéro substitut n'a été utilisé.`,
+        final_url: state.url,
+      };
+    }
+    await exactResult.click();
+    await page.waitForTimeout(3500);
+    const state = await inspectMatrixListingPage(page, centrisNum);
+    if (!state.exactListingMentioned) {
+      return { success: false, error_code: 'MATRIX_EXACT_LISTING_NOT_VERIFIED', message: `La page ouverte ne confirme pas le numéro exact #${centrisNum}. Aucun envoi effectué.`, final_url: state.url };
+    }
+    if (!['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) {
+      return { success: false, error_code: state.code, message: `Listing #${centrisNum} ouvert, mais la section des documents n'a pas pu être vérifiée. Aucun envoi effectué.`, final_url: state.url };
+    }
+    const inventory = buildCentrisDocumentInventory(centrisNum, state.docs);
+    return {
+      success: true, dry_run: true, via: 'matrix-global', listing: state.listing,
+      docs_count: inventory.docs.length, docs_list: inventory.docs,
+      document_inventory: inventory, manifest_id: inventory.manifest_id,
+      listing_url: state.url,
+      message: inventory.docs.length
+        ? `PREVIEW Matrix — ${inventory.docs.length} document(s) trouvé(s). Aucun envoi effectué.`
+        : `Listing #${centrisNum} trouvé dans Matrix, mais aucun document n'est affiché. Aucun envoi effectué.`,
+    };
+  } catch (error) {
+    return { success: false, error_code: 'MATRIX_PREVIEW_TECHNICAL_ERROR', message: safeErrorMessage(error).substring(0, 240) };
+  } finally {
+    if (browser) try { await browser.close(); } catch {}
+  }
+}
+
 function extractTaxCandidatesFromText(text, labelPattern) {
   const source = String(text || '');
   const candidates = [];
@@ -1482,46 +1627,72 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
 
     const context = await newStealthContext(browser);
     const page = await loginCentris(context);
+    const exactNum = String(centrisNum || '').replace(/\D/g, '');
+    if (!/^\d{7,9}$/.test(exactNum)) throw new Error('Numéro Centris invalide');
 
-    const filtreStr = filtre ? `en priorité "${filtre}"` : 'toutes';
-    const task = `
-Tu es sur le portail agent Centris. Mission: trouver et télécharger les annexes du listing #${centrisNum}.
+    // Chemin déterministe identique au geste humain montré par Shawn:
+    // recherche globale blanche → numéro exact → fiche détaillée → liens PDF.
+    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(2500);
+    const search = await findMatrixGlobalSearch(page);
+    if (!search) throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
+    await search.fill(exactNum);
+    await search.press('Enter');
+    await page.waitForTimeout(3500);
+    const exactResult = page.locator('a').filter({ hasText: new RegExp(`^\\s*${exactNum}\\s*$`) }).first();
+    if (!(await exactResult.isVisible({ timeout: 5000 }).catch(() => false))) {
+      throw new Error(`MATRIX_LISTING_NOT_FOUND:${exactNum}`);
+    }
+    await exactResult.click();
+    await page.waitForTimeout(3500);
+    const state = await inspectMatrixListingPage(page, exactNum);
+    if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
 
-Les annexes peuvent inclure: Déclaration du vendeur (DV), Certificat de localisation, Plans, Rapport d'inspection.
-
-Étapes:
-1. Navigue vers le listing #${centrisNum}
-2. Cherche un onglet "Annexes", "Documents", "Fichiers" ou "Attachments"
-3. Télécharge ${filtreStr} les annexes disponibles
-4. Confirme chaque téléchargement
-
-URL à essayer: ${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}
-`.trim();
-
-    try {
-      await page.goto(`${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}`, {
-        waitUntil: 'domcontentloaded', timeout: 15000
-      });
-      await page.waitForTimeout(2000);
-    } catch {}
-
-    const result = await runCUATask(page, task);
-
-    let annexes = result.pdfBuffers || [];
-    if (filtre && annexes.length > 0) {
-      const filtreLC = filtre.toLowerCase();
-      const filtered = annexes.filter(a =>
-        a.filename.toLowerCase().includes(filtreLC) ||
-        filtreLC.split(' ').some(w => a.filename.toLowerCase().includes(w))
-      );
-      if (filtered.length > 0) annexes = filtered;
+    let selectedDocs = state.docs.filter((doc) => doc.url);
+    if (filtre) {
+      const terms = normalizeCentrisMatchKey(filtre).split(/\s+/).filter(Boolean);
+      selectedDocs = selectedDocs.filter((doc) => terms.every((term) => doc.match_key?.includes(term) || normalizeCentrisMatchKey(doc.name).includes(term)));
+    }
+    if (!selectedDocs.length) {
+      return { success: false, annexes: [], message: filtre ? `Aucune annexe correspondant à « ${filtre} »` : 'Aucune annexe téléchargeable trouvée dans Matrix' };
     }
 
+    const annexes = [];
+    const failures = [];
+    for (const [index, doc] of selectedDocs.slice(0, 20).entries()) {
+      try {
+        const response = await context.request.get(doc.url, {
+          headers: { Referer: state.url, Accept: 'application/pdf,*/*' },
+          timeout: 45000,
+        });
+        if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
+        const buffer = await response.body();
+        if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+          throw new Error('réponse non-PDF');
+        }
+        const parsed = await parsePDFText(buffer);
+        const enriched = addCentrisContentMetadata(doc, buffer, parsed.pages);
+        const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
+        annexes.push({
+          buffer,
+          filename: `${safeBase}_${exactNum}.pdf`,
+          label: doc.name,
+          size: buffer.length,
+          page_count: enriched.page_count,
+          sha256: enriched.sha256,
+          source: 'matrix-global',
+        });
+      } catch (error) {
+        failures.push({ label: doc.name, error: safeErrorMessage(error).substring(0, 120) });
+      }
+    }
     return {
       success: annexes.length > 0,
       annexes,
-      message: annexes.length > 0 ? `${annexes.length} annexe(s) trouvée(s)` : 'Aucune annexe trouvée',
-      rawResult: result
+      failures,
+      message: annexes.length > 0
+        ? `${annexes.length} annexe(s) Matrix téléchargée(s) et validée(s)`
+        : `Aucune annexe PDF validée (${failures.length} échec(s))`,
     };
 
   } catch (e) {
@@ -1793,9 +1964,10 @@ async function sendCentrisListingByEmail(opts) {
     // 4. Sélectionner format (checkbox dans <li> avec title)
     console.log(`[CENTRIS-NATIVE] Format: ${formatTitle}`);
     const formatSelected = await page.evaluate((title) => {
-      const li = [...document.querySelectorAll('li')].find(l => l.title === title);
+      const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const li = [...document.querySelectorAll('li')].find(l => norm(l.title || l.textContent) === norm(title));
       const cb = li?.querySelector('input[type=checkbox]');
-      if (cb) { cb.checked = true; cb.click(); return true; }
+      if (cb) { if (!cb.checked) cb.click(); return true; }
       return false;
     }, formatTitle);
     if (!formatSelected) throw new Error(`Format "${formatTitle}" non trouvé dans listbox`);
@@ -2705,17 +2877,6 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
     }
     console.log(`[FICHE-PDF] Result clicked (${linkClicked})`);
     await page.waitForTimeout(5000);
-    const navigatedOK = true;
-
-    // 2. Click result link
-    const clicked = await page.evaluate((n) => {
-      const a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === String(n));
-      if (a) { a.click(); return true; }
-      return false;
-    }, centrisNum);
-    if (!clicked) throw new Error(`Listing #${centrisNum} non trouvé`);
-    await page.waitForTimeout(3000);
-
     // 3. Click Imprimer
     console.log('[FICHE-PDF] Click Imprimer');
     await page.evaluate(() => {
@@ -2729,9 +2890,10 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
     // 4. Select format
     console.log(`[FICHE-PDF] Format: ${formatTitle}`);
     const formatSelected = await page.evaluate((title) => {
-      const li = [...document.querySelectorAll('li')].find(l => l.title === title);
+      const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const li = [...document.querySelectorAll('li')].find(l => norm(l.title || l.textContent) === norm(title));
       const cb = li?.querySelector('input[type=checkbox]');
-      if (cb) { cb.checked = true; cb.click(); return true; }
+      if (cb) { if (!cb.checked) cb.click(); return true; }
       return false;
     }, formatTitle);
     if (!formatSelected) throw new Error(`Format "${formatTitle}" non trouvé`);
@@ -2798,6 +2960,7 @@ module.exports = {
   sendCentrisListingByEmail,
   searchCentrisVendus,
   shareCentrisZoneDocuments,
+  previewCentrisMatrixDocuments,
   getListingBroker,
   _loginCentrisZone: loginCentrisZone,
   // Internals exposés pour tests
@@ -2815,6 +2978,7 @@ module.exports = {
   _parseCentrisDisplaySize: parseCentrisDisplaySize,
   _normalizeCentrisLabel: normalizeCentrisLabel,
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
+  _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   cuaLoginCentris,
   ingestManualMFACode,

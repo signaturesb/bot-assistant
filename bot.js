@@ -1401,7 +1401,9 @@ CONTRAINTES ABSOLUES (non négociables):
 • VÉRIFIER (sortie tool) confirmation envoi avant de déclarer succès à Shawn.
 
 GESTION D'ERREURS (non négociable):
-• Listing introuvable → vérifier format # (7-9 chiffres) + statut En vigueur
+• Pour toute inscription, y compris celle d’un autre courtier: recherche globale Matrix via la barre blanche #QueryText → résultat au numéro EXACT → fiche détaillée → Document(s) additionnel(s).
+• Zone Courtier est réservée aux inscriptions présentes dans l’inventaire personnel de Shawn. Une absence de Zone ne signifie JAMAIS qu’un listing externe est introuvable.
+• Listing introuvable dans Matrix global → vérifier seulement le numéro exact (7-9 chiffres) et le statut; ne jamais proposer un numéro voisin.
 • Session expirée → re-login auto déjà câblé (TOTP→SMS→Email Gmail cascade)
 • Bot detection → escalade Browserless stealth (rebrowser-playwright)
 • JAMAIS de succès simulé. ÉCHEC = cause technique précise + suggestion fix.
@@ -1409,8 +1411,8 @@ GESTION D'ERREURS (non négociable):
 
 WORKFLOW AVANT ENVOI (préférer dry-run):
 1. Sur "envoie docs/fiche #N" → SUGGÈRE d'abord verifier_listing_centris pour
-   confirmer courtier inscripteur + liste docs (zéro envoi, ~30s)
-2. Shawn valide → envoyer_tous_documents_zone ou envoyer_fiche_centris_native
+   ouvrir le numéro exact dans Matrix global + inventorier la DV principale et les documents additionnels (zéro envoi)
+2. Inscription externe → telecharger_annexes_centris; inscription personnelle confirmée dans Zone → envoyer_tous_documents_zone; fiche officielle → envoyer_fiche_centris_native
 3. Toujours retourner: nb docs envoyés + courtier source + email destinataire
 
 FORMAT RAPPORT (ce que tu dis à Shawn après tool call):
@@ -7292,11 +7294,11 @@ const TOOLS = [
   // ── Centris fiche download ──────────────────────────────────────────────
   { name: 'telecharger_fiche_centris', description: 'Télécharge la fiche détaillée PDF d\'un listing Centris (peu importe quel courtier l\'a inscrit) via portail courtier authentifié de Shawn, et envoie par courriel au destinataire. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com". Toi en Cc auto. Nécessite CENTRIS_USER+CENTRIS_PASS.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS du listing (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email où envoyer la fiche' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels (séparés par virgules)' }, message_perso: { type: 'string', description: 'OPTIONNEL — message personnalisé dans le courriel (sinon template Shawn standard)' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'envoyer_fiche_centris_native', description: 'MEILLEUR pour envoyer fiche Centris au client: utilise l\'UI Matrix native (Imprimer → Détaillé client avec album de photos → Envoyer par courriel). Le PDF est OFFICIEL Centris (photos haute résolution + signature Shawn intégrée), expédié par l\'infra Centris. PRIVILÉGIER pour tout envoi à un client. Toi en Cc auto. Cas d\'usage: "envoie la fiche du #12345678 à client@email.com".', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS (7-9 chiffres)' }, email: { type: 'string', description: 'Email destinataire' }, cc: { type: 'string', description: 'OPTIONNEL — défaut shawn@signaturesb.com' }, sujet: { type: 'string', description: 'OPTIONNEL — sujet email (défaut: "Propriété Centris #N")' }, message: { type: 'string', description: 'OPTIONNEL — corps du courriel (défaut: template standard)' }, format: { type: 'string', enum: ['detaille_client_album_imperial', 'detaille_client_imperial', 'detaille_courtier_album_imperial', 'sommaire_imperial'], description: 'OPTIONNEL — format rapport (défaut album photos)' } }, required: ['centris_num', 'email'] } },
-  { name: 'envoyer_tous_documents_zone', description: 'Partage en UNE action uniquement les documents réellement disponibles dans Zone Centris pour un listing. Ne promet jamais DV, taxes, certificat ou plans s’ils sont absents. Identifie le courtier et refait obligatoirement l’inventaire avant l’envoi; bloque si le dossier a changé depuis le preview.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email: { type: 'string', description: 'Email destinataire' }, m_envoyer_copie: { type: 'boolean', description: 'OPTIONNEL — me mettre en copie (défaut false)' }, langue: { type: 'string', enum: ['fr', 'en'], description: 'OPTIONNEL — langue email (défaut fr)' }, message: { type: 'string', description: 'OPTIONNEL — message custom (défaut: message Centris standard)' } }, required: ['centris_num', 'email'] } },
-  { name: 'verifier_listing_centris', description: 'ÉTAPE OBLIGATOIRE, PREVIEW SANS ENVOI — vérifie le courtier inscripteur, inventorie les documents Zone et signale explicitement les documents standards absents. Produit une empreinte du dossier afin que l\'envoi soit bloqué si la liste change. ZÉRO email envoyé.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' } }, required: ['centris_num'] } },
+  { name: 'envoyer_tous_documents_zone', description: 'ZONE PERSONNELLE SEULEMENT — partage les documents d’une inscription présente dans la Zone Courtier de Shawn. Ne jamais utiliser pour une inscription d’un autre courtier; utiliser telecharger_annexes_centris via la recherche globale Matrix.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email: { type: 'string', description: 'Email destinataire' }, m_envoyer_copie: { type: 'boolean', description: 'OPTIONNEL — me mettre en copie (défaut false)' }, langue: { type: 'string', enum: ['fr', 'en'], description: 'OPTIONNEL — langue email (défaut fr)' }, message: { type: 'string', description: 'OPTIONNEL — message custom (défaut: message Centris standard)' } }, required: ['centris_num', 'email'] } },
+  { name: 'verifier_listing_centris', description: 'ÉTAPE OBLIGATOIRE, PREVIEW SANS ENVOI — recherche le numéro exact dans la barre globale Matrix, y compris les inscriptions d’autres courtiers, ouvre la fiche et inventorie la DV principale ainsi que tous les Document(s) additionnel(s). Produit une empreinte. ZÉRO email et ZÉRO téléchargement.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris exact (7-9 chiffres)' } }, required: ['centris_num'] } },
   { name: 'telecharger_docs_centris_complet', description: 'TOUT-EN-UN: envoie au client la fiche Centris officielle (PDF portail courtier) + TOUS les docs Dropbox matchant (match auto par Centris#). Cas d\'usage: "Envoie tout ce qui est dispo sur #12345678 à client@email.com". Toi en Cc auto sur les 2 envois. Le client reçoit 2 emails (1 avec fiche, 1 avec docs Dropbox).', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email du client' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels' }, message_perso: { type: 'string', description: 'OPTIONNEL — message dans email fiche' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'analyser_zonage_adresse', description: 'Trouve et envoie la grille de zonage PDF officielle pour une adresse Lanaudière. Scrape page urbanisme municipal → trouve liens PDF zonage → télécharge → envoie dans Telegram comme document. Optionnellement forward au client par email avec Cc Shawn. Cas d\'usage: "Marges de construction au 123 Ch. Lac Gratten Rawdon" ou "Grille zonage 456 Rue Sarine Sainte-Julienne, envoie à client@email.com".', input_schema: { type: 'object', properties: { adresse: { type: 'string', description: 'Adresse complète avec ville (ex: "123 Chemin Lac Gratten, Rawdon")' }, forward_email: { type: 'string', description: 'OPTIONNEL — email client si demande explicite forward (Shawn dit "envoie à X")' } }, required: ['adresse'] } },
-  { name: 'telecharger_annexes_centris', description: 'Récupère TOUTES les annexes Centris d\'un listing via portail courtier authentifié: Déclaration Vendeur (DV), certificat de localisation, plans cadastraux, rapport inspection, etc. Tout ce qui est dans la section "Annexes" du listing Matrix. Cas d\'usage: "Donne-moi la DV du #12345678" ou "Toutes les annexes Centris pour #12345678 à client@email.com".', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS (7-9 chiffres)' }, email_destination: { type: 'string', description: 'OPTIONNEL — email client pour forward avec Cc Shawn. Si vide: envoi dans Telegram seulement.' }, filtre: { type: 'string', description: 'OPTIONNEL — filtrer par mot-clé dans nom annexe (ex: "DV", "déclaration", "localisation", "plan"). Si vide: toutes les annexes.' } }, required: ['centris_num'] } },
+  { name: 'telecharger_annexes_centris', description: 'Récupère les PDF par le chemin déterministe Matrix global: barre blanche → numéro exact → fiche → Document(s) additionnel(s). Fonctionne pour les inscriptions de Shawn et des autres courtiers. Valide chaque PDF (signature, pages, SHA-256). Cas d’usage: DV, certificat, plans ou toutes les annexes.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS exact (7-9 chiffres)' }, email_destination: { type: 'string', description: 'OPTIONNEL — email client, soumis à confirmation one-shot; sans email les PDF vont seulement à Shawn dans Telegram.' }, filtre: { type: 'string', description: 'OPTIONNEL — filtre exact par mots du libellé (DV, localisation, plan, etc.). Vide = toutes.' } }, required: ['centris_num'] } },
 ];
 
 // Cache les tools (statiques) — Anthropic prompt caching sur le dernier tool
@@ -7797,16 +7799,13 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) return `❌ CENTRIS_USER/PASS absents`;
         const cuaMod = getCUA();
         if (!cuaMod || !cuaMod.CUA_AVAILABLE()) return `❌ CUA driver indispo`;
-        if (!cuaMod.shareCentrisZoneDocuments) return `❌ Function shareCentrisZoneDocuments absente (deploy needed)`;
-        log('INFO', 'CENTRIS-ZONE-DRY', `Preview docs #${num}`);
+        if (!cuaMod.previewCentrisMatrixDocuments) return `❌ Fonction previewCentrisMatrixDocuments absente (déploiement requis)`;
+        log('INFO', 'CENTRIS-MATRIX-DRY', `Preview global Matrix #${num}`);
         try {
-          const r = await cuaMod.shareCentrisZoneDocuments({ centris_num: num, dry_run: true });
+          const r = await cuaMod.previewCentrisMatrixDocuments({ centris_num: num });
           if (!r.success) {
-            const code = r.error_code || 'ZONE_TECHNICAL_ERROR';
-            const publicSignal = r.listing_public_found
-              ? `\n✅ Le listing #${num} existe dans la source publique Centris; ce résultat ne signifie pas qu’il est inexistant.`
-              : '';
-            return `❌ Preview Zone #${num} non complété [${code}]\n${r.message}${publicSignal}\nAucun document envoyé. Le bot ne remplacera jamais ce numéro par un autre.`;
+            const code = r.error_code || 'MATRIX_TECHNICAL_ERROR';
+            return `❌ Preview Matrix #${num} non complété [${code}]\n${r.message}\nAucun document envoyé. Le bot ne remplacera jamais ce numéro par un autre.`;
           }
           const b = r.broker_info || {};
           const docsTxt = (r.docs_list || []).map((d, i) => {
@@ -7818,11 +7817,12 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
           const missingTxt = missingDocs.length
             ? missingDocs.map((d) => `  ⚠️ ${d.label}`).join('\n')
             : '  ✅ Aucun document explicitement attendu ne manque';
-          auditLogEvent('centris', 'zone-docs-preview', {
+          auditLogEvent('centris', 'matrix-docs-preview', {
             num, docs: r.docs_count, broker: b.name,
             missing: missingDocs.map((d) => d.key), manifest: r.manifest_id,
           });
-          return `🔍 *PREVIEW #${num}* — Aucun envoi effectué\n\n` +
+          return `🔍 *PREVIEW MATRIX #${num}* — Aucun envoi effectué\n` +
+                 `_Recherche globale: inscriptions de Shawn et des autres courtiers._\n\n` +
                  `*Courtier inscripteur:*\n` +
                  `  • Nom: ${b.name || '?'}\n` +
                  `  • Agence: ${b.agency || '?'}\n` +
