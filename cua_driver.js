@@ -1832,6 +1832,20 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
         const htmlHead = buffer.subarray(0, Math.min(buffer.length, 32768)).toString('utf8');
         const title = String(htmlHead.match(/<title[^>]*>([^<]{0,120})<\/title>/i)?.[1] || '')
           .replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 80);
+        const formActionRaw = String(htmlHead.match(/<form[^>]+action=["']([^"']{1,500})["']/i)?.[1] || '');
+        let formPath = '';
+        try {
+          const formUrl = new URL(formActionRaw, responseUrl.origin);
+          formPath = `${formUrl.hostname}${formUrl.pathname}`;
+        } catch {}
+        const visibleText = htmlHead
+          .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&')
+          .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+          .replace(/\b\d{6,}\b/g, '[nombre]')
+          .replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 140);
         const status = typeof response.status === 'function' ? response.status() : 'inconnu';
         // Ne jamais journaliser la query media.ashx: elle contient des
         // identifiants propres à la session. Hôte + chemin + titre suffisent.
@@ -1842,6 +1856,8 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
           `bytes=${buffer.length}`,
           `signature=${buffer.subarray(0, 16).toString('hex') || 'vide'}`,
           title ? `title=${title}` : null,
+          formPath ? `form=${formPath}` : null,
+          visibleText ? `texte=${visibleText}` : null,
         ].filter(Boolean).join(',');
       } catch (error) {
         lastDiagnostic = safeErrorMessage(error).substring(0, 100);
