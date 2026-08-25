@@ -1073,14 +1073,15 @@ function extractTaxCandidatesFromText(text, labelPattern) {
   return candidates;
 }
 
-function browserlessEndpointWithTimeout(endpoint, timeoutMs = 60000) {
+function browserlessEndpointWithTimeout(endpoint, timeoutMs = 150000) {
   let url;
   try { url = new URL(endpoint); }
   catch { throw new Error('BROWSERLESS_WS invalide'); }
-  // Browserless production currently rejects values above 60,000 ms.
-  // Clamp locally so a stale environment value cannot prevent Chrome from
-  // opening before the Centris/MFA flow even starts.
-  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 60000, 60000));
+  // BaaS v2 accepte une durée supérieure à 60 s selon le forfait. La limite
+  // fixe précédente coupait systématiquement la génération de la fiche à
+  // 8/9. Garder un plafond de sécurité local tout en respectant la durée
+  // configurée pour le compte Browserless.
+  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 150000, 15 * 60 * 1000));
   url.searchParams.set('timeout', String(safeTimeout));
   return url.toString();
 }
@@ -1218,7 +1219,7 @@ async function launchBrowser() {
   const configuredEndpoint = process.env.BROWSERLESS_WS;
   if (configuredEndpoint) {
     console.log('[CUA] Mode Browserless externe (WS)');
-    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 60000;
+    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 150000;
     const wsEndpoint = browserlessEndpointWithTimeout(configuredEndpoint, sessionTimeoutMs);
     // Audit P3 #10: retry 3× avec backoff 3s/8s/20s
     let lastErr = null;

@@ -82,7 +82,7 @@ const endpoint = _browserlessEndpointWithTimeout('wss://example.invalid/chromium
 const parsed = new URL(endpoint);
 assert.strictEqual(parsed.searchParams.get('token'), 'test-token', 'Le paramètre Browserless existant doit être préservé');
 assert.strictEqual(parsed.searchParams.get('foo'), 'bar', 'Les paramètres Browserless existants doivent être préservés');
-assert.strictEqual(parsed.searchParams.get('timeout'), '60000', 'Le délai Browserless doit être plafonné à 60 000 ms');
+assert.strictEqual(parsed.searchParams.get('timeout'), '175000', 'Le délai Browserless configuré doit dépasser 60 s quand le forfait le permet');
 
 const shortEndpoint = _browserlessEndpointWithTimeout('wss://example.invalid/chromium?token=test-token', 45000);
 assert.strictEqual(new URL(shortEndpoint).searchParams.get('timeout'), '45000', 'Un délai Browserless valide doit être conservé');
