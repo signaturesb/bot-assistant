@@ -601,11 +601,42 @@ function matrixTextContainsExactNumber(value, centrisNum) {
   return new RegExp(`(^|\\D)${number}(\\D|$)`).test(String(value || ''));
 }
 
+function isExactMatrixListingLabel(value, centrisNum) {
+  const expected = String(centrisNum || '').replace(/\D/g, '');
+  const label = String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
+  return /^\d{7,9}$/.test(label) && label === expected;
+}
+
 async function openExactMatrixListing(page, centrisNum) {
   let state = await inspectMatrixListingPage(page, centrisNum);
   if (state.exactListingMentioned && state.detailEvidence === true &&
       ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
 
+  // Chemin déterministe observé dans Matrix: la page de résultats affiche le
+  // numéro Centris comme lien. Cliquer d'abord le lien dont le libellé est
+  // exactement le numéro demandé évite de choisir une action générique de la
+  // même ligne (photo, carte, impression, etc.).
+  for (const frame of page.frames()) {
+    const links = frame.locator('a');
+    const count = Math.min(await links.count().catch(() => 0), 300);
+    for (let index = 0; index < count; index += 1) {
+      const link = links.nth(index);
+      if (!(await link.isVisible().catch(() => false))) continue;
+      const label = await link.evaluate((element) =>
+        element.innerText || element.textContent || element.getAttribute('aria-label') || ''
+      ).catch(() => '');
+      if (!isExactMatrixListingLabel(label, centrisNum)) continue;
+      const clicked = await link.click({ timeout: 10000 }).then(() => true).catch(() => false);
+      if (!clicked) continue;
+      await page.waitForTimeout(3000);
+      state = await inspectMatrixListingPage(page, centrisNum);
+      if (state.exactListingMentioned &&
+          ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
+    }
+  }
+
+  // Repli défensif pour les variantes Matrix où le numéro est rendu dans un
+  // contrôle non standard ou dans une ligne navigable.
   for (const frame of page.frames()) {
     const candidates = frame.locator('a,button,[role="link"],[data-href]');
     const count = Math.min(await candidates.count().catch(() => 0), 300);
@@ -3489,6 +3520,7 @@ module.exports = {
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _matrixTextContainsExactNumber: matrixTextContainsExactNumber,
+  _isExactMatrixListingLabel: isExactMatrixListingLabel,
   _scoreMatrixSearchCandidate: scoreMatrixSearchCandidate,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,

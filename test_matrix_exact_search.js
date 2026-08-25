@@ -3,6 +3,7 @@
 const assert = require('assert');
 const {
   _matrixTextContainsExactNumber: containsExact,
+  _isExactMatrixListingLabel: isExactLabel,
   _scoreMatrixSearchCandidate: scoreSearch,
   _classifyMatrixPageSnapshot: classify,
 } = require('./cua_driver');
@@ -10,6 +11,11 @@ const {
 assert(containsExact('No Centris 28936167', '28936167'));
 assert(!containsExact('No Centris 1289361670', '28936167'));
 assert(!containsExact('Résultats 289361670 et 28936168', '28936167'));
+assert(isExactLabel('28936167', '28936167'));
+assert(isExactLabel('  28936167\u00a0', '28936167'));
+assert(!isExactLabel('No Centris 28936167', '28936167'));
+assert(!isExactLabel('28936167 (En vigueur)', '28936167'));
+assert(!isExactLabel('128936167', '28936167'));
 
 assert(scoreSearch('QueryText global search', { width: 700, y: 100 }) >= 100);
 assert(scoreSearch('omnisearch MLS Centris', { width: 500, y: 80 }) >= 100);
