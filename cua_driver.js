@@ -363,7 +363,7 @@ function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
 
 function redactCentrisDocumentInventory(inventory = {}) {
   const redactDoc = (doc = {}) => {
-    const { url, action_id, match_key, ...safeDoc } = doc;
+    const { url, action_id, action_label, match_key, ...safeDoc } = doc;
     return safeDoc;
   };
   const safeDocs = (Array.isArray(inventory.docs) ? inventory.docs : []).map(redactDoc);
@@ -385,6 +385,7 @@ function mergeMatrixDocumentSnapshots(snapshots = []) {
   return {
     ...primary,
     docs: dedupeCentrisDiscoveredDocs(ranked.flatMap((snapshot) => snapshot.docs || [])),
+    documentReferences: [...new Set(ranked.flatMap((snapshot) => snapshot.documentReferences || []))],
     mediaLinkCount: ranked.reduce((total, snapshot) => total + Number(snapshot.mediaLinkCount || 0), 0),
   };
 }
@@ -924,13 +925,11 @@ async function inspectMatrixListingPage(page, centrisNum) {
       });
     }
     const principalMatch = bodyText.match(/D[ée]claration du vendeur\s+(?:Oui\s+)?(DV[-\s]?\d+)/i);
-    if (principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))) {
-      docs.unshift({
-        name: principalMatch[1].replace(/\s+/g, ''), size: null, url: null,
-        action_label: principalMatch[1].replace(/\s+/g, ''),
-        provenance: 'matrix_principal_dv', source_section: 'principal_dv',
-      });
-    }
+    // Ce champ Matrix est une référence au formulaire existant, pas un lien.
+    // Il devient un document seulement si un vrai href/postback a été trouvé.
+    const documentReferences = principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))
+      ? [principalMatch[1].replace(/\s+/g, '')]
+      : [];
     const price = bodyText.match(/(?:^|\s)([0-9][0-9\s]*\$)(?:\s|$)/)?.[1] || null;
     const address = bodyText.match(/\b\d{1,6}\s+(?:rue|avenue|boulevard|chemin|rang|route)\s+[^\n]{3,100}/i)?.[0] || null;
     const detailEvidence = Boolean(
@@ -942,7 +941,7 @@ async function inspectMatrixListingPage(page, centrisNum) {
       exactListingMentioned: new RegExp(`(^|\\D)${String(expectedNum).replace(/\\D/g, '')}(\\D|$)`).test(bodyText),
       detailEvidence,
       passwordInputs: document.querySelectorAll('input[type=password]').length,
-      mediaLinkCount: mediaAnchors.length, docs,
+      mediaLinkCount: mediaAnchors.length, docs, documentReferences,
       listing: { centris_num: expectedNum, price: clean(price), address: clean(address) },
     };
   }, String(centrisNum));
@@ -1015,6 +1014,7 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     return {
       success: true, dry_run: true, via: 'matrix-global', listing: state.listing,
       docs_count: publicInventory.docs.length, docs_list: publicInventory.docs,
+      document_references: state.documentReferences || [],
       document_inventory: publicInventory, manifest_id: inventory.manifest_id,
       listing_url: safeCentrisPageLocation(state.url),
       message: inventory.docs.length
@@ -2376,6 +2376,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       validated_count: annexes.length,
       docs_count: state.docs.length,
       docs_list: publicInventory.docs,
+      document_references: state.documentReferences || [],
       document_inventory: publicInventory,
       manifest_id: fullInventory.manifest_id,
       message: annexes.length > 0

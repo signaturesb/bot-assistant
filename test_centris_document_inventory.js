@@ -26,10 +26,9 @@ assert.deepStrictEqual(legacy.missing, [], 'une catégorie possible absente ne d
 assert.match(legacy.inventory_manifest_id, /^[a-f0-9]{64}$/);
 assert.strictEqual(legacy.manifest_id, legacy.inventory_manifest_id, 'alias manifest_id conservé pour le flux Zone existant');
 
-// Fixture réelle confirmée par capture Matrix: 1 DV principale séparée et
-// 8 documents additionnels. Ce total n'est jamais une règle globale.
+// Fixture réelle confirmée par capture Matrix: 8 documents additionnels. La
+// mention DV-50037 est une référence de formulaire, pas un lien PDF.
 const fixture28936167 = [
-  { name: 'Oui DV-50037', size: null, source_section: 'principal_dv', provenance: 'matrix_principal_dv' },
   { name: 'Déclaration du vendeur / Modification DV (signé le 2026-03-25)', size: '584,48 k', source_section: 'additional_documents', provenance: 'matrix_additional_documents' },
   { name: 'Facture - Taxes scolaires', size: '92,66 k', source_section: 'additional_documents', provenance: 'matrix_additional_documents' },
   { name: 'Autre : Rôle évaluation', size: '8,26 k', source_section: 'additional_documents', provenance: 'matrix_additional_documents' },
@@ -40,11 +39,10 @@ const fixture28936167 = [
   { name: 'Autre : Obligation courtier envers son vendeur', size: '92,9 k', source_section: 'additional_documents', provenance: 'matrix_additional_documents' },
 ];
 const matrix = cua._buildCentrisDocumentInventory('28936167', fixture28936167, {
-  expectedCategories: ['declaration_vendeur_principale', 'certificat_localisation'],
+  expectedCategories: ['certificat_localisation'],
 });
-assert.strictEqual(matrix.docs.length, 9);
-assert.strictEqual(category(matrix, 'declaration_vendeur_principale').docs.length, 1);
-assert.strictEqual(category(matrix, 'declaration_vendeur_principale').docs[0].source_section, 'principal_dv');
+assert.strictEqual(matrix.docs.length, 8);
+assert.ok(!category(matrix, 'declaration_vendeur_principale'));
 assert.strictEqual(category(matrix, 'modification_dv').docs.length, 1);
 assert.strictEqual(category(matrix, 'plan_cadastral').docs.length, 2);
 assert.deepStrictEqual(new Set(category(matrix, 'plan_cadastral').docs.map((doc) => doc.lot)), new Set(['6184490', '6183408']));
@@ -150,6 +148,14 @@ assert.strictEqual(mergedFrames.docs.length, 2);
 assert.ok(mergedFrames.docs.some((doc) => doc.action_id === 'DV_Link'));
 assert.ok(mergedFrames.docs.some((doc) => /id=plan/.test(doc.url)));
 
+const referenceOnly = cua._mergeMatrixDocumentSnapshots([{
+  url: 'https://matrix.centris.ca/Matrix/Results.aspx', exactListingMentioned: true,
+  docs: fixture28936167,
+  documentReferences: ['DV-50037'], mediaLinkCount: 8,
+}]);
+assert.strictEqual(referenceOnly.docs.length, 8, 'une référence DV sans contrôle ne devient jamais un PDF fictif');
+assert.deepStrictEqual(referenceOnly.documentReferences, ['DV-50037']);
+
 // Les documents visibles mais sans URL/action sont conservés individuellement:
 // ils deviendront des échecs explicites au téléchargement au lieu de disparaître.
 const unresolvedTwins = cua._buildCentrisDocumentInventory('X', [
@@ -160,7 +166,7 @@ assert.strictEqual(unresolvedTwins.docs.length, 2);
 assert.strictEqual(new Set(unresolvedTwins.docs.map((doc) => doc.id)).size, 2);
 
 const reordered = cua._buildCentrisDocumentInventory('28936167', [...fixture28936167].reverse(), {
-  expectedCategories: ['declaration_vendeur_principale', 'certificat_localisation'],
+  expectedCategories: ['certificat_localisation'],
 });
 assert.strictEqual(reordered.inventory_manifest_id, matrix.inventory_manifest_id);
 
