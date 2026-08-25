@@ -38,6 +38,8 @@ assert(botSource.includes('deux connexions Browserless strictement séquentielle
 assert(cuaSource.includes('await context.close();\n      context = null;\n      await browser.close();\n      browser = null;\n\n      browser = await launchBrowser();'), 'La phase A doit être fermée avant le lancement Browserless B');
 assert(cuaSource.includes('resumeVerifiedCentrisSession(context)'), 'La phase B doit reprendre strictement la session, sans nouveau login/MFA');
 assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire modifié entre les phases doit bloquer la fiche');
+assert(cuaSource.includes('const authenticatedCheckpoint = {'), 'La connexion/MFA doit être figée avant la phase de recherche PDF');
+assert(cuaSource.includes('const deadline = Date.now() + 5000'), 'La stabilisation post-MFA doit garder une marge Browserless pour vérifier Matrix');
 assert(cuaSource.includes("Symbol('matrix-annexes')"), 'Un verrou global doit couvrir toute l’opération Matrix A+B');
 assert(cuaSource.includes('MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH'), 'Un inventaire connu incomplet ne doit jamais devenir un faux succès');
 assert(cuaSource.includes("content_manifest_id: complete ? contentManifest.content_manifest_id : null"), 'Un lot partiel ne doit jamais exposer un manifeste de contenu complet');

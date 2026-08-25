@@ -1812,7 +1812,10 @@ async function loginCentris(context) {
 // session valide. Attendre la redirection réelle, puis sonder Matrix une seule
 // fois si l'endpoint OAuth reste affiché sans champ MFA.
 async function settleCentrisAfterMFA(page) {
-  const deadline = Date.now() + 18000;
+  // Le code MFA est déjà accepté par Auth0 à ce point. Une attente de 18 s,
+  // suivie d'une navigation de 20 s, consommait toute la session Browserless.
+  // Laisser une courte fenêtre à la redirection, puis vérifier Matrix tôt.
+  const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     await page.waitForTimeout(750);
     const url = page.url();
@@ -1827,9 +1830,10 @@ async function settleCentrisAfterMFA(page) {
   if (/accounts\.centris\.ca\/connect\/authorize/i.test(page.url())) {
     console.log('[CUA] OAuth Centris encore affiché après MFA — vérification directe Matrix');
     await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, {
-      waitUntil: 'domcontentloaded', timeout: 20000,
+      waitUntil: 'commit', timeout: 12000,
     });
-    await page.waitForTimeout(1800);
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
+    await page.waitForTimeout(800);
   }
 }
 
@@ -2419,6 +2423,24 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     let page = await loginCentris(context);
     const exactNum = String(centrisNum || '').replace(/\D/g, '');
     if (!/^\d{7,9}$/.test(exactNum)) throw new Error('Numéro Centris invalide');
+
+    // La connexion/MFA est une phase dédiée. Même lorsqu'elle réussit près de
+    // la limite Browserless, elle ne doit pas gruger le budget de la recherche
+    // et des huit PDF. Capturer l'état validé, fermer complètement le navigateur
+    // d'authentification, puis reprendre sans mot de passe ni nouveau MFA.
+    const authenticatedUserAgent = await page.evaluate(() => navigator.userAgent).catch(() => '');
+    if (!authenticatedUserAgent) throw new Error('MATRIX_AUTH_USER_AGENT_MISSING');
+    const authenticatedCheckpoint = {
+      storageState: await context.storageState(),
+      userAgent: authenticatedUserAgent,
+    };
+    await context.close();
+    context = null;
+    await browser.close();
+    browser = null;
+    browser = await launchBrowser();
+    context = await newStealthContext(browser, authenticatedCheckpoint);
+    page = await resumeVerifiedCentrisSession(context);
 
     // Chemin déterministe identique au geste humain montré par Shawn:
     // recherche globale blanche → numéro exact → fiche détaillée → liens PDF.
@@ -4371,4 +4393,3 @@ module.exports = {
   ingestManualMFACode,
   isAwaitingCentrisMFA,
 };
-
