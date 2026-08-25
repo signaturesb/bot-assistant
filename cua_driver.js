@@ -1717,10 +1717,13 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     const candidates = selectedDocs.slice(0, 20);
     const downloaded = await mapWithConcurrency(candidates, 4, async (doc, index) => {
       try {
-        const buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url);
-        if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
-          throw new Error('réponse non-PDF');
+        let buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url);
+        const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+        if (buffer.length < 1000 || magicIndex === -1) {
+          const signature = buffer.subarray(0, 16).toString('hex');
+          throw new Error(`réponse non-PDF (bytes=${buffer.length}, signature=${signature || 'vide'})`);
         }
+        if (magicIndex > 0) buffer = buffer.subarray(magicIndex);
         const parsed = await parsePDFText(buffer);
         const enriched = addCentrisContentMetadata(doc, buffer, parsed.pages);
         const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
