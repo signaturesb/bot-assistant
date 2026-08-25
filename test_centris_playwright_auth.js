@@ -126,6 +126,10 @@ assert(
   'La page de connexions multiples ne doit jamais prouver une authentification'
 );
 assert(
+  !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Unexpected.aspx', 0, 'Matrix — fiche — erreur inattendue'),
+  'Le nom Matrix ou fiche seul sur une page d’erreur ne doit jamais prouver une authentification'
+);
+assert(
   _isMatrixMultipleLoginPage('https://matrix.centris.ca/Matrix/Error/MultipleLoginBreach.aspx'),
   'La collision de sessions Matrix doit avoir un diagnostic déterministe'
 );
@@ -160,6 +164,11 @@ assert.strictEqual(_classifyCentrisLoginSnapshot({
   userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0,
   bodyText: 'Matrix Recherche Critères Résultats Déconnexion',
 }), 'authenticated', 'un retour SSO direct dans Matrix doit être accepté sans chercher un formulaire');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/LoginIntermediateMLD.aspx',
+  userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0, mfaVisible: 0,
+  bodyText: "I've Read This",
+}), 'intermediate', 'la page intermédiaire Matrix doit être reconnue immédiatement sans nouvelle navigation login');
 assert.strictEqual(_classifyCentrisLoginSnapshot({
   url: 'https://matrix.centris.ca/Matrix/',
   userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0, bodyText: '',
