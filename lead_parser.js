@@ -102,15 +102,30 @@ function isJunkLeadEmail(subject, from, body) {
   const b = (body || '').toLowerCase();
   const sb = s + ' ' + b;
   // Notifications Centris / saved search alerts (tous les domaines Centris)
-  const isCentrisAuto = f.includes('no-reply@centris') || f.includes('noreply@centris')
-    || f.includes('notifications@centris') || f.includes('@mlsmatrix') || f.includes('centris@');
+  // Tous les sous-domaines officiels sont valides ici (ex. accounts.centris.ca).
+  // L'ancien test `no-reply@centris` manquait no-reply@accounts.centris.ca et
+  // laissait un vrai courriel MFA entrer dans le pipeline de leads.
+  const isCentrisDomain = /@(?:[a-z0-9-]+\.)*centris\.ca\b/i.test(f);
+  const isCentrisAuto = isCentrisDomain || f.includes('@mlsmatrix') || f.includes('centris@');
+  const isCentrisAuthMessage = /centris/i.test(sb) &&
+    /code\s+(?:de\s+)?(?:v[eé]rification|s[eé]curit[eé]|authentification)|verification\s+code|one[- ]time\s+(?:code|password)|\bMFA\b|double\s+authentification|tentative\s+de\s+connexion|connexion\s+à\s+votre\s+compte/i.test(sb);
+  // Un sujet d'authentification Centris explicite n'est jamais un prospect,
+  // même si Gmail reformate ou masque l'adresse From.
+  if (isCentrisAuthMessage) return true;
   if (isCentrisAuto) {
     if (/notification|r[eé]pondent\s+à\s+vos\s+crit[eè]res|d[eé]couvrez-les|inscriptions?\s+(correspondantes|matching|nouvelles)|une\s+ou\s+plusieurs\s+nouvelles\s+propri[eé]t[eé]s|voir\s+les\s+inscriptions/i.test(sb)) return true;
+    // Messages de compte/authentification et rappels de messagerie Centris.
+    // Ils proviennent des mêmes domaines que les leads, mais ne contiennent
+    // jamais une demande immobilière exploitable.
+    if (/code\s+(?:de\s+)?(?:v[eé]rification|s[eé]curit[eé]|authentification)|verification\s+code|one[- ]time\s+(?:code|password)|\bMFA\b|double\s+authentification|tentative\s+de\s+connexion|connexion\s+à\s+votre\s+compte/i.test(sb)) return true;
+    if (/(?:conversation|message)[^\n]{0,50}non\s+lu|vous\s+avez[^\n]{0,40}(?:conversation|message)|rappel[^\n]{0,40}(?:conversation|message)/i.test(sb)) return true;
   }
   // Pattern sujet saved-search typique: "[Nom, Prénom] Maison X et moins" ou "[Client] Critères"
   if (/^\[[^\]]+\]\s+(maison|terrain|plex|condo|chalet)\b/i.test(s)) return true;
   // Newsletters / promotions / marketing
   if (/(newsletter|infolettre|promotion|offre\s+sp[eé]ciale|super\s+promo|last\s+call|ending\s+soon|spring\s+sale|votre\s+campagne)/i.test(s)) return true;
+  const isRemaxSender = /@[^>\s]*remax|re\/max|remax[-.]/i.test(f);
+  if (isRemaxSender && /\b(?:webinaire|formation|magazine|actualit[eé]s?|bulletin|concours|rabais)\b|offre\s+exclusive|outils?\s+marketing|r[eé]seau\s+re\/max/i.test(sb)) return true;
   // Brevo / marketing tool notifications
   if (f.includes('brevo') || f.includes('brevosend')) return true;
   // Confirmations/annulations de visite entre courtiers (pas des leads, notifications internes)

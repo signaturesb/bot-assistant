@@ -1,0 +1,26 @@
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+
+const bot = fs.readFileSync('bot.js', 'utf8');
+const registry = fs.readFileSync('docs/CAPABILITY_REGISTRY.md', 'utf8');
+
+assert.match(bot, /La liste TOOLS fournie par l'application est la seule vérité/);
+assert.match(bot, /Un aperçu n'est jamais une preuve d'envoi/);
+assert.match(bot, /Ne jamais paralléliser deux écritures/);
+assert.match(bot, /La mémoire persistante conserve les faits stables/);
+assert.match(bot, /CONTRAT D'EXÉCUTION — UNE DEMANDE DOIT ABOUTIR/);
+assert.match(bot, /Ne pas abandonner les autres intentions/);
+assert.match(bot, /TERMINÉ.*PARTIEL.*BLOQUÉ/s);
+assert.match(bot, /ne jamais répéter une action externe dont le résultat est incertain/);
+assert.match(bot, /un hash mentionné, confirmé, mémorisé ou présent localement n'est PAS déployé/);
+assert.match(bot, /uniquement si la réponse production \/version/);
+assert.match(bot, /SESSION_LIVE\.md et docs\/CURRENT_STATE\.md décrivent l'état vérifié/);
+assert.match(registry, /Les skills et connecteurs de Codex.*ne deviennent pas automatiquement des outils Telegram/);
+assert.match(registry, /confirmation au contenu exact/);
+assert.match(registry, /Ne jamais mémoriser de secret/);
+assert.match(registry, /Chaque demande peut contenir plusieurs intentions/);
+assert.match(registry, /Un commit suit trois états distincts/);
+
+console.log('✅ Registre de capacités et règles de routage avancées présents');

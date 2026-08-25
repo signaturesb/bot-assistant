@@ -1,0 +1,185 @@
+openapi: 3.1.0
+info:
+  title: SignatureSB Centris Comparables API
+  version: 1.0.0
+  description: API privée en lecture seule pour rechercher des comparables et inscriptions Centris.
+servers:
+  - url: https://signaturesb-bot-s272.onrender.com
+paths:
+  /centris/comparables:
+    get:
+      operationId: get_comparables
+      summary: Rechercher des comparables ou inscriptions Centris
+      description: Retourne des propriétés vendues ou actives. Cette opération ne modifie aucune donnée.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: ville
+          in: query
+          required: true
+          description: Nom français de la municipalité québécoise.
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 80
+          examples:
+            rawdon:
+              value: Rawdon
+            sainteJulienne:
+              value: Sainte-Julienne
+        - name: type
+          in: query
+          required: false
+          description: Type de propriété recherché.
+          schema:
+            type: string
+            enum: [terrain, maison, plex, condo]
+            default: terrain
+        - name: statut
+          in: query
+          required: false
+          description: Propriétés vendues ou actuellement en vigueur.
+          schema:
+            type: string
+            enum: [vendu, actif]
+            default: vendu
+        - name: jours
+          in: query
+          required: false
+          description: Nombre de jours à couvrir pour les propriétés vendues.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 365
+            default: 14
+      responses:
+        "200":
+          description: Recherche terminée, avec zéro ou plusieurs propriétés.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ComparablesResponse"
+        "400":
+          description: Paramètre invalide.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Clé API absente ou invalide.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Limite temporaire de requêtes atteinte.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Session Centris ou configuration temporairement indisponible.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: Centris n’a pas répondu dans le délai maximal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ComparableQuery:
+      type: object
+      additionalProperties: false
+      required: [ville, type, statut, jours]
+      properties:
+        ville:
+          type: string
+        type:
+          type: string
+          enum: [terrain, maison, plex, condo]
+        statut:
+          type: string
+          enum: [vendu, actif]
+        jours:
+          type: integer
+    Comparable:
+      type: object
+      additionalProperties: false
+      required: [mls, adresse, ville, prix, superficie, dateVente, dateISO, annee]
+      properties:
+        mls:
+          type: [string, "null"]
+        adresse:
+          type: [string, "null"]
+        ville:
+          type: [string, "null"]
+        prix:
+          type: [number, "null"]
+        superficie:
+          type: [number, "null"]
+        dateVente:
+          type: [string, "null"]
+        dateISO:
+          type: [string, "null"]
+        annee:
+          type: [integer, "null"]
+    ResponseMeta:
+      type: object
+      additionalProperties: false
+      required: [source, readOnly, durationMs]
+      properties:
+        source:
+          type: string
+          const: Centris
+        readOnly:
+          type: boolean
+          const: true
+        durationMs:
+          type: integer
+    ComparablesResponse:
+      type: object
+      additionalProperties: false
+      required: [ok, query, count, results]
+      properties:
+        ok:
+          type: boolean
+        query:
+          $ref: "#/components/schemas/ComparableQuery"
+        count:
+          type: integer
+          minimum: 0
+        results:
+          type: array
+          maxItems: 30
+          items:
+            $ref: "#/components/schemas/Comparable"
+        message:
+          type: string
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    ErrorResponse:
+      type: object
+      additionalProperties: true
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        error:
+          type: string
+        detail:
+          type: [string, "null"]
+        nextAction:
+          type: string

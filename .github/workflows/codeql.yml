@@ -2,11 +2,12 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
+    branches: [main, audit/telegram-history-and-hardening]
     paths:
       - '**/*.js'
       - 'package.json'
       - 'package-lock.json'
+      - '.github/workflows/codeql.yml'
   pull_request:
     branches: [main]
     paths:

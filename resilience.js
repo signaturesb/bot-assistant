@@ -32,6 +32,9 @@ const state = {
   shawnId: null,
   alertsLast: {},       // anti-spam: { key: timestamp }
   alertCooldown: 15 * 60 * 1000, // 15 min entre alertes identiques
+  lastAutoRestartAt: 0,
+  restartInProgress: false,
+  highMemoryStreak: 0,
   circuits: {},         // { service: { state, fails, openUntil, lastError } }
   metrics: {
     requests: {},       // { service: { ok, fail, totalMs } }
@@ -205,6 +208,10 @@ async function fetchResilient(service, url, options = {}) {
 // ═══════════════════════════════════════════════════════════════
 
 async function heartbeatToGitHub() {
+  if (process.env.ENABLE_GITHUB_RUNTIME_WRITES !== 'true') {
+    state.lastHeartbeat = Date.now();
+    return;
+  }
   const token = process.env.GITHUB_TOKEN;
   if (!token) return;
 
@@ -282,6 +289,14 @@ function startEventLoopWatchdog() {
 // ═══════════════════════════════════════════════════════════════
 
 async function selfRestart(reason) {
+  const configuredCooldown = parseInt(process.env.SELF_RESTART_COOLDOWN_MS || '', 10);
+  const cooldownMs = Number.isFinite(configuredCooldown)
+    ? Math.max(5 * 60 * 1000, configuredCooldown)
+    : 30 * 60 * 1000;
+  if (state.restartInProgress || Date.now() - state.lastAutoRestartAt < cooldownMs) {
+    log(`⏭️  selfRestart ignoré (cooldown/in-flight): ${reason}`);
+    return false;
+  }
   const token = process.env.RENDER_API_KEY;
   const serviceId = process.env.RENDER_SERVICE_ID;
 
@@ -291,6 +306,8 @@ async function selfRestart(reason) {
   }
 
   log(`🔄 SELF-RESTART déclenché: ${reason}`);
+  state.restartInProgress = true;
+  state.lastAutoRestartAt = Date.now();
   state.metrics.autoRestarts++;
 
   await alertShawn(
@@ -315,6 +332,8 @@ async function selfRestart(reason) {
   } catch (err) {
     log(`❌ Self-restart API échec: ${err.message}`);
     return false;
+  } finally {
+    state.restartInProgress = false;
   }
 }
 
@@ -424,15 +443,35 @@ function formatDuration(s) {
 // 10. AUTO-RECOVERY — surveille sa propre santé
 // ═══════════════════════════════════════════════════════════════
 
+function startNonOverlappingInterval(label, fn, intervalMs) {
+  let active = false;
+  return setInterval(async () => {
+    if (active) {
+      log(`${label}: run ignoré — précédent toujours actif`);
+      return;
+    }
+    active = true;
+    try { await fn(); }
+    catch (e) { log(`${label}: ${e.message || e}`); }
+    finally { active = false; }
+  }, intervalMs).unref();
+}
+
 function startSelfRecovery() {
   // Check toutes les 5 min
-  setInterval(async () => {
+  startNonOverlappingInterval('self-recovery', async () => {
     const h = healthReport();
     const memMB = h.memory.rss_mb;
 
-    // Leak mémoire: >900 MB sur plan Render Starter (512 MB) → restart
-    if (memMB > 900) {
-      await selfRestart(`Mémoire critique: ${memMB} MB`);
+    // Seuil proportionnel au plan, soutenu sur 2 checks pour éviter un restart
+    // sur un pic GC isolé. Défaut: 88 % de 512 MB ≈ 450 MB.
+    const configuredMemoryMB = parseInt(process.env.RENDER_MEMORY_LIMIT_MB || '', 10);
+    const memoryLimitMB = Number.isFinite(configuredMemoryMB) ? Math.max(256, configuredMemoryMB) : 512;
+    const memoryRestartMB = Math.floor(memoryLimitMB * 0.88);
+    state.highMemoryStreak = memMB >= memoryRestartMB ? state.highMemoryStreak + 1 : 0;
+    if (state.highMemoryStreak >= 2) {
+      state.highMemoryStreak = 0;
+      await selfRestart(`Mémoire critique soutenue: ${memMB}/${memoryLimitMB} MB`);
       return;
     }
 
@@ -442,7 +481,7 @@ function startSelfRecovery() {
       await selfRestart(`${openCircuits} circuits ouverts simultanément`);
       return;
     }
-  }, 5 * 60 * 1000).unref();
+  }, 5 * 60 * 1000);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -466,16 +505,21 @@ function initAll({ telegram, shawnId }) {
   startEventLoopWatchdog();
   startSelfRecovery();
 
-  // Heartbeat toutes les 5 min vers GitHub
-  setInterval(heartbeatToGitHub, 5 * 60 * 1000).unref();
-  // Premier heartbeat dans 30s
-  setTimeout(heartbeatToGitHub, 30000).unref();
+  if (process.env.ENABLE_GITHUB_RUNTIME_WRITES === 'true') {
+    // Opt-in seulement: évite une boucle commit → auto-deploy → heartbeat.
+    startNonOverlappingInterval('github-heartbeat', heartbeatToGitHub, 5 * 60 * 1000);
+    setTimeout(heartbeatToGitHub, 30000).unref();
+  } else {
+    startNonOverlappingInterval('local-heartbeat', async () => {
+      state.lastHeartbeat = Date.now();
+    }, 5 * 60 * 1000);
+  }
 
   log('✅ Resilience system armed — 5 couches actives');
   log('   • Crash handlers (uncaught/unhandled)');
   log('   • Event loop watchdog (freeze detect 5s)');
   log('   • Self-recovery (mem > 900MB ou 3+ circuits open)');
-  log('   • Heartbeat GitHub /5min');
+  log(`   • Heartbeat ${process.env.ENABLE_GITHUB_RUNTIME_WRITES === 'true' ? 'GitHub opt-in' : 'local'} /5min`);
   log('   • Circuit breakers + retry universel');
 
   // Notif boot

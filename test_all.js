@@ -36,8 +36,30 @@ function runScript(name, scriptPath, env = {}) {
 // 1. Parser tests
 runScript('Parser tests', path.join(__dirname, 'test_parser.js'));
 
+// Runtime safety: crons non chevauchants, Telegram, HMAC et persistance.
+runScript('Runtime safety', path.join(__dirname, 'test_runtime_safety.js'));
+
+// Preflight: ne pas confondre route campagne 410/HMAC SMS ni backup/template actif.
+runScript('Preflight alerts', path.join(__dirname, 'test_preflight_alerts.js'));
+runScript('Deployment truth guard', path.join(__dirname, 'test_deployment_truth_guard.js'));
+
+// Dates/heures Toronto: calcul déterministe et contradictions bloquées.
+runScript('Calendar guard', path.join(__dirname, 'test_calendar_guard.js'));
+
+// Boucles, consentement CRM/campagnes et snapshots de persistance.
+runScript('Workflow/backups audit', path.join(__dirname, 'scripts/audit-runtime-workflows.js'));
+
 // 2. Firecrawl tests
 runScript('Firecrawl tests', path.join(__dirname, 'test_firecrawl.js'));
+runScript('Matrix exact search', path.join(__dirname, 'test_matrix_exact_search.js'));
+runScript('Matrix authentication', path.join(__dirname, 'test_centris_playwright_auth.js'));
+runScript('Matrix document inventory', path.join(__dirname, 'test_centris_document_inventory.js'));
+runScript('Matrix authenticated browser download', path.join(__dirname, 'test_matrix_browser_download.js'));
+runScript('Matrix PDF structural validation', path.join(__dirname, 'test_pdf_validation.js'));
+runScript('Matrix email preview guard', path.join(__dirname, 'test_matrix_email_preview_guard.js'));
+runScript('Email provider delivery receipt', path.join(__dirname, 'test_email_delivery_receipt.js'));
+runScript('Matrix email MIME', path.join(__dirname, 'test_matrix_email_mime.js'));
+runScript('Tool batch write serialization', path.join(__dirname, 'test_tool_batch.js'));
 
 // 3. Plan quotas inline test
 console.log('\n▶ Plan quotas');
@@ -80,29 +102,33 @@ if (r.status === 0) {
 // 5. Optional smoke boot
 if (runSmoke) {
   console.log('\n▶ Bot smoke boot (3s)');
+  let smokeDependenciesReady = true;
+  try { require.resolve('dotenv'); }
+  catch { smokeDependenciesReady = false; }
+  if (!smokeDependenciesReady) {
+    console.log('  ⏭ smoke SKIP — dépendances npm absentes dans cet environnement local');
+    results.push({ name: 'Smoke boot', status: 'SKIP', detail: 'npm dependencies absent' });
+  } else {
   const env = {
     TELEGRAM_BOT_TOKEN: 'TEST', TELEGRAM_ALLOWED_USER_ID: '1',
     ANTHROPIC_API_KEY: 'test',
   };
-  const child = require('child_process').spawn('node', [path.join(__dirname, 'bot.js')], {
-    env: { ...process.env, ...env }, stdio: 'pipe',
+  // spawnSync capture stdout/stderr correctement. L'ancien busy-wait bloquait
+  // l'event loop, donc les callbacks stdout ne roulaient jamais et le test
+  // déclarait un faux échec avec une sortie vide.
+  const smoke = spawnSync('node', [path.join(__dirname, 'bot.js')], {
+    env: { ...process.env, ...env },
+    encoding: 'utf8',
+    timeout: 3000,
+    killSignal: 'SIGTERM',
   });
-  let output = '';
-  child.stdout.on('data', d => output += d.toString());
-  child.stderr.on('data', d => output += d.toString());
-  // Wait 3s then kill
-  const killTimer = setTimeout(() => child.kill('SIGTERM'), 3000);
-  child.on('exit', () => clearTimeout(killTimer));
-  // Synchronous wait via deasync? Use polling
-  const start = Date.now();
-  while (child.exitCode === null && Date.now() - start < 4000) {
-    require('child_process').execSync('sleep 0.1');
-  }
+  const output = `${smoke.stdout || ''}${smoke.stderr || ''}`;
   const bootedOK = /Kira démarrée/.test(output);
   console.log(bootedOK ? '  ✅ boot OK' : '  ❌ boot FAIL');
   if (!bootedOK) console.log('  Output:', output.substring(0, 500));
   results.push({ name: 'Smoke boot', status: bootedOK ? 'PASS' : 'FAIL', detail: bootedOK ? '"Kira démarrée" trouvé' : 'pas trouvé' });
   if (bootedOK) totalPassed++; else totalFailed++;
+  }
 }
 
 // Résumé

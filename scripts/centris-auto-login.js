@@ -17,7 +17,6 @@ if (!chromium) {
   }
 }
 if (!chromium) { console.error('❌ No playwright module available — install with: npm install rebrowser-playwright'); process.exit(1); }
-const { execSync } = require('child_process');
 const fs = require('fs');
 
 // Log file
@@ -30,12 +29,17 @@ console.log = (...args) => {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch {}
 };
 
-const USER = '110509';
-const PASS = 'Milf1340@';
-const WEBHOOK_SECRET = execSync(`grep -E "^WEBHOOK_SECRET=" /Users/signaturesb/Documents/github/_CORE/config/.env.shared | cut -d= -f2- | tr -d '"'`).toString().trim();
+const USER = process.env.CENTRIS_USER;
+const PASS = process.env.CENTRIS_PASS;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const missingEnv = ['CENTRIS_USER', 'CENTRIS_PASS', 'WEBHOOK_SECRET'].filter(name => !process.env[name]);
+if (missingEnv.length) {
+  console.error(`❌ Variables d'environnement manquantes: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
 
 // Pin existing chromium-1217 binary (MCP installed it)
-const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const CHROME_PATH = process.env.CENTRIS_CHROME_PATH || '/Users/signaturesb/Library/Caches/ms-playwright/chromium-1217/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
 
 (async () => {
   console.log('🚀 Centris auto-login...');
@@ -46,9 +50,6 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
     console.log('1. Login page');
     await page.goto('https://matrix.centris.ca/Matrix/Login.aspx', { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForTimeout(2500);
-    const baselineRowId = parseInt(execSync(`sqlite3 -readonly ~/Library/Messages/chat.db "SELECT MAX(ROWID) FROM message;"`, { encoding: 'utf8' }).trim());
-    console.log(`   Baseline ROWID: ${baselineRowId}`);
-
     console.log('2. Saisir credentials');
     await page.fill('input[id*="UserCode"]', USER);
     await page.fill('input[id="Password"]', PASS);
@@ -121,7 +122,12 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
       await page.waitForTimeout(5000);
       for (let i = 0; i < 45; i++) {
         try {
-          const r = await fetch(`https://signaturesb-bot-s272.onrender.com/admin/centris-mfa-code?token=${WEBHOOK_SECRET}`);
+          // La borne temporelle relie strictement le code à cette tentative.
+          // Sans `after`, un ancien courriel de la dernière heure pouvait être
+          // soumis puis faire échouer inutilement la connexion.
+          const r = await fetch(`https://signaturesb-bot-s272.onrender.com/admin/centris-mfa-code?after=${startWait}`, {
+            headers: { Authorization: `Bearer ${WEBHOOK_SECRET}` },
+          });
           if (r.ok) {
             const j = await r.json();
             if (j.ok && j.code) {
@@ -132,14 +138,10 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
             }
           }
         } catch {}
-        // Fallback chat.db (si SMS Forwarding actif)
-        try {
-          const out = execSync(`sqlite3 -readonly ~/Library/Messages/chat.db "SELECT text FROM message WHERE ROWID > ${baselineRowId} AND is_from_me=0 ORDER BY ROWID DESC LIMIT 5;"`, { encoding: 'utf8' });
-          for (const line of out.split('\n')) {
-            const m = line.match(/\b(\d{6})\b/);
-            if (m) { code = m[1]; console.log(`   ✅ Code via chat.db: ${code.substring(0,2)}****`); break; }
-          }
-        } catch {}
+        // Aucun scan direct de Messages: un nombre à six chiffres provenant
+        // d'un autre expéditeur ne doit jamais être accepté comme MFA Centris.
+        // Le pont SMS authentifié du bot ou /mfa pendant l'attente restent les
+        // chemins de secours sûrs.
         if (code) break;
         await page.waitForTimeout(2000);
         if (i % 5 === 0) console.log(`   ... ${i*2}s elapsed`);
@@ -172,7 +174,7 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
 
     console.log('6. Push cookies au bot');
     const r = await fetch('https://signaturesb-bot-s272.onrender.com/admin/centris-cookies', {
-      method: 'POST', headers: { 'Content-Type': 'text/plain', 'X-Webhook-Secret': WEBHOOK_SECRET }, body: cs,
+      method: 'POST', headers: { 'Content-Type': 'text/plain', Authorization: `Bearer ${WEBHOOK_SECRET}` }, body: cs,
     });
     console.log(`   Bot cookies: ${r.status} ${(await r.text()).substring(0, 200)}`);
 
@@ -180,7 +182,7 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
     try {
       const r2 = await fetch('https://signaturesb-bot-s272.onrender.com/admin/centris-storage-state', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': WEBHOOK_SECRET },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WEBHOOK_SECRET}` },
         body: JSON.stringify({ storageState, userAgent }),
       });
       console.log(`   Bot storageState: ${r2.status} ${(await r2.text()).substring(0, 200)}`);
@@ -201,7 +203,7 @@ const CHROME_PATH = '/Users/signaturesb/Library/Caches/ms-playwright/chromium-12
     console.error(`❌ ${e.message}`);
     // Telegram alert via bot API direct (besoin TELEGRAM_BOT_TOKEN)
     try {
-      const tgToken = process.env.TELEGRAM_BOT_TOKEN || execSync('grep TELEGRAM_BOT_TOKEN /Users/signaturesb/Documents/github/_CORE/config/.env.shared 2>/dev/null | cut -d= -f2-').toString().trim();
+      const tgToken = process.env.TELEGRAM_BOT_TOKEN;
       const userId = process.env.TELEGRAM_ALLOWED_USER_ID || '5261213272';
       if (tgToken && tgToken.length > 20) {
         await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {

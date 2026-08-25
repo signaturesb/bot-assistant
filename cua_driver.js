@@ -25,6 +25,13 @@
 
 const fs   = require('fs');
 const path = require('path');
+const nodeCrypto = require('crypto');
+const {
+  readSessionFile,
+  removeSessionFile,
+  writeSessionFile,
+} = require('./lib/centris_session_store');
+const { validatePdfBuffer } = require('./lib/pdf_validation');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -32,15 +39,1029 @@ const path = require('path');
 
 const DATA_DIR       = fs.existsSync('/data') ? '/data' : '/tmp';
 const SESSION_FILE   = path.join(DATA_DIR, 'cua_session.json');
+const STORAGE_STATE_FILE = path.join(DATA_DIR, 'centris_storage_state.json');
 const SCREENSHOT_DIR = path.join(DATA_DIR, 'cua_screenshots');
 const PDF_DIR        = path.join(DATA_DIR, 'cua_pdfs');
-const SESSION_TTL    = 12 * 60 * 60 * 1000;   // 12h — refresh auto
+const SESSION_TTL    = clampDurationMs(process.env.CENTRIS_SESSION_TTL_MS, 25 * 24 * 60 * 60 * 1000, 60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000);
 const MAX_STEPS      = 25;                      // iterations max par tâche
 const VIEWPORT       = { width: 1280, height: 900 };
 // Centris a migré 2026: agent.centris.ca retiré → matrix.centris.ca
 const CENTRIS_BASE   = 'https://matrix.centris.ca';
 const MATRIX_BASE    = 'https://matrix.centris.ca';
 const PUBLIC_BASE    = 'https://www.centris.ca';
+const MANUAL_MFA_TTL = 2 * 60 * 1000;
+const MATRIX_DOCUMENT_FILE_MAX_BYTES = 25 * 1024 * 1024;
+const MATRIX_DOCUMENT_TOTAL_MAX_BYTES = 120 * 1024 * 1024;
+const MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS = 3;
+const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
+
+// Ces erreurs sont déterministes: les répéter charge Matrix sans augmenter les
+// chances de succès. Les erreurs réseau, timeouts et wrappers HTML restent, eux,
+// réessayables car une nouvelle requête authentifiée peut alors réussir.
+const MATRIX_DOCUMENT_NON_RETRYABLE_RE = /MATRIX_DOCUMENT_(?:TOO_LARGE|URL_REJECTED|ACTION_INVALID|ACTION_MISSING)/;
+
+function isMatrixDocumentRetryable(error) {
+  return !MATRIX_DOCUMENT_NON_RETRYABLE_RE.test(safeErrorMessage(error));
+}
+
+function clampDurationMs(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Math.max(min, Math.min(Number.isFinite(parsed) && parsed > 0 ? parsed : fallback, max));
+}
+
+// Pont MFA en mémoire entre Telegram (/mfa) et la session Playwright active.
+// Le code est accepté uniquement pendant une attente MFA, consommé une fois,
+// puis oublié. Il n'est jamais écrit sur disque ni journalisé.
+let centrisMFAWaiting = false;
+let pendingManualMFACode = null;
+let activeCentrisLoginPromise = null;
+const zonePreviewInFlight = new Map();
+
+function isAwaitingCentrisMFA() {
+  return centrisMFAWaiting;
+}
+
+function ingestManualMFACode(code) {
+  const normalized = String(code || '').trim();
+  if (!centrisMFAWaiting || !/^\d{6}$/.test(normalized)) return false;
+  pendingManualMFACode = { code: normalized, receivedAt: Date.now() };
+  return true;
+}
+
+function takeManualMFACode() {
+  const pending = pendingManualMFACode;
+  pendingManualMFACode = null;
+  if (!pending || Date.now() - pending.receivedAt > MANUAL_MFA_TTL) return null;
+  return pending.code;
+}
+
+function hasExplicitCentrisSendConfirmation(value) {
+  return EXPLICIT_CENTRIS_SEND_RE.test(String(value || '').trim());
+}
+
+const CENTRIS_DASH_RE = /[\u2010-\u2015\u2212]/g;
+
+function normalizeCentrisLabel(label, { stripAccents = false } = {}) {
+  let normalized = String(label || '')
+    .normalize('NFC')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(CENTRIS_DASH_RE, '-')
+    .replace(/[\u00A0\u2000-\u200B\s]+/g, ' ')
+    .trim();
+  if (stripAccents) {
+    normalized = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  }
+  return normalized;
+}
+
+function normalizeCentrisMatchKey(label) {
+  return normalizeCentrisLabel(label, { stripAccents: true }).toLowerCase();
+}
+
+function extractCentrisLotNumber(label) {
+  const match = normalizeCentrisLabel(label).match(/\blot\s*([0-9][0-9\s]*[0-9]|[0-9])\b/i);
+  return match ? match[1].replace(/\s+/g, '') : null;
+}
+
+function parseCentrisDisplaySize(sizeDisplay) {
+  if (sizeDisplay === null || sizeDisplay === undefined || sizeDisplay === '') return null;
+  const match = String(sizeDisplay).trim().match(/^([0-9]+(?:[.,][0-9]+)?)\s*([kmg])(?:o|b)?$/i);
+  if (!match) return null;
+  const amount = Number.parseFloat(match[1].replace(',', '.'));
+  if (!Number.isFinite(amount)) return null;
+  const unit = match[2].toLowerCase();
+  const multiplier = unit === 'k' ? 1024 : unit === 'm' ? 1024 ** 2 : 1024 ** 3;
+  return Math.round(amount * multiplier);
+}
+
+const CENTRIS_DOCUMENT_CATEGORIES = Object.freeze([
+  {
+    key: 'declaration_vendeur_principale',
+    label: 'Déclaration du vendeur (principale)',
+    test: (doc) => doc.source_section === 'principal_dv' || (
+      doc.source_section !== 'additional_documents' &&
+      !/modification/.test(doc.match_key) &&
+      (/declaration.*vendeur/.test(doc.match_key) || /(^|\s)oui\s+dv[-\s]?\d+/.test(doc.match_key) || /^dv[-\s]?\d+/.test(doc.match_key) || /\bdv\b/.test(doc.match_key))
+    ),
+  },
+  { key: 'modification_dv', label: 'Modification de la déclaration du vendeur', test: (doc) => /modification/.test(doc.match_key) && (/\bdv\b/.test(doc.match_key) || /declaration/.test(doc.match_key)) },
+  { key: 'fiche_detaillee', label: 'Fiche détaillée', test: (doc) => /fiche/.test(doc.match_key) || /descriptive/.test(doc.match_key) || /\bdetail/.test(doc.match_key) },
+  { key: 'plan_cadastral', label: 'Plan cadastral', test: (doc) => /cadastr/.test(doc.match_key) },
+  { key: 'plan_autre', label: 'Autre plan', test: (doc) => /\bplan\b/.test(doc.match_key) || /implantation/.test(doc.match_key) },
+  { key: 'certificat_localisation', label: 'Certificat de localisation', test: (doc) => /certificat.*localisation/.test(doc.match_key) || /\bcert\.?\s*loc/.test(doc.match_key) },
+  { key: 'taxes_scolaires', label: 'Taxes scolaires', test: (doc) => /taxe.*scolair/.test(doc.match_key) },
+  { key: 'taxes_municipales', label: 'Taxes municipales', test: (doc) => /taxe.*municip/.test(doc.match_key) },
+  { key: 'role_evaluation', label: "Rôle d'évaluation", test: (doc) => /role.*evaluation/.test(doc.match_key) },
+  { key: 'obligation_courtier', label: 'Obligation du courtier', test: (doc) => /obligation.*courtier/.test(doc.match_key) },
+]);
+
+const CENTRIS_CATEGORY_LABELS = Object.freeze(Object.fromEntries(
+  CENTRIS_DOCUMENT_CATEGORIES.map((category) => [category.key, category.label])
+));
+
+function stableCentrisManifestId(payload) {
+  return nodeCrypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function canonicalCentrisDocumentLocator(doc = {}) {
+  if (doc.action_id) return `action:${String(doc.action_id).trim()}`;
+  if (!doc.url) return null;
+  try {
+    const parsed = new URL(String(doc.url));
+    parsed.hash = '';
+    return `url:${parsed.toString()}`;
+  } catch {
+    return `url:${String(doc.url).trim().replace(/#.*$/, '')}`;
+  }
+}
+
+// Matrix peut rendre le même contrôle dans le document principal et dans un
+// iframe. On retire uniquement les copies qui pointent vers le même contrôle;
+// deux fichiers de même nom/taille mais avec des liens distincts sont conservés.
+function dedupeCentrisDiscoveredDocs(docs = []) {
+  const seenLocators = new Set();
+  const result = [];
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    const locator = canonicalCentrisDocumentLocator(doc);
+    const label = normalizeCentrisMatchKey(doc?.label_original || doc?.name || '');
+    const key = locator ? `${locator}|${label}` : null;
+    if (key && seenLocators.has(key)) continue;
+    if (key) seenLocators.add(key);
+    result.push(doc);
+  }
+  return result;
+}
+
+function canonicalManifestDocs(docs, { includeContent = false } = {}) {
+  return docs.map((doc) => {
+    const item = {
+      category: doc.category,
+      label_key: doc.match_key,
+      lot: doc.lot,
+      size_bytes: doc.size_bytes,
+    };
+    if (includeContent) {
+      item.actual_size_bytes = doc.actual_size_bytes;
+      item.page_count = doc.page_count;
+      item.sha256 = doc.sha256;
+    }
+    return item;
+  }).sort((a, b) => {
+    const left = JSON.stringify(a);
+    const right = JSON.stringify(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+}
+
+function buildCentrisContentManifest(centrisNum, docs = []) {
+  const list = Array.isArray(docs) ? docs : [];
+  if (!list.length) {
+    return {
+      complete: false,
+      content_manifest_id: null,
+      incomplete_document_ids: [],
+      error_code: 'CENTRIS_DOCUMENT_LIST_EMPTY',
+    };
+  }
+  const incomplete = list.filter((doc) =>
+    !/^[a-f0-9]{64}$/i.test(String(doc?.sha256 || '')) ||
+    !Number.isInteger(doc?.page_count) || doc.page_count < 1 ||
+    !Number.isInteger(doc?.actual_size_bytes) || doc.actual_size_bytes < 1
+  );
+  if (incomplete.length) {
+    return {
+      complete: false,
+      content_manifest_id: null,
+      incomplete_document_ids: incomplete.map((doc) => doc?.id || null),
+    };
+  }
+  return {
+    complete: true,
+    content_manifest_id: stableCentrisManifestId({
+      centris_num: String(centrisNum || ''),
+      docs: canonicalManifestDocs(list, { includeContent: true }),
+    }),
+    incomplete_document_ids: [],
+  };
+}
+
+function addCentrisContentMetadata(doc, bytes, pageCount) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || '');
+  if (!buffer.length) throw new Error('CENTRIS_DOCUMENT_EMPTY');
+  if (buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+    throw new Error('CENTRIS_DOCUMENT_NOT_PDF');
+  }
+  if (!Number.isInteger(pageCount) || pageCount < 1) throw new Error('CENTRIS_DOCUMENT_PAGE_COUNT_INVALID');
+  return {
+    ...doc,
+    actual_size_bytes: buffer.length,
+    page_count: pageCount,
+    sha256: nodeCrypto.createHash('sha256').update(buffer).digest('hex'),
+  };
+}
+
+function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
+  const rawList = dedupeCentrisDiscoveredDocs(docs);
+  const identityOccurrences = new Map();
+  const normalizedDocs = rawList.map((doc, index) => {
+    const labelOriginal = String(doc?.label_original || doc?.name || '').trim();
+    const sizeDisplay = doc?.size_display ?? doc?.size ?? null;
+    const labelNormalized = normalizeCentrisLabel(labelOriginal);
+    const sourceSection = String(doc?.source_section || '').trim() || null;
+    const provenance = String(doc?.provenance || '').trim() || 'unknown';
+    const locator = canonicalCentrisDocumentLocator(doc);
+    const identity = [normalizeCentrisMatchKey(labelOriginal), String(sizeDisplay || ''),
+      sourceSection || '', provenance, locator || 'unresolved'].join('|');
+    const occurrence = identityOccurrences.get(identity) || 0;
+    identityOccurrences.set(identity, occurrence + 1);
+    return {
+      id: nodeCrypto.createHash('sha256').update(`${identity}|${occurrence}`).digest('hex').slice(0, 16),
+      name: labelOriginal,
+      size: sizeDisplay === null ? null : String(sizeDisplay).trim(),
+      label_original: labelOriginal,
+      label_normalized: labelNormalized,
+      match_key: normalizeCentrisMatchKey(labelOriginal),
+      category: null,
+      subtype: doc?.subtype || null,
+      size_display: sizeDisplay === null ? null : String(sizeDisplay).trim(),
+      size_bytes: parseCentrisDisplaySize(sizeDisplay),
+      actual_size_bytes: Number.isInteger(doc?.actual_size_bytes) ? doc.actual_size_bytes : null,
+      lot: extractCentrisLotNumber(labelOriginal),
+      order: index,
+      provenance,
+      source_section: sourceSection,
+      url: doc?.url || null,
+      action_id: doc?.action_id || null,
+      page_count: Number.isInteger(doc?.page_count) ? doc.page_count : null,
+      sha256: /^[a-f0-9]{64}$/i.test(String(doc?.sha256 || '')) ? String(doc.sha256).toLowerCase() : null,
+    };
+  }).filter((doc) => doc.label_original);
+
+  const claimed = new Set();
+  const byCategory = new Map(CENTRIS_DOCUMENT_CATEGORIES.map((category) => [category.key, []]));
+  for (const category of CENTRIS_DOCUMENT_CATEGORIES) {
+    for (const doc of normalizedDocs) {
+      if (claimed.has(doc.id) || !category.test(doc)) continue;
+      doc.category = category.key;
+      claimed.add(doc.id);
+      byCategory.get(category.key).push(doc);
+    }
+  }
+
+  const unclassified = normalizedDocs.filter((doc) => !claimed.has(doc.id));
+  for (const doc of unclassified) doc.category = 'document_autre';
+
+  const present = CENTRIS_DOCUMENT_CATEGORIES.flatMap((category) => {
+    const categoryDocs = byCategory.get(category.key);
+    return categoryDocs.length ? [{
+      key: category.key,
+      label: category.label,
+      docs: categoryDocs,
+      matches: categoryDocs.map((doc) => doc.label_original),
+    }] : [];
+  });
+  if (unclassified.length) {
+    present.push({
+      key: 'document_autre',
+      label: 'Autre document',
+      docs: unclassified,
+      matches: unclassified.map((doc) => doc.label_original),
+    });
+  }
+
+  const requestedExpectedCategories = [...new Set(
+    Array.isArray(options.expectedCategories) ? options.expectedCategories : []
+  )];
+  const invalidExpectedCategories = requestedExpectedCategories
+    .filter((key) => !Object.prototype.hasOwnProperty.call(CENTRIS_CATEGORY_LABELS, key));
+  const expectedCategories = requestedExpectedCategories
+    .filter((key) => Object.prototype.hasOwnProperty.call(CENTRIS_CATEGORY_LABELS, key));
+  const missingExpectedDocuments = expectedCategories
+    .filter((key) => !(byCategory.get(key) || []).length)
+    .map((key) => ({ key, label: CENTRIS_CATEGORY_LABELS[key] }));
+
+  const inventoryManifestId = stableCentrisManifestId({
+    centris_num: String(centrisNum || ''),
+    docs: canonicalManifestDocs(normalizedDocs),
+  });
+  const contentManifest = buildCentrisContentManifest(centrisNum, normalizedDocs);
+  return {
+    docs: normalizedDocs,
+    present,
+    known_categories: Object.keys(CENTRIS_CATEGORY_LABELS),
+    expected_documents: expectedCategories,
+    invalid_expected_categories: invalidExpectedCategories,
+    inventory_valid: invalidExpectedCategories.length === 0,
+    missing_expected_documents: missingExpectedDocuments,
+    missing: missingExpectedDocuments,
+    inventory_manifest_id: inventoryManifestId,
+    manifest_id: inventoryManifestId,
+    content_manifest_id: contentManifest.content_manifest_id,
+    content_validation_complete: contentManifest.complete,
+  };
+}
+
+function redactCentrisDocumentInventory(inventory = {}) {
+  const redactDoc = (doc = {}) => {
+    const { url, action_id, match_key, ...safeDoc } = doc;
+    return safeDoc;
+  };
+  const safeDocs = (Array.isArray(inventory.docs) ? inventory.docs : []).map(redactDoc);
+  const safeById = new Map(safeDocs.map((doc) => [doc.id, doc]));
+  const present = (Array.isArray(inventory.present) ? inventory.present : []).map((entry) => ({
+    ...entry,
+    docs: (Array.isArray(entry.docs) ? entry.docs : []).map((doc) => safeById.get(doc.id) || redactDoc(doc)),
+  }));
+  return { ...inventory, docs: safeDocs, present };
+}
+
+function mergeMatrixDocumentSnapshots(snapshots = []) {
+  const ranked = [...snapshots].sort((left, right) => {
+    const score = (item) => (item.exactListingMentioned ? 1000 : 0) + (item.docs?.length || 0) * 10;
+    return score(right) - score(left);
+  });
+  const primary = ranked[0] || null;
+  if (!primary) return null;
+  return {
+    ...primary,
+    docs: dedupeCentrisDiscoveredDocs(ranked.flatMap((snapshot) => snapshot.docs || [])),
+    mediaLinkCount: ranked.reduce((total, snapshot) => total + Number(snapshot.mediaLinkCount || 0), 0),
+  };
+}
+
+function classifyZonePageSnapshot(snapshot = {}, centrisNum = '') {
+  const url = String(snapshot.url || '');
+  const title = String(snapshot.title || '');
+  const text = String(snapshot.text || '');
+  const combined = `${title}\n${text}`;
+  const num = String(centrisNum || '').replace(/\D/g, '');
+  const listingMentioned = num ? new RegExp(`(^|\\D)${num}(\\D|$)`).test(combined) : false;
+
+  if (/accounts\.centris\.ca|\/signin|\/login/i.test(url) || snapshot.passwordInputs > 0 ||
+      /connectez-vous|ouvrir une session|mot de passe/i.test(combined)) {
+    return { code: 'ZONE_AUTH_REQUIRED', listingMentioned };
+  }
+  if (/acc[eè]s refus[ée]|non autoris[ée]|forbidden|permission insuffisante/i.test(combined)) {
+    return { code: 'ZONE_FORBIDDEN', listingMentioned };
+  }
+  if (/page introuvable|listing introuvable|inscription introuvable|aucun r[ée]sultat|not found|erreur 404/i.test(combined)) {
+    return { code: 'ZONE_LISTING_NOT_FOUND', listingMentioned };
+  }
+  if ((snapshot.checkboxCount > 0 || snapshot.shareButtonCount > 0) &&
+      (listingMentioned || /\/Listings\//i.test(url))) {
+    return { code: 'ZONE_DOCUMENTS_READY', listingMentioned };
+  }
+  if (/aucun document|pas de document|no documents/i.test(combined) &&
+      (listingMentioned || /\/Listings\//i.test(url))) {
+    return { code: 'ZONE_NO_DOCUMENTS', listingMentioned };
+  }
+  return { code: 'ZONE_NAVIGATION_UNVERIFIED', listingMentioned };
+}
+
+async function inspectZonePage(page, centrisNum) {
+  const snapshot = await page.evaluate(() => ({
+    url: location.href,
+    title: document.title,
+    text: String(document.body?.innerText || '').replace(/\s+/g, ' ').trim().substring(0, 1200),
+    passwordInputs: document.querySelectorAll('input[type=password]').length,
+    checkboxCount: document.querySelectorAll('input[type=checkbox]:not([disabled])').length,
+    shareButtonCount: [...document.querySelectorAll('button,a')]
+      .filter((el) => /partager les documents/i.test(el.textContent || el.getAttribute('title') || '')).length,
+    controls: [...document.querySelectorAll('input,button,a')]
+      .filter((el) => {
+        const style = getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      })
+      .slice(0, 40)
+      .map((el) => ({
+        tag: el.tagName.toLowerCase(),
+        type: el.getAttribute('type') || '',
+        text: String(el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim().substring(0, 80),
+        href: String(el.getAttribute('href') || '').split('?')[0].split('#')[0].substring(0, 120),
+      })),
+  }));
+  return { ...snapshot, ...classifyZonePageSnapshot(snapshot, centrisNum) };
+}
+
+async function waitForZoneAppReady(page, timeoutMs = 15000) {
+  try {
+    await page.waitForFunction(() => {
+      const body = document.body;
+      if (!body) return false;
+      const textReady = String(body.innerText || '').trim().length > 0;
+      const uiReady = !!body.querySelector('input, button, a, table, [role="button"], [role="row"], [role="main"]');
+      return textReady || uiReady;
+    }, null, { timeout: timeoutMs, polling: 250 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function navigateToZoneDocuments(page, centrisNum) {
+  const attempts = [];
+  const inspect = async (label) => {
+    const state = await inspectZonePage(page, centrisNum);
+    const safeLocation = safeCentrisPageLocation(state.url);
+    attempts.push({ label, code: state.code, url: safeLocation, title: state.title });
+    console.log(`[ZONE-NAV] ${label}: ${state.code} page=${safeLocation}`);
+    if (state.code === 'ZONE_NAVIGATION_UNVERIFIED') {
+      // Diagnostic sans secret: seulement titre, extrait de texte et contrôles
+      // visibles. Permet d'adapter les sélecteurs si Centris change son UI.
+      console.log(`[ZONE-DIAG] ${label}: ${JSON.stringify({
+        title: state.title,
+        text: String(state.text || '').substring(0, 500),
+        controls: state.controls,
+      })}`);
+    }
+    return state;
+  };
+
+  const directUrl = `https://zone.centris.ca/Listings/${centrisNum}/Documents`;
+  const response = await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const directReady = await waitForZoneAppReady(page);
+  let state = await inspect('direct-documents');
+  state.httpStatus = response?.status?.() || null;
+  if (!directReady) state = { ...state, code: 'ZONE_APP_BLANK' };
+  if (['ZONE_DOCUMENTS_READY', 'ZONE_NO_DOCUMENTS', 'ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN'].includes(state.code)) {
+    return { state, attempts };
+  }
+
+  // If a bookmarked route changed, use Zone's own Dashboard search and follow
+  // the exact listing instead of guessing alternate Centris numbers.
+  await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const dashboardReady = await waitForZoneAppReady(page);
+  state = await inspect('dashboard');
+  if (!dashboardReady) {
+    return { state: { ...state, code: 'ZONE_APP_BLANK' }, attempts };
+  }
+  if (['ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN'].includes(state.code)) return { state, attempts };
+
+  const search = page.locator([
+    'input[type=search]',
+    'input[placeholder*="recherch" i]',
+    'input[placeholder*="centris" i]',
+    'input[placeholder*="inscription" i]',
+    'input[name*="search" i]',
+  ].join(',')).first();
+  if (!(await search.isVisible({ timeout: 2500 }).catch(() => false))) {
+    return { state: { ...state, code: 'ZONE_SEARCH_CONTROL_MISSING' }, attempts };
+  }
+  await search.fill(String(centrisNum));
+  await search.press('Enter');
+  await page.waitForTimeout(3000);
+  state = await inspect('dashboard-search');
+  if (['ZONE_AUTH_REQUIRED', 'ZONE_FORBIDDEN', 'ZONE_LISTING_NOT_FOUND'].includes(state.code)) return { state, attempts };
+
+  const exactListingLink = page.locator(`a[href*="/Listings/${centrisNum}"]`).first();
+  if (await exactListingLink.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await exactListingLink.click();
+    await page.waitForTimeout(2500);
+    state = await inspect('exact-listing');
+  } else if (!state.listingMentioned) {
+    return { state: { ...state, code: 'ZONE_LISTING_NOT_FOUND' }, attempts };
+  }
+
+  const documentsTab = page.locator('a[href*="/Documents"], a:has-text("Documents"), button:has-text("Documents")').first();
+  if (!(await documentsTab.isVisible({ timeout: 2500 }).catch(() => false))) {
+    return { state: { ...state, code: 'ZONE_DOCUMENTS_TAB_MISSING' }, attempts };
+  }
+  await documentsTab.click();
+  await page.waitForTimeout(2500);
+  state = await inspect('documents-tab');
+  return { state, attempts };
+}
+
+function classifyMatrixPageSnapshot(snapshot = {}, centrisNum = '') {
+  const url = String(snapshot.url || '');
+  const text = String(snapshot.text || '');
+  const num = String(centrisNum || '').replace(/\D/g, '');
+  const exactListingMentioned = snapshot.exactListingMentioned === true ||
+    (num ? new RegExp(`(^|\\D)${num}(\\D|$)`).test(text) : false);
+  if (/accounts\.centris\.ca|\/signin|\/login/i.test(url) || snapshot.passwordInputs > 0) {
+    return { code: 'MATRIX_AUTH_REQUIRED', exactListingMentioned };
+  }
+  if (/aucun r[ée]sultat|no results|inscription introuvable/i.test(text)) {
+    return { code: 'MATRIX_LISTING_NOT_FOUND', exactListingMentioned };
+  }
+  // Une page de résultats peut contenir le numéro exact ET un lien générique
+  // media.ashx (ex. « Consultez le guide »). Elle ne doit jamais être prise
+  // pour la fiche détaillée: il faut une preuve structurelle de la fiche.
+  const detailEvidence = snapshot.detailEvidence === true;
+  const documentCount = Array.isArray(snapshot.docs) ? snapshot.docs.length : 0;
+  if (exactListingMentioned && detailEvidence && documentCount > 0) {
+    return { code: 'MATRIX_DOCUMENTS_READY', exactListingMentioned };
+  }
+  if (exactListingMentioned && detailEvidence) {
+    return { code: 'MATRIX_LISTING_READY_NO_DOCUMENTS', exactListingMentioned };
+  }
+  return { code: 'MATRIX_NAVIGATION_UNVERIFIED', exactListingMentioned };
+}
+
+async function findMatrixGlobalSearch(page) {
+  const selectors = [
+    '#QueryText',
+    'input[id*="QueryText" i]',
+    'input[name*="QueryText" i]',
+    'input[id*="Search" i]',
+    'input[name*="Search" i]',
+    'input[type="search"]',
+    'input[placeholder*="recherch" i]',
+    'input[placeholder*="centris" i]',
+    'input[placeholder*="mls" i]',
+  ];
+
+  // Matrix est une application ASP.NET dont l'identifiant du champ global
+  // peut varier entre les déploiements. Chercher d'abord les attributs
+  // sémantiques, puis choisir le grand champ éditable placé dans l'en-tête.
+  // Le parcours est répété pendant l'hydratation et inclut les frames.
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    for (const frame of page.frames()) {
+      // Ne pas limiter ce chemin aux 50 premiers champs: la page Recherche
+      // Matrix contient beaucoup de critères et la barre globale peut être
+      // rendue plus loin dans le DOM. Les sélecteurs ciblés ont déjà prouvé
+      // leur fonctionnement sur l'interface réelle.
+      for (const selector of selectors) {
+        const candidates = frame.locator(selector);
+        const selectorCount = Math.min(await candidates.count().catch(() => 0), 20);
+        for (let index = 0; index < selectorCount; index += 1) {
+          const candidate = candidates.nth(index);
+          if (!(await candidate.isVisible().catch(() => false)) ||
+              !(await candidate.isEnabled().catch(() => false)) ||
+              !(await candidate.isEditable().catch(() => false))) continue;
+          const box = await candidate.boundingBox().catch(() => null);
+          if (!box || box.width < 240 || box.height < 18) continue;
+          const meta = await candidate.evaluate((el) => [
+            el.id, el.getAttribute('name'), el.getAttribute('placeholder'),
+            el.getAttribute('aria-label'), el.getAttribute('class'), el.getAttribute('type'),
+          ].filter(Boolean).join(' ')).catch(() => '');
+          if (scoreMatrixSearchCandidate(meta, box) >= 100) return candidate;
+        }
+      }
+
+      const inputs = frame.locator('input:not([type]), input[type="text"], input[type="search"]');
+      // Matrix peut rendre la barre globale sans id/name/placeholder utile.
+      // Ne pas supposer qu'elle figure parmi les 50 premiers contrôles: les
+      // formulaires de critères ASP.NET peuvent injecter de nombreux champs.
+      const count = Math.min(await inputs.count().catch(() => 0), 200);
+      let best = null;
+      let bestScore = -1;
+      for (let index = 0; index < count; index += 1) {
+        const input = inputs.nth(index);
+        if (!(await input.isVisible().catch(() => false)) ||
+            !(await input.isEnabled().catch(() => false)) ||
+            !(await input.isEditable().catch(() => false))) continue;
+        const box = await input.boundingBox().catch(() => null);
+        if (!box || box.width < 240 || box.height < 18) continue;
+        const meta = await input.evaluate((el) => [
+          el.id, el.getAttribute('name'), el.getAttribute('placeholder'),
+          el.getAttribute('aria-label'), el.getAttribute('class'), el.getAttribute('type'),
+          el.parentElement?.id, el.parentElement?.className,
+          el.parentElement?.parentElement?.id, el.parentElement?.parentElement?.className,
+          el.nextElementSibling?.id, el.nextElementSibling?.className,
+          el.nextElementSibling?.getAttribute?.('title'),
+          el.nextElementSibling?.getAttribute?.('aria-label'),
+        ].filter(Boolean).join(' ')).catch(() => '');
+        const score = scoreMatrixSearchCandidate(meta, box);
+        if (score > bestScore) { best = input; bestScore = score; }
+      }
+      // Un champ de formulaire ordinaire (ville, prix, nom du client, etc.) ne
+      // doit jamais être choisi seulement parce qu'il est large ou dans le haut
+      // de la page. Il faut une preuve sémantique qu'il s'agit de la recherche
+      // globale Matrix.
+      if (best && bestScore >= 100) return best;
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
+async function openMatrixGlobalSearch(page) {
+  // La démonstration vidéo de Shawn montre que la recherche se fait dans la
+  // barre blanche persistante de l'en-tête Matrix (Home/Results.aspx), pas sur
+  // la page de critères /Matrix/Recherche. Réutiliser d'abord la page rendue
+  // après connexion, puis revenir à Home seulement si l'en-tête n'y est pas.
+  let search = await findMatrixGlobalSearch(page);
+  if (search) return search;
+  await page.goto(`${MATRIX_BASE}/Matrix/Home`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(2500);
+  return findMatrixGlobalSearch(page);
+}
+
+async function submitMatrixGlobalSearch(page, search, centrisNum) {
+  await search.fill(centrisNum);
+  await search.press('Enter');
+  await page.waitForTimeout(2500);
+
+  let state = await inspectMatrixListingPage(page, centrisNum);
+  if (state.exactListingMentioned) return { ...state, submit_via: 'enter' };
+
+  // Matrix peut réhydrater l'en-tête après Enter. L'ancien locator devient
+  // alors détaché même si une nouvelle barre identique est visible. Toujours
+  // résoudre le contrôle dans le DOM courant avant le clic de repli.
+  const currentSearch = await findMatrixGlobalSearch(page) || search;
+  await currentSearch.fill(centrisNum).catch(() => {});
+
+  // Identifiants observés directement dans Matrix v12.6 de Shawn.
+  // Le nom du bouton est plus stable que son id ASP.NET (vide actuellement).
+  const exactSubmit = currentSearch.locator('xpath=..').locator('button[name="MagnifyingGlass"], button[aria-label="Recherche"]');
+  if (await exactSubmit.first().isVisible().catch(() => false)) {
+    await exactSubmit.first().click({ timeout: 10000 });
+    await page.waitForTimeout(3500);
+    state = await inspectMatrixListingPage(page, centrisNum);
+    if (state.exactListingMentioned) return { ...state, submit_via: 'named-magnifying-glass' };
+  }
+
+  // Matrix v12.6 ne traite pas toujours Entrée. La vidéo de Shawn montre une
+  // loupe immédiatement à droite de la barre. Repérer le contrôle visible le
+  // plus à droite dans les deux conteneurs parents, plutôt que des coordonnées
+  // d'écran ou un identifiant ASP.NET instable. Le X d'effacement est à gauche
+  // de la loupe; le bouton de recherche obtient donc le meilleur score.
+  const inputBox = await currentSearch.boundingBox().catch(() => null);
+  let best = null;
+  let bestScore = -Infinity;
+  for (const scope of [currentSearch.locator('xpath=..'), currentSearch.locator('xpath=../..')]) {
+    const controls = scope.locator('button, input[type="submit"], a, [role="button"]');
+    const count = Math.min(await controls.count().catch(() => 0), 20);
+    for (let index = 0; index < count; index += 1) {
+      const control = controls.nth(index);
+      if (!(await control.isVisible().catch(() => false)) || !(await control.isEnabled().catch(() => false))) continue;
+      const box = await control.boundingBox().catch(() => null);
+      if (!box || !inputBox) continue;
+      const meta = await control.evaluate((el) => [
+        el.id, el.getAttribute('name'), el.getAttribute('class'),
+        el.getAttribute('title'), el.getAttribute('aria-label'), el.textContent,
+      ].filter(Boolean).join(' ')).catch(() => '');
+      const score = scoreMatrixSubmitControl(meta, inputBox, box);
+      if (score > bestScore) { best = control; bestScore = score; }
+    }
+  }
+  if (best && Number.isFinite(bestScore)) {
+    await best.click({ timeout: 10000 });
+    const deadline = Date.now() + 10000;
+    do {
+      await page.waitForTimeout(500);
+      state = await inspectMatrixListingPage(page, centrisNum);
+      if (state.exactListingMentioned) break;
+    } while (Date.now() < deadline);
+    return { ...state, submit_via: 'adjacent-search-button' };
+  }
+  return { ...state, submit_via: 'no-adjacent-search-button' };
+}
+
+function scoreMatrixSubmitControl(meta = '', inputBox = {}, box = {}) {
+  const right = Number(inputBox.x) + Number(inputBox.width);
+  if (![right, inputBox.y, inputBox.height, box.x, box.y, box.width, box.height].every(Number.isFinite)) return -Infinity;
+  const visibleSize = box.width > 0 && box.height > 0 && box.width <= 140 && box.height <= 100;
+  const immediatelyRight = box.x >= right - 8 && box.x <= right + 160;
+  const verticallyAligned = box.y < Number(inputBox.y) + Number(inputBox.height) + 8 &&
+    box.y + box.height > Number(inputBox.y) - 8;
+  if (!visibleSize || !immediatelyRight || !verticallyAligned) return -Infinity;
+  const value = String(meta || '');
+  if (/clear|effacer|close|fermer|reset/i.test(value)) return -Infinity;
+  let score = 1000 - Math.abs(box.x - right);
+  if (/search|recherch|loupe|magnif|submit/i.test(value)) score += 10000;
+  return score;
+}
+
+function scoreMatrixSearchCandidate(meta = '', box = {}) {
+  const value = String(meta || '');
+  let score = 0;
+  if (/\bquerytext\b/i.test(value)) score += 250;
+  if (/global|omni|quick/i.test(value)) score += 140;
+  if (/centris|\bmls\b/i.test(value)) score += 130;
+  if (/query|search|recherch|keyword/i.test(value)) score += 100;
+  if (/\bcrit[eè]re/i.test(value)) score += 40;
+  if (Number(box.width) >= 600) score += 35;
+  if (Number(box.y) >= 40 && Number(box.y) <= 450) score += 20;
+  const looksLikeOrdinaryField = /password|courriel|email|client|municipalit|ville|prix|adresse|telephone|phone/i.test(value);
+  if (looksLikeOrdinaryField) score -= 300;
+  // Variante observée dans Matrix v12.6: la grande barre blanche de l'en-tête
+  // peut ne porter aucun attribut sémantique exploitable. Sa géométrie est
+  // toutefois stable et distinctive. Accepter seulement un champ très large,
+  // éditable, dans la bande supérieure; les champs métier explicites restent
+  // exclus par la pénalité ci-dessus. Cette règle reproduit exactement le
+  // geste montré par Shawn sans deviner un numéro ni utiliser Zone Courtier.
+  if (!looksLikeOrdinaryField &&
+      Number(box.width) >= 500 && Number(box.height) >= 18 && Number(box.height) <= 80 &&
+      Number(box.y) >= 35 && Number(box.y) <= 220) score += 100;
+  return score;
+}
+
+async function matrixSearchDiagnostics(page) {
+  const frames = [];
+  for (const frame of page.frames()) {
+    const controls = await frame.locator('input:not([type]), input[type="text"], input[type="search"]')
+      .evaluateAll((elements) => elements.slice(0, 30).map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return {
+          id: element.id || '',
+          name: element.getAttribute('name') || '',
+          type: element.getAttribute('type') || '',
+          placeholder: element.getAttribute('placeholder') || '',
+          aria: element.getAttribute('aria-label') || '',
+          class: String(element.getAttribute('class') || '').substring(0, 120),
+          visible: style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0,
+          box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        };
+      })).catch(() => []);
+    frames.push({ page: safeCentrisPageLocation(frame.url()), controls });
+  }
+  return { page: safeCentrisPageLocation(page.url()), title: await page.title().catch(() => ''), frames };
+}
+
+async function matrixResultDiagnostics(page, centrisNum, submitState = {}) {
+  const frames = [];
+  for (const frame of page.frames()) {
+    const diagnostic = await frame.evaluate((expected) => {
+      const clean = (value) => String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
+      const body = clean(document.body?.innerText || '');
+      const controls = [...document.querySelectorAll('a,button,[role="link"]')];
+      return {
+        body_has_exact: new RegExp(`(^|\\D)${String(expected).replace(/\\D/g, '')}(\\D|$)`).test(body),
+        exact_link_count: controls.filter((element) => clean(element.textContent) === String(expected)).length,
+        numeric_link_count: controls.filter((element) => /^\d{7,9}$/.test(clean(element.textContent))).length,
+        result_marker: /r[ée]sultats?|1\s+de\s+1/i.test(body),
+        empty_marker: /aucun r[ée]sultat|no results?/i.test(body),
+      };
+    }, String(centrisNum)).catch(() => null);
+    frames.push({ page: safeCentrisPageLocation(frame.url()), ...(diagnostic || {}) });
+  }
+  return {
+    page: safeCentrisPageLocation(page.url()),
+    submit_via: String(submitState.submit_via || 'unknown'),
+    frames,
+  };
+}
+
+function matrixTextContainsExactNumber(value, centrisNum) {
+  const number = String(centrisNum || '').replace(/\D/g, '');
+  if (!number) return false;
+  return new RegExp(`(^|\\D)${number}(\\D|$)`).test(String(value || ''));
+}
+
+function isExactMatrixListingLabel(value, centrisNum) {
+  const expected = String(centrisNum || '').replace(/\D/g, '');
+  const label = String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
+  return /^\d{7,9}$/.test(label) && label === expected;
+}
+
+async function openExactMatrixListing(page, centrisNum) {
+  let state = await inspectMatrixListingPage(page, centrisNum);
+  if (state.exactListingMentioned && state.detailEvidence === true &&
+      ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
+
+  // Chemin déterministe observé dans Matrix: la page de résultats affiche le
+  // numéro Centris comme lien. Cliquer d'abord le lien dont le libellé est
+  // exactement le numéro demandé évite de choisir une action générique de la
+  // même ligne (photo, carte, impression, etc.).
+  for (const frame of page.frames()) {
+    const links = frame.locator('a');
+    const count = Math.min(await links.count().catch(() => 0), 300);
+    for (let index = 0; index < count; index += 1) {
+      const link = links.nth(index);
+      if (!(await link.isVisible().catch(() => false))) continue;
+      const label = await link.evaluate((element) =>
+        element.innerText || element.textContent || element.getAttribute('aria-label') || ''
+      ).catch(() => '');
+      if (!isExactMatrixListingLabel(label, centrisNum)) continue;
+      const clicked = await link.click({ timeout: 10000 }).then(() => true).catch(() => false);
+      if (!clicked) continue;
+      await page.waitForTimeout(3000);
+      state = await inspectMatrixListingPage(page, centrisNum);
+      if (state.exactListingMentioned &&
+          ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
+    }
+  }
+
+  // Repli défensif pour les variantes Matrix où le numéro est rendu dans un
+  // contrôle non standard ou dans une ligne navigable.
+  for (const frame of page.frames()) {
+    const candidates = frame.locator('a,button,[role="link"],[data-href]');
+    const count = Math.min(await candidates.count().catch(() => 0), 300);
+    for (let index = 0; index < count; index += 1) {
+      const candidate = candidates.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      const metadata = await candidate.evaluate((element) => ({
+        own: [element.innerText, element.textContent, element.getAttribute('aria-label'),
+          element.getAttribute('title'), element.getAttribute('href'),
+          element.getAttribute('data-href')].filter(Boolean).join(' '),
+        row: element.closest('tr,[role="row"]')?.innerText || '',
+        navigates: element.matches('a,[role="link"]') &&
+          !!(element.getAttribute('href') || element.getAttribute('data-href')),
+      })).catch(() => null);
+      if (!metadata) continue;
+      // Préférer un contrôle qui porte lui-même le numéro exact. Un contrôle
+      // générique dans une ligne voisine (menu, étoile, imprimer) n'est accepté
+      // que s'il navigue réellement et que sa ligne contient le numéro exact.
+      if (!matrixTextContainsExactNumber(metadata.own, centrisNum) &&
+          !(metadata.navigates && matrixTextContainsExactNumber(metadata.row, centrisNum))) continue;
+      await candidate.click().catch(() => null);
+      await page.waitForTimeout(3000);
+      state = await inspectMatrixListingPage(page, centrisNum);
+      if (state.exactListingMentioned &&
+          ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
+    }
+  }
+  return state;
+}
+
+async function inspectMatrixListingPage(page, centrisNum) {
+  const inspectFrame = async (frame) => frame.evaluate((expectedNum) => {
+    const clean = (value) => String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
+    const bodyText = clean(document.body?.innerText || '');
+    const allElements = [...document.querySelectorAll('h1,h2,h3,h4,h5,div,span,strong')];
+    const additionalHeading = allElements.find((el) => /^document\(s\) additionnel\(s\)$/i.test(clean(el.textContent)));
+    const afterHeading = (element) => !!additionalHeading &&
+      !!(additionalHeading.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const mediaAnchors = [...document.querySelectorAll('a[href], [data-href]')].filter((element) => {
+      const href = element.href || element.getAttribute('href') || element.getAttribute('data-href') || '';
+      const label = clean(element.textContent || element.getAttribute('title') || element.getAttribute('aria-label') || '');
+      const row = element.closest('tr,li,[role="row"]') || element.parentElement?.parentElement || element.parentElement;
+      const rowText = clean(row?.innerText || row?.textContent || label);
+      const hrefLooksLikeDocument = /media\.ashx|annex|document|download|\.pdf(?:$|[?#])/i.test(href);
+      const labelLooksLikeDocument = /d[ée]claration du vendeur|\bDV[-\s]?\d+|certificat|\bplan\b|taxes|r[oô]le d['’]?[ée]valuation|obligation\s+courtier/i.test(label);
+      const rowHasDisplayedSize = /[0-9]+(?:[.,][0-9]+)?\s*[kmg](?:o|b)?\b/i.test(rowText);
+      return hrefLooksLikeDocument &&
+        (labelLooksLikeDocument || (afterHeading(element) && rowHasDisplayedSize));
+    });
+    const seen = new Set();
+    const docs = [];
+    for (const anchor of mediaAnchors) {
+      const href = anchor.href || anchor.getAttribute('href') || anchor.getAttribute('data-href') || '';
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || anchor.getAttribute('aria-label') || '');
+      if (!href || !label) continue;
+      const row = anchor.closest('tr,li,[role="row"]') || anchor.parentElement?.parentElement || anchor.parentElement;
+      const rowText = clean(row?.innerText || row?.textContent || label);
+      const sizeMatch = rowText.match(/([0-9]+(?:[.,][0-9]+)?)\s*([kmg])(?:o|b)?\b/i);
+      const key = `${label}|${sizeMatch?.[0] || ''}|${href}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const additional = afterHeading(anchor);
+      docs.push({
+        name: label,
+        size: sizeMatch?.[0] || null,
+        url: href,
+        provenance: additional ? 'matrix_additional_documents' : 'matrix_principal_dv',
+        source_section: additional ? 'additional_documents' : 'principal_dv',
+      });
+    }
+    const postbackAnchors = [...document.querySelectorAll('a[id]')].filter((anchor) => {
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || anchor.getAttribute('aria-label') || '');
+      const action = `${anchor.getAttribute('href') || ''} ${anchor.getAttribute('onclick') || ''}`;
+      return /(?:oui\s+)?dv[-\s]?\d+|d[ée]claration du vendeur/i.test(label) &&
+        /__doPostBack|javascript:|download|media\.ashx/i.test(action);
+    });
+    for (const anchor of postbackAnchors) {
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || anchor.getAttribute('aria-label') || '');
+      if (!label || docs.some((doc) => doc.name === label && doc.source_section === 'principal_dv')) continue;
+      docs.unshift({
+        name: label, size: null, url: null, action_id: anchor.id,
+        provenance: 'matrix_principal_dv', source_section: 'principal_dv',
+      });
+    }
+    const principalMatch = bodyText.match(/D[ée]claration du vendeur\s+(?:Oui\s+)?(DV[-\s]?\d+)/i);
+    if (principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))) {
+      docs.unshift({
+        name: principalMatch[1].replace(/\s+/g, ''), size: null, url: null,
+        action_label: principalMatch[1].replace(/\s+/g, ''),
+        provenance: 'matrix_principal_dv', source_section: 'principal_dv',
+      });
+    }
+    const price = bodyText.match(/(?:^|\s)([0-9][0-9\s]*\$)(?:\s|$)/)?.[1] || null;
+    const address = bodyText.match(/\b\d{1,6}\s+(?:rue|avenue|boulevard|chemin|rang|route)\s+[^\n]{3,100}/i)?.[0] || null;
+    const detailEvidence = Boolean(
+      additionalHeading || principalMatch ||
+      /[ée]valuation\s*\(municipale\)|taxes\s*\(annuelles\)|vente avec garantie l[ée]gale|superficie du terrain|certificat de localisation/i.test(bodyText)
+    );
+    return {
+      url: location.href, title: document.title, text: bodyText.substring(0, 4000),
+      exactListingMentioned: new RegExp(`(^|\\D)${String(expectedNum).replace(/\\D/g, '')}(\\D|$)`).test(bodyText),
+      detailEvidence,
+      passwordInputs: document.querySelectorAll('input[type=password]').length,
+      mediaLinkCount: mediaAnchors.length, docs,
+      listing: { centris_num: expectedNum, price: clean(price), address: clean(address) },
+    };
+  }, String(centrisNum));
+  const snapshots = [];
+  for (const frame of page.frames()) {
+    const snapshot = await inspectFrame(frame).catch(() => null);
+    if (snapshot) snapshots.push(snapshot);
+  }
+  const snapshot = mergeMatrixDocumentSnapshots(snapshots) ||
+    { url: page.url(), text: '', docs: [], mediaLinkCount: 0, passwordInputs: 0 };
+  return { ...snapshot, ...classifyMatrixPageSnapshot(snapshot, centrisNum) };
+}
+
+// Recherche globale Matrix: fonctionne aussi pour les inscriptions d'autres
+// courtiers. Zone Courtier demeure un chemin séparé pour l'inventaire de Shawn.
+async function previewCentrisMatrixDocuments(opts = {}) {
+  if (!CUA_AVAILABLE()) return { success: false, error_code: 'MATRIX_PLAYWRIGHT_UNAVAILABLE', message: 'Playwright non disponible' };
+  loadDeps();
+  initDirs();
+  const centrisNum = String(opts.centris_num || '').replace(/\D/g, '');
+  if (!/^\d{7,9}$/.test(centrisNum)) {
+    return { success: false, error_code: 'MATRIX_INVALID_CENTRIS_NUMBER', message: 'Numéro Centris invalide (7-9 chiffres)' };
+  }
+  let browser = null;
+  try {
+    browser = await launchBrowser();
+    const context = await newStealthContext(browser);
+    const page = await loginCentris(context);
+    const search = await openMatrixGlobalSearch(page);
+    if (!search) {
+      if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+        return {
+          success: false,
+          error_code: 'MATRIX_MULTIPLE_LOGIN_BREACH',
+          message: 'Matrix refuse une deuxième session simultanée. Aucun envoi effectué.',
+          final_url: safeCentrisPageLocation(page.url()),
+        };
+      }
+      console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
+      return { success: false, error_code: 'MATRIX_SEARCH_CONTROL_MISSING', message: 'Barre de recherche globale Matrix introuvable. Aucun envoi effectué.' };
+    }
+
+    console.log(`[MATRIX-PREVIEW] Recherche globale exacte #${centrisNum}`);
+    const submitted = await submitMatrixGlobalSearch(page, search, centrisNum);
+    if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+      return {
+        success: false,
+        error_code: 'MATRIX_MULTIPLE_LOGIN_BREACH',
+        message: 'Matrix refuse une deuxième session simultanée. Fermez les autres onglets Matrix, puis relancez. Aucun envoi effectué.',
+        final_url: safeCentrisPageLocation(page.url()),
+      };
+    }
+    if (!submitted.exactListingMentioned) {
+      console.warn('[MATRIX-RESULT-DIAG]', JSON.stringify(await matrixResultDiagnostics(page, centrisNum, submitted)));
+    }
+    const state = await openExactMatrixListing(page, centrisNum);
+    if (!state.exactListingMentioned) {
+      return {
+        success: false,
+        error_code: state.code === 'MATRIX_AUTH_REQUIRED' ? state.code : 'MATRIX_LISTING_NOT_FOUND',
+        message: `Le résultat exact #${centrisNum} n'a pas été trouvé dans Matrix. Aucun numéro substitut n'a été utilisé.`,
+        final_url: safeCentrisPageLocation(state.url),
+      };
+    }
+    if (!['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) {
+      return { success: false, error_code: state.code, message: `Listing #${centrisNum} ouvert, mais la section des documents n'a pas pu être vérifiée. Aucun envoi effectué.`, final_url: safeCentrisPageLocation(state.url) };
+    }
+    const inventory = buildCentrisDocumentInventory(centrisNum, state.docs);
+    const publicInventory = redactCentrisDocumentInventory(inventory);
+    return {
+      success: true, dry_run: true, via: 'matrix-global', listing: state.listing,
+      docs_count: publicInventory.docs.length, docs_list: publicInventory.docs,
+      document_inventory: publicInventory, manifest_id: inventory.manifest_id,
+      listing_url: safeCentrisPageLocation(state.url),
+      message: inventory.docs.length
+        ? `PREVIEW Matrix — ${inventory.docs.length} document(s) trouvé(s). Aucun envoi effectué.`
+        : `Listing #${centrisNum} trouvé dans Matrix, mais aucun document n'est affiché. Aucun envoi effectué.`,
+    };
+  } catch (error) {
+    return { success: false, error_code: 'MATRIX_PREVIEW_TECHNICAL_ERROR', message: safeErrorMessage(error).substring(0, 240) };
+  } finally {
+    if (browser) try { await browser.close(); } catch {}
+  }
+}
+
+function extractTaxCandidatesFromText(text, labelPattern) {
+  const source = String(text || '');
+  const candidates = [];
+  const labelRegex = new RegExp(labelPattern, 'i');
+  for (const line of source.split(/\r?\n/)) {
+    if (!labelRegex.test(line)) continue;
+    const afterLabel = line.replace(labelRegex, ' ');
+    const dollarMatches = [...afterLabel.matchAll(/(?:\$\s*([0-9][0-9 \,\.]*))|(?:([0-9][0-9 \,\.]*)\s*\$)/g)];
+    const lastAmount = dollarMatches[dollarMatches.length - 1];
+    const raw = String(lastAmount?.[1] || lastAmount?.[2] || '').trim();
+    if (!raw) continue;
+    const value = Number(raw.replace(/\s/g, '').replace(/,/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, ''));
+    if (Number.isFinite(value) && value >= 0 && value < 1000000 && !candidates.includes(value)) candidates.push(value);
+  }
+  return candidates;
+}
+
+function browserlessEndpointWithTimeout(endpoint, timeoutMs = 60000) {
+  let url;
+  try { url = new URL(endpoint); }
+  catch { throw new Error('BROWSERLESS_WS invalide'); }
+  // Browserless production currently rejects values above 60,000 ms.
+  // Clamp locally so a stale environment value cannot prevent Chrome from
+  // opening before the Centris/MFA flow even starts.
+  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 60000, 60000));
+  url.searchParams.set('timeout', String(safeTimeout));
+  return url.toString();
+}
+
+function safeErrorMessage(error) {
+  return String(error?.message || error || 'erreur inconnue')
+    .replace(/([?&](?:token|api[_-]?key)=)[^&\s]+/gi, '$1[REDACTED]')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]');
+}
 
 // Lazy-load Playwright — Préférence: rebrowser-playwright (anti-detect natif)
 // > playwright-core > playwright (fallback)
@@ -116,9 +1137,11 @@ WebGLRenderingContext.prototype.getParameter = function (p) {
 // Sinon → launch local (nécessite Chromium installé).
 async function launchBrowser() {
   loadDeps();
-  const wsEndpoint = process.env.BROWSERLESS_WS;
-  if (wsEndpoint) {
+  const configuredEndpoint = process.env.BROWSERLESS_WS;
+  if (configuredEndpoint) {
     console.log('[CUA] Mode Browserless externe (WS)');
+    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 60000;
+    const wsEndpoint = browserlessEndpointWithTimeout(configuredEndpoint, sessionTimeoutMs);
     // Audit P3 #10: retry 3× avec backoff 3s/8s/20s
     let lastErr = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -132,14 +1155,14 @@ async function launchBrowser() {
         lastErr = e;
         if (attempt < 3) {
           const delay = [3000, 8000, 20000][attempt - 1];
-          console.warn(`[CUA] Browserless connect échoué (attempt ${attempt}/${3}, retry ${delay}ms): ${e.message}`);
+          console.warn(`[CUA] Browserless connect échoué (attempt ${attempt}/${3}, retry ${delay}ms): ${safeErrorMessage(e)}`);
           await new Promise(r => setTimeout(r, delay));
         }
       }
     }
     // 3 fails → reset cache disponibilité pour forcer re-check au prochain appel
     _cuaAvailable = null;
-    throw new Error(`Browserless WS connect échoué 3× — last: ${lastErr?.message}. Vérifie BROWSERLESS_WS / quota.`);
+    throw new Error(`Browserless WS connect échoué 3× — last: ${safeErrorMessage(lastErr)}. Vérifie BROWSERLESS_WS / quota.`);
   }
   console.log('[CUA] Mode local Chromium');
   return await playwright.chromium.launch({
@@ -174,17 +1197,6 @@ async function newStealthContext(browser, opts = {}) {
     bypassCSP: true,
     extraHTTPHeaders: {
       'Accept-Language': 'fr-CA,fr;q=0.9,en-CA;q=0.8,en;q=0.7',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'no-cache',
-      'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
-      'sec-ch-ua-mobile': '?0',
-      'sec-ch-ua-platform': ua.includes('Macintosh') ? '"macOS"' : '"Windows"',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-      'sec-fetch-site': 'none',
-      'sec-fetch-user': '?1',
-      'upgrade-insecure-requests': '1',
     },
   };
   // Inject storageState si dispo (skip MFA, session valide direct)
@@ -241,9 +1253,10 @@ function initDirs() {
 function loadSession() {
   try {
     if (!fs.existsSync(SESSION_FILE)) return null;
-    const s = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-    if (Date.now() - s.ts > SESSION_TTL) {
-      fs.unlinkSync(SESSION_FILE);
+    const s = readSessionFile(SESSION_FILE);
+    const expiresAt = Number(s?.expiry || ((s?.ts || 0) + SESSION_TTL));
+    if (!s || !Array.isArray(s.cookies) || Date.now() > expiresAt) {
+      removeSessionFile(SESSION_FILE);
       return null;
     }
     return s.cookies || null;
@@ -252,12 +1265,223 @@ function loadSession() {
 
 function saveSession(cookies) {
   try {
-    fs.writeFileSync(SESSION_FILE, JSON.stringify({ ts: Date.now(), cookies }));
-  } catch (e) { console.warn('[CUA] session save error:', e.message); }
+    const capturedAt = Date.now();
+    writeSessionFile(SESSION_FILE, { ts: capturedAt, capturedAt, expiry: capturedAt + SESSION_TTL, cookies });
+  } catch (e) { console.warn('[CUA] session save error:', safeErrorMessage(e)); }
 }
 
-function clearSession() {
-  try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch {}
+function isAuthenticatedCentrisUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase();
+    if (!new Set(['matrix.centris.ca', 'zone.centris.ca']).has(host)) return false;
+    return !/\/(?:login|auth|signin|error|accessdenied)(?:[/.?]|$)|LoginIntermediate/i.test(`${url.pathname}${url.search}`);
+  } catch {
+    return false;
+  }
+}
+
+// Une URL Matrix seule ne prouve pas une session: Centris peut servir une page
+// d'erreur ou un shell vide avec HTTP 200. Exiger aussi un marqueur applicatif
+// et refuser les marqueurs d'authentification/accès.
+function isAuthenticatedMatrixPage(rawUrl, passwordVisible, bodyText) {
+  if (passwordVisible || !isAuthenticatedCentrisUrl(rawUrl)) return false;
+  const text = normalizeCentrisMatchKey(String(bodyText || '').slice(0, 200000));
+  if (!text) return false;
+  if (/(?:^|\s)connexion(?:\s|$)|se connecter|sign in|log in|mot de passe|password|acces refuse|access denied|session expiree/.test(text)) {
+    return false;
+  }
+  return /recherche|criteres|resultats|matrix|deconnexion|logout|fiche/.test(text);
+}
+
+function safeCentrisPageLocation(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return `${url.hostname.toLowerCase()}${url.pathname}`;
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+function isMatrixMultipleLoginPage(rawUrl, bodyText = '') {
+  const location = safeCentrisPageLocation(rawUrl);
+  const text = normalizeCentrisMatchKey(String(bodyText || '').slice(0, 10000));
+  return /\/Matrix\/Error\/MultipleLoginBreach\.aspx$/i.test(location) ||
+    /multiple login|connexion multiple|session deja active|already (?:signed|logged) in/i.test(text);
+}
+
+function classifyCentrisLoginSnapshot(snapshot = {}) {
+  const rawUrl = String(snapshot.url || '');
+  let url;
+  try { url = new URL(rawUrl); } catch { return 'missing'; }
+  const host = url.hostname.toLowerCase();
+  const pathAndQuery = `${url.pathname}${url.search}`;
+  const passwordVisible = Number(snapshot.passwordVisible || 0);
+  const userCodeVisible = Number(snapshot.userCodeVisible || 0);
+  const identifierVisible = Number(snapshot.identifierVisible || 0);
+  const mfaVisible = Number(snapshot.mfaVisible || 0);
+  const bodyText = String(snapshot.bodyText || '');
+
+  if (isAuthenticatedMatrixPage(rawUrl, passwordVisible, bodyText)) return 'authenticated';
+  if (mfaVisible && new Set(['accounts.centris.ca', 'centris-prod.ca.auth0.com']).has(host)) return 'mfa';
+  if (host === 'accounts.centris.ca' && /\/account\/login/i.test(url.pathname) && userCodeVisible && passwordVisible) {
+    return 'credentials';
+  }
+  if (host === 'centris-prod.ca.auth0.com' && /\/u\/login\/identifier/i.test(pathAndQuery) && identifierVisible) {
+    return 'identifier';
+  }
+  if (host === 'centris-prod.ca.auth0.com' && /\/u\/login(?:\/password)?/i.test(pathAndQuery) && passwordVisible) {
+    return 'password';
+  }
+  return 'missing';
+}
+
+async function inspectCentrisLoginStep(page) {
+  const userCode = page.locator([
+    'input[id="UserCode"]',
+    'input[name="UserCode"]',
+    'input[id*="UserCode" i]',
+    'input[name*="UserCode" i]',
+    'input[autocomplete="username"]',
+  ].join(', '));
+  const identifier = page.locator([
+    'input[name="username"]',
+    'input[name="email"]',
+    'input[id*="username" i]',
+    'input[id*="identifier" i]',
+    'input[autocomplete="username"]',
+  ].join(', '));
+  const password = page.locator([
+    'input[id="Password"]',
+    'input[name="Password"]',
+    'input[type="password"]',
+    'input[autocomplete="current-password"]',
+  ].join(', '));
+  const mfa = page.locator('input[autocomplete="one-time-code"], input[name="code"], input[id="code"], input[name*="verification" i], input[id*="verification" i], input[type="tel"]');
+  const visibleCount = async (locator) => {
+    const count = Math.min(await locator.count().catch(() => 0), 10);
+    let visible = 0;
+    for (let index = 0; index < count; index += 1) {
+      if (await locator.nth(index).isVisible().catch(() => false)) visible += 1;
+    }
+    return visible;
+  };
+  const snapshot = {
+    url: page.url(),
+    userCodeVisible: await visibleCount(userCode),
+    identifierVisible: await visibleCount(identifier),
+    passwordVisible: await visibleCount(password),
+    mfaVisible: await visibleCount(mfa),
+    bodyText: await page.locator('body').innerText({ timeout: 2500 }).catch(() => ''),
+  };
+  return {
+    kind: classifyCentrisLoginSnapshot(snapshot),
+    location: safeCentrisPageLocation(snapshot.url),
+    userCode,
+    identifier,
+    password,
+    mfa,
+  };
+}
+
+async function waitForCentrisLoginStep(page, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  let step = await inspectCentrisLoginStep(page);
+  while (step.kind === 'missing' && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    step = await inspectCentrisLoginStep(page);
+  }
+  return step;
+}
+
+async function clickCentrisLoginSubmit(page) {
+  const submit = page.locator([
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("Connect")',
+    'button:has-text("Connexion")',
+    'button:has-text("Continue")',
+    'button:has-text("Sign In")',
+    'button:has-text("Log In")',
+  ].join(', ')).first();
+  if (!(await submit.isVisible().catch(() => false)) || !(await submit.isEnabled().catch(() => false))) {
+    throw new Error(`CENTRIS_LOGIN_SUBMIT_MISSING:${safeCentrisPageLocation(page.url())}`);
+  }
+  await submit.click({ timeout: 10000 });
+}
+
+async function submitCentrisLogin(page, user, pass) {
+  // Supporte le formulaire Centris actuel (UserCode + Password) et le flux
+  // Auth0 fractionné observé lors de migrations. Aucun repli vers "le premier
+  // champ visible": une page inconnue échoue sans jamais y injecter de secret.
+  const submitted = new Set();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const step = await waitForCentrisLoginStep(page, attempt === 0 ? 12000 : 8000);
+    if (step.kind === 'authenticated') return 'authenticated';
+    if (step.kind === 'mfa') return 'mfa';
+    if (step.kind === 'credentials') {
+      if (submitted.has('credentials')) throw new Error(`CENTRIS_LOGIN_REJECTED:${step.location}`);
+      submitted.add('credentials');
+      await step.userCode.first().fill(user, { timeout: 10000 });
+      await step.password.first().fill(pass, { timeout: 10000 });
+      await clickCentrisLoginSubmit(page);
+      await page.waitForTimeout(3500);
+      continue;
+    }
+    if (step.kind === 'identifier') {
+      if (submitted.has('identifier')) throw new Error(`CENTRIS_IDENTIFIER_REJECTED:${step.location}`);
+      submitted.add('identifier');
+      await step.identifier.first().fill(user, { timeout: 10000 });
+      await clickCentrisLoginSubmit(page);
+      await page.waitForTimeout(2500);
+      continue;
+    }
+    if (step.kind === 'password') {
+      if (submitted.has('password')) throw new Error(`CENTRIS_PASSWORD_REJECTED:${step.location}`);
+      submitted.add('password');
+      await step.password.first().fill(pass, { timeout: 10000 });
+      await clickCentrisLoginSubmit(page);
+      await page.waitForTimeout(3500);
+      continue;
+    }
+    throw new Error(`CENTRIS_LOGIN_FORM_MISSING:${step.location}`);
+  }
+  const finalStep = await inspectCentrisLoginStep(page);
+  if (finalStep.kind === 'authenticated') return 'authenticated';
+  if (finalStep.kind === 'mfa') return 'mfa';
+  throw new Error(`CENTRIS_LOGIN_NOT_COMPLETED:${finalStep.location}`);
+}
+
+function cookieHeaderFromPlaywrightCookies(cookies, targetHost = 'matrix.centris.ca') {
+  const host = String(targetHost || '').toLowerCase();
+  return (Array.isArray(cookies) ? cookies : [])
+    .filter(c => {
+      const domain = String(c.domain || '').replace(/^\./, '').toLowerCase();
+      return /(?:^|\.)centris\.ca$/.test(domain)
+        && (host === domain || host.endsWith(`.${domain}`));
+    })
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
+}
+
+async function saveBrowserStorageState(context, page) {
+  try {
+    const storageState = await context.storageState();
+    const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => null);
+    writeSessionFile(STORAGE_STATE_FILE, {
+      storageState,
+      userAgent,
+      capturedAt: Date.now(),
+      expiry: Date.now() + SESSION_TTL,
+    });
+  } catch (e) {
+    console.warn('[CUA] storageState save error:', safeErrorMessage(e));
+  }
+}
+
+function clearSession(options = {}) {
+  removeSessionFile(SESSION_FILE);
+  if (options.includeStorageState) removeSessionFile(STORAGE_STATE_FILE);
 }
 
 // Récupère cookies du bot principal (centris_cookies.json) si CUA n'a pas sa propre session
@@ -266,11 +1490,11 @@ function clearSession() {
 // Plus fiable que juste cookies. Source: LaunchAgent Mac centris-auto-login push.
 function loadBotCentrisStorageState() {
   try {
-    const stateFile = path.join(DATA_DIR, 'centris_storage_state.json');
-    if (!fs.existsSync(stateFile)) return null;
-    const data = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    const data = readSessionFile(STORAGE_STATE_FILE);
+    if (!data) return null;
     if (data.expiry && Date.now() > data.expiry) {
       console.log('[CUA] storageState expiré');
+      removeSessionFile(STORAGE_STATE_FILE);
       return null;
     }
     if (!data.storageState || !data.storageState.cookies) return null;
@@ -289,8 +1513,8 @@ function loadBotCentrisCookies() {
     ];
     const botCookieFile = candidates.find(f => fs.existsSync(f));
     if (!botCookieFile) return null;
-    const data = JSON.parse(fs.readFileSync(botCookieFile, 'utf8'));
-    console.log(`[CUA] Loaded cookies from ${botCookieFile}`);
+    const data = readSessionFile(botCookieFile);
+    console.log(`[CUA] Loaded cookies from ${path.basename(botCookieFile)}`);
     // Format bot.js: { cookies: "name1=val1; name2=val2", expiry: timestamp }
     // Format Playwright requis: [{ name, value, domain, path }, ...]
     if (!data.cookies || typeof data.cookies !== 'string') return null;
@@ -324,21 +1548,43 @@ async function loginCentris(context) {
   const page = await context.newPage();
   await page.setViewportSize(VIEWPORT);
 
-  // Essayer session cachée d'abord (CUA propre OU cookies bot principal partagés)
+  // Essayer toute session persistée d'abord. Le storageState complet a déjà
+  // été injecté par newStealthContext; les cookies simples restent un fallback.
   const savedCookies = loadSession() || loadBotCentrisCookies();
   if (savedCookies && savedCookies.length > 0) {
-    try {
-      await context.addCookies(savedCookies);
-      await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await page.waitForTimeout(2000);
-      const url = page.url();
-      if (!/\/login|\/auth|signin|LoginIntermediate|accounts\.centris/i.test(url)) {
-        console.log('[CUA] Session cachée valide ✅', url.substring(0, 80));
-        return page;
-      }
-      console.log('[CUA] Session expirée, re-login...');
-      clearSession();
-    } catch (e) { console.warn('[CUA] Cookie session échouée:', e.message); clearSession(); }
+    try { await context.addCookies(savedCookies); }
+    catch (e) { console.warn('[CUA] Injection cookies échouée:', safeErrorMessage(e)); }
+  }
+  try {
+    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(1800);
+    const probeUrl = page.url();
+    const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+    const probeText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+    if (isAuthenticatedMatrixPage(probeUrl, passwordVisible, probeText)) {
+      const cookies = await context.cookies();
+      saveSession(cookies);
+      await saveBrowserStorageState(context, page);
+      console.log('[CUA] Session persistante vérifiée dans Matrix ✅', safeCentrisPageLocation(probeUrl));
+      return page;
+    }
+    // Ne jamais détruire une session persistée sur la seule foi d'une sonde
+    // refusée ou d'un shell Matrix incomplet. Une nouvelle session validée la
+    // remplacera atomiquement; en cas de panne transitoire, l'ancienne reste
+    // disponible pour un futur renouvellement ou un nouveau push du Mac.
+    console.log('[CUA] Session persistante non vérifiée par Matrix — renouvellement sans suppression');
+    // Matrix n'autorise qu'une session par compte. Un cookie encore accepté
+    // par le SSO mais refusé par Matrix peut créer lui-même une collision au
+    // premier clic de recherche. Fermer explicitement cette session serveur
+    // avant le login frais; conserver le storageState sur disque jusqu'à ce
+    // que la nouvelle session soit réellement validée et sauvegardée.
+    if (savedCookies && savedCookies.length > 0) {
+      await page.goto(`${MATRIX_BASE}/Matrix/Logout.aspx`, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+      await page.waitForTimeout(1200);
+      console.log('[CUA] Session Matrix persistée fermée avant renouvellement unique');
+    }
+  } catch (e) {
+    console.warn('[CUA] Vérification session échouée:', safeErrorMessage(e));
   }
 
   // Login frais — page Centris Matrix qui redirige vers accounts.centris.ca
@@ -346,62 +1592,58 @@ async function loginCentris(context) {
   await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(2500);
 
-  const currentUrl = page.url();
-  console.log('[CUA] URL login:', currentUrl.substring(0, 100));
+  console.log('[CUA] Page login:', safeCentrisPageLocation(page.url()));
+  const loginResult = await submitCentrisLogin(page, user, pass);
+  if (loginResult === 'authenticated') {
+    const cookies = await context.cookies();
+    saveSession(cookies);
+    await saveBrowserStorageState(context, page);
+    try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
+    console.log('[CUA] SSO Centris déjà authentifié ✅', safeCentrisPageLocation(page.url()));
+    return page;
+  }
+  console.log('[CUA] Identifiants Centris soumis via formulaire reconnu ✅');
 
-  // Centris form: UserCode + Password sur même page (pas Auth0 split)
-  let loginDeterministicOK = false;
-  try {
-    const userField = page.locator('input[id*="UserCode"], input[name*="UserCode"], input[id="UserCode"], input[placeholder*="user" i], input[placeholder*="code" i]').first();
-    await userField.waitFor({ timeout: 10000 });
-    await userField.fill(user);
-
-    const passField = page.locator('input[id="Password"], input[type="password"], input[name="Password"]').first();
-    await passField.fill(pass);
-
-    const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Connect"), button:has-text("Connexion"), button:has-text("Sign In"), button:has-text("Log In")').first();
-    await submitBtn.click();
-    console.log('[CUA] Login form rempli (deterministic) ✅');
-    await page.waitForTimeout(4500);
-    loginDeterministicOK = true;
-  } catch (e) {
-    console.warn(`[CUA] Login deterministic échoué: ${e.message}. Fallback CUA visuel...`);
+  // Si Centris propose le courriel, le privilégier: le bot peut lire le code
+  // automatiquement dans Gmail. Sinon, le SMS reste disponible via /mfa.
+  if (/mfa-sms-challenge/i.test(page.url())) {
+    try {
+      const changeMethod = page.locator('a,button').filter({
+        hasText: /changer.*méthode|change.*method|autre.*méthode|another.*method|try another/i,
+      }).first();
+      if (await changeMethod.isVisible().catch(() => false)) {
+        await changeMethod.click();
+        await page.waitForTimeout(1200);
+        const emailMethod = page.locator('a,button,label').filter({ hasText: /courriel|e-?mail/i }).first();
+        if (await emailMethod.isVisible().catch(() => false)) {
+          await emailMethod.click();
+          await page.waitForTimeout(1800);
+          console.log('[CUA] MFA basculé vers courriel');
+        }
+      }
+    } catch (e) {
+      console.warn('[CUA] MFA courriel indisponible, conserve SMS:', safeErrorMessage(e));
+    }
   }
 
-  // FALLBACK CUA — si selectors deterministic ratent (UI change), Claude voit l'écran et décide
-  if (!loginDeterministicOK) {
-    console.log('[CUA] Activation CUA pour login visuel...');
-    const loginTask = `Tu es sur la page de login Centris/Matrix. Mes credentials:
-- UserCode/Username: "${user}"
-- Password: "${pass}"
-
-Étapes:
-1. Trouve le champ UserCode/Username et entre "${user}"
-2. Trouve le champ Password et entre "${pass}"
-3. Clique le bouton Connect/Connexion/Sign In/Log In
-4. Attends que la page suivante charge
-
-Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accueil Matrix.`;
-    const visualResult = await runCUATask(page, loginTask);
-    if (!visualResult.success) throw new Error(`CUA visual login échec: ${visualResult.message}`);
-    console.log('[CUA] Login visuel réussi ✅');
-  }
-
-  // Handle MFA (Email ou SMS) — Centris envoie code par email après login basic
+  // Handle MFA (Email ou SMS)
   for (let mfaAttempt = 0; mfaAttempt < 2; mfaAttempt++) {
-    const mfaField = page.locator('input[name*="ode"], input[id*="ode"], input[placeholder*="code" i], input[placeholder*="vérif" i], input[type="tel"]').first();
+    const mfaField = page.locator('input[autocomplete="one-time-code"], input[name="code"], input[id="code"], input[name*="verification" i], input[id*="verification" i], input[placeholder*="code" i], input[placeholder*="vérif" i], input[type="tel"]').first();
     const mfaVisible = await mfaField.isVisible().catch(() => false);
     if (!mfaVisible) break;
 
-    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — fetch code via Gmail (max 180s)...`);
-    const mfaCode = await fetchMFACodeFromBot(180000);
-    if (!mfaCode) throw new Error('MFA timeout — pas de code MFA reçu en 180s via Gmail/bot. Vérifier LaunchAgent sms-bridge actif sur Mac.');
+    // Browserless limite la session Playwright à 60 s. Conserver une marge
+    // pour soumettre le code et vérifier Matrix avant la fermeture du socket.
+    const mfaWaitMs = process.env.BROWSERLESS_WS ? 40000 : 180000;
+    console.log(`[CUA] MFA requis (tentative ${mfaAttempt + 1}/2) — Gmail, pont Messages ou /mfa (max ${Math.round(mfaWaitMs / 1000)}s)...`);
+    const mfaCode = await fetchMFACodeFromBot(mfaWaitMs);
+    if (!mfaCode) throw new Error(`MFA timeout — aucun code reçu en ${Math.round(mfaWaitMs / 1000)}s via Gmail, Telegram ou pont Messages.`);
     console.log(`[CUA] MFA code reçu: ${mfaCode.substring(0, 2)}****`);
 
     await mfaField.fill(mfaCode);
     const mfaSubmit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Vérif"), button:has-text("Submit"), button:has-text("Confirmer")').first();
     await mfaSubmit.click();
-    await page.waitForTimeout(4000);
+    await page.waitForTimeout(4500);
   }
 
   // Handle disclaimers "I've Read This" / "Continue"
@@ -409,7 +1651,8 @@ Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accu
     const url = page.url();
     if (!/LoginIntermediate|Disclaimer|Consent/i.test(url)) break;
     console.log('[CUA] Disclaimer detected, clicking continue...');
-    const continueBtn = page.locator('button:has-text("Continue"), input[type="submit"][value*="Continue"], button:has-text("I.?ve Read")').first();
+    const continueBtn = page.locator('button,a').filter({ hasText: /continue|i.?ve read|j.?ai lu|accepter/i }).first()
+      .or(page.locator('input[type="submit"][value*="Continue" i], input[type="submit"][value*="Accept" i]')).first();
     const visible = await continueBtn.isVisible().catch(() => false);
     if (!visible) break;
     await continueBtn.click();
@@ -417,16 +1660,20 @@ Termine quand tu vois soit un champ MFA (code à 6 chiffres) soit la page d'accu
   }
 
   const finalUrl = page.url();
-  if (/\/login|\/auth|signin|accounts\.centris/i.test(finalUrl)) {
-    throw new Error(`Login Centris échoué — URL finale: ${finalUrl.substring(0, 200)}`);
+  const finalPasswordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+  const finalText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+  if (!isAuthenticatedMatrixPage(finalUrl, finalPasswordVisible, finalText)) {
+    throw new Error(`Login Centris échoué — page finale: ${safeCentrisPageLocation(finalUrl)}`);
   }
 
-  // Sauvegarder session pour reuse 12h
+  // Sauvegarder la session sur le disque persistant. La durée locale est un
+  // plafond; chaque réutilisation est d'abord vérifiée réellement dans Matrix.
   const cookies = await context.cookies();
   saveSession(cookies);
+  await saveBrowserStorageState(context, page);
   // Push aussi vers bot principal pour partage
-  try { pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', e.message); }
-  console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', finalUrl.substring(0, 80));
+  try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
+  console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', safeCentrisPageLocation(finalUrl));
   return page;
 }
 
@@ -437,53 +1684,75 @@ async function fetchMFACodeFromBot(timeoutMs) {
   const botUrl = process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com';
   const token = process.env.WEBHOOK_SECRET;
   if (!token) {
-    console.warn('[CUA] WEBHOOK_SECRET manquant — fallback file /data/centris_mfa.txt');
-    return await waitForMFACode(timeoutMs);
+    console.warn('[CUA] WEBHOOK_SECRET manquant — MFA manuel/fichier seulement');
   }
   const start = Date.now();
   let alertSent = false;
-  while (Date.now() - start < timeoutMs) {
-    try {
-      // 1. Try Gmail via bot endpoint
-      const r = await fetch(`${botUrl}/admin/centris-mfa-code?token=${encodeURIComponent(token)}`, {
-        signal: AbortSignal.timeout(15000),
-      });
-      if (r.ok) {
-        const d = await r.json();
-        if (d.code && /^\d{4,8}$/.test(d.code)) {
-          console.log(`[CUA] MFA from Gmail (${d.emails_checked} emails scanned, subject="${d.subject?.substring(0,40)}")`);
-          return d.code;
+  centrisMFAWaiting = true;
+  pendingManualMFACode = null;
+  try {
+    while (Date.now() - start < timeoutMs) {
+      try {
+        // 1. Code envoyé manuellement par /mfa dans Telegram.
+        const manualCode = takeManualMFACode();
+        if (manualCode) {
+          console.log('[CUA] MFA reçu depuis Telegram');
+          return manualCode;
         }
-      }
-      // 2. Try local file (Mac LaunchAgent sms-bridge)
-      const mfaFile = path.join(DATA_DIR, 'centris_mfa.txt');
-      if (fs.existsSync(mfaFile)) {
-        const code = fs.readFileSync(mfaFile, 'utf8').trim();
-        if (code && /^\d{4,8}$/.test(code)) {
-          fs.unlinkSync(mfaFile);
-          console.log('[CUA] MFA from local file (sms-bridge)');
-          return code;
+
+        // 2. Gmail via l'endpoint interne authentifié du bot.
+        if (token) {
+          const r = await fetch(`${botUrl}/admin/centris-mfa-code?after=${start}`, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15000),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            if (d.code && /^\d{4,8}$/.test(d.code)) {
+              console.log(`[CUA] MFA from Gmail (${d.emails_checked} emails scanned)`);
+              return d.code;
+            }
+          }
         }
-      }
-      // 3. Après 30s, alerter Shawn sur Telegram (1 fois)
-      if (!alertSent && Date.now() - start > 30000) {
-        alertSent = true;
-        await alertShawnMFA(botUrl, token).catch(() => {});
-      }
-    } catch (e) { console.warn('[CUA] fetchMFA loop:', e.message); }
-    await new Promise(r => setTimeout(r, 3000));
+
+        // 3. Fichier local écrit par le bridge SMS.
+        const mfaFile = path.join(DATA_DIR, 'centris_mfa.txt');
+        if (fs.existsSync(mfaFile)) {
+          const code = fs.readFileSync(mfaFile, 'utf8').trim();
+          if (code && /^\d{4,8}$/.test(code)) {
+            fs.unlinkSync(mfaFile);
+            console.log('[CUA] MFA from local file (sms-bridge)');
+            return code;
+          }
+        }
+
+        // 4. Alerte immédiatement l'utilisateur: Browserless peut avoir une
+        // limite de session courte et il faut laisser le maximum de temps utile.
+        if (!alertSent && token) {
+          alertSent = true;
+          await alertShawnMFA(botUrl, token, timeoutMs).catch(() => {});
+        }
+      } catch (e) { console.warn('[CUA] fetchMFA loop:', safeErrorMessage(e)); }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    return null;
+  } finally {
+    centrisMFAWaiting = false;
+    pendingManualMFACode = null;
   }
-  return null;
 }
 
 // Alerte Telegram à Shawn quand MFA tarde — il peut envoyer code via /mfa CMD
-async function alertShawnMFA(botUrl, token) {
+async function alertShawnMFA(botUrl, token, timeoutMs) {
   try {
-    await fetch(`${botUrl}/admin/notify?token=${encodeURIComponent(token)}`, {
+    await fetch(`${botUrl}/admin/notify`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
-        text: '🔐 *CUA Centris* attend code MFA\n\nCode pas trouvé dans Gmail en 30s.\n\n👉 Envoie le code via `/mfa 123456` ou réponds avec le code seul.\n\n_(timeout 60s total)_',
+        text: `🔐 *CUA Centris* attend le code MFA\n\n👉 Envoie immédiatement le code via \`/mfa 123456\`.\n\n_(fenêtre maximale: ${Math.round(timeoutMs / 1000)}s)_`,
         parse_mode: 'Markdown',
       }),
       signal: AbortSignal.timeout(8000),
@@ -498,20 +1767,56 @@ async function pushCookiesToBot(playwrightCookies) {
   const token = process.env.WEBHOOK_SECRET;
   if (!token) return;
   // Convert Playwright format → Cookie header string
-  const cookieStr = playwrightCookies
-    .filter(c => /centris\.ca$/i.test(c.domain || ''))
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+  const cookieStr = cookieHeaderFromPlaywrightCookies(playwrightCookies);
   if (!cookieStr) return;
   try {
-    await fetch(`${botUrl}/admin/centris-cookies?token=${encodeURIComponent(token)}`, {
+    await fetch(`${botUrl}/admin/centris-cookies`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ cookies: cookieStr, source: 'cua', ts: Date.now() }),
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        Authorization: `Bearer ${token}`,
+      },
+      body: cookieStr,
       signal: AbortSignal.timeout(10000),
     });
     console.log('[CUA] Cookies pushed to bot ✅');
   } catch (e) { console.warn('[CUA] pushCookies failed:', e.message); }
+}
+
+// Connexion Playwright explicite pour Telegram et les appels Centris du bot.
+// Les appels concurrents partagent la même tentative pour éviter plusieurs SMS.
+async function cuaLoginCentris() {
+  if (activeCentrisLoginPromise) return activeCentrisLoginPromise;
+  activeCentrisLoginPromise = (async () => {
+    if (!CUA_AVAILABLE()) return { ok: false, error: 'Playwright non disponible' };
+    initDirs();
+    let browser = null;
+    try {
+      browser = await launchBrowser();
+      const context = await newStealthContext(browser);
+      const page = await loginCentris(context);
+      const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+      if (passwordVisible || !isAuthenticatedCentrisUrl(page.url())) {
+        throw new Error('Vérification de session Centris échouée après le login');
+      }
+      const cookies = await context.cookies();
+      const cookieHeader = cookieHeaderFromPlaywrightCookies(cookies);
+      if (cookieHeader.length < 100) throw new Error('Session Centris créée sans cookies suffisants');
+      await saveBrowserStorageState(context, page);
+      return {
+        ok: true,
+        cookieCount: cookieHeader.split(';').filter(Boolean).length,
+        cookieHeader,
+        expiresAt: Date.now() + SESSION_TTL,
+      };
+    } catch (e) {
+      return { ok: false, error: safeErrorMessage(e).substring(0, 240) };
+    } finally {
+      if (browser) try { await browser.close(); } catch {}
+    }
+  })();
+  try { return await activeCentrisLoginPromise; }
+  finally { activeCentrisLoginPromise = null; }
 }
 
 // Attendre code MFA dans /data/centris_mfa.txt (écrit par sms-bridge LaunchAgent)
@@ -858,7 +2163,6 @@ Le PDF sera capturé automatiquement dès que le téléchargement commence.
 
   } catch (e) {
     console.error('[CUA] cuaGetCentrisPDF error:', e.message);
-    if (/session|login|auth/i.test(e.message)) clearSession();
     return { success: false, buffer: null, message: e.message };
   } finally {
     if (browser) try { await browser.close(); } catch {}
@@ -909,59 +2213,432 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
   initDirs();
 
   let browser = null;
+  let context = null;
+  const operationStartedAt = Date.now();
   try {
     browser = await launchBrowser();
 
-    const context = await newStealthContext(browser);
+    context = await newStealthContext(browser);
     const page = await loginCentris(context);
+    const exactNum = String(centrisNum || '').replace(/\D/g, '');
+    if (!/^\d{7,9}$/.test(exactNum)) throw new Error('Numéro Centris invalide');
 
-    const filtreStr = filtre ? `en priorité "${filtre}"` : 'toutes';
-    const task = `
-Tu es sur le portail agent Centris. Mission: trouver et télécharger les annexes du listing #${centrisNum}.
+    // Chemin déterministe identique au geste humain montré par Shawn:
+    // recherche globale blanche → numéro exact → fiche détaillée → liens PDF.
+    const search = await openMatrixGlobalSearch(page);
+    if (!search) {
+      if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+        throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+      }
+      console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
+      throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
+    }
+    const submitted = await submitMatrixGlobalSearch(page, search, exactNum);
+    if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+      throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+    }
+    if (!submitted.exactListingMentioned) {
+      console.warn('[MATRIX-RESULT-DIAG]', JSON.stringify(await matrixResultDiagnostics(page, exactNum, submitted)));
+    }
+    const state = await openExactMatrixListing(page, exactNum);
+    if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
 
-Les annexes peuvent inclure: Déclaration du vendeur (DV), Certificat de localisation, Plans, Rapport d'inspection.
+    const fullInventory = buildCentrisDocumentInventory(exactNum, state.docs);
+    const publicInventory = redactCentrisDocumentInventory(fullInventory);
 
-Étapes:
-1. Navigue vers le listing #${centrisNum}
-2. Cherche un onglet "Annexes", "Documents", "Fichiers" ou "Attachments"
-3. Télécharge ${filtreStr} les annexes disponibles
-4. Confirme chaque téléchargement
-
-URL à essayer: ${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}
-`.trim();
-
-    try {
-      await page.goto(`${MATRIX_BASE}/Matrix/Public/Portal.aspx?L=1&K=1&p=DE-1-1-${centrisNum}`, {
-        waitUntil: 'domcontentloaded', timeout: 15000
-      });
-      await page.waitForTimeout(2000);
-    } catch {}
-
-    const result = await runCUATask(page, task);
-
-    let annexes = result.pdfBuffers || [];
-    if (filtre && annexes.length > 0) {
-      const filtreLC = filtre.toLowerCase();
-      const filtered = annexes.filter(a =>
-        a.filename.toLowerCase().includes(filtreLC) ||
-        filtreLC.split(' ').some(w => a.filename.toLowerCase().includes(w))
-      );
-      if (filtered.length > 0) annexes = filtered;
+    let matchedDocs = state.docs;
+    if (filtre) {
+      const terms = normalizeCentrisMatchKey(filtre).split(/\s+/).filter(Boolean);
+      matchedDocs = matchedDocs.filter((doc) => terms.every((term) => doc.match_key?.includes(term) || normalizeCentrisMatchKey(doc.name).includes(term)));
+    }
+    if (!matchedDocs.length) {
+      return { success: false, annexes: [], message: filtre ? `Aucune annexe correspondant à « ${filtre} »` : 'Aucune annexe téléchargeable trouvée dans Matrix' };
     }
 
+    const selectedDocs = matchedDocs.filter((doc) => doc.url || doc.action_id || doc.action_label);
+    // Fail closed: un document affiché dans Matrix mais dont le lien n'a pas
+    // été résolu (notamment une DV principale rendue en postback) ne doit
+    // jamais disparaître silencieusement du lot envoyé au client.
+    const unresolvedDocs = matchedDocs.filter((doc) => !doc.url && !doc.action_id && !doc.action_label);
+
+    const annexes = [];
+    const failures = unresolvedDocs.map((doc) => ({
+      label: doc.name,
+      error: 'lien de téléchargement Matrix non résolu',
+    }));
+    // mediaserver.centris.ca refuse parfois les requêtes API directes même si
+    // elles partagent les cookies. Ouvrir le lien comme un vrai onglet Matrix
+    // conserve la navigation authentifiée utilisée par un clic manuel.
+    const candidates = selectedDocs.slice(0, 20);
+    // Séquentiel volontairement: Matrix ouvre les documents depuis la fiche
+    // et certains contrôles de session sont propres à l'onglet parent.
+    let downloadAbortReason = null;
+    let runningDownloadedBytes = 0;
+    let batchTooLarge = false;
+    const downloadedContentHashes = new Set();
+    const downloaded = await mapWithConcurrency(candidates, 1, async (doc, index) => {
+      if (downloadAbortReason) {
+        return { ok: false, failure: {
+          label: doc.name,
+          error: `non tenté après erreur de session: ${downloadAbortReason}`.substring(0, 120),
+        } };
+      }
+      try {
+        let buffer;
+        let lastError;
+        for (let attempt = 1; attempt <= MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS; attempt += 1) {
+          try {
+            buffer = doc.url
+              ? await downloadMatrixPdfAuthenticated(context, doc.url, state.url, page)
+              : await downloadMatrixPdfByAction(context, page, doc.action_id, doc.action_label);
+            break;
+          } catch (error) {
+            lastError = error;
+            if (!isMatrixDocumentRetryable(error)) break;
+            if (attempt < MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS) await page.waitForTimeout(400 * attempt);
+          }
+        }
+        if (!buffer) throw lastError || new Error('MATRIX_DOWNLOAD_FAILED');
+        const magicIndex = buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-'));
+        if (buffer.length < 1000 || magicIndex === -1) {
+          const signature = buffer.subarray(0, 16).toString('hex');
+          throw new Error(`réponse non-PDF (bytes=${buffer.length}, signature=${signature || 'vide'})`);
+        }
+        const validatedPdf = await validatePdfBuffer(buffer, {
+          maxBytes: MATRIX_DOCUMENT_FILE_MAX_BYTES, minBytes: 1000,
+          allowEncrypted: true,
+        });
+        buffer = validatedPdf.buffer;
+        if (downloadedContentHashes.has(validatedPdf.sha256)) {
+          throw new Error('MATRIX_DOCUMENT_DUPLICATE_CONTENT');
+        }
+        downloadedContentHashes.add(validatedPdf.sha256);
+        const parsed = validatedPdf.encrypted ? null : await parsePDFText(buffer);
+        // Deux parseurs indépendants doivent s'accorder sur un nombre de pages
+        // positif. pdf-lib protège l'enveloppe; pdf-parse alimente l'extraction.
+        if (parsed && parsed.pages !== validatedPdf.pageCount) throw new Error('MATRIX_DOCUMENT_PAGE_COUNT_MISMATCH');
+        const enriched = addCentrisContentMetadata(doc, buffer, validatedPdf.pageCount);
+        runningDownloadedBytes += buffer.length;
+        if (runningDownloadedBytes > MATRIX_DOCUMENT_TOTAL_MAX_BYTES) {
+          batchTooLarge = true;
+          downloadAbortReason = 'MATRIX_DOCUMENT_BATCH_TOO_LARGE';
+          throw new Error(downloadAbortReason);
+        }
+        const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
+        return { ok: true, document: {
+          buffer,
+          filename: `${safeBase}_${exactNum}.pdf`,
+          label: doc.name,
+          size: buffer.length,
+          page_count: enriched.page_count,
+          sha256: enriched.sha256,
+          source: 'matrix-global',
+        } };
+      } catch (error) {
+        const message = safeErrorMessage(error).substring(0, 120);
+        if (/MATRIX_DOCUMENT_PDF_TIMEOUT|Target page|context or browser has been closed|Browser disconnected/i.test(message)) {
+          downloadAbortReason = message;
+        }
+        return { ok: false, failure: { label: doc.name, error: message } };
+      }
+    });
+    for (const item of downloaded) {
+      if (item.ok) annexes.push(item.document);
+      else {
+        failures.push(item.failure);
+        console.warn(`[MATRIX-PDF] ${item.failure.label}: ${item.failure.error}`);
+      }
+    }
+    if (batchTooLarge) {
+      return {
+        success: false, annexes: [], failures,
+        discovered_count: matchedDocs.length, validated_count: 0,
+        message: `Lot Matrix trop volumineux (maximum ${Math.floor(MATRIX_DOCUMENT_TOTAL_MAX_BYTES / 1024 / 1024)} MB). Téléchargement interrompu; aucun envoi effectué.`,
+      };
+    }
+    const totalDownloadedBytes = annexes.reduce((total, doc) => total + Number(doc.size || 0), 0);
+    if (totalDownloadedBytes > MATRIX_DOCUMENT_TOTAL_MAX_BYTES) {
+      return {
+        success: false, annexes: [], failures,
+        discovered_count: matchedDocs.length, validated_count: 0,
+        message: `Lot Matrix trop volumineux (${Math.ceil(totalDownloadedBytes / 1024 / 1024)} MB; maximum 120 MB). Aucun envoi effectué.`,
+      };
+    }
     return {
       success: annexes.length > 0,
       annexes,
-      message: annexes.length > 0 ? `${annexes.length} annexe(s) trouvée(s)` : 'Aucune annexe trouvée',
-      rawResult: result
+      failures,
+      discovered_count: matchedDocs.length,
+      validated_count: annexes.length,
+      docs_count: state.docs.length,
+      docs_list: publicInventory.docs,
+      document_inventory: publicInventory,
+      manifest_id: fullInventory.manifest_id,
+      message: annexes.length > 0
+        ? `${annexes.length}/${matchedDocs.length} annexe(s) Matrix téléchargée(s) et validée(s)`
+        : `Aucune annexe PDF validée (${failures.length} échec(s)): ${failures.slice(0, 3).map((item) => item.error).join(' | ')}`,
+      duration_ms: Date.now() - operationStartedAt,
     };
 
   } catch (e) {
     console.error('[CUA] cuaGetCentrisAnnexes error:', e.message);
-    if (/login|auth/i.test(e.message)) clearSession();
     return { success: false, annexes: [], message: e.message };
   } finally {
+    // Fermer explicitement le contexte libère pages, réponses et buffers avant
+    // de rendre la session Browserless. browser.close() reste le filet final.
+    if (context) try { await context.close(); } catch {}
     if (browser) try { await browser.close(); } catch {}
+  }
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
+  let lastDiagnostic = 'aucune réponse candidate';
+  let settled = false;
+  let timer;
+  let handler;
+  const removeHandler = () => {
+    try { context.off?.('response', handler); } catch {}
+  };
+  const result = new Promise((resolve, reject) => {
+    const finish = (error, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      removeHandler();
+      if (error) reject(error); else resolve(buffer);
+    };
+    handler = async (response) => {
+      try {
+        const responseUrl = new URL(response.url());
+        if (!/(^|\.)centris\.ca$/i.test(responseUrl.hostname)) return;
+        const contentType = String(response.headers()['content-type'] || '').toLowerCase();
+        if (!contentType.includes('pdf') && !/media\.ashx/i.test(responseUrl.pathname)) return;
+        const contentLength = Number(response.headers()['content-length'] || 0);
+        if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+          finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+          return;
+        }
+        const buffer = await response.body();
+        if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+          finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+          return;
+        }
+        const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+        if (buffer.length >= 1000 && magicIndex >= 0) {
+          finish(null, magicIndex ? buffer.subarray(magicIndex) : buffer);
+          return;
+        }
+        const htmlHead = buffer.subarray(0, Math.min(buffer.length, 32768)).toString('utf8');
+        const title = String(htmlHead.match(/<title[^>]*>([^<]{0,120})<\/title>/i)?.[1] || '')
+          .replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 80);
+        const formActionRaw = String(htmlHead.match(/<form[^>]+action=["']([^"']{1,500})["']/i)?.[1] || '');
+        let formPath = '';
+        try {
+          const formUrl = new URL(formActionRaw, responseUrl.origin);
+          formPath = `${formUrl.hostname}${formUrl.pathname}`;
+        } catch {}
+        // Le corps HTML peut contenir adresse, nom de client ou jetons rendus.
+        // Le diagnostic expose seulement une classe de wrapper, jamais son texte.
+        const wrapperKind = /mot de passe|password|connectez-vous|sign[ -]?in/i.test(htmlHead)
+          ? 'auth'
+          : /__viewstate|__doPostBack/i.test(htmlHead)
+            ? 'postback'
+            : /<html|<!doctype/i.test(htmlHead)
+              ? 'html'
+              : 'non-pdf';
+        const status = typeof response.status === 'function' ? response.status() : 'inconnu';
+        // Ne jamais journaliser la query media.ashx: elle contient des
+        // identifiants propres à la session. Hôte + chemin + titre suffisent.
+        lastDiagnostic = [
+          `status=${status}`,
+          `type=${contentType || 'inconnu'}`,
+          `url=${responseUrl.hostname}${responseUrl.pathname}`,
+          `bytes=${buffer.length}`,
+          `signature=${buffer.subarray(0, 16).toString('hex') || 'vide'}`,
+          title ? `title=${title}` : null,
+          formPath ? `form=${formPath}` : null,
+          `wrapper=${wrapperKind}`,
+        ].filter(Boolean).join(',');
+      } catch (error) {
+        lastDiagnostic = safeErrorMessage(error).substring(0, 100);
+      }
+    };
+    try { context.on('response', handler); }
+    catch (error) { finish(error); return; }
+    timer = setTimeout(() => finish(new Error(`MATRIX_DOCUMENT_PDF_TIMEOUT:${lastDiagnostic}`)), timeoutMs);
+  });
+  try {
+    await trigger();
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      clearTimeout(timer);
+      removeHandler();
+    }
+    throw error;
+  }
+  return result;
+}
+
+async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = null) {
+  const id = String(actionId || '').trim();
+  const label = normalizeCentrisLabel(actionLabel);
+  if ((!id && !label) || id.length > 300 || label.length > 120) throw new Error('MATRIX_DOCUMENT_ACTION_INVALID');
+  let control = null;
+  for (const frame of page.frames()) {
+    // XPath avec chaîne JSON évite d'interpréter l'id ASP.NET comme CSS.
+    if (id) {
+      const direct = frame.locator(`xpath=//*[@id=${JSON.stringify(id)}]`).first();
+      if (await direct.isVisible().catch(() => false)) { control = direct; break; }
+    }
+    if (label) {
+      if (typeof frame.getByText === 'function') {
+        const exactText = frame.getByText(label, { exact: true }).first();
+        if (await exactText.isVisible().catch(() => false)) {
+          control = exactText;
+          break;
+        }
+        const containingText = frame.getByText(label, { exact: false }).first();
+        if (await containingText.isVisible().catch(() => false)) {
+          control = containingText;
+          break;
+        }
+      }
+      const candidates = frame.locator('a,button,[role="link"],[onclick]');
+      const count = Math.min(await candidates.count().catch(() => 0), 400);
+      for (let index = 0; index < count; index += 1) {
+        const candidate = candidates.nth(index);
+        if (!(await candidate.isVisible().catch(() => false))) continue;
+        const metadata = await candidate.evaluate((element) => ({
+          own: element.innerText || element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '',
+          context: (element.closest('tr,li,[role="row"]') || element.parentElement?.parentElement || element.parentElement)?.innerText || '',
+        })).catch(() => ({ own: '', context: '' }));
+        const candidateLabel = normalizeCentrisLabel(metadata.own);
+        const candidateContext = normalizeCentrisLabel(metadata.context);
+        const compactTarget = label.replace(/\s+/g, '');
+        const exactOwn = candidateLabel === label || candidateLabel.replace(/\s+/g, '') === compactTarget;
+        const contextualControl = candidateContext.replace(/\s+/g, '').includes(compactTarget) &&
+          /^(?:oui|dv|voir|ouvrir|t[ée]l[ée]charger)?$/i.test(candidateLabel);
+        if (exactOwn || contextualControl) {
+          control = candidate;
+          break;
+        }
+      }
+      if (control) break;
+    }
+  }
+  if (!control) throw new Error('MATRIX_DOCUMENT_ACTION_MISSING');
+  return waitForMatrixPdfResponse(context, () => control.click(), 45000);
+}
+
+async function clickMatrixMediaAnchor(openerPage, targetHref) {
+  const anchors = openerPage.locator?.('a[href*="media.ashx" i]');
+  if (anchors) {
+    const count = Math.min(await anchors.count().catch(() => 0), 100);
+    for (let index = 0; index < count; index += 1) {
+      const anchor = anchors.nth(index);
+      const rawHref = await anchor.getAttribute('href').catch(() => null);
+      if (!rawHref) continue;
+      let absoluteHref = rawHref;
+      try { absoluteHref = new URL(rawHref, openerPage.url()).href; } catch {}
+      if (absoluteHref !== targetHref) continue;
+      await anchor.click({ timeout: 10000, noWaitAfter: true });
+      return;
+    }
+    throw new Error('MATRIX_DOCUMENT_ANCHOR_MISSING');
+  }
+  // Compatibilité des doubles de test; en production, le clic Playwright
+  // ci-dessus est toujours utilisé afin de reproduire le geste humain.
+  await openerPage.evaluate((href) => { window.open(href, '_blank'); }, targetHref);
+}
+
+async function downloadMatrixPdfInBrowser(context, url, referer, openerPage = null) {
+  const target = new URL(String(url));
+  if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname)) {
+    throw new Error('MATRIX_DOCUMENT_URL_REJECTED');
+  }
+  if (openerPage) {
+    let popup = null;
+    let popupPromise = null;
+    try {
+      popupPromise = openerPage.waitForEvent('popup', { timeout: 10000 }).catch(() => null);
+      const bufferPromise = waitForMatrixPdfResponse(context, () =>
+        clickMatrixMediaAnchor(openerPage, target.href), 12000);
+      // Attacher immédiatement le gestionnaire de rejet: attendre d'abord le
+      // popup créait une fenêtre de 10 s où un échec rapide devenait une
+      // unhandledRejection en production.
+      const buffer = await bufferPromise;
+      popup = await popupPromise;
+      return buffer;
+    } finally {
+      if (!popup && popupPromise) popup = await popupPromise.catch(() => null);
+      try { await popup?.close(); } catch {}
+    }
+  }
+  const tab = await context.newPage();
+  try {
+    const response = await tab.goto(target.href, { referer, waitUntil: 'commit', timeout: 30000 });
+    if (!response) throw new Error('MATRIX_DOCUMENT_NO_RESPONSE');
+    if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
+    const contentType = String(response.headers()['content-type'] || '').toLowerCase();
+    const contentLength = Number(response.headers()['content-length'] || 0);
+    if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    const buffer = await response.body();
+    if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+      throw new Error(`MATRIX_DOCUMENT_NOT_PDF:${contentType || 'unknown'}`);
+    }
+    return buffer;
+  } finally {
+    await tab.close().catch(() => {});
+  }
+}
+
+async function downloadMatrixPdfAuthenticated(context, url, referer, openerPage = null) {
+  const target = new URL(String(url));
+  if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname)) {
+    throw new Error('MATRIX_DOCUMENT_URL_REJECTED');
+  }
+  let requestError = null;
+  try {
+    const response = await context.request.get(target.href, {
+      headers: { Referer: referer, Accept: 'application/pdf,*/*' },
+      timeout: 30000,
+    });
+    if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
+    const contentLength = Number(response.headers()['content-length'] || 0);
+    if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    const buffer = await response.body();
+    if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+      throw new Error(`MATRIX_DOCUMENT_NOT_PDF:${String(response.headers()['content-type'] || 'unknown')}`);
+    }
+    return buffer;
+  } catch (error) {
+    // Une URL rejetée ou un fichier annoncé trop volumineux ne deviendra pas
+    // valide en ouvrant un nouvel onglet. Éviter ce fallback coûteux et sa
+    // seconde allocation mémoire.
+    if (!isMatrixDocumentRetryable(error)) throw error;
+    requestError = safeErrorMessage(error).substring(0, 100);
+  }
+  try {
+    return await downloadMatrixPdfInBrowser(context, target.href, referer, openerPage);
+  } catch (browserError) {
+    if (!isMatrixDocumentRetryable(browserError)) throw browserError;
+    throw new Error(`MATRIX_DOWNLOAD_FAILED:request=${requestError};browser=${safeErrorMessage(browserError).substring(0, 100)}`);
   }
 }
 
@@ -1061,6 +2738,27 @@ function getPdfParse() {
   return _pdfParse || null;
 }
 
+async function parsePdfBufferWithModule(pdfModule, pdfBuffer) {
+  const legacyParser = typeof pdfModule === 'function'
+    ? pdfModule
+    : typeof pdfModule?.default === 'function'
+      ? pdfModule.default
+      : null;
+  if (legacyParser) return legacyParser(pdfBuffer);
+
+  if (typeof pdfModule?.PDFParse === 'function') {
+    const parser = new pdfModule.PDFParse({ data: pdfBuffer });
+    try {
+      // pdf-parse 2.4.x expose getText(); getRaw() n'existe pas dans cette API.
+      if (typeof parser.getText !== 'function') throw new Error('API pdf-parse v2 getText absente');
+      return await parser.getText();
+    } finally {
+      await parser.destroy?.();
+    }
+  }
+  throw new Error('API pdf-parse non supportée');
+}
+
 /**
  * Extrait du texte + données structurées d'un PDF Centris.
  * @param {Buffer} pdfBuffer
@@ -1070,12 +2768,14 @@ async function parsePDFText(pdfBuffer) {
   const pdfParse = getPdfParse();
   if (!pdfParse) throw new Error('pdf-parse non installé');
   try {
-    const data = await pdfParse(pdfBuffer);
+    const data = await parsePdfBufferWithModule(pdfParse, pdfBuffer);
+    const text = String(data?.text || '');
+    const pages = Number(data?.numpages || data?.numPages || data?.total || data?.pages?.length || 0);
     return {
-      text: data.text,
-      pages: data.numpages,
-      info: data.info,
-      length: data.text.length,
+      text,
+      pages,
+      info: data?.info || data?.infoData || null,
+      length: text.length,
     };
   } catch (e) {
     console.error('[CUA] parsePDF error:', e.message);
@@ -1101,12 +2801,16 @@ async function extractCentrisPDFData(pdfBuffer) {
   // Adresse (heuristique: ligne avec numéro civique)
   const adrM = text.match(/(\d{1,5}[A-Za-z]?[,\s]+(?:rue|avenue|av\.|boul\.|boulevard|chemin|ch\.|route|rang|rte)\s+[^\n]{3,80})/i);
   if (adrM) data.adresse = adrM[1].trim().substring(0, 200);
-  // Taxes municipales (annuelles)
-  const taxMuniM = text.match(/taxes?\s*municipal[ea]s?\s*[:\s]*\$?\s*([\d\s,]+)/i);
-  if (taxMuniM) data.taxes_municipales = parseFloat(taxMuniM[1].replace(/[\s,]/g, ''));
-  // Taxes scolaires
-  const taxScolM = text.match(/taxes?\s*scolair[es]+\s*[:\s]*\$?\s*([\d\s,]+)/i);
-  if (taxScolM) data.taxes_scolaires = parseFloat(taxScolM[1].replace(/[\s,]/g, ''));
+  // Taxes: PDF texte = fallback seulement. Ne jamais choisir arbitrairement
+  // entre plusieurs montants (année courante, historique, estimé, etc.).
+  const municipalCandidates = extractTaxCandidatesFromText(text, 'taxes?\\s*municipal(?:e|es|aux)?');
+  const schoolCandidates = extractTaxCandidatesFromText(text, 'taxes?\\s*scolair(?:e|es)?');
+  data.taxes_provenance = 'pdf-text-fallback';
+  data.taxes_municipales_candidates = municipalCandidates;
+  data.taxes_scolaires_candidates = schoolCandidates;
+  if (municipalCandidates.length === 1) data.taxes_municipales = municipalCandidates[0];
+  if (schoolCandidates.length === 1) data.taxes_scolaires = schoolCandidates[0];
+  data.taxes_ambiguous = municipalCandidates.length > 1 || schoolCandidates.length > 1;
   // Année construction
   const yearM = text.match(/(?:ann[ée]?e?\s*(?:de\s*)?construction|built|construit)\s*[:\s]*(\d{4})/i);
   if (yearM) data.year_built = parseInt(yearM[1]);
@@ -1162,9 +2866,13 @@ function cuaCleanup() {
  * @param {string} [opts.sujet] — défaut auto-généré
  * @param {string} [opts.message] — défaut message standard
  * @param {string} [opts.format] — 'detaille_client_album_imperial' (défaut), 'detaille_client_imperial', etc
+ * @param {string} opts.confirmationMessage — confirmation exacte et courante de Shawn
  * @returns {Promise<{success, message, email_sent_to, cc, listing_url, screenshots?}>}
  */
 async function sendCentrisListingByEmail(opts) {
+  if (!hasExplicitCentrisSendConfirmation(opts?.confirmationMessage)) {
+    return { success: false, blocked: true, message: 'Envoi Centris bloqué: confirmation exacte « envoie » requise' };
+  }
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
@@ -1217,9 +2925,10 @@ async function sendCentrisListingByEmail(opts) {
     // 4. Sélectionner format (checkbox dans <li> avec title)
     console.log(`[CENTRIS-NATIVE] Format: ${formatTitle}`);
     const formatSelected = await page.evaluate((title) => {
-      const li = [...document.querySelectorAll('li')].find(l => l.title === title);
+      const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const li = [...document.querySelectorAll('li')].find(l => norm(l.title || l.textContent) === norm(title));
       const cb = li?.querySelector('input[type=checkbox]');
-      if (cb) { cb.checked = true; cb.click(); return true; }
+      if (cb) { if (!cb.checked) cb.click(); return true; }
       return false;
     }, formatTitle);
     if (!formatSelected) throw new Error(`Format "${formatTitle}" non trouvé dans listbox`);
@@ -1584,8 +3293,10 @@ async function loginCentrisZone(context) {
     try {
       await context.addCookies(savedCookies);
       await page.goto('https://zone.centris.ca/Dashboard', { waitUntil: 'domcontentloaded', timeout: 20000 });
+      const appReady = await waitForZoneAppReady(page);
       const u = page.url();
-      if (/Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u)) {
+      const state = await inspectZonePage(page, '');
+      if (appReady && /Dashboard|Directory|Listings/i.test(u) && !/login|signin/i.test(u) && state.code !== 'ZONE_AUTH_REQUIRED') {
         console.log('[ZONE] Session cachée valide ✅');
         return page;
       }
@@ -1622,14 +3333,21 @@ async function loginCentrisZone(context) {
     await page.waitForTimeout(4000);
   }
 
-  // Vérif logged
-  if (!/Dashboard|Directory|Listings/i.test(page.url())) {
-    throw new Error(`Zone login échoué — URL: ${page.url().substring(0, 100)}`);
+  // Vérif logged: une URL Dashboard avec une application vide n'est pas une
+  // session valide. Attendre le rendu réel de Zone avant de continuer.
+  const appReady = await waitForZoneAppReady(page);
+  const loggedState = await inspectZonePage(page, '');
+  if (!appReady) {
+    throw new Error(`ZONE_APP_BLANK — Centris Zone n'a rendu aucun contrôle après la connexion`);
+  }
+  if (!/Dashboard|Directory|Listings/i.test(page.url()) || loggedState.code === 'ZONE_AUTH_REQUIRED') {
+    throw new Error(`Zone login échoué — page: ${safeCentrisPageLocation(page.url())}`);
   }
   console.log('[ZONE] Logged ✅');
   // Save cookies pour reuse
   try {
     const cookies = await context.cookies();
+    await saveBrowserStorageState(context, page);
     pushCookiesToBot(cookies).catch(() => {});
   } catch {}
   return page;
@@ -1705,13 +3423,18 @@ async function getListingBroker(centrisNum, opts = {}) {
  * @param {boolean} [opts.sendSelfCopy] — défaut false
  * @param {string} [opts.langue] — 'fr' (défaut) | 'en'
  * @param {string} [opts.message] — message custom (sinon défaut Centris)
+ * @param {string} [opts.confirmationMessage] — requis pour tout envoi réel
+ * @param {string} [opts.expectedManifestId] — empreinte du dry-run; requise pour lier l'envoi au même dossier
  * @returns {Promise<{success, broker_info, docs_shared, docs_list?, sent_to, listing_url, dry_run?}>}
  */
-async function shareCentrisZoneDocuments(opts = {}) {
+async function runCentrisZoneDocuments(opts = {}) {
+  if (!opts.dry_run && !hasExplicitCentrisSendConfirmation(opts.confirmationMessage)) {
+    return { success: false, blocked: true, message: 'Partage Zone bloqué: confirmation exacte « envoie » requise' };
+  }
   if (!CUA_AVAILABLE()) return { success: false, message: 'Playwright non disponible' };
   loadDeps();
   initDirs();
-  const { centris_num, email, dry_run = false, sendSelfCopy = false, langue = 'fr', message } = opts;
+  const { centris_num, email, dry_run = false, sendSelfCopy = false, langue = 'fr', message, expectedManifestId } = opts;
   if (!centris_num) return { success: false, message: 'centris_num requis' };
   if (!dry_run && !email) return { success: false, message: 'email requis (sauf dry_run=true)' };
 
@@ -1725,13 +3448,24 @@ async function shareCentrisZoneDocuments(opts = {}) {
     const broker = await getListingBroker(centris_num, { page });
     console.log(`[ZONE${dry_run?'-DRY':''}] Listing #${centris_num} → courtier inscripteur: ${broker.name || '?'} (${broker.agency || '?'}) source=${broker.source}`);
 
-    // 2. URL directe page Documents
-    console.log(`[ZONE${dry_run?'-DRY':''}] Navigate /Listings/${centris_num}/Documents`);
-    await page.goto(`https://zone.centris.ca/Listings/${centris_num}/Documents`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3500);
+    // 2. Navigation vérifiée. Zéro document n'est jamais interprété comme
+    // listing inexistant sans un état explicite rendu par Zone.
+    const navigation = await navigateToZoneDocuments(page, centris_num);
+    const zoneState = navigation.state;
+    if (zoneState.code !== 'ZONE_DOCUMENTS_READY' && zoneState.code !== 'ZONE_NO_DOCUMENTS') {
+      return {
+        success: false,
+        error_code: zoneState.code,
+        message: `Accès Zone non confirmé (${zoneState.code}). Aucun envoi effectué.`,
+        broker_info: broker,
+        listing_public_found: broker.source === 'centris.ca-public',
+        final_url: safeCentrisPageLocation(zoneState.url),
+        navigation_attempts: navigation.attempts,
+      };
+    }
 
     // 3. Liste les docs (et coche pour count) — capture noms+tailles
-    const docsInfo = await page.evaluate(() => {
+    const docsInfo = await page.evaluate((isDryRun) => {
       const rows = [...document.querySelectorAll('tr, [role=row], li')].filter(r => r.querySelector('input[type=checkbox]'));
       const docs = [];
       for (const row of rows) {
@@ -1745,27 +3479,64 @@ async function shareCentrisZoneDocuments(opts = {}) {
         const name = txt.split('\n').filter(Boolean)[0]?.substring(0, 120) || '(sans nom)';
         // Skip ligne sans contenu utile
         if (!name || name.toLowerCase().includes('description')) continue;
-        docs.push({ name: name.trim(), size: sizeMatch?.[0] || null });
-        if (!cb.checked) cb.click();
+        docs.push({
+          name: name.trim(),
+          size: sizeMatch?.[0] || null,
+          provenance: 'zone',
+          source_section: 'zone_documents',
+        });
+        if (!isDryRun && !cb.checked) cb.click();
       }
       return docs;
-    });
+    }, dry_run);
     const checkedCount = docsInfo.length;
+    const inventory = buildCentrisDocumentInventory(centris_num, docsInfo);
     console.log(`[ZONE${dry_run?'-DRY':''}] ${checkedCount} documents listés${dry_run?' (DRY-RUN)':' cochés'}`);
     if (checkedCount === 0) {
-      return { success: false, message: `Aucun document trouvé pour #${centris_num} (listing inexistant ou pas de docs)`, broker_info: broker };
+      return {
+        success: false,
+        error_code: zoneState.code === 'ZONE_NO_DOCUMENTS' ? 'ZONE_NO_DOCUMENTS' : 'ZONE_DOCUMENT_SELECTORS_CHANGED',
+        message: zoneState.code === 'ZONE_NO_DOCUMENTS'
+          ? `Listing #${centris_num} trouvé dans Zone, mais aucun document n’y est disponible.`
+          : `Page Documents trouvée pour #${centris_num}, mais l’inventaire n’a pas pu être lu. Aucun envoi effectué.`,
+        broker_info: broker,
+        listing_public_found: broker.source === 'centris.ca-public',
+        final_url: safeCentrisPageLocation(zoneState.url),
+        navigation_attempts: navigation.attempts,
+      };
     }
 
     // DRY-RUN: short-circuit ici, pas d'envoi
     if (dry_run) {
+      const publicInventory = redactCentrisDocumentInventory(inventory);
       return {
         success: true,
         dry_run: true,
         broker_info: broker,
         docs_count: checkedCount,
-        docs_list: docsInfo,
+        docs_list: publicInventory.docs,
+        document_inventory: publicInventory,
+        manifest_id: inventory.manifest_id,
         listing_url: `https://zone.centris.ca/Listings/${centris_num}/Documents`,
         message: `PREVIEW — ${checkedCount} docs prêts à partager. Confirme avec envoyer_tous_documents_zone pour livrer.`,
+      };
+    }
+
+    if (!expectedManifestId) {
+      return {
+        success: false,
+        blocked: true,
+        message: 'Partage Zone bloqué: inventaire dry-run manquant. Relance verifier_listing_centris.',
+      };
+    }
+    if (expectedManifestId !== inventory.manifest_id) {
+      return {
+        success: false,
+        blocked: true,
+        message: 'Partage Zone bloqué: la liste des documents a changé depuis l’aperçu. Une nouvelle vérification est requise.',
+        expected_manifest_id: expectedManifestId,
+        actual_manifest_id: inventory.manifest_id,
+        document_inventory: redactCentrisDocumentInventory(inventory),
       };
     }
 
@@ -1806,6 +3577,9 @@ async function shareCentrisZoneDocuments(opts = {}) {
       success: true,
       broker_info: broker,
       docs_shared: checkedCount,
+      docs_list: redactCentrisDocumentInventory(inventory).docs,
+      document_inventory: redactCentrisDocumentInventory(inventory),
+      manifest_id: inventory.manifest_id,
       sent_to: email,
       send_self_copy: sendSelfCopy,
       langue,
@@ -1818,6 +3592,21 @@ async function shareCentrisZoneDocuments(opts = {}) {
   } finally {
     if (browser) try { await browser.close(); } catch {}
   }
+}
+
+async function shareCentrisZoneDocuments(opts = {}) {
+  if (!opts.dry_run && !hasExplicitCentrisSendConfirmation(opts.confirmationMessage)) {
+    return { success: false, blocked: true, message: 'Partage Zone bloqué: confirmation exacte « envoie » requise' };
+  }
+  if (!opts.dry_run) return runCentrisZoneDocuments(opts);
+  const key = String(opts.centris_num || '').replace(/\D/g, '');
+  if (zonePreviewInFlight.has(key)) {
+    console.log(`[ZONE-DRY] Preview #${key} déjà en cours — résultat partagé`);
+    return zonePreviewInFlight.get(key);
+  }
+  const task = runCentrisZoneDocuments(opts).finally(() => zonePreviewInFlight.delete(key));
+  zonePreviewInFlight.set(key, task);
+  return task;
 }
 
 /**
@@ -2050,17 +3839,6 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
     }
     console.log(`[FICHE-PDF] Result clicked (${linkClicked})`);
     await page.waitForTimeout(5000);
-    const navigatedOK = true;
-
-    // 2. Click result link
-    const clicked = await page.evaluate((n) => {
-      const a = [...document.querySelectorAll('a')].find(x => x.textContent.trim() === String(n));
-      if (a) { a.click(); return true; }
-      return false;
-    }, centrisNum);
-    if (!clicked) throw new Error(`Listing #${centrisNum} non trouvé`);
-    await page.waitForTimeout(3000);
-
     // 3. Click Imprimer
     console.log('[FICHE-PDF] Click Imprimer');
     await page.evaluate(() => {
@@ -2074,9 +3852,10 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
     // 4. Select format
     console.log(`[FICHE-PDF] Format: ${formatTitle}`);
     const formatSelected = await page.evaluate((title) => {
-      const li = [...document.querySelectorAll('li')].find(l => l.title === title);
+      const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const li = [...document.querySelectorAll('li')].find(l => norm(l.title || l.textContent) === norm(title));
       const cb = li?.querySelector('input[type=checkbox]');
-      if (cb) { cb.checked = true; cb.click(); return true; }
+      if (cb) { if (!cb.checked) cb.click(); return true; }
       return false;
     }, formatTitle);
     if (!formatSelected) throw new Error(`Format "${formatTitle}" non trouvé`);
@@ -2143,6 +3922,7 @@ module.exports = {
   sendCentrisListingByEmail,
   searchCentrisVendus,
   shareCentrisZoneDocuments,
+  previewCentrisMatrixDocuments,
   getListingBroker,
   _loginCentrisZone: loginCentrisZone,
   // Internals exposés pour tests
@@ -2150,4 +3930,37 @@ module.exports = {
   _runCUATask: runCUATask,
   _executeCUAAction: executeCUAAction,
   _newStealthContext: newStealthContext,
+  _browserlessEndpointWithTimeout: browserlessEndpointWithTimeout,
+  _isAuthenticatedCentrisUrl: isAuthenticatedCentrisUrl,
+  _isAuthenticatedMatrixPage: isAuthenticatedMatrixPage,
+  _isMatrixMultipleLoginPage: isMatrixMultipleLoginPage,
+  _safeCentrisPageLocation: safeCentrisPageLocation,
+  _classifyCentrisLoginSnapshot: classifyCentrisLoginSnapshot,
+  _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
+  _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
+  _buildCentrisDocumentInventory: buildCentrisDocumentInventory,
+  _redactCentrisDocumentInventory: redactCentrisDocumentInventory,
+  _dedupeCentrisDiscoveredDocs: dedupeCentrisDiscoveredDocs,
+  _mergeMatrixDocumentSnapshots: mergeMatrixDocumentSnapshots,
+  _buildCentrisContentManifest: buildCentrisContentManifest,
+  _addCentrisContentMetadata: addCentrisContentMetadata,
+  _parseCentrisDisplaySize: parseCentrisDisplaySize,
+  _normalizeCentrisLabel: normalizeCentrisLabel,
+  _classifyZonePageSnapshot: classifyZonePageSnapshot,
+  _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
+  _matrixTextContainsExactNumber: matrixTextContainsExactNumber,
+  _isExactMatrixListingLabel: isExactMatrixListingLabel,
+  _scoreMatrixSearchCandidate: scoreMatrixSearchCandidate,
+  _scoreMatrixSubmitControl: scoreMatrixSubmitControl,
+  _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
+  _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
+  _downloadMatrixPdfAuthenticated: downloadMatrixPdfAuthenticated,
+  _downloadMatrixPdfByAction: downloadMatrixPdfByAction,
+  _isMatrixDocumentRetryable: isMatrixDocumentRetryable,
+  _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
+  _mapWithConcurrency: mapWithConcurrency,
+  _parsePdfBufferWithModule: parsePdfBufferWithModule,
+  cuaLoginCentris,
+  ingestManualMFACode,
+  isAwaitingCentrisMFA,
 };
