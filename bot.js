@@ -8713,13 +8713,18 @@ function registerHandlers() {
           ].join('\n');
           await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
         }
-      } else if (action === 'cmp_send' || action === 'cmp_cancel' || action === 'cmp_preview') {
+      } else if (action === 'cmp_send' || action === 'cmp_cancel' || action === 'cmp_preview' || action === 'cmp_julie') {
         if (!BREVO_KEY) {
           await bot.answerCallbackQuery(cbq.id, { text: '❌ BREVO_API_KEY manquant' });
           return;
         }
         const campaignId = arg;
-        if (action === 'cmp_preview') {
+        if (action === 'cmp_julie') {
+          approveJulieCampaign(campaignId);
+          auditLogEvent('campaign', 'julie-terrain-confirmed', { campaignId, confirmedBy: 'Shawn via Telegram' });
+          await bot.answerCallbackQuery(cbq.id, { text: '✅ Validation enregistrée' });
+          await bot.sendMessage(chatId, `✅ Tu as confirmé avec Julie que la liste est à jour pour la campagne #${campaignId}.`);
+        } else if (action === 'cmp_preview') {
           await bot.answerCallbackQuery(cbq.id, { text: '👁 Récupération preview...' });
           try {
             const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
@@ -8772,6 +8777,9 @@ function registerHandlers() {
                     expectedList: 8,
                   });
                   throw new Error(`TERRAINS BLOQUÉ: destinataires [${terrainLists.join(',')}] — liste Entrepreneurs L8 requise`);
+                }
+                if (!isJulieCampaignConfirmed(campaignId)) {
+                  throw new Error("TERRAINS BLOQUÉ: clique d'abord sur « J'ai confirmé avec Julie »");
                 }
               }
               const sched = det.scheduledAt;
@@ -10059,12 +10067,17 @@ function registerHandlers() {
       for (const c of campaigns.slice(0, 10)) {
         const sched = c.scheduledAt ? new Date(c.scheduledAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' }) : '?';
         const txt = `*#${c.id}* · ${c.name?.substring(0, 60) || '?'}\n📅 ${sched}\n📋 ${c.subject?.substring(0, 80) || '?'}`;
-        const replyMarkup = {
-          inline_keyboard: [[
+        const inlineKeyboard = [];
+        if (/terrain/i.test(c.name || '')) inlineKeyboard.push([
+          { text: "👩‍💼 J'ai confirmé avec Julie", callback_data: `cmp_julie:${c.id}` },
+        ]);
+        inlineKeyboard.push([
             { text: '✅ Confirmer', callback_data: `cmp_send:${c.id}` },
             { text: '🚫 Annuler', callback_data: `cmp_cancel:${c.id}` },
             { text: '👁 Preview', callback_data: `cmp_preview:${c.id}` },
-          ]],
+        ]);
+        const replyMarkup = {
+          inline_keyboard: inlineKeyboard,
         };
         await bot.sendMessage(msg.chat.id, txt, { parse_mode: 'Markdown', reply_markup: replyMarkup }).catch(() =>
           bot.sendMessage(msg.chat.id, txt.replace(/[*_`]/g, ''), { reply_markup: replyMarkup }).catch(() => {})
@@ -11690,6 +11703,17 @@ let campaignApprovals = loadJSON(CAMPAIGN_APPROVALS_FILE, { approved: {} });
 function approveCampaign(id) {
   campaignApprovals.approved[String(id)] = { approvedAt: new Date().toISOString() };
   saveJSON(CAMPAIGN_APPROVALS_FILE, campaignApprovals);
+}
+function approveJulieCampaign(id) {
+  const key = String(id);
+  campaignApprovals.approved[key] = {
+    ...(campaignApprovals.approved[key] || {}),
+    julieConfirmedAt: new Date().toISOString(),
+  };
+  saveJSON(CAMPAIGN_APPROVALS_FILE, campaignApprovals);
+}
+function isJulieCampaignConfirmed(id) {
+  return !!campaignApprovals.approved[String(id)]?.julieConfirmedAt;
 }
 function isCampaignApproved(id) {
   return !!campaignApprovals.approved[String(id)];
