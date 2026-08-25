@@ -2606,6 +2606,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           }
         }
         if (!buffer) throw lastError || new Error('MATRIX_DOWNLOAD_FAILED');
+        const generationMethod = String(buffer._matrixGenerationMethod || 'matrix-native-pdf');
         const magicIndex = buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-'));
         if (buffer.length < 1000 || magicIndex === -1) {
           const signature = buffer.subarray(0, 16).toString('hex');
@@ -2635,7 +2636,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           downloadAbortReason = 'MATRIX_DOCUMENT_BATCH_TOO_LARGE';
           throw new Error(downloadAbortReason);
         }
-        const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${indexOffset + index + 1}`;
+        const capturedReport = generationMethod === 'matrix-detail-page-capture';
+        const safeBase = capturedReport
+          ? 'fiche_detaillee_matrix_capture'
+          : normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${indexOffset + index + 1}`;
         return { ok: true, document: {
           buffer,
           filename: `${safeBase}_${exactNum}.pdf`,
@@ -2644,9 +2648,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           page_count: enriched.page_count,
           sha256: enriched.sha256,
           source: 'matrix-global',
-          provenance: doc.provenance || null,
+          provenance: capturedReport ? 'matrix_listing_report_capture_pdf' : (doc.provenance || null),
           source_section: doc.source_section || null,
           is_matrix_listing_report: doc.action_id === MATRIX_LISTING_REPORT_ACTION,
+          generation_method: generationMethod,
         } };
       } catch (error) {
         const message = safeErrorMessage(error).substring(0, 120);
@@ -2839,8 +2844,8 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
             const cookieHeader = cookieHeaderFromPlaywrightCookies(authenticatedState.cookies, responseUrl.hostname);
             if (!cookieHeader) throw new Error('MATRIX_PRINT_COOKIE_MISSING');
             clearTimeout(timer);
-            timer = setTimeout(() => finish(new Error(`MATRIX_PRINT_DETACHED_TIMEOUT:${lastDiagnostic}`)), 270000);
-            const fetchedBuffer = await streamMatrixPdfUntilEof(response.url(), cookieHeader, 240000);
+            timer = setTimeout(() => finish(new Error(`MATRIX_PRINT_DETACHED_TIMEOUT:${lastDiagnostic}`)), 25000);
+            const fetchedBuffer = await streamMatrixPdfUntilEof(response.url(), cookieHeader, 20000);
             console.log(`[MATRIX-PDF] Fiche PrintP récupérée jusqu'à %%EOF (${fetchedBuffer.length} octets)`);
             finish(null, fetchedBuffer);
             return;
@@ -2910,7 +2915,7 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
   return result;
 }
 
-async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 240000) {
+async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 20000) {
   const target = new URL(String(rawUrl || ''));
   if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
       !/^\/Matrix\/PrintP/i.test(target.pathname)) {
@@ -3028,7 +3033,23 @@ async function findVisibleMatrixControl(page, matcher) {
 }
 
 async function downloadMatrixListingReport(context, page) {
+  let matrixDetailCapture = null;
   if (!/\/Matrix\/Printing\/PrintOptions\.aspx/i.test(page.url())) {
+    // Repli sans faux contenu: capturer la vraie fiche Matrix authentifiée
+    // avant de quitter la page. Il n'est utilisé que si le PrintP natif annonce
+    // PDF 200 sans jamais livrer d'octets sur le forfait Browserless gratuit.
+    if (typeof page.pdf === 'function') {
+      matrixDetailCapture = await page.pdf({
+        format: 'Letter',
+        printBackground: true,
+        displayHeaderFooter: false,
+        margin: { top: '8mm', bottom: '8mm', left: '8mm', right: '8mm' },
+      }).catch(() => null);
+    }
+    if (matrixDetailCapture &&
+        (matrixDetailCapture.length < 1000 || matrixDetailCapture.subarray(0, 4096).indexOf(Buffer.from('%PDF-')) < 0)) {
+      matrixDetailCapture = null;
+    }
     const printControl = await findVisibleMatrixControl(page, /^imprimer$/i);
     if (!printControl) throw new Error('MATRIX_PRINT_CONTROL_MISSING');
     await printControl.click({ timeout: 10000 });
@@ -3067,9 +3088,19 @@ async function downloadMatrixListingReport(context, page) {
 
   const pdfControl = await findVisibleMatrixControl(page, /^imprimer\s+en\s+pdf$/i);
   if (!pdfControl) throw new Error('MATRIX_PRINT_PDF_CONTROL_MISSING');
-  // Une génération Matrix réelle dépasse parfois 20 s. Sur le forfait gratuit
-  // de 60 s, une seule attente longue est plus sûre que deux clics/retry.
-  return waitForMatrixPdfOrDownload(context, page, () => pdfControl.click({ timeout: 10000 }), 40000);
+  // Essayer d'abord le PrintP natif. S'il reste ouvert sans corps, utiliser la
+  // capture de la fiche Matrix déjà réalisée, jamais un PDF inventé.
+  try {
+    const nativeReport = await waitForMatrixPdfOrDownload(
+      context, page, () => pdfControl.click({ timeout: 10000 }), 30000
+    );
+    return nativeReport;
+  } catch (error) {
+    if (!matrixDetailCapture) throw error;
+    matrixDetailCapture._matrixGenerationMethod = 'matrix-detail-page-capture';
+    console.warn(`[MATRIX-PDF] PrintP natif indisponible (${safeErrorMessage(error).substring(0, 100)}); utilise la capture PDF de la fiche Matrix exacte`);
+    return matrixDetailCapture;
+  }
 }
 
 async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = null) {

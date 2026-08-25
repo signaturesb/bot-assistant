@@ -41,13 +41,17 @@ assert(cuaSource.includes('resumeVerifiedCentrisSession(context)'), 'La phase B 
 assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire modifié entre les phases doit bloquer la fiche');
 assert(cuaSource.includes('reopenVerifiedMatrixListing(page, exactNum, state.url)'), 'La phase fiche doit rouvrir directement le listing vérifié sans répéter la recherche globale');
 assert(cuaSource.includes('doc.action_id === MATRIX_LISTING_REPORT_ACTION ? 1'), 'La fiche doit être générée avec une seule tentative longue sous la limite Browserless');
-assert(cuaSource.includes('pdfControl.click({ timeout: 10000 }), 40000'), 'La fiche doit disposer de 40 s de génération dans sa session dédiée');
-assert(cuaSource.includes('streamMatrixPdfUntilEof(response.url(), cookieHeader, 240000)'),
+assert(cuaSource.includes('pdfControl.click({ timeout: 10000 }), 30000'), 'Le PrintP natif doit rester borné dans sa session dédiée');
+assert(cuaSource.includes('streamMatrixPdfUntilEof(response.url(), cookieHeader, 20000)'),
   'une réponse PrintP doit être lue par un flux HTTP autonome borné');
 assert(cuaSource.includes("scan.indexOf(Buffer.from('%%EOF'))") && cuaSource.includes("full.lastIndexOf(Buffer.from('%%EOF'))"),
   'le flux PrintP doit s’arrêter sur la vraie fin PDF sans attendre la fermeture Matrix');
 assert(cuaSource.includes('MATRIX_PRINT_DETACHED_TIMEOUT') && cuaSource.includes('MATRIX_PRINT_STREAM_URL_REJECTED'),
   'la récupération PrintP autonome doit rester bornée et limitée au domaine Matrix');
+assert(cuaSource.includes("matrixDetailCapture._matrixGenerationMethod = 'matrix-detail-page-capture'"),
+  'un PrintP bloqué doit utiliser seulement une capture PDF de la vraie fiche Matrix');
+assert(cuaSource.includes("provenance: capturedReport ? 'matrix_listing_report_capture_pdf'"),
+  'la capture Matrix doit rester explicitement distinguée du PrintP natif');
 assert(cuaSource.includes('const authenticatedCheckpoint = {'), 'La connexion/MFA doit être figée avant la phase de recherche PDF');
 assert(cuaSource.includes('const deadline = Date.now() + 5000'), 'La stabilisation post-MFA doit garder une marge Browserless pour vérifier Matrix');
 assert(cuaSource.includes("Symbol('matrix-annexes')"), 'Un verrou global doit couvrir toute l’opération Matrix A+B');
