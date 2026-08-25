@@ -2830,14 +2830,23 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
         // de l'onglet ouvert au-delà des 60 s Browserless. Dès que cette URL
         // authentifiée existe, la relire via APIRequestContext (mêmes cookies)
         // évite d'attendre la fermeture du flux navigateur.
-        if (/^\/Matrix\/PrintP/i.test(responseUrl.pathname) && context.request?.get) {
+        if (/^\/Matrix\/PrintP/i.test(responseUrl.pathname) && playwright?.request?.newContext) {
+          let detachedRequest = null;
           try {
-            const fetched = await context.request.get(response.url(), {
-              headers: {
+            // Détacher la requête du browserContext distant: Browserless peut
+            // fermer son WebSocket à 60 s sans disposer ce client HTTP local.
+            const authenticatedState = await context.storageState();
+            detachedRequest = await playwright.request.newContext({
+              storageState: authenticatedState,
+              extraHTTPHeaders: {
                 Referer: `${MATRIX_BASE}/Matrix/Printing/PrintOptions.aspx`,
                 Accept: 'application/pdf,*/*',
               },
-              timeout: 15000,
+            });
+            clearTimeout(timer);
+            timer = setTimeout(() => finish(new Error(`MATRIX_PRINT_DETACHED_TIMEOUT:${lastDiagnostic}`)), 90000);
+            const fetched = await detachedRequest.get(response.url(), {
+              timeout: 75000,
             });
             if (fetched.ok()) {
               const fetchedLength = Number(fetched.headers()['content-length'] || 0);
@@ -2859,6 +2868,8 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
             }
           } catch (error) {
             lastDiagnostic = `printp-fetch=${safeErrorMessage(error).substring(0, 80)}`;
+          } finally {
+            await detachedRequest?.dispose().catch(() => null);
           }
         }
         const buffer = await response.body();
