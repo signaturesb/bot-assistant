@@ -39,6 +39,9 @@ assert(botSource.includes('deux connexions Browserless strictement séquentielle
 assert(cuaSource.includes('await context.close();\n      context = null;\n      await browser.close();\n      browser = null;\n\n      browser = await launchBrowser();'), 'La phase A doit être fermée avant le lancement Browserless B');
 assert(cuaSource.includes('resumeVerifiedCentrisSession(context)'), 'La phase B doit reprendre strictement la session, sans nouveau login/MFA');
 assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire modifié entre les phases doit bloquer la fiche');
+assert(cuaSource.includes('reopenVerifiedMatrixListing(page, exactNum, state.url)'), 'La phase fiche doit rouvrir directement le listing vérifié sans répéter la recherche globale');
+assert(cuaSource.includes('doc.action_id === MATRIX_LISTING_REPORT_ACTION ? 1'), 'La fiche doit être générée avec une seule tentative longue sous la limite Browserless');
+assert(cuaSource.includes('pdfControl.click({ timeout: 10000 }), 40000'), 'La fiche doit disposer de 40 s de génération dans sa session dédiée');
 assert(cuaSource.includes('const authenticatedCheckpoint = {'), 'La connexion/MFA doit être figée avant la phase de recherche PDF');
 assert(cuaSource.includes('const deadline = Date.now() + 5000'), 'La stabilisation post-MFA doit garder une marge Browserless pour vérifier Matrix');
 assert(cuaSource.includes("Symbol('matrix-annexes')"), 'Un verrou global doit couvrir toute l’opération Matrix A+B');

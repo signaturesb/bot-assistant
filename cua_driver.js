@@ -1073,7 +1073,7 @@ function extractTaxCandidatesFromText(text, labelPattern) {
   return candidates;
 }
 
-function browserlessEndpointWithTimeout(endpoint, timeoutMs = 150000) {
+function browserlessEndpointWithTimeout(endpoint, timeoutMs = 60000) {
   let url;
   try { url = new URL(endpoint); }
   catch { throw new Error('BROWSERLESS_WS invalide'); }
@@ -1081,7 +1081,7 @@ function browserlessEndpointWithTimeout(endpoint, timeoutMs = 150000) {
   // fixe précédente coupait systématiquement la génération de la fiche à
   // 8/9. Garder un plafond de sécurité local tout en respectant la durée
   // configurée pour le compte Browserless.
-  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 150000, 15 * 60 * 1000));
+  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 60000, 15 * 60 * 1000));
   url.searchParams.set('timeout', String(safeTimeout));
   return url.toString();
 }
@@ -1219,7 +1219,7 @@ async function launchBrowser() {
   const configuredEndpoint = process.env.BROWSERLESS_WS;
   if (configuredEndpoint) {
     console.log('[CUA] Mode Browserless externe (WS)');
-    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 150000;
+    const sessionTimeoutMs = Number(process.env.BROWSERLESS_SESSION_TIMEOUT_MS) || 60000;
     const wsEndpoint = browserlessEndpointWithTimeout(configuredEndpoint, sessionTimeoutMs);
     // Audit P3 #10: retry 3× avec backoff 3s/8s/20s
     let lastErr = null;
@@ -2454,7 +2454,7 @@ async function resumeVerifiedCentrisSession(context) {
   const page = await context.newPage();
   await page.setViewportSize(VIEWPORT);
   await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 20000 });
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(300);
   const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
   const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
   if (!isAuthenticatedMatrixPage(page.url(), passwordVisible, bodyText)) {
@@ -2462,6 +2462,24 @@ async function resumeVerifiedCentrisSession(context) {
   }
   if (isMatrixMultipleLoginPage(page.url(), bodyText)) throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
   return page;
+}
+
+async function reopenVerifiedMatrixListing(page, exactNum, rawListingUrl) {
+  let listingUrl;
+  try { listingUrl = new URL(String(rawListingUrl || '')); }
+  catch { throw new Error('MATRIX_RESUME_LISTING_URL_INVALID'); }
+  if (listingUrl.protocol !== 'https:' || listingUrl.hostname.toLowerCase() !== 'matrix.centris.ca' ||
+      /\/(?:login|auth|error|accessdenied)(?:[/.?]|$)|LoginIntermediate/i.test(`${listingUrl.pathname}${listingUrl.search}`)) {
+    throw new Error('MATRIX_RESUME_LISTING_URL_REJECTED');
+  }
+  await page.goto(listingUrl.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  await page.waitForTimeout(300);
+  const state = await inspectMatrixListingPage(page, exactNum);
+  if (!state.exactListingMentioned || state.detailEvidence !== true ||
+      !['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) {
+    throw new Error(`MATRIX_RESUME_LISTING_NOT_VERIFIED:${exactNum}`);
+  }
+  return state;
 }
 
 /**
@@ -2574,7 +2592,8 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       try {
         let buffer;
         let lastError;
-        for (let attempt = 1; attempt <= MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS; attempt += 1) {
+        const maxAttempts = doc.action_id === MATRIX_LISTING_REPORT_ACTION ? 1 : MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           try {
             buffer = doc.url
               ? await downloadMatrixPdfAuthenticated(activeContext, doc.url, activeState.url, activePage)
@@ -2583,7 +2602,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           } catch (error) {
             lastError = error;
             if (!isMatrixDocumentRetryable(error)) break;
-            if (attempt < MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS) await activePage.waitForTimeout(400 * attempt);
+            if (attempt < maxAttempts) await activePage.waitForTimeout(400 * attempt);
           }
         }
         if (!buffer) throw lastError || new Error('MATRIX_DOWNLOAD_FAILED');
@@ -2676,8 +2695,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
 
       browser = await launchBrowser();
       context = await newStealthContext(browser, checkpoint);
+      const reportPhaseStartedAt = Date.now();
       page = await resumeVerifiedCentrisSession(context);
-      const resumedState = await openVerifiedMatrixListingForDownload(page, exactNum);
+      console.log(`[MATRIX-PDF] Phase fiche: session reprise en ${Date.now() - reportPhaseStartedAt}ms`);
+      const resumedState = await reopenVerifiedMatrixListing(page, exactNum, state.url);
+      console.log(`[MATRIX-PDF] Phase fiche: listing direct vérifié en ${Date.now() - reportPhaseStartedAt}ms`);
       const resumedDocs = matrixDownloadableDocs(resumedState);
       const resumedInventory = buildCentrisDocumentInventory(exactNum, resumedDocs);
       const resumedPlanFingerprint = matrixDownloadPlanFingerprint(resumedDocs);
@@ -2688,9 +2710,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       if (!resumedDocs.some((doc) => doc.action_id === MATRIX_LISTING_REPORT_ACTION)) {
         throw new Error('MATRIX_RESUME_PRINT_CONTROL_MISSING');
       }
+      console.log(`[MATRIX-PDF] Phase fiche: inventaire inchangé, génération à ${Date.now() - reportPhaseStartedAt}ms`);
       state = resumedState;
       const reportDownloaded = await downloadDocuments(reportCandidates, context, page, state, primaryCandidates.length);
       collectDownloaded(reportDownloaded);
+      console.log(`[MATRIX-PDF] Phase fiche terminée en ${Date.now() - reportPhaseStartedAt}ms`);
     } else if (reportCandidates.length) {
       const reason = downloadAbortReason || failures[0]?.error || 'phase principale incomplète';
       for (const doc of reportCandidates) {
@@ -2929,7 +2953,7 @@ async function downloadMatrixListingReport(context, page) {
     if (!printControl) throw new Error('MATRIX_PRINT_CONTROL_MISSING');
     await printControl.click({ timeout: 10000 });
     await page.waitForURL(/\/Matrix\/Printing\/PrintOptions\.aspx/i, { timeout: 15000 });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(100);
   }
 
   let formatSelected = false;
@@ -2959,11 +2983,13 @@ async function downloadMatrixListingReport(context, page) {
     if (formatSelected) break;
   }
   if (!formatSelected) throw new Error('MATRIX_PRINT_FORMAT_MISSING');
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(100);
 
   const pdfControl = await findVisibleMatrixControl(page, /^imprimer\s+en\s+pdf$/i);
   if (!pdfControl) throw new Error('MATRIX_PRINT_PDF_CONTROL_MISSING');
-  return waitForMatrixPdfOrDownload(context, page, () => pdfControl.click({ timeout: 10000 }), 20000);
+  // Une génération Matrix réelle dépasse parfois 20 s. Sur le forfait gratuit
+  // de 60 s, une seule attente longue est plus sûre que deux clics/retry.
+  return waitForMatrixPdfOrDownload(context, page, () => pdfControl.click({ timeout: 10000 }), 40000);
 }
 
 async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = null) {
