@@ -656,7 +656,17 @@ async function submitMatrixGlobalSearch(page, search, centrisNum) {
   await page.waitForTimeout(2500);
 
   let state = await inspectMatrixListingPage(page, centrisNum);
-  if (state.exactListingMentioned || /\/Matrix\/Results\.aspx/i.test(page.url())) return state;
+  if (state.exactListingMentioned) return state;
+
+  // Identifiants observés directement dans Matrix v12.6 de Shawn.
+  // Le nom du bouton est plus stable que son id ASP.NET (vide actuellement).
+  const exactSubmit = search.locator('xpath=..').locator('button[name="MagnifyingGlass"], button[aria-label="Recherche"]');
+  if (await exactSubmit.first().isVisible().catch(() => false)) {
+    await exactSubmit.first().click({ timeout: 10000 });
+    await page.waitForTimeout(3500);
+    state = await inspectMatrixListingPage(page, centrisNum);
+    if (state.exactListingMentioned) return state;
+  }
 
   // Matrix v12.6 ne traite pas toujours Entrée. La vidéo de Shawn montre une
   // loupe immédiatement à droite de la barre. Repérer le contrôle visible le

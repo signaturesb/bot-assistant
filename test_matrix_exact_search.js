@@ -56,6 +56,10 @@ assert.match(driverCode, /async function submitMatrixGlobalSearch/,
   'le parcours doit encapsuler la soumission de la recherche Matrix');
 assert.match(driverCode, /search\.press\('Enter'\)[\s\S]*?best\.click/,
   'la loupe Matrix doit servir de repli quand Entrée ne navigue pas');
+assert.match(driverCode, /button\[name="MagnifyingGlass"\]/,
+  'le bouton réel observé dans Matrix v12.6 doit être ciblé explicitement');
+assert.ok(!driverCode.includes("state.exactListingMentioned || /\\/Matrix\\/Results\\.aspx/i"),
+  'une URL Results.aspx sans numéro exact ne doit jamais compter comme succès');
 assert.match(driverCode, /clear\|effacer\|close\|fermer\|reset/,
   'le repli ne doit jamais cliquer le X d’effacement');
 
