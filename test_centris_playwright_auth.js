@@ -35,6 +35,9 @@ assert(botSource.includes("safeCron('centris-session-maintenance'"), 'La session
 assert(botSource.includes("maintainCentrisSession('boot-delayed')"), 'Le boot doit programmer un renouvellement différé');
 assert(botSource.includes("if (process.env.CENTRIS_SMOKE_TEST_LISTING) await runCentrisReadOnlySmokeTest('boot-delayed')"), 'Le smoke boot doit remplacer le renouvellement préalable pour éviter MultipleLoginBreach');
 assert(botSource.includes('Une seule session Matrix pour recherche + inventaire + téléchargement'), 'Le smoke téléchargement doit rester dans une seule session Matrix');
+assert(cuaSource.includes('async function navigateToMatrixLogin(page)'), 'La navigation OAuth Matrix doit avoir une reprise dédiée');
+assert(cuaSource.includes("waitUntil: 'commit', timeout: 45000"), 'La redirection OAuth ne doit pas attendre indéfiniment domcontentloaded');
+assert(cuaSource.includes('if (step.kind !== \'missing\') return'), 'Un formulaire reconnu après timeout doit être conservé');
 assert(botSource.includes('consecutiveFailures >= 3'), 'Les alertes de renouvellement doivent avoir un seuil anti-bruit');
 assert(botSource.includes('failure-cooldown'), 'Une panne ne doit jamais créer une boucle MFA rapide');
 assert(botSource.includes('sessionKey.length >= 32'), 'La maintenance automatique doit exiger une clé de session robuste');
