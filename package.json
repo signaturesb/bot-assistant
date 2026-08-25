@@ -32,6 +32,7 @@
     "test-admin-auth": "node test_admin_auth.js",
     "test-outbound-url-guard": "node test_outbound_url_guard.js",
     "test-runtime-safety": "node test_runtime_safety.js",
+    "test-preflight-alerts": "node test_preflight_alerts.js",
     "test-telegram-compat": "node test_telegram_compat.js",
     "test-calendar-guard": "node test_calendar_guard.js",
     "test-centris-query": "node test_centris_query.js",
@@ -41,7 +42,7 @@
     "test-centris-document-inventory": "node test_centris_document_inventory.js",
     "test-pdf-parse-compat": "node test_pdf_parse_compat.js",
     "test-capability-registry": "node test_capability_registry.js",
-    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-outbound-url-guard && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-centris-query && npm run test-centris-auth-bridge && npm run test-centris-mfa && npm run test-centris-session-store && npm run test-centris-document-inventory && npm run test-pdf-parse-compat && npm run test-capability-registry && npm run test-brevo-readonly && npm run security-status"
+    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-outbound-url-guard && npm run test-runtime-safety && npm run test-preflight-alerts && npm run test-calendar-guard && npm run test-centris-query && npm run test-centris-auth-bridge && npm run test-centris-mfa && npm run test-centris-session-store && npm run test-centris-document-inventory && npm run test-pdf-parse-compat && npm run test-capability-registry && npm run test-brevo-readonly && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

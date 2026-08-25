@@ -39,6 +39,10 @@ runScript('Parser tests', path.join(__dirname, 'test_parser.js'));
 // Runtime safety: crons non chevauchants, Telegram, HMAC et persistance.
 runScript('Runtime safety', path.join(__dirname, 'test_runtime_safety.js'));
 
+// Preflight: ne pas confondre route campagne 410/HMAC SMS ni backup/template actif.
+runScript('Preflight alerts', path.join(__dirname, 'test_preflight_alerts.js'));
+runScript('Deployment truth guard', path.join(__dirname, 'test_deployment_truth_guard.js'));
+
 // Dates/heures Toronto: calcul déterministe et contradictions bloquées.
 runScript('Calendar guard', path.join(__dirname, 'test_calendar_guard.js'));
 
@@ -49,6 +53,7 @@ runScript('Workflow/backups audit', path.join(__dirname, 'scripts/audit-runtime-
 runScript('Firecrawl tests', path.join(__dirname, 'test_firecrawl.js'));
 runScript('Matrix authenticated browser download', path.join(__dirname, 'test_matrix_browser_download.js'));
 runScript('Matrix email preview guard', path.join(__dirname, 'test_matrix_email_preview_guard.js'));
+runScript('Tool batch write serialization', path.join(__dirname, 'test_tool_batch.js'));
 
 // 3. Plan quotas inline test
 console.log('\n▶ Plan quotas');

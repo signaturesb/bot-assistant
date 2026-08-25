@@ -7,11 +7,13 @@ const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
 const crypto      = require('crypto');
+const { evaluateSmsHmacSelfTest, evaluateActiveTemplate } = require('./lib/preflight_checks');
 const { AsyncLocalStorage } = require('async_hooks');
 const leadParser  = require('./lead_parser');
 const { createOneShotAuthorization, consumeOneShotAuthorization } = require('./lib/email_send_guard');
 const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
+const { messageExplicitlyAuthorizesGitHubWrite, verifyProtectedStateWrite } = require('./lib/deployment_truth_guard');
 const { isAdminAuthorized } = require('./lib/admin_auth');
 const {
   createNonOverlappingRunner,
@@ -2111,6 +2113,15 @@ async function readGitHubFile(repo, filePath) {
 async function writeGitHubFile(repo, filePath, content, commitMsg) {
   if (!process.env.GITHUB_TOKEN) return 'Erreur: GITHUB_TOKEN manquant';
   const p = filePath.replace(/^\//, '');
+  const truthCheck = await verifyProtectedStateWrite({
+    filePath: p,
+    content,
+    productionUrl: process.env.BOT_URL || process.env.RENDER_EXTERNAL_URL || 'https://signaturesb-bot-s272.onrender.com',
+  });
+  if (!truthCheck.ok) {
+    const observed = truthCheck.observed ? ` Production /version retourne « ${truthCheck.observed} ».` : '';
+    return `🔒 Écriture de ${p} bloquée: l'état de déploiement n'est pas prouvé (${truthCheck.code}).${observed} Vérifie /version puis indique seulement le commit actif observé.`;
+  }
   const url = `https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${p}`;
   let sha;
   const getRes = await fetch(url, { headers: githubHeaders() });
@@ -7333,6 +7344,8 @@ const TOOLS_WITH_CACHE = TOOLS.map((t, i, arr) => i === arr.length - 1
   ? { ...t, cache_control: { type: 'ephemeral' } }
   : t);
 
+const { executeToolBatch } = require('./lib/tool_batch');
+
 const PIPEDRIVE_WRITE_TOOL_ACTIONS = Object.freeze({
   marquer_perdu: 'update',
   ajouter_note: 'create',
@@ -7613,10 +7626,8 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
     }
 
     if (name === 'write_github_file') {
-      const current = String(userMessage || '').toLowerCase();
       const filename = path.basename(String(input?.path || '')).toLowerCase();
-      const explicitWrite = /\b(?:écris|ecris|modifie|mets à jour|met à jour|commit|publie)\b/i.test(current);
-      if (!explicitWrite || !current.includes('github') || !filename || !current.includes(filename)) {
+      if (!messageExplicitlyAuthorizesGitHubWrite(userMessage, input?.path)) {
         return `🔒 Écriture GitHub bloquée: demande explicitement dans le message courant de modifier « ${filename || 'fichier'} » sur GitHub.`;
       }
     }
@@ -9482,12 +9493,12 @@ async function callClaude(chatId, userMsg, retries = 3) {
           messages.push({ role: 'assistant', content: res.content });
           const toolBlocks = res.content.filter(b => b.type === 'tool_use');
           toolBlocks.forEach((b) => usedTools.add(b.name));
-          const results = await Promise.all(toolBlocks.map(async b => {
+          const results = await executeToolBatch(toolBlocks, async b => {
             log('INFO', 'TOOL', `${b.name}(${JSON.stringify(b.input).substring(0, 80)})`);
             mTick('tools', b.name);
             const result = await executeToolSafe(b.name, b.input, chatId, userMsg);
             return { type: 'tool_result', tool_use_id: b.id, content: String(result), _toolName: b.name };
-          }));
+          });
           // Détecter pattern: même outil fail 3× consécutifs → abort
           const errorTools = results.filter(r => /^(❌|⚠️|Erreur|Error|HTTP \d{3})/i.test(r.content));
           if (errorTools.length > 0 && errorTools.length === results.length) {
@@ -9608,11 +9619,11 @@ async function callClaudeVision(chatId, content, contextLabel) {
       if (res.stop_reason === 'tool_use') {
         messages.push({ role: 'assistant', content: res.content });
         const toolBlocks = res.content.filter(b => b.type === 'tool_use');
-        const results = await Promise.all(toolBlocks.map(async b => {
+        const results = await executeToolBatch(toolBlocks, async b => {
           log('INFO', 'TOOL', `vision:${b.name}(${JSON.stringify(b.input).substring(0, 60)})`);
           const result = await executeToolSafe(b.name, b.input, chatId, '');
           return { type: 'tool_result', tool_use_id: b.id, content: String(result) };
-        }));
+        });
         messages.push({ role: 'user', content: results });
         continue;
       }
@@ -14704,7 +14715,6 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     req.on('data', chunk => { body += chunk; if (body.length > 100000) req.destroy(); });
     req.on('end', async () => {
       if (ghSecret) {
-        const crypto = require('crypto');
         const sig = req.headers['x-hub-signature-256'] || '';
         const expected = 'sha256=' + crypto.createHmac('sha256', ghSecret).update(body).digest('hex');
         if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
@@ -18495,12 +18505,11 @@ async function main() {
     try {
       const tpl = await loadMasterTemplate();
       const validation = tpl ? (_masterTplCache.validation || validateMasterEmailTemplate(tpl)) : null;
+      const templateCheck = evaluateActiveTemplate(validation);
       checks.push({
-        ok: !!validation?.ok,
+        ok: templateCheck.ok,
         label: 'Template email',
-        detail: validation?.ok
-          ? `structure OK · sha256 ${validation.sha256.slice(0, 12)} · ${Math.round(validation.bytes/1024)}KB`
-          : `invalide: ${(validation?.errors || ['indisponible']).join(', ').substring(0, 140)}`,
+        detail: templateCheck.detail,
       });
     } catch (e) {
       checks.push({ ok: false, label: 'Template email', detail: e.message.substring(0, 100) });
@@ -18509,12 +18518,8 @@ async function main() {
     // Auto-test cryptographique local. La route publique applique la même
     // comparaison et répond 401 à un mauvais jeton (jamais 2xx).
     try {
-      const hmacSecret = process.env.SMS_BRIDGE_SECRET || process.env.WEBHOOK_SECRET || '';
-      const probeBody = '{"probe":true}';
-      const good = crypto.createHmac('sha256', hmacSecret).update(probeBody).digest('hex');
-      const bad = `${good[0] === '0' ? '1' : '0'}${good.slice(1)}`;
-      const ok = !!hmacSecret && timingSafeHexEqual(good, good) && !timingSafeHexEqual(bad, good);
-      checks.push({ ok, label: 'HMAC SMS bridge', detail: ok ? 'mauvais token rejeté (HTTP 401)' : 'secret absent ou comparaison invalide' });
+      const hmacCheck = evaluateSmsHmacSelfTest(process.env.SMS_BRIDGE_SECRET || process.env.WEBHOOK_SECRET);
+      checks.push({ ...hmacCheck, label: 'HMAC SMS bridge' });
     } catch (e) {
       checks.push({ ok: false, label: 'HMAC SMS bridge', detail: e.message.substring(0, 100) });
     }
