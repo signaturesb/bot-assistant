@@ -2486,14 +2486,29 @@ async function reopenVerifiedMatrixListing(page, exactNum, rawListingUrl) {
  * Télécharge toutes les annexes (DV, certificat, plans) d'un listing via CUA.
  * @param {string} centrisNum
  * @param {string} [filtre] — mot-clé (ex: "DV", "déclaration", "localisation")
+ * @param {{waitForLockMs?: number}} [options] — attente bornée du verrou pour
+ * une action utilisateur; les contrôles automatiques gardent le fail-fast.
  * @returns {Promise<{success, annexes: [{buffer, filename}], message}>}
  */
-async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
+async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
   if (!CUA_AVAILABLE()) {
     return { success: false, annexes: [], message: 'Playwright non disponible' };
   }
   const operationOwner = Symbol('matrix-annexes');
-  if (!acquireMatrixOperation(operationOwner)) {
+  const requestedWaitMs = Number(options?.waitForLockMs || 0);
+  const waitForLockMs = Number.isFinite(requestedWaitMs)
+    ? Math.max(0, Math.min(120000, Math.trunc(requestedWaitMs)))
+    : 0;
+  const lockDeadline = Date.now() + waitForLockMs;
+  let lockAcquired = acquireMatrixOperation(operationOwner);
+  if (!lockAcquired && waitForLockMs > 0) {
+    console.log(`[MATRIX-LOCK] Opération en cours; attente utilisateur bornée à ${waitForLockMs}ms`);
+    while (!lockAcquired && Date.now() < lockDeadline) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      lockAcquired = acquireMatrixOperation(operationOwner);
+    }
+  }
+  if (!lockAcquired) {
     return { success: false, annexes: [], error_code: 'MATRIX_OPERATION_IN_PROGRESS', message: 'Une autre opération Matrix est déjà en cours. Aucun envoi effectué.' };
   }
 
