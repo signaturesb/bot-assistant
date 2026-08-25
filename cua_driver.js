@@ -2512,13 +2512,22 @@ async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = 
           break;
         }
       }
-      const candidates = frame.locator('a,button,[role="link"]');
+      const candidates = frame.locator('a,button,[role="link"],[onclick]');
       const count = Math.min(await candidates.count().catch(() => 0), 400);
       for (let index = 0; index < count; index += 1) {
         const candidate = candidates.nth(index);
         if (!(await candidate.isVisible().catch(() => false))) continue;
-        const candidateLabel = normalizeCentrisLabel(await candidate.innerText().catch(() => ''));
-        if (candidateLabel === label || candidateLabel.replace(/\s+/g, '') === label.replace(/\s+/g, '')) {
+        const metadata = await candidate.evaluate((element) => ({
+          own: element.innerText || element.textContent || element.getAttribute('aria-label') || element.getAttribute('title') || '',
+          context: (element.closest('tr,li,[role="row"]') || element.parentElement?.parentElement || element.parentElement)?.innerText || '',
+        })).catch(() => ({ own: '', context: '' }));
+        const candidateLabel = normalizeCentrisLabel(metadata.own);
+        const candidateContext = normalizeCentrisLabel(metadata.context);
+        const compactTarget = label.replace(/\s+/g, '');
+        const exactOwn = candidateLabel === label || candidateLabel.replace(/\s+/g, '') === compactTarget;
+        const contextualControl = candidateContext.replace(/\s+/g, '').includes(compactTarget) &&
+          /^(?:oui|dv|voir|ouvrir|t[ée]l[ée]charger)?$/i.test(candidateLabel);
+        if (exactOwn || contextualControl) {
           control = candidate;
           break;
         }
