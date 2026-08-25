@@ -11708,6 +11708,45 @@ function registerHandlers() {
     }
   });
 
+  // /matrix-preview <centris#> <email> [message]
+  // Chemin déterministe pour le flux critique Matrix: aucun choix de tool par
+  // le modèle, aucun envoi fournisseur. Cette commande récupère et valide les
+  // PDF, les remet dans Telegram, construit l'aperçu SignatureSB et arme la
+  // confirmation one-shot « envoie » pour 15 minutes.
+  bot.onText(/^\/matrix[-_]?preview\s+(\d{7,9})\s+(\S+@\S+)(?:\s+([\s\S]+))?$/i, async (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const chatId = msg.chat.id;
+    const num = match[1];
+    const emailDestination = String(match[2] || '').trim();
+    const messagePerso = String(match[3] || '').trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailDestination)) {
+      await bot.sendMessage(chatId, '❌ Adresse courriel invalide. Aucun document récupéré et aucun email envoyé.');
+      return;
+    }
+
+    const stopTyping = startTypingIndicator(chatId, 6 * 60 * 1000);
+    await bot.sendMessage(
+      chatId,
+      `🔎 Matrix #${num}: récupération et validation des PDF pour l’aperçu ${emailDestination}.\n🔒 Aucun courriel ne sera envoyé par cette commande.`,
+    );
+    try {
+      const result = await executeMatrixAnnexesTool({
+        num,
+        emailDestination,
+        filtre: '',
+        messagePerso,
+        chatId,
+        userMessage: msg.text || '',
+      });
+      await send(chatId, result);
+    } catch (error) {
+      log('ERR', 'MATRIX-PREVIEW-CMD', String(error?.message || error).substring(0, 220));
+      await send(chatId, `❌ Aperçu Matrix #${num} non complété: ${String(error?.message || error).substring(0, 180)}\nAucun email envoyé.`);
+    } finally {
+      stopTyping();
+    }
+  });
+
   // /flush-pending — audit lecture seule. Une commande groupée ne peut jamais
   // autoriser plusieurs emails: chaque destinataire exige sa propre confirmation.
   bot.onText(/\/flush[-_]?pending/i, async msg => {
@@ -18851,4 +18890,3 @@ main().catch(err => {
   // Si health fail, Render restart. Si on exit, on crash loop.
   setTimeout(() => process.exit(1), 5000); // Délai pour que les logs soient envoyés
 });
-
