@@ -55,6 +55,9 @@ assert(cuaSource.includes("provenance: capturedReport ? 'matrix_listing_report_c
 assert(cuaSource.includes('const authenticatedCheckpoint = {'), 'La connexion/MFA doit être figée avant la phase de recherche PDF');
 assert(cuaSource.includes('const deadline = Date.now() + 5000'), 'La stabilisation post-MFA doit garder une marge Browserless pour vérifier Matrix');
 assert(cuaSource.includes("Symbol('matrix-annexes')"), 'Un verrou global doit couvrir toute l’opération Matrix A+B');
+assert(cuaSource.includes('Math.min(120000, Math.trunc(requestedWaitMs))'), 'l’attente du verrou Matrix doit rester strictement bornée');
+assert(cuaSource.includes('await new Promise(resolve => setTimeout(resolve, 250))'), 'une action utilisateur doit pouvoir attendre le smoke sans chevaucher Matrix');
+assert(botSource.includes("{ waitForLockMs: 90000 }"), 'le preview utilisateur doit attendre brièvement le contrôle automatique en cours');
 assert(cuaSource.includes('MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH'), 'Un inventaire connu incomplet ne doit jamais devenir un faux succès');
 assert(cuaSource.includes("content_manifest_id: complete ? contentManifest.content_manifest_id : null"), 'Un lot partiel ne doit jamais exposer un manifeste de contenu complet');
 assert(cuaSource.includes('async function navigateToMatrixLogin(page)'), 'La navigation OAuth Matrix doit avoir une reprise dédiée');
