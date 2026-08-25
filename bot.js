@@ -13530,6 +13530,30 @@ async function runCentrisReadOnlySmokeTest(reason = 'manual') {
 
   try {
     const cua = getCUA();
+    if (process.env.CENTRIS_SMOKE_TEST_DOWNLOAD === 'true') {
+      if (!cua.cuaGetCentrisAnnexes) throw new Error('téléchargement Matrix indisponible');
+      // Une seule session Matrix pour recherche + inventaire + téléchargement.
+      // Un preview séparé créerait une deuxième connexion rapprochée et
+      // déclencherait MultipleLoginBreach.aspx sans ajouter de preuve.
+      const download = await cua.cuaGetCentrisAnnexes(num);
+      const manifest = String(download?.manifest_id || '');
+      const docsCount = Number(download?.docs_count || download?.discovered_count || 0);
+      const discovered = Number(download?.discovered_count || 0);
+      const validated = Number(download?.validated_count || 0);
+      const failures = Array.isArray(download?.failures) ? download.failures.length : 0;
+      const expectedDocs = Number(process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS || 0);
+      const expectedManifest = String(process.env.CENTRIS_SMOKE_EXPECTED_MANIFEST || '').trim().toLowerCase();
+      const expectationMismatch = (expectedDocs > 0 && docsCount !== expectedDocs) ||
+        (expectedManifest && !manifest.toLowerCase().startsWith(expectedManifest));
+      if (!download?.success || failures > 0 || validated !== discovered || discovered !== docsCount || expectationMismatch) {
+        log('WARN', 'CENTRIS-SMOKE', `#${num} validation PDF incomplète: inventaire=${docsCount}, découverts=${discovered}, validés=${validated}, échecs=${failures}, attendu=${expectedDocs || 'non fixé'}, manifeste=${manifest.slice(0, 12) || 'aucun'}`);
+        return { ok: false, stage: 'pdf-validation', docs_count: docsCount, discovered, validated, failures, expectation_mismatch: expectationMismatch };
+      }
+      const pages = download.annexes.reduce((total, doc) => total + Number(doc.page_count || 0), 0);
+      log('OK', 'CENTRIS-SMOKE', `#${num} Matrix global + PDF validés: ${validated}/${discovered}, ${pages} page(s), manifeste ${manifest.slice(0, 12)}, SHA-256 présents (${reason})`);
+      return { ok: true, docs_count: docsCount, validated, pages, manifest_id: manifest || null };
+    }
+
     if (!cua?.previewCentrisMatrixDocuments) throw new Error('preview Matrix indisponible');
     const result = await cua.previewCentrisMatrixDocuments({ centris_num: num });
     const manifest = String(result?.manifest_id || '').slice(0, 12) || 'aucun';
@@ -13538,21 +13562,6 @@ async function runCentrisReadOnlySmokeTest(reason = 'manual') {
       return { ok: false, error_code: result?.error_code || null };
     }
     log('OK', 'CENTRIS-SMOKE', `#${num} Matrix global vérifié: ${result.docs_count || 0} document(s), manifeste ${manifest} (${reason})`);
-
-    if (process.env.CENTRIS_SMOKE_TEST_DOWNLOAD === 'true') {
-      if (!cua.cuaGetCentrisAnnexes) throw new Error('téléchargement Matrix indisponible');
-      const download = await cua.cuaGetCentrisAnnexes(num);
-      const discovered = Number(download?.discovered_count || 0);
-      const validated = Number(download?.validated_count || 0);
-      const failures = Array.isArray(download?.failures) ? download.failures.length : 0;
-      if (!download?.success || failures > 0 || validated !== discovered || discovered !== Number(result.docs_count || 0)) {
-        log('WARN', 'CENTRIS-SMOKE', `#${num} validation PDF incomplète: preview=${result.docs_count || 0}, découverts=${discovered}, validés=${validated}, échecs=${failures}`);
-        return { ok: false, stage: 'pdf-validation', docs_count: result.docs_count || 0, discovered, validated, failures };
-      }
-      const pages = download.annexes.reduce((total, doc) => total + Number(doc.page_count || 0), 0);
-      log('OK', 'CENTRIS-SMOKE', `#${num} PDF validés: ${validated}/${discovered}, ${pages} page(s), SHA-256 présents (${reason})`);
-      return { ok: true, docs_count: result.docs_count || 0, validated, pages, manifest_id: result.manifest_id || null };
-    }
     return { ok: true, docs_count: result.docs_count || 0, manifest_id: result.manifest_id || null };
   } catch (e) {
     log('WARN', 'CENTRIS-SMOKE', `#${num} exception lecture seule (${reason}): ${String(e?.message || e).substring(0, 180)}`);
@@ -13576,10 +13585,11 @@ function startDailyTasks() {
   // empêchent les connexions concurrentes et les boucles de MFA.
   if (centrisAutomationConfigured()) {
     setTimeout(async () => {
-      const session = await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
-      if (session?.ok && process.env.CENTRIS_SMOKE_TEST_LISTING) {
-        await runCentrisReadOnlySmokeTest('boot-delayed');
-      }
+      // Le smoke vérifie et renouvelle lui-même la session. Ne jamais lancer
+      // d'abord maintainCentrisSession(): Matrix interprète les deux
+      // navigateurs successifs comme des connexions concurrentes.
+      if (process.env.CENTRIS_SMOKE_TEST_LISTING) await runCentrisReadOnlySmokeTest('boot-delayed');
+      else await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
     }, 60 * 1000);
     safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 6 * 60 * 60 * 1000, { timeoutMs: 120000 });
     log('OK', 'CENTRIS', 'Maintenance de session automatique activée (boot + 6 h)');
