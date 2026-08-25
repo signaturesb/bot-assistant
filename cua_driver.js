@@ -618,6 +618,11 @@ async function findMatrixGlobalSearch(page) {
         const meta = await input.evaluate((el) => [
           el.id, el.getAttribute('name'), el.getAttribute('placeholder'),
           el.getAttribute('aria-label'), el.getAttribute('class'), el.getAttribute('type'),
+          el.parentElement?.id, el.parentElement?.className,
+          el.parentElement?.parentElement?.id, el.parentElement?.parentElement?.className,
+          el.nextElementSibling?.id, el.nextElementSibling?.className,
+          el.nextElementSibling?.getAttribute?.('title'),
+          el.nextElementSibling?.getAttribute?.('aria-label'),
         ].filter(Boolean).join(' ')).catch(() => '');
         const score = scoreMatrixSearchCandidate(meta, box);
         if (score > bestScore) { best = input; bestScore = score; }
@@ -631,6 +636,18 @@ async function findMatrixGlobalSearch(page) {
     await page.waitForTimeout(500);
   }
   return null;
+}
+
+async function openMatrixGlobalSearch(page) {
+  // La démonstration vidéo de Shawn montre que la recherche se fait dans la
+  // barre blanche persistante de l'en-tête Matrix (Home/Results.aspx), pas sur
+  // la page de critères /Matrix/Recherche. Réutiliser d'abord la page rendue
+  // après connexion, puis revenir à Home seulement si l'en-tête n'y est pas.
+  let search = await findMatrixGlobalSearch(page);
+  if (search) return search;
+  await page.goto(`${MATRIX_BASE}/Matrix/Home`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(2500);
+  return findMatrixGlobalSearch(page);
 }
 
 function scoreMatrixSearchCandidate(meta = '', box = {}) {
@@ -853,9 +870,7 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     browser = await launchBrowser();
     const context = await newStealthContext(browser);
     const page = await loginCentris(context);
-    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(2500);
-    const search = await findMatrixGlobalSearch(page);
+    const search = await openMatrixGlobalSearch(page);
     if (!search) {
       console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
       return { success: false, error_code: 'MATRIX_SEARCH_CONTROL_MISSING', message: 'Barre de recherche globale Matrix introuvable. Aucun envoi effectué.' };
@@ -2075,9 +2090,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
 
     // Chemin déterministe identique au geste humain montré par Shawn:
     // recherche globale blanche → numéro exact → fiche détaillée → liens PDF.
-    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(2500);
-    const search = await findMatrixGlobalSearch(page);
+    const search = await openMatrixGlobalSearch(page);
     if (!search) {
       console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
       throw new Error('MATRIX_SEARCH_CONTROL_MISSING');

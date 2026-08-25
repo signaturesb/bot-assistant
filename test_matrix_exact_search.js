@@ -19,6 +19,9 @@ assert(!isExactLabel('128936167', '28936167'));
 
 assert(scoreSearch('QueryText global search', { width: 700, y: 100 }) >= 100);
 assert(scoreSearch('omnisearch MLS Centris', { width: 500, y: 80 }) >= 100);
+// Matrix 12.6 place parfois le mot « Search » sur le conteneur ou le bouton
+// loupe adjacent plutôt que sur l'input lui-même.
+assert(scoreSearch('text SearchContainer SearchButton', { width: 900, y: 220 }) >= 100);
 assert(scoreSearch('clientSearch email', { width: 800, y: 100 }) < 100);
 assert(scoreSearch('municipalite critère', { width: 700, y: 120 }) < 100);
 assert(scoreSearch('adresse', { width: 900, y: 100 }) < 100);
