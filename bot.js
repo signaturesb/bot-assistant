@@ -7361,6 +7361,134 @@ function externalEmailActionSummary(name, input = {}) {
   return { to, label: labels[name] || name };
 }
 
+async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId, userMessage }) {
+  const cuaMod = getCUA();
+  if (!cuaMod || !cuaMod.CUA_AVAILABLE() || !cuaMod.cuaGetCentrisAnnexes) {
+    return `❌ Matrix/Playwright indisponible — aucune annexe récupérée et aucun envoi effectué.`;
+  }
+
+  log('INFO', 'CENTRIS-MATRIX-ANNEXES', `Recherche globale exacte #${num}${filtre ? ` · filtre=${filtre}` : ''}`);
+  const result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null);
+  if (!result?.success || !Array.isArray(result.annexes) || result.annexes.length === 0) {
+    return `❌ Annexes Matrix #${num} non récupérées: ${String(result?.message || 'aucun PDF validé').substring(0, 220)}\nAucun email envoyé. Aucun numéro substitut n'a été utilisé.`;
+  }
+
+  const documents = result.annexes.map((doc, index) => ({
+    buffer: doc.buffer,
+    filename: String(doc.filename || `document_${index + 1}_${num}.pdf`),
+    label: String(doc.label || doc.filename || `Document ${index + 1}`),
+    size: Number(doc.size || doc.buffer?.length || 0),
+    page_count: Number.isFinite(doc.page_count) ? doc.page_count : null,
+    sha256: doc.sha256 || crypto.createHash('sha256').update(doc.buffer).digest('hex'),
+    source: 'matrix-global',
+  }));
+  const failures = Array.isArray(result.failures) ? result.failures : [];
+
+  // Telegram est le canal privé de Shawn: livraison interne des PDFs validés.
+  if (ALLOWED_ID && chatId) {
+    for (const doc of documents) {
+      await bot.sendDocument(chatId, doc.buffer, {
+        caption: `📎 ${doc.label}\nCentris #${num} · ${Math.round(doc.size / 1024)} KB${doc.page_count ? ` · ${doc.page_count} page(s)` : ''}`,
+      }, { filename: doc.filename, contentType: 'application/pdf' })
+        .catch((error) => log('WARN', 'CENTRIS-MATRIX-ANNEXES', `Telegram: ${error.message}`));
+    }
+  }
+
+  const list = documents.map((doc) => `  📎 ${doc.label} (${Math.round(doc.size / 1024)} KB${doc.page_count ? ` · ${doc.page_count} p.` : ''})`).join('\n');
+  const failureText = failures.length
+    ? `\n\n⚠️ ${failures.length} document(s) non validé(s):\n${failures.slice(0, 8).map((item) => `  • ${item.label}: ${item.error}`).join('\n')}`
+    : '';
+
+  if (!emailDestination) {
+    auditLogEvent('centris', 'matrix-annexes-downloaded', { num, count: documents.length, failures: failures.length, filtre: filtre || null });
+    return `📂 *${documents.length} annexe(s) Matrix #${num} récupérée(s) et validée(s)*\n\n${list}${failureText}\n\nAucun email envoyé.`;
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailDestination)) {
+    return `❌ Adresse courriel invalide. Les ${documents.length} PDF(s) ont seulement été remis dans Telegram; aucun email envoyé.`;
+  }
+  if (failures.length) {
+    return `⚠️ Preview incomplet pour #${num}: ${documents.length} PDF(s) validé(s), ${failures.length} échec(s).\nAucun email envoyé pour éviter un dossier partiel.\n\n${list}${failureText}`;
+  }
+
+  // Gmail limite le message encodé à environ 25 MB. On échoue avant l'envoi
+  // plutôt que de retirer silencieusement une pièce jointe.
+  const encodedBytes = documents.reduce((total, doc) => total + Math.ceil(doc.size * 4 / 3), 0);
+  if (encodedBytes > 22 * 1024 * 1024) {
+    return `⚠️ Les ${documents.length} pièces jointes dépassent la limite sécuritaire Gmail (22 MB encodés). Aucun email envoyé; aucun document omis silencieusement.`;
+  }
+
+  const token = await getGmailToken();
+  if (!token) return `❌ Gmail indisponible. Les PDF ont été récupérés, mais aucun email n'a été envoyé.`;
+  const subject = `Documents Centris #${num}${filtre ? ` — ${filtre}` : ''}`;
+  const cc = emailDestination.toLowerCase() === AGENT.email.toLowerCase() ? [] : [AGENT.email];
+  const bodyText = `Bonjour,\n\nVoici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.\n\n${documents.map((doc) => `• ${doc.label}`).join('\n')}\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.telephone}`;
+  const contentHtml = `<p style="color:#cccccc;font-size:14px;line-height:1.7;">Voici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;">${documents.map((doc) => `<div style="color:#f5f5f7;margin:6px 0;">📎 ${escapeHtml(doc.label)} <span style="color:#888;">(${Math.round(doc.size / 1024)} KB)</span></div>`).join('')}</div>`;
+  let html = await buildEmailFromMasterTpl({
+    TITRE_EMAIL: `Documents Centris #${num}`,
+    LABEL_SECTION: 'Documents officiels',
+    TERRITOIRES: `Centris #${num}`,
+    HERO_TITRE: `Documents<br>Centris #${num}.`,
+    INTRO_TEXTE: contentHtml,
+    CITATION: 'Je reste disponible pour répondre à toutes vos questions sur ce dossier.',
+  });
+  if (!html) html = `<!doctype html><html><body style="background:#0a0a0a;color:#f5f5f7;font-family:Arial,sans-serif;padding:24px;">${contentHtml}</body></html>`;
+
+  const enc = (value) => `=?UTF-8?B?${Buffer.from(String(value)).toString('base64')}?=`;
+  const boundary = `sbMatrix${Date.now()}`;
+  const lines = [
+    `From: ${AGENT.nom} <${AGENT.email}>`,
+    `To: ${emailDestination}`,
+    ...(cc.length ? [`Cc: ${cc.join(', ')}`] : []),
+    `Reply-To: ${AGENT.email}`,
+    `Subject: ${enc(subject)}`,
+    'MIME-Version: 1.0',
+    'X-SignatureSB-Automation: kira-bot',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html, 'utf8').toString('base64'),
+  ];
+  for (const doc of documents) {
+    lines.push(
+      `--${boundary}`,
+      'Content-Type: application/pdf',
+      `Content-Disposition: attachment; filename="${enc(doc.filename)}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      doc.buffer.toString('base64'),
+    );
+  }
+  lines.push(`--${boundary}--`);
+  const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const emailPayload = {
+    via: 'gmail', to: emailDestination, cc, bcc: [], subject, body: bodyText,
+    attachments: documents.map((doc) => ({ name: doc.filename, size: doc.size, sha256: doc.sha256 })),
+  };
+  let authorization;
+  try {
+    authorization = createOneShotAuthorization({ message: userMessage, ...emailPayload });
+  } catch {
+    return `📂 ${documents.length} PDF(s) Matrix #${num} sont prêts et validés.\n🔒 Aucun email envoyé à ${emailDestination}; réponds exactement « envoie » pour une tentative unique liée à ces pièces jointes.`;
+  }
+
+  const sent = await sendEmailLogged({
+    via: 'gmail', to: emailDestination, cc, subject,
+    category: 'centris-matrix-annexes', authorization, emailPayload,
+    sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw }),
+    }),
+  });
+  if (!sent.ok) return `❌ Les PDF ont été validés, mais Gmail a refusé l'envoi: ${sent.error || sent.status}. Aucune relance automatique.`;
+
+  auditLogEvent('centris', 'matrix-annexes-sent', { num, to: emailDestination, count: documents.length, manifest: emailPayload.attachments.map((doc) => doc.sha256) });
+  return `✅ ${documents.length} documents Matrix #${num} envoyés à *${emailDestination}*${cc.length ? ` (Cc ${AGENT.email})` : ''}.\nAucun document omis; aucune relance automatique.`;
+}
+
 async function executeTool(name, input, chatId, userMessage = '', actionContext = {}) {
   try {
     const pdAction = PIPEDRIVE_WRITE_TOOL_ACTIONS[name];
@@ -7835,7 +7963,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
                  `🔗 ${r.listing_url}\n\n` +
                  `✅ *Pour envoyer:* "envoie tous les docs du #${num} à client@email.com"`;
         } catch (e) {
-          return `❌ Exception preview Zone: ${e.message?.substring(0, 200)}`;
+          return `❌ Exception preview Matrix: ${e.message?.substring(0, 200)}\nAucun document envoyé.`;
         }
       }
 
@@ -7984,6 +8112,19 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         const num = String(centris_num || '').replace(/\D/g, '').trim();
         if (!num || num.length < 7) return `❌ Numéro Centris invalide`;
         if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) return `❌ CENTRIS_USER/PASS absents`;
+        // Chemin canonique unique: Matrix global, numéro exact, téléchargement
+        // Playwright authentifié, validation PDF + SHA-256, puis garde d'envoi.
+        // Le code HTTP/Zone historique ci-dessous est conservé temporairement
+        // pour faciliter le rollback, mais il est intentionnellement inaccessible.
+        return await executeMatrixAnnexesTool({
+          num,
+          emailDestination: email_destination,
+          filtre,
+          chatId,
+          userMessage,
+        });
+
+        /* c8 ignore start -- legacy rollback path, unreachable by design */
         // Login si pas connecté
         if (!centrisSession.cookies || Date.now() > centrisSession.expiry) {
           const ok = await centrisLogin();
@@ -8223,6 +8364,7 @@ ${pjList}
                ok.map(d => `  📎 ${d.label} (${Math.round(d.size/1024)}KB)`).join('\n') +
                (fails.length ? `\n\n⚠️ ${fails.length} échec(s):\n${fails.slice(0, 3).map(f => `  • ${f.label}: ${f.error}`).join('\n')}` : '') +
                emailMsg;
+        /* c8 ignore stop */
       }
 
       case 'analyser_zonage_adresse': {
@@ -16262,9 +16404,10 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     return;
   }
 
-  // ─── GET /admin/zone-test?num=N — test Zone Centris dry-run (preview docs + courtier)
-  // Reproduce le tool envoyer_tous_documents_zone sans envoyer, capture erreur exacte
-  if (req.method === 'GET' && url.startsWith('/admin/zone-test')) {
+  // ─── GET /admin/matrix-test?num=N — test Matrix global en lecture seule.
+  // L'ancien alias /admin/zone-test pointe volontairement vers le même test
+  // pour qu'aucun diagnostic ne retombe dans la Zone personnelle de Shawn.
+  if (req.method === 'GET' && (url.startsWith('/admin/matrix-test') || url.startsWith('/admin/zone-test'))) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
     const num = u.searchParams.get('num') || '';
@@ -16276,17 +16419,20 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         out.error = 'CUA non disponible';
         res.writeHead(503); res.end(JSON.stringify(out, null, 2)); return;
       }
-      if (!cua.shareCentrisZoneDocuments) {
-        out.error = 'shareCentrisZoneDocuments absent (deploy needed)';
+      if (!cua.previewCentrisMatrixDocuments) {
+        out.error = 'previewCentrisMatrixDocuments absent (deploy needed)';
         res.writeHead(503); res.end(JSON.stringify(out, null, 2)); return;
       }
       out.status_before = cua.cuaStatus();
-      const r = await cua.shareCentrisZoneDocuments({ centris_num: num, dry_run: true });
+      const r = await cua.previewCentrisMatrixDocuments({ centris_num: num });
       out.success = r.success;
       out.dry_run = r.dry_run;
+      out.via = r.via;
+      out.error_code = r.error_code;
       out.broker_info = r.broker_info;
       out.docs_count = r.docs_count;
       out.docs_list = r.docs_list;
+      out.manifest_id = r.manifest_id;
       out.message = r.message;
       out.listing_url = r.listing_url;
       out.status_after = cua.cuaStatus();
