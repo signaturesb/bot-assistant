@@ -53,6 +53,25 @@ assert.ok(category(matrix, 'certificat_localisation'));
 assert.ok(category(matrix, 'obligation_courtier'));
 assert.deepStrictEqual(matrix.missing_expected_documents, []);
 
+// Le 9/9 est une attente propre au smoke #28936167, jamais une règle globale.
+// Une inscription externe avec trois documents doit conserver exactement ces
+// trois documents, sans ajout artificiel ni catégorie obligatoire inventée.
+const genericThreeDocuments = cua._buildCentrisDocumentInventory('11111111', [
+  { name: 'Déclaration du vendeur', size: '50 k', provenance: 'matrix_additional_documents' },
+  { name: 'Plan cadastral', size: '100 k', provenance: 'matrix_additional_documents' },
+  { name: 'Taxes scolaires', size: '25 k', provenance: 'matrix_additional_documents' },
+]);
+assert.strictEqual(genericThreeDocuments.docs.length, 3);
+assert.deepStrictEqual(genericThreeDocuments.missing_expected_documents, []);
+
+// Une fiche qui n'offre qu'un seul document reste un lot valide de un; le
+// pipeline ne doit jamais exiger neuf pièces pour un autre numéro.
+const genericSingleDocument = cua._buildCentrisDocumentInventory('22222222', [
+  { name: 'DV-1', size: '50 k', provenance: 'matrix_additional_documents' },
+]);
+assert.strictEqual(genericSingleDocument.docs.length, 1);
+assert.deepStrictEqual(genericSingleDocument.missing_expected_documents, []);
+
 // La provenance structurelle empêche une annexe DV d'être promue en DV principale.
 const additionalDv = cua._buildCentrisDocumentInventory('X', [
   { name: 'DV-99999', source_section: 'additional_documents', provenance: 'matrix_additional_documents' },
