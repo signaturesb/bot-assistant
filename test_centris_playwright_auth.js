@@ -17,6 +17,7 @@ assert(cuaSource.includes('function ingestManualMFACode'), 'Le pont MFA manuel d
 assert(cuaSource.includes('function isAwaitingCentrisMFA'), 'L’état d’attente MFA doit être exposé');
 assert(cuaSource.includes('async function cuaLoginCentris()'), 'La connexion Playwright explicite doit être exposée');
 assert(cuaSource.includes('async function settleCentrisAfterMFA(page)'), 'La redirection OAuth post-MFA doit être stabilisée');
+assert(cuaSource.includes("return 'intermediate'"), 'La page intermédiaire SSO doit être reconnue avant de chercher un formulaire');
 assert.match(cuaSource, /settleCentrisAfterMFA\(page\)[\s\S]*?OAuth Centris encore affiché après MFA — vérification directe Matrix/,
   'un endpoint OAuth bloqué doit être vérifié directement dans Matrix avant de déclarer le login en échec');
 assert.match(cuaSource, /let authorizeRecoveryUsed = false;[\s\S]*?OAuth Centris sans formulaire — reprise unique depuis Matrix Login/,
