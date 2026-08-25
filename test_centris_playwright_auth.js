@@ -19,6 +19,8 @@ assert(cuaSource.includes('async function cuaLoginCentris()'), 'La connexion Pla
 assert(cuaSource.includes('async function settleCentrisAfterMFA(page)'), 'La redirection OAuth post-MFA doit être stabilisée');
 assert.match(cuaSource, /settleCentrisAfterMFA\(page\)[\s\S]*?OAuth Centris encore affiché après MFA — vérification directe Matrix/,
   'un endpoint OAuth bloqué doit être vérifié directement dans Matrix avant de déclarer le login en échec');
+assert.match(cuaSource, /let authorizeRecoveryUsed = false;[\s\S]*?OAuth Centris sans formulaire — reprise unique depuis Matrix Login/,
+  'un endpoint authorize sans formulaire doit reprendre une seule fois depuis le login Matrix officiel');
 assert(botSource.includes('cua?.isAwaitingCentrisMFA?.()'), 'Telegram doit détecter une attente MFA Playwright');
 assert(botSource.includes('cua.ingestManualMFACode(code)'), 'Telegram doit transmettre le code à Playwright');
 assert(botSource.includes('cua.ingestManualMFACode(data.code)'), 'Le pont Messages doit transmettre automatiquement le code à Playwright');
