@@ -207,6 +207,8 @@ assert.ok(botCode.includes('Aucun email envoyé pour éviter un dossier partiel'
 assert.ok(botCode.includes("url.startsWith('/admin/matrix-test') || url.startsWith('/admin/zone-test')"), 'le diagnostic historique Zone doit être redirigé vers Matrix global');
 assert.ok(!botCode.includes('Exception preview Zone:'), 'les erreurs de preview ne doivent plus attribuer Matrix à la Zone');
 assert.ok(cuaCode.includes('Recherche globale exacte'), 'le chemin Matrix global doit journaliser la recherche exacte');
+assert.ok(cuaCode.includes('lien de téléchargement Matrix non résolu'), 'un document visible sans URL doit devenir un échec explicite, jamais disparaître');
+assert.ok(cuaCode.includes('discovered_count: matchedDocs.length'), 'le résultat doit comparer documents découverts et PDF validés');
 assert.ok(!cuaCode.includes('cb.checked = true; cb.click()'), 'sélectionner un format ne doit pas cocher puis décocher la case');
 assert.ok(!cuaCode.includes('const navigatedOK = true'), 'le téléchargement de fiche ne doit pas cliquer deux fois le même résultat');
 assert.ok(cuaCode.includes("normalize('NFD')"), 'le format Détaillé doit être reconnu avec ou sans accent');

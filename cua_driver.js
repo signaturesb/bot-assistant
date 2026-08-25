@@ -1648,17 +1648,26 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     const state = await inspectMatrixListingPage(page, exactNum);
     if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
 
-    let selectedDocs = state.docs.filter((doc) => doc.url);
+    let matchedDocs = state.docs;
     if (filtre) {
       const terms = normalizeCentrisMatchKey(filtre).split(/\s+/).filter(Boolean);
-      selectedDocs = selectedDocs.filter((doc) => terms.every((term) => doc.match_key?.includes(term) || normalizeCentrisMatchKey(doc.name).includes(term)));
+      matchedDocs = matchedDocs.filter((doc) => terms.every((term) => doc.match_key?.includes(term) || normalizeCentrisMatchKey(doc.name).includes(term)));
     }
-    if (!selectedDocs.length) {
+    if (!matchedDocs.length) {
       return { success: false, annexes: [], message: filtre ? `Aucune annexe correspondant à « ${filtre} »` : 'Aucune annexe téléchargeable trouvée dans Matrix' };
     }
 
+    const selectedDocs = matchedDocs.filter((doc) => doc.url);
+    // Fail closed: un document affiché dans Matrix mais dont le lien n'a pas
+    // été résolu (notamment une DV principale rendue en postback) ne doit
+    // jamais disparaître silencieusement du lot envoyé au client.
+    const unresolvedDocs = matchedDocs.filter((doc) => !doc.url);
+
     const annexes = [];
-    const failures = [];
+    const failures = unresolvedDocs.map((doc) => ({
+      label: doc.name,
+      error: 'lien de téléchargement Matrix non résolu',
+    }));
     for (const [index, doc] of selectedDocs.slice(0, 20).entries()) {
       try {
         const response = await context.request.get(doc.url, {
@@ -1690,8 +1699,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       success: annexes.length > 0,
       annexes,
       failures,
+      discovered_count: matchedDocs.length,
+      validated_count: annexes.length,
       message: annexes.length > 0
-        ? `${annexes.length} annexe(s) Matrix téléchargée(s) et validée(s)`
+        ? `${annexes.length}/${matchedDocs.length} annexe(s) Matrix téléchargée(s) et validée(s)`
         : `Aucune annexe PDF validée (${failures.length} échec(s))`,
     };
 
