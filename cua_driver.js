@@ -1433,6 +1433,29 @@ async function clickCentrisLoginSubmit(page) {
   await submit.click({ timeout: 10000 });
 }
 
+// Les redirections Matrix → accounts.centris.ca peuvent continuer à charger
+// des ressources plus de 30 s sur Browserless. Le premier document HTTP suffit
+// pour poursuivre: attendre `commit`, puis inspecter la page reconnue. Une
+// seule reprise est permise et aucun secret n'est injecté sur une page inconnue.
+async function navigateToMatrixLogin(page) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, {
+        waitUntil: 'commit', timeout: 45000,
+      });
+      await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => null);
+      return;
+    } catch (error) {
+      lastError = error;
+      const step = await inspectCentrisLoginStep(page).catch(() => ({ kind: 'missing' }));
+      if (step.kind !== 'missing') return;
+      if (attempt === 0) await page.waitForTimeout(1500);
+    }
+  }
+  throw lastError || new Error('CENTRIS_MATRIX_LOGIN_NAVIGATION_FAILED');
+}
+
 async function submitCentrisLogin(page, user, pass) {
   // Supporte le formulaire Centris actuel (UserCode + Password) et le flux
   // Auth0 fractionné observé lors de migrations. Aucun repli vers "le premier
@@ -1475,9 +1498,7 @@ async function submitCentrisLogin(page, user, pass) {
     if (!authorizeRecoveryUsed && /accounts\.centris\.ca\/connect\/authorize$/i.test(step.location)) {
       authorizeRecoveryUsed = true;
       console.log('[CUA] OAuth Centris sans formulaire — reprise unique depuis Matrix Login');
-      await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, {
-        waitUntil: 'domcontentloaded', timeout: 30000,
-      });
+      await navigateToMatrixLogin(page);
       await page.waitForTimeout(2500);
       continue;
     }
@@ -1626,7 +1647,7 @@ async function loginCentris(context) {
 
   // Login frais — page Centris Matrix qui redirige vers accounts.centris.ca
   console.log('[CUA] Login Centris matrix (fresh)...');
-  await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await navigateToMatrixLogin(page);
   await page.waitForTimeout(2500);
 
   console.log('[CUA] Page login:', safeCentrisPageLocation(page.url()));
