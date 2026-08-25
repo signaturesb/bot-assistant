@@ -3996,6 +3996,17 @@ async function chercherListingDropbox(terme) {
            q.split(/[\s,]+/).every(w => n.includes(w));
   }).slice(0, 6);
 
+  if (!matches.length && /^\d{7,9}$/.test(String(terme).trim())) {
+    // Un fichier vient souvent d'être ajouté par Julie après le dernier build
+    // de l'index. Chercher immédiatement dans tout Dropbox, puis reconstruire
+    // le cache pour les prochaines commandes.
+    const live = await dropboxLiveSearch(String(terme).trim());
+    if (live?.folder && live?.pdfs?.length) {
+      buildDropboxIndex().catch(() => {});
+      matches.push(live.folder);
+    }
+  }
+
   if (!matches.length) {
     const preview = dossiers.slice(0, 6).map(d => d.adresse || d.name).join(', ');
     return `Aucun listing "${terme}".\nDossiers disponibles: ${preview}${dossiers.length > 6 ? ` (+${dossiers.length - 6})` : ''}`;
@@ -4070,8 +4081,14 @@ async function dropboxLiveSearch(query) {
       } else if (meta['.tag'] === 'file') {
         // Fichier trouvé → remonte au dossier parent immédiat
         const parent = meta.path_lower.split('/').slice(0, -1).join('/');
+        const numericQuery = /^\d{7,9}$/.test(String(query));
+        const exactNumericFilename = numericQuery && new RegExp(`(^|\\D)${String(query)}(\\D|$)`).test(meta.name);
         if (!folderCandidates.has(parent)) {
-          folderCandidates.set(parent, { meta: { name: parent.split('/').pop(), path_lower: parent }, score: 82, reason: 'filename_match' });
+          folderCandidates.set(parent, {
+            meta: { name: parent.split('/').pop(), path_lower: parent },
+            score: exactNumericFilename ? 90 : 82,
+            reason: exactNumericFilename ? 'filename_centris_exact' : 'filename_match',
+          });
         }
       }
     }
@@ -4080,9 +4097,10 @@ async function dropboxLiveSearch(query) {
     // Extraire centris/adresse du nom
     const folderName = best.meta.name;
     const parsed = _parseFolderMeta(folderName);
+    const exactCentrisFile = best.reason === 'filename_centris_exact' && /^\d{7,9}$/.test(String(query));
     const folder = {
       name: folderName, path: bestPath,
-      centris: parsed.centris, adresse: parsed.adresse,
+      centris: parsed.centris || (exactCentrisFile ? String(query) : ''), adresse: parsed.adresse,
       source: '(live search)',
     };
     const pdfs = await _listFolderPDFs(folder);
@@ -4620,6 +4638,31 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   }
   log('INFO', 'DOCS', `[STEP 2/9] email destination: ${toEmail || '(VIDE — listing-mode)'} | centris=${centris || '(none)'}`);
 
+  // Confidentialité: même une commande explicite exige un vrai contact client
+  // avec courriel + téléphone. Si seulement l'email est fourni, compléter en
+  // lecture seule depuis Pipedrive; ne jamais inventer ni contourner ce contrôle.
+  let clientPhone = '';
+  if (deal?.person_id && PD_KEY) {
+    try {
+      const p = await pdGet(`/persons/${deal.person_id}`);
+      clientPhone = p?.data?.phone?.find(x => x.primary)?.value || p?.data?.phone?.[0]?.value || '';
+    } catch {}
+  }
+  if (!clientPhone && toEmail && PD_KEY) {
+    try {
+      const ps = await pdGet(`/persons/search?term=${encodeURIComponent(toEmail)}&fields=email&exact_match=true&limit=2`);
+      const person = ps?.data?.items?.[0]?.item;
+      if (person?.id) {
+        const p = await pdGet(`/persons/${person.id}`);
+        clientPhone = p?.data?.phone?.find(x => x.primary)?.value || p?.data?.phone?.[0]?.value || '';
+      }
+    } catch {}
+  }
+  const clientPhoneDigits = String(clientPhone).replace(/\D/g, '').replace(/^1/, '');
+  if (toEmail && !/^\d{10}$/.test(clientPhoneDigits)) {
+    return `🔒 Aucun document préparé ni envoyé à ${toEmail}: un numéro de téléphone client valide est obligatoire. Ajoute/confirme le téléphone dans Pipedrive, puis relance la commande.`;
+  }
+
   // 3. Dossier Dropbox — folder hint (auto) ou fastDropboxMatch via index complet
   let folder = opts.folderHint || null;
   if (folder) {
@@ -4637,6 +4680,14 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
       }
     } else {
       log('WARN', 'DOCS', `[STEP 3/9] dropboxIndex VIDE — fallback dropboxTerrains`);
+    }
+  }
+  if (!folder && /^\d{7,9}$/.test(String(centris))) {
+    const live = await dropboxLiveSearch(String(centris));
+    if (live?.folder && live.folder.centris === String(centris) && live.pdfs?.length) {
+      folder = live.folder;
+      buildDropboxIndex().catch(() => {});
+      log('OK', 'DOCS', `[STEP 3/9] folder via recherche live Centris exacte: "${folder.name}"`);
     }
   }
   if (!folder) {
@@ -18537,7 +18588,10 @@ async function main() {
       auditLogEvent('webhook', 'anomaly', { pending: w.pending_update_count, error: w.last_error_message, consecutive: webhookHealth.consecutiveFails });
 
       const synced = await syncWebhookWithSecret(`auto-heal #${webhookHealth.consecutiveFails}`);
-      if (synced && ALLOWED_ID) {
+      // Une seule erreur 502 survient normalement pendant un déploiement
+      // Render. Auto-réparer sans bruit; alerter seulement si elle persiste ou
+      // si Telegram accumule réellement des messages.
+      if (synced && ALLOWED_ID && (webhookHealth.consecutiveFails >= 2 || tooPending)) {
         bot.sendMessage(ALLOWED_ID, `🔧 *Webhook auto-heal*\n${w.last_error_message}\nResync OK. Renvoie messages perdus si besoin.`, { parse_mode: 'Markdown' }).catch(()=>{});
       }
 
