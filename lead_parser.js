@@ -63,7 +63,21 @@ function sanitizeProspect(data) {
   if (emailLower && BLACKLIST_EMAIL_PARTS.some(b => emailLower.includes(b))) {
     data.email = ''; // Rejeté — c'est le courtier ou un système, pas un client
   }
+  // Une adresse sert à retrouver des documents confidentiels: elle doit être
+  // une vraie adresse civique, jamais une phrase de transfert/signature.
+  if (data.adresse && !isLikelyPropertyAddress(data.adresse)) data.adresse = '';
   return data;
+}
+
+// Validation volontairement stricte. Un faux négatif mène à une vérification
+// manuelle; un faux positif pourrait exposer les documents d'une transaction.
+function isLikelyPropertyAddress(value) {
+  const s = String(value || '').replace(/\s+/g, ' ').trim();
+  if (s.length < 6 || s.length > 120) return false;
+  if (/destinataire|si vous n['’]?êtes|confidentiel|courriel|email|transf[eé]r[eé]|forwarded|shawn\s+barrette|signaturesb/i.test(s)) return false;
+  const streetType = '(?:rue|avenue|av\\.?|boulevard|boul\\.?|chemin|ch\\.?|rang|route|rte\\.?|mont[eé]e|place|pl\\.?|cour|court|drive|dr\\.?|street|st\\.?|road|rd\\.?|lane|ln\\.?)';
+  // Québec: « 123 rue Principale »; accepte aussi « 123, chemin du Lac ».
+  return new RegExp(`^\\d{1,6}(?:[-–]\\d{1,6})?[, ]+${streetType}\\s+[A-Za-zÀ-ÿ0-9'’.-]{2,}(?:\\s+[A-Za-zÀ-ÿ0-9'’.-]{1,}){0,8}(?:,\\s*[^;|<>]{2,40})?$`, 'i').test(s);
 }
 
 // Score qualité 0-100 pour décider si AI fallback nécessaire
@@ -369,7 +383,8 @@ Appelle enregistrer_infos_lead avec les valeurs extraites.`;
     const nomClean = String(parsed.nom || '').trim().replace(/\s+/g, ' ').substring(0, 100);
     // Rejeter nom si c'est visiblement pas une personne (Shawn, RE/MAX, compagnie)
     const nomValid = nomClean && !/shawn|barrette|remax|re\/max|centris|signature/i.test(nomClean) ? nomClean : '';
-    const adresseClean = String(parsed.adresse || '').trim().substring(0, 150);
+    const adresseRaw = String(parsed.adresse || '').trim().substring(0, 150);
+    const adresseClean = isLikelyPropertyAddress(adresseRaw) ? adresseRaw : '';
 
     // Merge: regex prioritaire quand présent, AI comble les trous
     const merged = {
@@ -410,4 +425,5 @@ module.exports = {
   sanitizeProspect,
   leadQualityScore,
   isValidProspectName,
+  isLikelyPropertyAddress,
 };
