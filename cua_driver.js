@@ -1666,7 +1666,7 @@ async function loginCentris(context) {
     await mfaField.fill(mfaCode);
     const mfaSubmit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Vérif"), button:has-text("Submit"), button:has-text("Confirmer")').first();
     await mfaSubmit.click();
-    await page.waitForTimeout(4500);
+    await settleCentrisAfterMFA(page);
   }
 
   // Handle disclaimers "I've Read This" / "Continue"
@@ -1698,6 +1698,33 @@ async function loginCentris(context) {
   try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
   console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', safeCentrisPageLocation(finalUrl));
   return page;
+}
+
+// Le POST MFA revient parfois brièvement sur l'endpoint OAuth
+// accounts.centris.ca/connect/authorize avant que Matrix termine son échange
+// de code. Une simple attente fixe produit alors un faux échec et ferme la
+// session valide. Attendre la redirection réelle, puis sonder Matrix une seule
+// fois si l'endpoint OAuth reste affiché sans champ MFA.
+async function settleCentrisAfterMFA(page) {
+  const deadline = Date.now() + 18000;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(750);
+    const url = page.url();
+    if (isAuthenticatedCentrisUrl(url)) return;
+    const mfaStillVisible = await page.locator(
+      'input[autocomplete="one-time-code"], input[name="code"], input[id="code"], input[name*="verification" i], input[id*="verification" i], input[placeholder*="code" i], input[placeholder*="vérif" i], input[type="tel"]'
+    ).first().isVisible().catch(() => false);
+    if (mfaStillVisible) return;
+    if (/LoginIntermediate|Disclaimer|Consent/i.test(url)) return;
+  }
+
+  if (/accounts\.centris\.ca\/connect\/authorize/i.test(page.url())) {
+    console.log('[CUA] OAuth Centris encore affiché après MFA — vérification directe Matrix');
+    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, {
+      waitUntil: 'domcontentloaded', timeout: 20000,
+    });
+    await page.waitForTimeout(1800);
+  }
 }
 
 // Fetch MFA code depuis le bot Render qui lit Gmail automatiquement
