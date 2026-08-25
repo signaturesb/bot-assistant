@@ -1829,7 +1829,20 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
           finish(null, magicIndex ? buffer.subarray(magicIndex) : buffer);
           return;
         }
-        lastDiagnostic = `bytes=${buffer.length}, signature=${buffer.subarray(0, 16).toString('hex') || 'vide'}`;
+        const htmlHead = buffer.subarray(0, Math.min(buffer.length, 32768)).toString('utf8');
+        const title = String(htmlHead.match(/<title[^>]*>([^<]{0,120})<\/title>/i)?.[1] || '')
+          .replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 80);
+        const status = typeof response.status === 'function' ? response.status() : 'inconnu';
+        // Ne jamais journaliser la query media.ashx: elle contient des
+        // identifiants propres à la session. Hôte + chemin + titre suffisent.
+        lastDiagnostic = [
+          `status=${status}`,
+          `type=${contentType || 'inconnu'}`,
+          `url=${responseUrl.hostname}${responseUrl.pathname}`,
+          `bytes=${buffer.length}`,
+          `signature=${buffer.subarray(0, 16).toString('hex') || 'vide'}`,
+          title ? `title=${title}` : null,
+        ].filter(Boolean).join(',');
       } catch (error) {
         lastDiagnostic = safeErrorMessage(error).substring(0, 100);
       }
