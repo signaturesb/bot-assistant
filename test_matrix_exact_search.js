@@ -22,6 +22,14 @@ assert(scoreSearch('omnisearch MLS Centris', { width: 500, y: 80 }) >= 100);
 assert(scoreSearch('clientSearch email', { width: 800, y: 100 }) < 100);
 assert(scoreSearch('municipalite critère', { width: 700, y: 120 }) < 100);
 assert(scoreSearch('adresse', { width: 900, y: 100 }) < 100);
+assert(scoreSearch('', { width: 700, height: 42, y: 100 }) >= 100,
+  'la barre Matrix v12.6 sans attribut sémantique doit être reconnue par sa géométrie d’en-tête');
+assert(scoreSearch('form-control text', { width: 700, height: 42, y: 100 }) >= 100,
+  'les attributs CSS/type génériques ne doivent pas masquer la barre Matrix d’en-tête');
+assert(scoreSearch('', { width: 700, height: 42, y: 500 }) < 100,
+  'un champ large hors en-tête ne doit pas être pris pour la recherche globale');
+assert(scoreSearch('adresse', { width: 700, height: 42, y: 100 }) < 100,
+  'un champ métier explicite reste exclu même s’il ressemble géométriquement à la barre globale');
 
 assert.strictEqual(classify({
   url: 'https://matrix.centris.ca/Matrix/Results',
