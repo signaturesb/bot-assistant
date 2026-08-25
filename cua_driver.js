@@ -2830,46 +2830,22 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
         // de l'onglet ouvert au-delà des 60 s Browserless. Dès que cette URL
         // authentifiée existe, la relire via APIRequestContext (mêmes cookies)
         // évite d'attendre la fermeture du flux navigateur.
-        if (/^\/Matrix\/PrintP/i.test(responseUrl.pathname) && playwright?.request?.newContext) {
-          let detachedRequest = null;
+        if (/^\/Matrix\/PrintP/i.test(responseUrl.pathname)) {
           try {
-            // Détacher la requête du browserContext distant: Browserless peut
-            // fermer son WebSocket à 60 s sans disposer ce client HTTP local.
+            // Détacher le flux du browserContext distant. Matrix garde parfois
+            // la connexion PrintP ouverte indéfiniment après avoir envoyé le
+            // PDF; le lecteur HTTP local s'arrête lui-même sur %%EOF.
             const authenticatedState = await context.storageState();
-            detachedRequest = await playwright.request.newContext({
-              storageState: authenticatedState,
-              extraHTTPHeaders: {
-                Referer: `${MATRIX_BASE}/Matrix/Printing/PrintOptions.aspx`,
-                Accept: 'application/pdf,*/*',
-              },
-            });
+            const cookieHeader = cookieHeaderFromPlaywrightCookies(authenticatedState.cookies, responseUrl.hostname);
+            if (!cookieHeader) throw new Error('MATRIX_PRINT_COOKIE_MISSING');
             clearTimeout(timer);
             timer = setTimeout(() => finish(new Error(`MATRIX_PRINT_DETACHED_TIMEOUT:${lastDiagnostic}`)), 90000);
-            const fetched = await detachedRequest.get(response.url(), {
-              timeout: 75000,
-            });
-            if (fetched.ok()) {
-              const fetchedLength = Number(fetched.headers()['content-length'] || 0);
-              if (fetchedLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
-                finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
-                return;
-              }
-              const fetchedBuffer = await fetched.body();
-              if (fetchedBuffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
-                finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
-                return;
-              }
-              const fetchedMagic = fetchedBuffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
-              if (fetchedBuffer.length >= 1000 && fetchedMagic >= 0) {
-                console.log(`[MATRIX-PDF] Fiche PrintP récupérée via requête authentifiée (${fetchedBuffer.length} octets)`);
-                finish(null, fetchedMagic ? fetchedBuffer.subarray(fetchedMagic) : fetchedBuffer);
-                return;
-              }
-            }
+            const fetchedBuffer = await streamMatrixPdfUntilEof(response.url(), cookieHeader, 75000);
+            console.log(`[MATRIX-PDF] Fiche PrintP récupérée jusqu'à %%EOF (${fetchedBuffer.length} octets)`);
+            finish(null, fetchedBuffer);
+            return;
           } catch (error) {
             lastDiagnostic = `printp-fetch=${safeErrorMessage(error).substring(0, 80)}`;
-          } finally {
-            await detachedRequest?.dispose().catch(() => null);
           }
         }
         const buffer = await response.body();
@@ -2932,6 +2908,60 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
     throw error;
   }
   return result;
+}
+
+async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 75000) {
+  const target = new URL(String(rawUrl || ''));
+  if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
+      !/^\/Matrix\/PrintP/i.test(target.pathname)) {
+    throw new Error('MATRIX_PRINT_STREAM_URL_REJECTED');
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(target.href, {
+      method: 'GET',
+      headers: {
+        Cookie: cookieHeader,
+        Referer: `${MATRIX_BASE}/Matrix/Printing/PrintOptions.aspx`,
+        Accept: 'application/pdf,*/*',
+      },
+      redirect: 'manual',
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`MATRIX_PRINT_STREAM_HTTP_${response.status}`);
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('pdf')) throw new Error(`MATRIX_PRINT_STREAM_NOT_PDF:${contentType || 'unknown'}`);
+    const announcedLength = Number(response.headers.get('content-length') || 0);
+    if (announcedLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    if (!response.body) throw new Error('MATRIX_PRINT_STREAM_BODY_MISSING');
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    let tail = Buffer.alloc(0);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.length;
+      if (total > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+      chunks.push(chunk);
+      const scan = Buffer.concat([tail, chunk]);
+      if (scan.indexOf(Buffer.from('%%EOF')) >= 0) {
+        const full = Buffer.concat(chunks, total);
+        const magic = full.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+        const eof = full.lastIndexOf(Buffer.from('%%EOF'));
+        if (magic < 0 || eof < magic || eof + 5 < 1000) throw new Error('MATRIX_PRINT_STREAM_INVALID_PDF');
+        controller.abort();
+        return full.subarray(magic, eof + 5);
+      }
+      tail = scan.subarray(Math.max(0, scan.length - 8));
+    }
+    throw new Error('MATRIX_PRINT_STREAM_EOF_MISSING');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function matrixDownloadBuffer(download) {

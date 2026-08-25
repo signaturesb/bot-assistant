@@ -42,12 +42,12 @@ assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire mod
 assert(cuaSource.includes('reopenVerifiedMatrixListing(page, exactNum, state.url)'), 'La phase fiche doit rouvrir directement le listing vérifié sans répéter la recherche globale');
 assert(cuaSource.includes('doc.action_id === MATRIX_LISTING_REPORT_ACTION ? 1'), 'La fiche doit être générée avec une seule tentative longue sous la limite Browserless');
 assert(cuaSource.includes('pdfControl.click({ timeout: 10000 }), 40000'), 'La fiche doit disposer de 40 s de génération dans sa session dédiée');
-assert(cuaSource.includes('detachedRequest = await playwright.request.newContext({'),
-  'une réponse PrintP doit créer un client HTTP autonome');
-assert(cuaSource.includes('storageState: authenticatedState'),
-  'le client PrintP autonome doit reprendre exactement l’état authentifié');
-assert(cuaSource.includes('MATRIX_PRINT_DETACHED_TIMEOUT') && cuaSource.includes('detachedRequest.get(response.url()'),
-  'la récupération PrintP autonome doit survivre à la coupure Browserless avec un délai borné');
+assert(cuaSource.includes('streamMatrixPdfUntilEof(response.url(), cookieHeader, 75000)'),
+  'une réponse PrintP doit être lue par un flux HTTP autonome borné');
+assert(cuaSource.includes("scan.indexOf(Buffer.from('%%EOF'))") && cuaSource.includes("full.lastIndexOf(Buffer.from('%%EOF'))"),
+  'le flux PrintP doit s’arrêter sur la vraie fin PDF sans attendre la fermeture Matrix');
+assert(cuaSource.includes('MATRIX_PRINT_DETACHED_TIMEOUT') && cuaSource.includes('MATRIX_PRINT_STREAM_URL_REJECTED'),
+  'la récupération PrintP autonome doit rester bornée et limitée au domaine Matrix');
 assert(cuaSource.includes('const authenticatedCheckpoint = {'), 'La connexion/MFA doit être figée avant la phase de recherche PDF');
 assert(cuaSource.includes('const deadline = Date.now() + 5000'), 'La stabilisation post-MFA doit garder une marge Browserless pour vérifier Matrix');
 assert(cuaSource.includes("Symbol('matrix-annexes')"), 'Un verrou global doit couvrir toute l’opération Matrix A+B');
