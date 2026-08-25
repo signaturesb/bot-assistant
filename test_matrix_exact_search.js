@@ -28,6 +28,8 @@ assert.strictEqual(classify({
   url: 'https://matrix.centris.ca/Matrix/Detail',
   text: 'No Centris 28936167 Document(s) additionnel(s)',
   exactListingMentioned: true,
+  detailEvidence: true,
+  docs: [],
   mediaLinkCount: 0,
 }, '28936167').code, 'MATRIX_LISTING_READY_NO_DOCUMENTS');
 
