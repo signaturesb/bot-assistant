@@ -13,6 +13,8 @@ assert.match(handler, /APERÇU COURRIEL — aucun envoi/);
 assert.match(handler, /if \(!isSendConfirmation && ALLOWED_ID && chatId\)/);
 assert.match(handler, /Confirmation refusée:.*PDF ont changé/s);
 assert.ok(code.includes('Ne jamais conclure « courtier concurrent / accès restreint » sans un code HTTP 401/403 observé'));
+assert.ok(code.includes('ne jamais créer/prétendre sauvegarder chatgpt_config.md'));
+assert.ok(code.includes('ne jamais déclarer les documents inaccessibles à cause du courtier sans preuve 401/403'));
 assert.ok(code.includes("name !== 'telecharger_annexes_centris'"), 'le preview Matrix doit passer avant le garde générique');
 
 console.log('✅ Aperçu Matrix lié au destinataire, modèle et PDF avant confirmation');

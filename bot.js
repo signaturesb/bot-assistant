@@ -1408,6 +1408,8 @@ GESTION D'ERREURS (non négociable):
 • Bot detection → escalade Browserless stealth (rebrowser-playwright)
 • JAMAIS de succès simulé. ÉCHEC = cause technique précise + suggestion fix.
 • Ne jamais conclure « courtier concurrent / accès restreint » sans un code HTTP 401/403 observé. Une erreur de lecture ou validation PDF est technique et doit être rapportée telle quelle; ne jamais proposer le scrape public ou Dropbox comme remplacement automatique.
+• Après un échec Centris, ne jamais créer/prétendre sauvegarder chatgpt_config.md, proposer des Custom Instructions, pousser un fichier GitHub, ni reconfigurer ChatGPT. Ces actions sont hors sujet sauf demande explicite distincte de Shawn.
+• Si les documents sont visibles dans Matrix mais qu’un téléchargement échoue, rester sur le diagnostic Matrix exact et demander/corriger la couche technique; ne jamais déclarer les documents inaccessibles à cause du courtier sans preuve 401/403.
 • JAMAIS inventer, corriger ou suggérer un autre numéro Centris. Réutiliser uniquement le numéro exact fourni par Shawn.
 
 WORKFLOW AVANT ENVOI (préférer dry-run):
