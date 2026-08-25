@@ -602,7 +602,10 @@ async function findMatrixGlobalSearch(page) {
       }
 
       const inputs = frame.locator('input:not([type]), input[type="text"], input[type="search"]');
-      const count = Math.min(await inputs.count().catch(() => 0), 50);
+      // Matrix peut rendre la barre globale sans id/name/placeholder utile.
+      // Ne pas supposer qu'elle figure parmi les 50 premiers contrôles: les
+      // formulaires de critères ASP.NET peuvent injecter de nombreux champs.
+      const count = Math.min(await inputs.count().catch(() => 0), 200);
       let best = null;
       let bestScore = -1;
       for (let index = 0; index < count; index += 1) {
@@ -640,8 +643,41 @@ function scoreMatrixSearchCandidate(meta = '', box = {}) {
   if (/\bcrit[eè]re/i.test(value)) score += 40;
   if (Number(box.width) >= 600) score += 35;
   if (Number(box.y) >= 40 && Number(box.y) <= 450) score += 20;
-  if (/password|courriel|email|client|municipalit|ville|prix|adresse|telephone|phone/i.test(value)) score -= 300;
+  const looksLikeOrdinaryField = /password|courriel|email|client|municipalit|ville|prix|adresse|telephone|phone/i.test(value);
+  if (looksLikeOrdinaryField) score -= 300;
+  // Variante observée dans Matrix v12.6: la grande barre blanche de l'en-tête
+  // peut ne porter aucun attribut sémantique exploitable. Sa géométrie est
+  // toutefois stable et distinctive. Accepter seulement un champ très large,
+  // éditable, dans la bande supérieure; les champs métier explicites restent
+  // exclus par la pénalité ci-dessus. Cette règle reproduit exactement le
+  // geste montré par Shawn sans deviner un numéro ni utiliser Zone Courtier.
+  if (!looksLikeOrdinaryField &&
+      Number(box.width) >= 500 && Number(box.height) >= 18 && Number(box.height) <= 80 &&
+      Number(box.y) >= 35 && Number(box.y) <= 220) score += 100;
   return score;
+}
+
+async function matrixSearchDiagnostics(page) {
+  const frames = [];
+  for (const frame of page.frames()) {
+    const controls = await frame.locator('input:not([type]), input[type="text"], input[type="search"]')
+      .evaluateAll((elements) => elements.slice(0, 30).map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return {
+          id: element.id || '',
+          name: element.getAttribute('name') || '',
+          type: element.getAttribute('type') || '',
+          placeholder: element.getAttribute('placeholder') || '',
+          aria: element.getAttribute('aria-label') || '',
+          class: String(element.getAttribute('class') || '').substring(0, 120),
+          visible: style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0,
+          box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        };
+      })).catch(() => []);
+    frames.push({ page: safeCentrisPageLocation(frame.url()), controls });
+  }
+  return { page: safeCentrisPageLocation(page.url()), title: await page.title().catch(() => ''), frames };
 }
 
 function matrixTextContainsExactNumber(value, centrisNum) {
@@ -820,7 +856,10 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(2500);
     const search = await findMatrixGlobalSearch(page);
-    if (!search) return { success: false, error_code: 'MATRIX_SEARCH_CONTROL_MISSING', message: 'Barre de recherche globale Matrix introuvable. Aucun envoi effectué.' };
+    if (!search) {
+      console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
+      return { success: false, error_code: 'MATRIX_SEARCH_CONTROL_MISSING', message: 'Barre de recherche globale Matrix introuvable. Aucun envoi effectué.' };
+    }
 
     console.log(`[MATRIX-PREVIEW] Recherche globale exacte #${centrisNum}`);
     await search.fill(centrisNum);
@@ -2039,7 +2078,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(2500);
     const search = await findMatrixGlobalSearch(page);
-    if (!search) throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
+    if (!search) {
+      console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
+      throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
+    }
     await search.fill(exactNum);
     await search.press('Enter');
     await page.waitForTimeout(3500);
