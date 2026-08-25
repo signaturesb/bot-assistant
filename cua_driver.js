@@ -1568,6 +1568,13 @@ async function submitCentrisLogin(page, user, pass) {
     // Aucun identifiant n'est injecté tant qu'un formulaire reconnu n'apparaît.
     if (!authorizeRecoveryUsed && /accounts\.centris\.ca\/connect\/authorize$/i.test(step.location)) {
       authorizeRecoveryUsed = true;
+      console.log('[CUA] OAuth Centris sans formulaire — vérification directe Matrix avant reprise');
+      await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, {
+        waitUntil: 'commit', timeout: 12000,
+      }).catch(() => null);
+      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
+      const matrixStep = await inspectCentrisLoginStep(page).catch(() => ({ kind: 'missing' }));
+      if (matrixStep.kind === 'authenticated') return 'authenticated';
       console.log('[CUA] OAuth Centris sans formulaire — reprise unique depuis Matrix Login');
       await navigateToMatrixLogin(page);
       await page.waitForTimeout(2500);
