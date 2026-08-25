@@ -7385,8 +7385,11 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   }));
   const failures = Array.isArray(result.failures) ? result.failures : [];
 
+  const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
+
   // Telegram est le canal privé de Shawn: livraison interne des PDFs validés.
-  if (ALLOWED_ID && chatId) {
+  // Ne pas renvoyer les mêmes pièces lors de la confirmation finale.
+  if (!isSendConfirmation && ALLOWED_ID && chatId) {
     for (const doc of documents) {
       await bot.sendDocument(chatId, doc.buffer, {
         caption: `📎 ${doc.label}\nCentris #${num} · ${Math.round(doc.size / 1024)} KB${doc.page_count ? ` · ${doc.page_count} page(s)` : ''}`,
@@ -7468,11 +7471,46 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     via: 'gmail', to: emailDestination, cc, bcc: [], subject, body: bodyText,
     attachments: documents.map((doc) => ({ name: doc.filename, size: doc.size, sha256: doc.sha256 })),
   };
+  const payloadFingerprint = crypto.createHash('sha256').update(JSON.stringify({
+    to: emailPayload.to,
+    cc: emailPayload.cc,
+    subject: emailPayload.subject,
+    body: emailPayload.body,
+    attachments: emailPayload.attachments,
+  })).digest('hex');
+
+  if (!isSendConfirmation) {
+    pendingExternalEmailActions.set(chatId, {
+      name: 'telecharger_annexes_centris',
+      input: { centris_num: num, email_destination: emailDestination, filtre: filtre || '' },
+      createdAt: Date.now(),
+      inFlight: false,
+      matrixFingerprint: payloadFingerprint,
+      matrixPreviewExpiresAt: Date.now() + 15 * 60 * 1000,
+    });
+    savePendingEmailState();
+    if (chatId) {
+      await bot.sendDocument(chatId, Buffer.from(html, 'utf8'), {
+        caption: `APERÇU COURRIEL — aucun envoi\nÀ: ${emailDestination}\nCc: ${cc.join(', ') || 'aucune'}\nObjet: ${subject}\nPièces jointes: ${documents.length}\nValide 15 minutes; réponds exactement « envoie ».`,
+      }, { filename: `apercu_courriel_centris_${num}.html`, contentType: 'text/html' })
+        .catch((error) => log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Telegram: ${error.message}`));
+    }
+    return `📂 ${documents.length} PDF(s) Matrix #${num} récupérés et validés.\n🔍 Aperçu SignatureSB remis dans Telegram pour ${emailDestination}.\n🔒 Aucun email envoyé; réponds exactement « envoie » dans les 15 minutes.`;
+  }
+
+  const approvedPreview = pendingExternalEmailActions.get(chatId);
+  if (!approvedPreview || approvedPreview.name !== 'telecharger_annexes_centris' ||
+      approvedPreview.matrixPreviewExpiresAt < Date.now()) {
+    return `🔒 Confirmation refusée: l’aperçu Matrix #${num} est absent ou expiré. Demande un nouvel aperçu; aucun email envoyé.`;
+  }
+  if (approvedPreview.matrixFingerprint !== payloadFingerprint) {
+    return `🔒 Confirmation refusée: le destinataire, le modèle ou les PDF ont changé depuis l’aperçu. Demande un nouvel aperçu; aucun email envoyé.`;
+  }
   let authorization;
   try {
     authorization = createOneShotAuthorization({ message: userMessage, ...emailPayload });
   } catch {
-    return `📂 ${documents.length} PDF(s) Matrix #${num} sont prêts et validés.\n🔒 Aucun email envoyé à ${emailDestination}; réponds exactement « envoie » pour une tentative unique liée à ces pièces jointes.`;
+    return `🔒 Confirmation exacte « envoie » requise. Aucun email envoyé à ${emailDestination}.`;
   }
 
   const sent = await sendEmailLogged({
@@ -7560,7 +7598,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
     }
 
     const externalRecipient = getExternalEmailToolRecipient(name, input);
-    if (externalRecipient && !isInternalEmailPayload({ to: externalRecipient })) {
+    if (externalRecipient && !isInternalEmailPayload({ to: externalRecipient }) && name !== 'telecharger_annexes_centris') {
       if (name === 'telecharger_docs_centris_complet') {
         return '🔒 Envoi multi-courriels désactivé: une confirmation ne peut autoriser qu’une tentative fournisseur. Demande séparément la fiche Centris, puis les documents Dropbox.';
       }

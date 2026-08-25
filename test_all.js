@@ -48,6 +48,7 @@ runScript('Workflow/backups audit', path.join(__dirname, 'scripts/audit-runtime-
 // 2. Firecrawl tests
 runScript('Firecrawl tests', path.join(__dirname, 'test_firecrawl.js'));
 runScript('Matrix authenticated browser download', path.join(__dirname, 'test_matrix_browser_download.js'));
+runScript('Matrix email preview guard', path.join(__dirname, 'test_matrix_email_preview_guard.js'));
 
 // 3. Plan quotas inline test
 console.log('\n▶ Plan quotas');

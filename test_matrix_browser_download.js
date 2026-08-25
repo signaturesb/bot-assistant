@@ -33,6 +33,20 @@ const context = {
   assert.strictEqual(navigation.options.referer, 'https://matrix.centris.ca/Matrix/Results.aspx?c=xyz');
   assert.strictEqual(navigation.options.waitUntil, 'commit');
   assert.strictEqual(closed, true);
+  const oversizedContext = {
+    async newPage() {
+      return {
+        async goto() {
+          return { ok: () => true, status: () => 200, headers: () => ({ 'content-type': 'application/pdf', 'content-length': String(26 * 1024 * 1024) }), body: async () => pdf };
+        },
+        async close() {},
+      };
+    },
+  };
+  await assert.rejects(
+    () => cua._downloadMatrixPdfInBrowser(oversizedContext, 'https://mediaserver.centris.ca/media.ashx?id=large', navigation.options.referer),
+    /MATRIX_DOCUMENT_TOO_LARGE/
+  );
   await assert.rejects(
     () => cua._downloadMatrixPdfInBrowser(context, 'https://example.com/file.pdf', navigation.options.referer),
     /MATRIX_DOCUMENT_URL_REJECTED/

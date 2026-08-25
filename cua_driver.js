@@ -49,6 +49,8 @@ const CENTRIS_BASE   = 'https://matrix.centris.ca';
 const MATRIX_BASE    = 'https://matrix.centris.ca';
 const PUBLIC_BASE    = 'https://www.centris.ca';
 const MANUAL_MFA_TTL = 2 * 60 * 1000;
+const MATRIX_DOCUMENT_FILE_MAX_BYTES = 25 * 1024 * 1024;
+const MATRIX_DOCUMENT_TOTAL_MAX_BYTES = 120 * 1024 * 1024;
 const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
 
 function clampDurationMs(value, fallback, min, max) {
@@ -1737,7 +1739,18 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     });
     for (const item of downloaded) {
       if (item.ok) annexes.push(item.document);
-      else failures.push(item.failure);
+      else {
+        failures.push(item.failure);
+        console.warn(`[MATRIX-PDF] ${item.failure.label}: ${item.failure.error}`);
+      }
+    }
+    const totalDownloadedBytes = annexes.reduce((total, doc) => total + Number(doc.size || 0), 0);
+    if (totalDownloadedBytes > MATRIX_DOCUMENT_TOTAL_MAX_BYTES) {
+      return {
+        success: false, annexes: [], failures,
+        discovered_count: matchedDocs.length, validated_count: 0,
+        message: `Lot Matrix trop volumineux (${Math.ceil(totalDownloadedBytes / 1024 / 1024)} MB; maximum 120 MB). Aucun envoi effectué.`,
+      };
     }
     return {
       success: annexes.length > 0,
@@ -1783,7 +1796,10 @@ async function downloadMatrixPdfInBrowser(context, url, referer) {
     if (!response) throw new Error('MATRIX_DOCUMENT_NO_RESPONSE');
     if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
     const contentType = String(response.headers()['content-type'] || '').toLowerCase();
+    const contentLength = Number(response.headers()['content-length'] || 0);
+    if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
     const buffer = await response.body();
+    if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
     if (!contentType.includes('pdf') && buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
       throw new Error(`MATRIX_DOCUMENT_NOT_PDF:${contentType || 'unknown'}`);
     }
