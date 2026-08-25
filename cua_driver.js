@@ -479,14 +479,55 @@ async function findMatrixGlobalSearch(page) {
   const selectors = [
     '#QueryText',
     'input[id*="Query"]',
+    'input[id*="Search" i]',
+    'input[name*="Query" i]',
+    'input[name*="Search" i]',
     'input[type="search"]',
     'input[placeholder*="recherch" i]',
     'input[placeholder*="centris" i]',
     'input[placeholder*="mls" i]',
   ];
-  for (const selector of selectors) {
-    const locator = page.locator(selector).first();
-    if (await locator.isVisible({ timeout: 1500 }).catch(() => false)) return locator;
+
+  // Matrix est une application ASP.NET dont l'identifiant du champ global
+  // peut varier entre les déploiements. Chercher d'abord les attributs
+  // sémantiques, puis choisir le grand champ éditable placé dans l'en-tête.
+  // Le parcours est répété pendant l'hydratation et inclut les frames.
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    for (const frame of page.frames()) {
+      for (const selector of selectors) {
+        const locator = frame.locator(selector).first();
+        if (await locator.isVisible().catch(() => false) &&
+            await locator.isEnabled().catch(() => false) &&
+            await locator.isEditable().catch(() => false)) return locator;
+      }
+
+      const inputs = frame.locator('input:not([type]), input[type="text"], input[type="search"]');
+      const count = Math.min(await inputs.count().catch(() => 0), 50);
+      let best = null;
+      let bestScore = -1;
+      for (let index = 0; index < count; index += 1) {
+        const input = inputs.nth(index);
+        if (!(await input.isVisible().catch(() => false)) ||
+            !(await input.isEnabled().catch(() => false)) ||
+            !(await input.isEditable().catch(() => false))) continue;
+        const box = await input.boundingBox().catch(() => null);
+        if (!box || box.width < 240 || box.height < 18) continue;
+        const meta = await input.evaluate((el) => [
+          el.id, el.getAttribute('name'), el.getAttribute('placeholder'),
+          el.getAttribute('aria-label'), el.getAttribute('class'), el.getAttribute('type'),
+        ].filter(Boolean).join(' ')).catch(() => '');
+        let score = 0;
+        if (/query|search|recherch|centris|mls|quick|global|keyword|crit[eè]re/i.test(meta)) score += 100;
+        if (/\bsearch\b/i.test(meta)) score += 50;
+        if (box.width >= 600) score += 50;
+        if (box.y >= 40 && box.y <= 450) score += 30;
+        if (String(meta).includes('password')) score -= 500;
+        if (score > bestScore) { best = input; bestScore = score; }
+      }
+      if (best && bestScore >= 50) return best;
+    }
+    await page.waitForTimeout(500);
   }
   return null;
 }
