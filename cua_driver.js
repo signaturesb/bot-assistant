@@ -471,10 +471,15 @@ function classifyMatrixPageSnapshot(snapshot = {}, centrisNum = '') {
   if (/aucun r[ée]sultat|no results|inscription introuvable/i.test(text)) {
     return { code: 'MATRIX_LISTING_NOT_FOUND', exactListingMentioned };
   }
-  if (exactListingMentioned && snapshot.mediaLinkCount > 0) {
+  // Une page de résultats peut contenir le numéro exact ET un lien générique
+  // media.ashx (ex. « Consultez le guide »). Elle ne doit jamais être prise
+  // pour la fiche détaillée: il faut une preuve structurelle de la fiche.
+  const detailEvidence = snapshot.detailEvidence === true;
+  const documentCount = Array.isArray(snapshot.docs) ? snapshot.docs.length : 0;
+  if (exactListingMentioned && detailEvidence && documentCount > 0) {
     return { code: 'MATRIX_DOCUMENTS_READY', exactListingMentioned };
   }
-  if (exactListingMentioned && /document\(s\) additionnel\(s\)|d[ée]claration du vendeur/i.test(text)) {
+  if (exactListingMentioned && detailEvidence) {
     return { code: 'MATRIX_LISTING_READY_NO_DOCUMENTS', exactListingMentioned };
   }
   return { code: 'MATRIX_NAVIGATION_UNVERIFIED', exactListingMentioned };
@@ -545,7 +550,7 @@ function matrixTextContainsExactNumber(value, centrisNum) {
 
 async function openExactMatrixListing(page, centrisNum) {
   let state = await inspectMatrixListingPage(page, centrisNum);
-  if (state.exactListingMentioned &&
+  if (state.exactListingMentioned && state.detailEvidence === true &&
       ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
 
   for (const frame of page.frames()) {
@@ -580,8 +585,13 @@ async function inspectMatrixListingPage(page, centrisNum) {
     const mediaAnchors = [...document.querySelectorAll('a[href], [data-href]')].filter((element) => {
       const href = element.href || element.getAttribute('href') || element.getAttribute('data-href') || '';
       const label = clean(element.textContent || element.getAttribute('title') || element.getAttribute('aria-label') || '');
-      return /media\.ashx|annex|document|download|\.pdf(?:$|[?#])/i.test(href) ||
-        (/d[ée]claration du vendeur|\bDV[-\s]?\d+|certificat|plan cadastral|taxes|r[oô]le d['’]?[ée]valuation/i.test(label) && /^https?:/i.test(href));
+      const row = element.closest('tr,li,[role="row"]') || element.parentElement?.parentElement || element.parentElement;
+      const rowText = clean(row?.innerText || row?.textContent || label);
+      const hrefLooksLikeDocument = /media\.ashx|annex|document|download|\.pdf(?:$|[?#])/i.test(href);
+      const labelLooksLikeDocument = /d[ée]claration du vendeur|\bDV[-\s]?\d+|certificat|\bplan\b|taxes|r[oô]le d['’]?[ée]valuation|obligation\s+courtier/i.test(label);
+      const rowHasDisplayedSize = /[0-9]+(?:[.,][0-9]+)?\s*[kmg](?:o|b)?\b/i.test(rowText);
+      return hrefLooksLikeDocument &&
+        (labelLooksLikeDocument || (afterHeading(element) && rowHasDisplayedSize));
     });
     const seen = new Set();
     const docs = [];
@@ -627,9 +637,14 @@ async function inspectMatrixListingPage(page, centrisNum) {
     }
     const price = bodyText.match(/(?:^|\s)([0-9][0-9\s]*\$)(?:\s|$)/)?.[1] || null;
     const address = bodyText.match(/\b\d{1,6}\s+(?:rue|avenue|boulevard|chemin|rang|route)\s+[^\n]{3,100}/i)?.[0] || null;
+    const detailEvidence = Boolean(
+      additionalHeading || principalMatch ||
+      /[ée]valuation\s*\(municipale\)|taxes\s*\(annuelles\)|vente avec garantie l[ée]gale|superficie du terrain|certificat de localisation/i.test(bodyText)
+    );
     return {
       url: location.href, title: document.title, text: bodyText.substring(0, 4000),
       exactListingMentioned: new RegExp(`(^|\\D)${String(expectedNum).replace(/\\D/g, '')}(\\D|$)`).test(bodyText),
+      detailEvidence,
       passwordInputs: document.querySelectorAll('input[type=password]').length,
       mediaLinkCount: mediaAnchors.length, docs,
       listing: { centris_num: expectedNum, price: clean(price), address: clean(address) },
