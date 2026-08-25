@@ -28,6 +28,8 @@ assert(!botSource.includes('bot.onText(/\\/centris/'), 'Un handler /centris trop
 assert(botSource.includes('bot.onText(/^\\/centris(?:@\\w+)?\\s*$/i'), 'La commande /centris doit être strictement délimitée');
 assert(botSource.includes("safeCron('centris-session-maintenance'"), 'La session Centris doit être entretenue automatiquement');
 assert(botSource.includes("maintainCentrisSession('boot-delayed')"), 'Le boot doit programmer un renouvellement différé');
+assert(botSource.includes("if (process.env.CENTRIS_SMOKE_TEST_LISTING) await runCentrisReadOnlySmokeTest('boot-delayed')"), 'Le smoke boot doit remplacer le renouvellement préalable pour éviter MultipleLoginBreach');
+assert(botSource.includes('Une seule session Matrix pour recherche + inventaire + téléchargement'), 'Le smoke téléchargement doit rester dans une seule session Matrix');
 assert(botSource.includes('consecutiveFailures >= 3'), 'Les alertes de renouvellement doivent avoir un seuil anti-bruit');
 assert(botSource.includes('failure-cooldown'), 'Une panne ne doit jamais créer une boucle MFA rapide');
 assert(botSource.includes('sessionKey.length >= 32'), 'La maintenance automatique doit exiger une clé de session robuste');
@@ -54,6 +56,7 @@ const {
   _cookieHeaderFromPlaywrightCookies,
   _isAuthenticatedCentrisUrl,
   _isAuthenticatedMatrixPage,
+  _isMatrixMultipleLoginPage,
   _safeCentrisPageLocation,
   _classifyCentrisLoginSnapshot,
   _hasExplicitCentrisSendConfirmation,
@@ -100,6 +103,14 @@ assert(
 assert(
   !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Recherche', 0, ''),
   'Un shell Matrix vide ne doit jamais prouver une authentification'
+);
+assert(
+  !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Error/MultipleLoginBreach.aspx', 0, 'Matrix'),
+  'La page de connexions multiples ne doit jamais prouver une authentification'
+);
+assert(
+  _isMatrixMultipleLoginPage('https://matrix.centris.ca/Matrix/Error/MultipleLoginBreach.aspx'),
+  'La collision de sessions Matrix doit avoir un diagnostic déterministe'
 );
 
 assert.strictEqual(_safeCentrisPageLocation(
