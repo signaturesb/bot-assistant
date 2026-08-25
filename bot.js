@@ -8757,6 +8757,23 @@ function registerHandlers() {
               const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
                 headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
               }).then(r => r.json());
+
+              // Verrou absolu Signature SB: toute campagne Terrains doit viser
+              // uniquement la liste Entrepreneurs L8 documentée dans GitHub.
+              if (/terrain/i.test(det.name || '')) {
+                const terrainLists = (det.recipients?.listIds || det.recipients?.lists || [])
+                  .map(Number)
+                  .filter(Number.isInteger)
+                  .sort((a, b) => a - b);
+                if (terrainLists.length !== 1 || terrainLists[0] !== 8) {
+                  auditLogEvent('campaign', 'terrain-audience-blocked', {
+                    campaignId,
+                    lists: terrainLists,
+                    expectedList: 8,
+                  });
+                  throw new Error(`TERRAINS BLOQUÉ: destinataires [${terrainLists.join(',')}] — liste Entrepreneurs L8 requise`);
+                }
+              }
               const sched = det.scheduledAt;
               const schedMs = sched ? new Date(sched).getTime() : 0;
               const isFuture = schedMs > Date.now() + 60000; // >1 min dans le futur
