@@ -7427,11 +7427,23 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   // Telegram est le canal privé de Shawn: livraison interne des PDFs validés.
   // Ne pas renvoyer les mêmes pièces lors de la confirmation finale.
   if (!isSendConfirmation && ALLOWED_ID && chatId) {
+    const telegramDeliveryFailures = [];
     for (const doc of documents) {
-      await bot.sendDocument(chatId, doc.buffer, {
-        caption: `📎 ${doc.label}\nCentris #${num} · ${Math.round(doc.size / 1024)} KB${doc.page_count ? ` · ${doc.page_count} page(s)` : ''}`,
-      }, { filename: doc.filename, contentType: 'application/pdf' })
-        .catch((error) => log('WARN', 'CENTRIS-MATRIX-ANNEXES', `Telegram: ${error.message}`));
+      try {
+        const telegramReceipt = await bot.sendDocument(chatId, doc.buffer, {
+          caption: `📎 ${doc.label}\nCentris #${num} · ${Math.round(doc.size / 1024)} KB${doc.page_count ? ` · ${doc.page_count} page(s)` : ''}`,
+        }, { filename: doc.filename, contentType: 'application/pdf' });
+        if (!telegramReceipt?.message_id) throw new Error('accusé Telegram sans message_id');
+      } catch (error) {
+        telegramDeliveryFailures.push({ filename: doc.filename, error: String(error?.message || error) });
+        log('WARN', 'CENTRIS-MATRIX-ANNEXES', `Telegram: ${error.message}`);
+      }
+    }
+    if (telegramDeliveryFailures.length) {
+      auditLogEvent('centris', 'matrix-telegram-preview-incomplete', {
+        num, expected: documents.length, failed: telegramDeliveryFailures.map((item) => item.filename),
+      });
+      return `❌ Aperçu Telegram incomplet pour Matrix #${num}: ${documents.length - telegramDeliveryFailures.length}/${documents.length} PDF(s) remis.\nAucun courriel n'est armé; redemande l'aperçu après avoir corrigé Telegram.`;
     }
   }
 
@@ -7504,8 +7516,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   }
   lines.push(`--${boundary}--`);
   const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const renderedHtmlSha256 = crypto.createHash('sha256').update(html, 'utf8').digest('hex');
   const emailPayload = {
     via: 'gmail', to: emailDestination, cc, bcc: [], subject, body: bodyText,
+    renderedHtmlSha256,
     attachments: documents.map((doc) => ({ name: doc.filename, size: doc.size, sha256: doc.sha256 })),
   };
   const payloadFingerprint = crypto.createHash('sha256').update(JSON.stringify({
@@ -7513,6 +7527,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     cc: emailPayload.cc,
     subject: emailPayload.subject,
     body: emailPayload.body,
+    renderedHtmlSha256: emailPayload.renderedHtmlSha256,
     attachments: emailPayload.attachments,
   })).digest('hex');
 
@@ -7550,19 +7565,34 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     return `🔒 Confirmation exacte « envoie » requise. Aucun email envoyé à ${emailDestination}.`;
   }
 
+  let gmailProviderReceipt = null;
   const sent = await sendEmailLogged({
     via: 'gmail', to: emailDestination, cc, subject,
     category: 'centris-matrix-annexes', authorization, emailPayload,
-    sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ raw }),
-    }),
+    sendFn: async () => {
+      const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw }),
+      });
+      if (response.ok) {
+        gmailProviderReceipt = await response.clone().json().catch(() => null);
+        if (!gmailProviderReceipt?.id) {
+          throw new Error('Gmail a répondu sans identifiant de message; livraison incertaine');
+        }
+      }
+      return response;
+    },
   });
   if (!sent.ok) return `❌ Les PDF ont été validés, mais Gmail a refusé l'envoi: ${sent.error || sent.status}. Aucune relance automatique.`;
 
-  auditLogEvent('centris', 'matrix-annexes-sent', { num, to: emailDestination, count: documents.length, manifest: emailPayload.attachments.map((doc) => doc.sha256) });
-  return `✅ ${documents.length} documents Matrix #${num} envoyés à *${emailDestination}*${cc.length ? ` (Cc ${AGENT.email})` : ''}.\nAucun document omis; aucune relance automatique.`;
+  auditLogEvent('centris', 'matrix-annexes-sent', {
+    num, to: emailDestination, count: documents.length,
+    manifest: emailPayload.attachments.map((doc) => doc.sha256),
+    gmail_message_id: gmailProviderReceipt.id,
+    gmail_thread_id: gmailProviderReceipt.threadId || null,
+  });
+  return `✅ ${documents.length} documents Matrix #${num} envoyés à *${emailDestination}*${cc.length ? ` (Cc ${AGENT.email})` : ''}.\nPreuve Gmail: \`${gmailProviderReceipt.id}\`\nAucun document omis; aucune relance automatique.`;
 }
 
 async function executeTool(name, input, chatId, userMessage = '', actionContext = {}) {

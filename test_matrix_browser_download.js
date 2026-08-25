@@ -117,6 +117,35 @@ const context = {
     pdf,
     'une réponse API enveloppée doit basculer vers le clic authentifié Matrix',
   );
+  const actionContext = new EventEmitter();
+  let actionClicks = 0;
+  const actionPage = {
+    frames() {
+      return [{
+        locator(selector) {
+          assert.strictEqual(selector, 'xpath=//*[@id="ctl00_DV_Link"]');
+          return {
+            first() { return this; },
+            async isVisible() { return true; },
+            async click() {
+              actionClicks += 1;
+              actionContext.emit('response', {
+                url: () => 'https://mediaserver.centris.ca/media.ashx?id=dv',
+                headers: () => ({ 'content-type': 'application/pdf', 'content-length': String(pdf.length) }),
+                body: async () => pdf,
+              });
+            },
+          };
+        },
+      }];
+    },
+  };
+  assert.deepStrictEqual(
+    await cua._downloadMatrixPdfByAction(actionContext, actionPage, 'ctl00_DV_Link'),
+    pdf,
+    'une DV ASP.NET sans URL directe doit être téléchargée par son vrai clic',
+  );
+  assert.strictEqual(actionClicks, 1);
   console.log('✅ Téléchargement PDF Matrix par navigation authentifiée validé');
 })().catch((error) => {
   console.error(error);

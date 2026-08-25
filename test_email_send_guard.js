@@ -22,6 +22,7 @@ const base = {
   bcc: [],
   subject: 'Sujet',
   body: 'Bonjour',
+  renderedHtmlSha256: 'html-v1',
   attachments: [{ name: 'fiche.pdf', size: 1234, sha256: 'abc123' }],
 };
 
@@ -35,6 +36,7 @@ for (const changed of [
   { ...base, bcc: ['audit@example.com'] },
   { ...base, subject: 'Autre sujet' },
   { ...base, body: 'Contenu changé' },
+  { ...base, renderedHtmlSha256: 'html-v2' },
   { ...base, via: 'brevo' },
   { ...base, attachments: [{ name: 'fiche.pdf', size: 1234, sha256: 'different' }] },
 ]) {

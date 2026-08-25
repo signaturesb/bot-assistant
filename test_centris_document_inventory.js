@@ -191,6 +191,10 @@ assert.strictEqual(cua._classifyMatrixPageSnapshot({
   url: 'https://matrix.centris.ca/Matrix/Results.aspx',
   text: 'Aucun résultat', mediaLinkCount: 0, passwordInputs: 0,
 }, '28936167').code, 'MATRIX_LISTING_NOT_FOUND');
+assert.strictEqual(cua._matrixTextContainsExactNumber('No Centris : 28936167 — Terrain', '28936167'), true);
+assert.strictEqual(cua._matrixTextContainsExactNumber('Ouvrir 28936167', '28936167'), true);
+assert.strictEqual(cua._matrixTextContainsExactNumber('1289361670', '28936167'), false);
+assert.strictEqual(cua._matrixTextContainsExactNumber('28939185', '28936167'), false);
 
 assert.ok(botCode.includes('JAMAIS inventer, corriger ou suggérer un autre numéro Centris'));
 assert.ok(botCode.includes('verifier_listing_centris: 120000'));
@@ -207,6 +211,9 @@ assert.ok(botCode.includes('Aucun email envoyé pour éviter un dossier partiel'
 assert.ok(botCode.includes("url.startsWith('/admin/matrix-test') || url.startsWith('/admin/zone-test')"), 'le diagnostic historique Zone doit être redirigé vers Matrix global');
 assert.ok(!botCode.includes('Exception preview Zone:'), 'les erreurs de preview ne doivent plus attribuer Matrix à la Zone');
 assert.ok(cuaCode.includes('Recherche globale exacte'), 'le chemin Matrix global doit journaliser la recherche exacte');
+assert.ok(cuaCode.includes('for (const frame of page.frames())'), 'la recherche et l’inventaire doivent couvrir les frames Matrix');
+assert.ok(cuaCode.includes('a,button,[role="link"],[data-href]'), 'le résultat exact ne doit pas dépendre d’un lien texte unique');
+assert.ok(cuaCode.includes('media\\.ashx|annex|document|download'), 'les documents doivent tolérer les variantes d’URL Matrix');
 assert.ok(cuaCode.includes('lien de téléchargement Matrix non résolu'), 'un document visible sans URL doit devenir un échec explicite, jamais disparaître');
 assert.ok(cuaCode.includes('discovered_count: matchedDocs.length'), 'le résultat doit comparer documents découverts et PDF validés');
 assert.ok(!cuaCode.includes('cb.checked = true; cb.click()'), 'sélectionner un format ne doit pas cocher puis décocher la case');

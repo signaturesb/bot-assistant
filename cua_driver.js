@@ -51,6 +51,7 @@ const PUBLIC_BASE    = 'https://www.centris.ca';
 const MANUAL_MFA_TTL = 2 * 60 * 1000;
 const MATRIX_DOCUMENT_FILE_MAX_BYTES = 25 * 1024 * 1024;
 const MATRIX_DOCUMENT_TOTAL_MAX_BYTES = 120 * 1024 * 1024;
+const MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS = 3;
 const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
 
 function clampDurationMs(value, fallback, min, max) {
@@ -245,6 +246,7 @@ function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
       provenance,
       source_section: sourceSection,
       url: doc?.url || null,
+      action_id: doc?.action_id || null,
       page_count: Number.isInteger(doc?.page_count) ? doc.page_count : null,
       sha256: /^[a-f0-9]{64}$/i.test(String(doc?.sha256 || '')) ? String(doc.sha256).toLowerCase() : null,
     };
@@ -461,7 +463,8 @@ function classifyMatrixPageSnapshot(snapshot = {}, centrisNum = '') {
   const url = String(snapshot.url || '');
   const text = String(snapshot.text || '');
   const num = String(centrisNum || '').replace(/\D/g, '');
-  const exactListingMentioned = num ? new RegExp(`(^|\\D)${num}(\\D|$)`).test(text) : false;
+  const exactListingMentioned = snapshot.exactListingMentioned === true ||
+    (num ? new RegExp(`(^|\\D)${num}(\\D|$)`).test(text) : false);
   if (/accounts\.centris\.ca|\/signin|\/login/i.test(url) || snapshot.passwordInputs > 0) {
     return { code: 'MATRIX_AUTH_REQUIRED', exactListingMentioned };
   }
@@ -534,20 +537,57 @@ async function findMatrixGlobalSearch(page) {
   return null;
 }
 
+function matrixTextContainsExactNumber(value, centrisNum) {
+  const number = String(centrisNum || '').replace(/\D/g, '');
+  if (!number) return false;
+  return new RegExp(`(^|\\D)${number}(\\D|$)`).test(String(value || ''));
+}
+
+async function openExactMatrixListing(page, centrisNum) {
+  let state = await inspectMatrixListingPage(page, centrisNum);
+  if (state.exactListingMentioned &&
+      ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
+
+  for (const frame of page.frames()) {
+    const candidates = frame.locator('a,button,[role="link"],[data-href]');
+    const count = Math.min(await candidates.count().catch(() => 0), 300);
+    for (let index = 0; index < count; index += 1) {
+      const candidate = candidates.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      const metadata = await candidate.evaluate((element) => [
+        element.innerText, element.textContent, element.getAttribute('aria-label'),
+        element.getAttribute('title'), element.getAttribute('href'),
+        element.getAttribute('data-href'), element.closest('tr,[role="row"]')?.innerText,
+      ].filter(Boolean).join(' ')).catch(() => '');
+      if (!matrixTextContainsExactNumber(metadata, centrisNum)) continue;
+      await candidate.click().catch(() => null);
+      await page.waitForTimeout(3000);
+      state = await inspectMatrixListingPage(page, centrisNum);
+      if (state.exactListingMentioned) return state;
+    }
+  }
+  return state;
+}
+
 async function inspectMatrixListingPage(page, centrisNum) {
-  const snapshot = await page.evaluate((expectedNum) => {
+  const inspectFrame = async (frame) => frame.evaluate((expectedNum) => {
     const clean = (value) => String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
     const bodyText = clean(document.body?.innerText || '');
     const allElements = [...document.querySelectorAll('h1,h2,h3,h4,h5,div,span,strong')];
     const additionalHeading = allElements.find((el) => /^document\(s\) additionnel\(s\)$/i.test(clean(el.textContent)));
     const afterHeading = (element) => !!additionalHeading &&
       !!(additionalHeading.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING);
-    const mediaAnchors = [...document.querySelectorAll('a[href*="media.ashx" i]')];
+    const mediaAnchors = [...document.querySelectorAll('a[href], [data-href]')].filter((element) => {
+      const href = element.href || element.getAttribute('href') || element.getAttribute('data-href') || '';
+      const label = clean(element.textContent || element.getAttribute('title') || element.getAttribute('aria-label') || '');
+      return /media\.ashx|annex|document|download|\.pdf(?:$|[?#])/i.test(href) ||
+        (/d[ée]claration du vendeur|\bDV[-\s]?\d+|certificat|plan cadastral|taxes|r[oô]le d['’]?[ée]valuation/i.test(label) && /^https?:/i.test(href));
+    });
     const seen = new Set();
     const docs = [];
     for (const anchor of mediaAnchors) {
-      const href = anchor.href || anchor.getAttribute('href') || '';
-      const label = clean(anchor.textContent || anchor.getAttribute('title') || '');
+      const href = anchor.href || anchor.getAttribute('href') || anchor.getAttribute('data-href') || '';
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || anchor.getAttribute('aria-label') || '');
       if (!href || !label) continue;
       const row = anchor.closest('tr,li,[role="row"]') || anchor.parentElement?.parentElement || anchor.parentElement;
       const rowText = clean(row?.innerText || row?.textContent || label);
@@ -564,6 +604,20 @@ async function inspectMatrixListingPage(page, centrisNum) {
         source_section: additional ? 'additional_documents' : 'principal_dv',
       });
     }
+    const postbackAnchors = [...document.querySelectorAll('a[id]')].filter((anchor) => {
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || anchor.getAttribute('aria-label') || '');
+      const action = `${anchor.getAttribute('href') || ''} ${anchor.getAttribute('onclick') || ''}`;
+      return /(?:oui\s+)?dv[-\s]?\d+|d[ée]claration du vendeur/i.test(label) &&
+        /__doPostBack|javascript:|download|media\.ashx/i.test(action);
+    });
+    for (const anchor of postbackAnchors) {
+      const label = clean(anchor.textContent || anchor.getAttribute('title') || anchor.getAttribute('aria-label') || '');
+      if (!label || docs.some((doc) => doc.name === label && doc.source_section === 'principal_dv')) continue;
+      docs.unshift({
+        name: label, size: null, url: null, action_id: anchor.id,
+        provenance: 'matrix_principal_dv', source_section: 'principal_dv',
+      });
+    }
     const principalMatch = bodyText.match(/D[ée]claration du vendeur\s+(?:Oui\s+)?(DV[-\s]?\d+)/i);
     if (principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))) {
       docs.unshift({
@@ -575,11 +629,21 @@ async function inspectMatrixListingPage(page, centrisNum) {
     const address = bodyText.match(/\b\d{1,6}\s+(?:rue|avenue|boulevard|chemin|rang|route)\s+[^\n]{3,100}/i)?.[0] || null;
     return {
       url: location.href, title: document.title, text: bodyText.substring(0, 4000),
+      exactListingMentioned: new RegExp(`(^|\\D)${String(expectedNum).replace(/\\D/g, '')}(\\D|$)`).test(bodyText),
       passwordInputs: document.querySelectorAll('input[type=password]').length,
       mediaLinkCount: mediaAnchors.length, docs,
       listing: { centris_num: expectedNum, price: clean(price), address: clean(address) },
     };
   }, String(centrisNum));
+  const snapshots = [];
+  for (const frame of page.frames()) {
+    const snapshot = await inspectFrame(frame).catch(() => null);
+    if (snapshot) snapshots.push(snapshot);
+  }
+  const snapshot = snapshots.sort((left, right) => {
+    const score = (item) => (item.exactListingMentioned || matrixTextContainsExactNumber(item.text, centrisNum) ? 1000 : 0) + (item.docs?.length || 0) * 10;
+    return score(right) - score(left);
+  })[0] || { url: page.url(), text: '', docs: [], mediaLinkCount: 0, passwordInputs: 0 };
   return { ...snapshot, ...classifyMatrixPageSnapshot(snapshot, centrisNum) };
 }
 
@@ -607,21 +671,14 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     await search.fill(centrisNum);
     await search.press('Enter');
     await page.waitForTimeout(3500);
-    const exactResult = page.locator('a').filter({ hasText: new RegExp(`^\\s*${centrisNum}\\s*$`) }).first();
-    if (!(await exactResult.isVisible({ timeout: 5000 }).catch(() => false))) {
-      const state = await inspectMatrixListingPage(page, centrisNum);
+    const state = await openExactMatrixListing(page, centrisNum);
+    if (!state.exactListingMentioned) {
       return {
         success: false,
         error_code: state.code === 'MATRIX_AUTH_REQUIRED' ? state.code : 'MATRIX_LISTING_NOT_FOUND',
         message: `Le résultat exact #${centrisNum} n'a pas été trouvé dans Matrix. Aucun numéro substitut n'a été utilisé.`,
         final_url: state.url,
       };
-    }
-    await exactResult.click();
-    await page.waitForTimeout(3500);
-    const state = await inspectMatrixListingPage(page, centrisNum);
-    if (!state.exactListingMentioned) {
-      return { success: false, error_code: 'MATRIX_EXACT_LISTING_NOT_VERIFIED', message: `La page ouverte ne confirme pas le numéro exact #${centrisNum}. Aucun envoi effectué.`, final_url: state.url };
     }
     if (!['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) {
       return { success: false, error_code: state.code, message: `Listing #${centrisNum} ouvert, mais la section des documents n'a pas pu être vérifiée. Aucun envoi effectué.`, final_url: state.url };
@@ -1682,13 +1739,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     await search.fill(exactNum);
     await search.press('Enter');
     await page.waitForTimeout(3500);
-    const exactResult = page.locator('a').filter({ hasText: new RegExp(`^\\s*${exactNum}\\s*$`) }).first();
-    if (!(await exactResult.isVisible({ timeout: 5000 }).catch(() => false))) {
-      throw new Error(`MATRIX_LISTING_NOT_FOUND:${exactNum}`);
-    }
-    await exactResult.click();
-    await page.waitForTimeout(3500);
-    const state = await inspectMatrixListingPage(page, exactNum);
+    const state = await openExactMatrixListing(page, exactNum);
     if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
 
     let matchedDocs = state.docs;
@@ -1700,11 +1751,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       return { success: false, annexes: [], message: filtre ? `Aucune annexe correspondant à « ${filtre} »` : 'Aucune annexe téléchargeable trouvée dans Matrix' };
     }
 
-    const selectedDocs = matchedDocs.filter((doc) => doc.url);
+    const selectedDocs = matchedDocs.filter((doc) => doc.url || doc.action_id);
     // Fail closed: un document affiché dans Matrix mais dont le lien n'a pas
     // été résolu (notamment une DV principale rendue en postback) ne doit
     // jamais disparaître silencieusement du lot envoyé au client.
-    const unresolvedDocs = matchedDocs.filter((doc) => !doc.url);
+    const unresolvedDocs = matchedDocs.filter((doc) => !doc.url && !doc.action_id);
 
     const annexes = [];
     const failures = unresolvedDocs.map((doc) => ({
@@ -1719,7 +1770,20 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     // et certains contrôles de session sont propres à l'onglet parent.
     const downloaded = await mapWithConcurrency(candidates, 1, async (doc, index) => {
       try {
-        let buffer = await downloadMatrixPdfAuthenticated(context, doc.url, state.url, page);
+        let buffer;
+        let lastError;
+        for (let attempt = 1; attempt <= MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS; attempt += 1) {
+          try {
+            buffer = doc.url
+              ? await downloadMatrixPdfAuthenticated(context, doc.url, state.url, page)
+              : await downloadMatrixPdfByAction(context, page, doc.action_id);
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS) await page.waitForTimeout(400 * attempt);
+          }
+        }
+        if (!buffer) throw lastError || new Error('MATRIX_DOWNLOAD_FAILED');
         const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
         if (buffer.length < 1000 || magicIndex === -1) {
           const signature = buffer.subarray(0, 16).toString('hex');
@@ -1809,7 +1873,16 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
         if (!/(^|\.)centris\.ca$/i.test(responseUrl.hostname)) return;
         const contentType = String(response.headers()['content-type'] || '').toLowerCase();
         if (!contentType.includes('pdf') && !/media\.ashx/i.test(responseUrl.pathname)) return;
+        const contentLength = Number(response.headers()['content-length'] || 0);
+        if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+          finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+          return;
+        }
         const buffer = await response.body();
+        if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+          finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+          return;
+        }
         const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
         if (buffer.length >= 1000 && magicIndex >= 0) {
           finish(null, magicIndex ? buffer.subarray(magicIndex) : buffer);
@@ -1834,6 +1907,19 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
     throw error;
   }
   return result;
+}
+
+async function downloadMatrixPdfByAction(context, page, actionId) {
+  const id = String(actionId || '').trim();
+  if (!id || id.length > 300) throw new Error('MATRIX_DOCUMENT_ACTION_INVALID');
+  let control = null;
+  for (const frame of page.frames()) {
+    // XPath avec chaîne JSON évite d'interpréter l'id ASP.NET comme CSS.
+    const direct = frame.locator(`xpath=//*[@id=${JSON.stringify(id)}]`).first();
+    if (await direct.isVisible().catch(() => false)) { control = direct; break; }
+  }
+  if (!control) throw new Error('MATRIX_DOCUMENT_ACTION_MISSING');
+  return waitForMatrixPdfResponse(context, () => control.click(), 45000);
 }
 
 async function downloadMatrixPdfInBrowser(context, url, referer, openerPage = null) {
@@ -3200,9 +3286,11 @@ module.exports = {
   _normalizeCentrisLabel: normalizeCentrisLabel,
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
+  _matrixTextContainsExactNumber: matrixTextContainsExactNumber,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
   _downloadMatrixPdfAuthenticated: downloadMatrixPdfAuthenticated,
+  _downloadMatrixPdfByAction: downloadMatrixPdfByAction,
   _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
