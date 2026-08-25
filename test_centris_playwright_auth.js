@@ -16,6 +16,9 @@ assert(cuaSource.includes('Authorization: `Bearer ${token}`'), 'Les appels inter
 assert(cuaSource.includes('function ingestManualMFACode'), 'Le pont MFA manuel doit exister');
 assert(cuaSource.includes('function isAwaitingCentrisMFA'), 'L’état d’attente MFA doit être exposé');
 assert(cuaSource.includes('async function cuaLoginCentris()'), 'La connexion Playwright explicite doit être exposée');
+assert(cuaSource.includes('async function settleCentrisAfterMFA(page)'), 'La redirection OAuth post-MFA doit être stabilisée');
+assert.match(cuaSource, /settleCentrisAfterMFA\(page\)[\s\S]*?OAuth Centris encore affiché après MFA — vérification directe Matrix/,
+  'un endpoint OAuth bloqué doit être vérifié directement dans Matrix avant de déclarer le login en échec');
 assert(botSource.includes('cua?.isAwaitingCentrisMFA?.()'), 'Telegram doit détecter une attente MFA Playwright');
 assert(botSource.includes('cua.ingestManualMFACode(code)'), 'Telegram doit transmettre le code à Playwright');
 assert(botSource.includes('cua.ingestManualMFACode(data.code)'), 'Le pont Messages doit transmettre automatiquement le code à Playwright');
