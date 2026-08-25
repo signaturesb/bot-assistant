@@ -54,6 +54,8 @@ const {
   _cookieHeaderFromPlaywrightCookies,
   _isAuthenticatedCentrisUrl,
   _isAuthenticatedMatrixPage,
+  _safeCentrisPageLocation,
+  _classifyCentrisLoginSnapshot,
   _hasExplicitCentrisSendConfirmation,
 } = require('./cua_driver');
 const endpoint = _browserlessEndpointWithTimeout('wss://example.invalid/chromium?token=test-token&foo=bar', 175000);
@@ -99,6 +101,41 @@ assert(
   !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Recherche', 0, ''),
   'Un shell Matrix vide ne doit jamais prouver une authentification'
 );
+
+assert.strictEqual(_safeCentrisPageLocation(
+  'https://accounts.centris.ca/Account/Login?ReturnUrl=%2Fconnect%2Fauthorize%3Fstate%3Dsecret'
+), 'accounts.centris.ca/Account/Login', 'les paramètres OIDC ne doivent jamais entrer dans les logs');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://accounts.centris.ca/Account/Login?ReturnUrl=secret',
+  userCodeVisible: 1, passwordVisible: 1, identifierVisible: 0, bodyText: 'Connect to Matrix',
+}), 'credentials', 'le formulaire Centris UserCode + Password doit être reconnu strictement');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://centris-prod.ca.auth0.com/u/login/identifier?state=secret',
+  userCodeVisible: 0, passwordVisible: 0, identifierVisible: 1, bodyText: 'Continue',
+}), 'identifier', 'l’étape Auth0 identifier doit rester supportée');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://centris-prod.ca.auth0.com/u/login/password?state=secret',
+  userCodeVisible: 0, passwordVisible: 1, identifierVisible: 0, bodyText: 'Password',
+}), 'password', 'l’étape Auth0 password doit rester supportée');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://centris-prod.ca.auth0.com/u/mfa-sms-challenge?state=secret',
+  userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0, mfaVisible: 1, bodyText: 'Verification code',
+}), 'mfa', 'l’étape MFA doit être reconnue sans tenter de remplir de nouveau les identifiants');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/',
+  userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0,
+  bodyText: 'Matrix Recherche Critères Résultats Déconnexion',
+}), 'authenticated', 'un retour SSO direct dans Matrix doit être accepté sans chercher un formulaire');
+assert.strictEqual(_classifyCentrisLoginSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/',
+  userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0, bodyText: '',
+}), 'missing', 'un shell Matrix vide ne doit recevoir aucun identifiant');
+
+assert(!cuaSource.includes('input:visible:not([type="password"])'), 'le repli vers un champ arbitraire doit être supprimé');
+assert(cuaSource.includes('CENTRIS_LOGIN_FORM_MISSING:'), 'une interface inconnue doit échouer avec un code déterministe');
+assert(cuaSource.includes('CENTRIS_LOGIN_REJECTED:'), 'un formulaire identique après soumission doit échouer sans répéter le mot de passe');
+assert(cuaSource.includes('renouvellement sans suppression'), 'une sonde refusée ne doit pas supprimer la session persistée');
+assert(!cuaSource.includes('clearSession({ includeStorageState: true })'), 'le login ne doit jamais effacer le storageState avant validation du remplacement');
 
 assert(_hasExplicitCentrisSendConfirmation('envoie'), '« envoie » doit autoriser une seule tentative Centris');
 assert(_hasExplicitCentrisSendConfirmation('send!'), '« send! » doit être accepté');
