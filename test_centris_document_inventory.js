@@ -317,6 +317,8 @@ assert.ok(cuaCode.includes('for (const frame of page.frames())'), 'la recherche 
 assert.ok(cuaCode.includes('a,button,[role="link"],[data-href]'), 'le résultat exact ne doit pas dépendre d’un lien texte unique');
 assert.ok(cuaCode.includes('media\\.ashx|annex|document|download'), 'les documents doivent tolérer les variantes d’URL Matrix');
 assert.ok(cuaCode.includes('lien de téléchargement Matrix non résolu'), 'un document visible sans URL doit devenir un échec explicite, jamais disparaître');
+assert.ok(cuaCode.includes("const addressElement = [...document.querySelectorAll"), 'l’adresse doit être extraite d’un élément court de la fiche Matrix');
+assert.ok(cuaCode.includes("listing: state.listing || null"), 'le téléchargement doit retourner l’adresse vérifiée au générateur de courriel');
 assert.ok(cuaCode.includes('discovered_count: matchedDocs.length'), 'le résultat doit comparer documents découverts et PDF validés');
 assert.ok(!cuaCode.includes('cb.checked = true; cb.click()'), 'sélectionner un format ne doit pas cocher puis décocher la case');
 assert.ok(!cuaCode.includes('const navigatedOK = true'), 'le téléchargement de fiche ne doit pas cliquer deux fois le même résultat');
