@@ -1572,6 +1572,16 @@ async function loginCentris(context) {
     // remplacera atomiquement; en cas de panne transitoire, l'ancienne reste
     // disponible pour un futur renouvellement ou un nouveau push du Mac.
     console.log('[CUA] Session persistante non vérifiée par Matrix — renouvellement sans suppression');
+    // Matrix n'autorise qu'une session par compte. Un cookie encore accepté
+    // par le SSO mais refusé par Matrix peut créer lui-même une collision au
+    // premier clic de recherche. Fermer explicitement cette session serveur
+    // avant le login frais; conserver le storageState sur disque jusqu'à ce
+    // que la nouvelle session soit réellement validée et sauvegardée.
+    if (savedCookies && savedCookies.length > 0) {
+      await page.goto(`${MATRIX_BASE}/Matrix/Logout.aspx`, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+      await page.waitForTimeout(1200);
+      console.log('[CUA] Session Matrix persistée fermée avant renouvellement unique');
+    }
   } catch (e) {
     console.warn('[CUA] Vérification session échouée:', safeErrorMessage(e));
   }
