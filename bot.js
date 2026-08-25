@@ -13351,6 +13351,21 @@ async function runCentrisReadOnlySmokeTest(reason = 'manual') {
       return { ok: false, error_code: result?.error_code || null };
     }
     log('OK', 'CENTRIS-SMOKE', `#${num} Matrix global vérifié: ${result.docs_count || 0} document(s), manifeste ${manifest} (${reason})`);
+
+    if (process.env.CENTRIS_SMOKE_TEST_DOWNLOAD === 'true') {
+      if (!cua.cuaGetCentrisAnnexes) throw new Error('téléchargement Matrix indisponible');
+      const download = await cua.cuaGetCentrisAnnexes(num);
+      const discovered = Number(download?.discovered_count || 0);
+      const validated = Number(download?.validated_count || 0);
+      const failures = Array.isArray(download?.failures) ? download.failures.length : 0;
+      if (!download?.success || failures > 0 || validated !== discovered || discovered !== Number(result.docs_count || 0)) {
+        log('WARN', 'CENTRIS-SMOKE', `#${num} validation PDF incomplète: preview=${result.docs_count || 0}, découverts=${discovered}, validés=${validated}, échecs=${failures}`);
+        return { ok: false, stage: 'pdf-validation', docs_count: result.docs_count || 0, discovered, validated, failures };
+      }
+      const pages = download.annexes.reduce((total, doc) => total + Number(doc.page_count || 0), 0);
+      log('OK', 'CENTRIS-SMOKE', `#${num} PDF validés: ${validated}/${discovered}, ${pages} page(s), SHA-256 présents (${reason})`);
+      return { ok: true, docs_count: result.docs_count || 0, validated, pages, manifest_id: result.manifest_id || null };
+    }
     return { ok: true, docs_count: result.docs_count || 0, manifest_id: result.manifest_id || null };
   } catch (e) {
     log('WARN', 'CENTRIS-SMOKE', `#${num} exception lecture seule (${reason}): ${String(e?.message || e).substring(0, 180)}`);
