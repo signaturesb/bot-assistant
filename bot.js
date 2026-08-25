@@ -8934,7 +8934,10 @@ ${pjList}
 const TOOL_TIMEOUT_MS = Object.freeze({
   verifier_listing_centris: 120000,
   envoyer_tous_documents_zone: 180000,
-  telecharger_annexes_centris: 180000,
+  // Peut inclure jusqu'à 90 s d'attente du verrou, puis plusieurs sessions
+  // Browserless de 60 s strictement séquentielles. Le garde externe reste
+  // borné, mais ne doit pas abandonner une opération saine déjà verrouillée.
+  telecharger_annexes_centris: 360000,
 });
 
 async function executeToolSafe(name, input, chatId, userMessage = '', actionContext = {}) {
