@@ -872,6 +872,14 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     const page = await loginCentris(context);
     const search = await openMatrixGlobalSearch(page);
     if (!search) {
+      if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+        return {
+          success: false,
+          error_code: 'MATRIX_MULTIPLE_LOGIN_BREACH',
+          message: 'Matrix refuse une deuxième session simultanée. Aucun envoi effectué.',
+          final_url: safeCentrisPageLocation(page.url()),
+        };
+      }
       console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
       return { success: false, error_code: 'MATRIX_SEARCH_CONTROL_MISSING', message: 'Barre de recherche globale Matrix introuvable. Aucun envoi effectué.' };
     }
@@ -1183,6 +1191,13 @@ function safeCentrisPageLocation(rawUrl) {
   } catch {
     return 'invalid-url';
   }
+}
+
+function isMatrixMultipleLoginPage(rawUrl, bodyText = '') {
+  const location = safeCentrisPageLocation(rawUrl);
+  const text = normalizeCentrisMatchKey(String(bodyText || '').slice(0, 10000));
+  return /\/Matrix\/Error\/MultipleLoginBreach\.aspx$/i.test(location) ||
+    /multiple login|connexion multiple|session deja active|already (?:signed|logged) in/i.test(text);
 }
 
 function classifyCentrisLoginSnapshot(snapshot = {}) {
@@ -2092,6 +2107,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     // recherche globale blanche → numéro exact → fiche détaillée → liens PDF.
     const search = await openMatrixGlobalSearch(page);
     if (!search) {
+      if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+        throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+      }
       console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
       throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
     }
@@ -2100,6 +2118,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     await page.waitForTimeout(3500);
     const state = await openExactMatrixListing(page, exactNum);
     if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
+
+    const fullInventory = buildCentrisDocumentInventory(exactNum, state.docs);
+    const publicInventory = redactCentrisDocumentInventory(fullInventory);
 
     let matchedDocs = state.docs;
     if (filtre) {
@@ -2222,6 +2243,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       failures,
       discovered_count: matchedDocs.length,
       validated_count: annexes.length,
+      docs_count: state.docs.length,
+      docs_list: publicInventory.docs,
+      document_inventory: publicInventory,
+      manifest_id: fullInventory.manifest_id,
       message: annexes.length > 0
         ? `${annexes.length}/${matchedDocs.length} annexe(s) Matrix téléchargée(s) et validée(s)`
         : `Aucune annexe PDF validée (${failures.length} échec(s)): ${failures.slice(0, 3).map((item) => item.error).join(' | ')}`,
@@ -3743,6 +3768,7 @@ module.exports = {
   _browserlessEndpointWithTimeout: browserlessEndpointWithTimeout,
   _isAuthenticatedCentrisUrl: isAuthenticatedCentrisUrl,
   _isAuthenticatedMatrixPage: isAuthenticatedMatrixPage,
+  _isMatrixMultipleLoginPage: isMatrixMultipleLoginPage,
   _safeCentrisPageLocation: safeCentrisPageLocation,
   _classifyCentrisLoginSnapshot: classifyCentrisLoginSnapshot,
   _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
