@@ -1438,6 +1438,7 @@ async function submitCentrisLogin(page, user, pass) {
   // Auth0 fractionné observé lors de migrations. Aucun repli vers "le premier
   // champ visible": une page inconnue échoue sans jamais y injecter de secret.
   const submitted = new Set();
+  let authorizeRecoveryUsed = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const step = await waitForCentrisLoginStep(page, attempt === 0 ? 12000 : 8000);
     if (step.kind === 'authenticated') return 'authenticated';
@@ -1465,6 +1466,19 @@ async function submitCentrisLogin(page, user, pass) {
       await step.password.first().fill(pass, { timeout: 10000 });
       await clickCentrisLoginSubmit(page);
       await page.waitForTimeout(3500);
+      continue;
+    }
+    // Centris peut conserver un endpoint OAuth /connect/authorize sans champ
+    // visible après la fermeture d'une ancienne session Matrix. Repartir une
+    // seule fois de l'entrée officielle Matrix recrée un state OAuth valide.
+    // Aucun identifiant n'est injecté tant qu'un formulaire reconnu n'apparaît.
+    if (!authorizeRecoveryUsed && /accounts\.centris\.ca\/connect\/authorize$/i.test(step.location)) {
+      authorizeRecoveryUsed = true;
+      console.log('[CUA] OAuth Centris sans formulaire — reprise unique depuis Matrix Login');
+      await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, {
+        waitUntil: 'domcontentloaded', timeout: 30000,
+      });
+      await page.waitForTimeout(2500);
       continue;
     }
     throw new Error(`CENTRIS_LOGIN_FORM_MISSING:${step.location}`);
