@@ -10,8 +10,13 @@ assert.match(bot, /La liste TOOLS fournie par l'application est la seule vérit�
 assert.match(bot, /Un aperçu n'est jamais une preuve d'envoi/);
 assert.match(bot, /Ne jamais paralléliser deux écritures/);
 assert.match(bot, /La mémoire persistante conserve les faits stables/);
+assert.match(bot, /CONTRAT D'EXÉCUTION — UNE DEMANDE DOIT ABOUTIR/);
+assert.match(bot, /Ne pas abandonner les autres intentions/);
+assert.match(bot, /TERMINÉ.*PARTIEL.*BLOQUÉ/s);
+assert.match(bot, /ne jamais répéter une action externe dont le résultat est incertain/);
 assert.match(registry, /Les skills et connecteurs de Codex.*ne deviennent pas automatiquement des outils Telegram/);
 assert.match(registry, /confirmation au contenu exact/);
 assert.match(registry, /Ne jamais mémoriser de secret/);
+assert.match(registry, /Chaque demande peut contenir plusieurs intentions/);
 
 console.log('✅ Registre de capacités et règles de routage avancées présents');
