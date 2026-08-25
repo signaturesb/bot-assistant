@@ -938,6 +938,14 @@ async function previewCentrisMatrixDocuments(opts = {}) {
 
     console.log(`[MATRIX-PREVIEW] Recherche globale exacte #${centrisNum}`);
     await submitMatrixGlobalSearch(page, search, centrisNum);
+    if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+      return {
+        success: false,
+        error_code: 'MATRIX_MULTIPLE_LOGIN_BREACH',
+        message: 'Matrix refuse une deuxième session simultanée. Fermez les autres onglets Matrix, puis relancez. Aucun envoi effectué.',
+        final_url: safeCentrisPageLocation(page.url()),
+      };
+    }
     const state = await openExactMatrixListing(page, centrisNum);
     if (!state.exactListingMentioned) {
       return {
@@ -2164,6 +2172,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
     }
     await submitMatrixGlobalSearch(page, search, exactNum);
+    if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+      throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+    }
     const state = await openExactMatrixListing(page, exactNum);
     if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
 

@@ -112,6 +112,8 @@ assert(
   _isMatrixMultipleLoginPage('https://matrix.centris.ca/Matrix/Error/MultipleLoginBreach.aspx'),
   'La collision de sessions Matrix doit avoir un diagnostic déterministe'
 );
+assert.match(cuaSource, /await submitMatrixGlobalSearch\(page, search, exactNum\);[\s\S]*?MATRIX_MULTIPLE_LOGIN_BREACH/,
+  'une collision déclenchée après le clic de recherche doit être signalée explicitement');
 
 assert.strictEqual(_safeCentrisPageLocation(
   'https://accounts.centris.ca/Account/Login?ReturnUrl=%2Fconnect%2Fauthorize%3Fstate%3Dsecret'
