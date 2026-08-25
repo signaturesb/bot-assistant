@@ -13333,6 +13333,31 @@ async function maintainCentrisSession(reason = 'periodic') {
   }
 }
 
+async function runCentrisReadOnlySmokeTest(reason = 'manual') {
+  const num = String(process.env.CENTRIS_SMOKE_TEST_LISTING || '').replace(/\D/g, '');
+  if (!num) return { ok: false, skipped: 'not-configured' };
+  if (!/^\d{7,9}$/.test(num)) {
+    log('WARN', 'CENTRIS-SMOKE', 'CENTRIS_SMOKE_TEST_LISTING invalide (7 à 9 chiffres requis)');
+    return { ok: false, skipped: 'invalid-listing' };
+  }
+
+  try {
+    const cua = getCUA();
+    if (!cua?.previewCentrisMatrixDocuments) throw new Error('preview Matrix indisponible');
+    const result = await cua.previewCentrisMatrixDocuments({ centris_num: num });
+    const manifest = String(result?.manifest_id || '').slice(0, 12) || 'aucun';
+    if (!result?.success) {
+      log('WARN', 'CENTRIS-SMOKE', `#${num} échec lecture seule (${reason}): ${result?.error_code || result?.message || 'inconnu'}`);
+      return { ok: false, error_code: result?.error_code || null };
+    }
+    log('OK', 'CENTRIS-SMOKE', `#${num} Matrix global vérifié: ${result.docs_count || 0} document(s), manifeste ${manifest} (${reason})`);
+    return { ok: true, docs_count: result.docs_count || 0, manifest_id: result.manifest_id || null };
+  } catch (e) {
+    log('WARN', 'CENTRIS-SMOKE', `#${num} exception lecture seule (${reason}): ${String(e?.message || e).substring(0, 180)}`);
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
 function startDailyTasks() {
   // KEEP-ALIVE — self-ping /health toutes les 10 min pour empêcher Render de
   // mettre le service en veille (spin-down après inactivité sur certains plans).
@@ -13348,7 +13373,12 @@ function startDailyTasks() {
   // Le délai au boot évite la pointe de redéploiement; un verrou et un cooldown
   // empêchent les connexions concurrentes et les boucles de MFA.
   if (centrisAutomationConfigured()) {
-    setTimeout(() => maintainCentrisSession('boot-delayed').catch(() => {}), 60 * 1000);
+    setTimeout(async () => {
+      const session = await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
+      if (session?.ok && process.env.CENTRIS_SMOKE_TEST_LISTING) {
+        await runCentrisReadOnlySmokeTest('boot-delayed');
+      }
+    }, 60 * 1000);
     safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 6 * 60 * 60 * 1000, { timeoutMs: 120000 });
     log('OK', 'CENTRIS', 'Maintenance de session automatique activée (boot + 6 h)');
   } else if (process.env.CENTRIS_USER && process.env.CENTRIS_PASS) {
