@@ -1717,7 +1717,14 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     const candidates = selectedDocs.slice(0, 20);
     // Séquentiel volontairement: Matrix ouvre les documents depuis la fiche
     // et certains contrôles de session sont propres à l'onglet parent.
+    let downloadAbortReason = null;
     const downloaded = await mapWithConcurrency(candidates, 1, async (doc, index) => {
+      if (downloadAbortReason) {
+        return { ok: false, failure: {
+          label: doc.name,
+          error: `non tenté après erreur de session: ${downloadAbortReason}`.substring(0, 120),
+        } };
+      }
       try {
         let buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url, page);
         const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
@@ -1739,7 +1746,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           source: 'matrix-global',
         } };
       } catch (error) {
-        return { ok: false, failure: { label: doc.name, error: safeErrorMessage(error).substring(0, 120) } };
+        const message = safeErrorMessage(error).substring(0, 120);
+        if (/MATRIX_DOCUMENT_PDF_TIMEOUT|Target page|context or browser has been closed|Browser disconnected/i.test(message)) {
+          downloadAbortReason = message;
+        }
+        return { ok: false, failure: { label: doc.name, error: message } };
       }
     });
     for (const item of downloaded) {
@@ -1795,12 +1806,15 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
   let settled = false;
   let timer;
   let handler;
+  const removeHandler = () => {
+    try { context.off?.('response', handler); } catch {}
+  };
   const result = new Promise((resolve, reject) => {
     const finish = (error, buffer) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      context.off?.('response', handler);
+      removeHandler();
       if (error) reject(error); else resolve(buffer);
     };
     handler = async (response) => {
@@ -1820,7 +1834,8 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
         lastDiagnostic = safeErrorMessage(error).substring(0, 100);
       }
     };
-    context.on('response', handler);
+    try { context.on('response', handler); }
+    catch (error) { finish(error); return; }
     timer = setTimeout(() => finish(new Error(`MATRIX_DOCUMENT_PDF_TIMEOUT:${lastDiagnostic}`)), timeoutMs);
   });
   try {
@@ -1829,11 +1844,32 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
     if (!settled) {
       settled = true;
       clearTimeout(timer);
-      context.off?.('response', handler);
+      removeHandler();
     }
     throw error;
   }
   return result;
+}
+
+async function clickMatrixMediaAnchor(openerPage, targetHref) {
+  const anchors = openerPage.locator?.('a[href*="media.ashx" i]');
+  if (anchors) {
+    const count = Math.min(await anchors.count().catch(() => 0), 100);
+    for (let index = 0; index < count; index += 1) {
+      const anchor = anchors.nth(index);
+      const rawHref = await anchor.getAttribute('href').catch(() => null);
+      if (!rawHref) continue;
+      let absoluteHref = rawHref;
+      try { absoluteHref = new URL(rawHref, openerPage.url()).href; } catch {}
+      if (absoluteHref !== targetHref) continue;
+      await anchor.click({ timeout: 10000, noWaitAfter: true });
+      return;
+    }
+    throw new Error('MATRIX_DOCUMENT_ANCHOR_MISSING');
+  }
+  // Compatibilité des doubles de test; en production, le clic Playwright
+  // ci-dessus est toujours utilisé afin de reproduire le geste humain.
+  await openerPage.evaluate((href) => { window.open(href, '_blank'); }, targetHref);
 }
 
 async function downloadMatrixPdfInBrowser(context, url, referer, openerPage = null) {
@@ -1843,14 +1879,20 @@ async function downloadMatrixPdfInBrowser(context, url, referer, openerPage = nu
   }
   if (openerPage) {
     let popup = null;
+    let popupPromise = null;
     try {
-      const popupPromise = openerPage.waitForEvent('popup', { timeout: 10000 }).catch(() => null);
+      popupPromise = openerPage.waitForEvent('popup', { timeout: 10000 }).catch(() => null);
       const bufferPromise = waitForMatrixPdfResponse(context, () =>
-        openerPage.evaluate((href) => { window.open(href, '_blank'); }, target.href), 30000);
+        clickMatrixMediaAnchor(openerPage, target.href), 12000);
+      // Attacher immédiatement le gestionnaire de rejet: attendre d'abord le
+      // popup créait une fenêtre de 10 s où un échec rapide devenait une
+      // unhandledRejection en production.
+      const buffer = await bufferPromise;
       popup = await popupPromise;
-      return await bufferPromise;
+      return buffer;
     } finally {
-      await popup?.close().catch(() => {});
+      if (!popup && popupPromise) popup = await popupPromise.catch(() => null);
+      try { await popup?.close(); } catch {}
     }
   }
   const tab = await context.newPage();
