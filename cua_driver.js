@@ -2826,6 +2826,41 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
           finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
           return;
         }
+        // Matrix peut annoncer la fiche PrintP en PDF 200, puis garder le flux
+        // de l'onglet ouvert au-delà des 60 s Browserless. Dès que cette URL
+        // authentifiée existe, la relire via APIRequestContext (mêmes cookies)
+        // évite d'attendre la fermeture du flux navigateur.
+        if (/^\/Matrix\/PrintP/i.test(responseUrl.pathname) && context.request?.get) {
+          try {
+            const fetched = await context.request.get(response.url(), {
+              headers: {
+                Referer: `${MATRIX_BASE}/Matrix/Printing/PrintOptions.aspx`,
+                Accept: 'application/pdf,*/*',
+              },
+              timeout: 15000,
+            });
+            if (fetched.ok()) {
+              const fetchedLength = Number(fetched.headers()['content-length'] || 0);
+              if (fetchedLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+                finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+                return;
+              }
+              const fetchedBuffer = await fetched.body();
+              if (fetchedBuffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+                finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+                return;
+              }
+              const fetchedMagic = fetchedBuffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+              if (fetchedBuffer.length >= 1000 && fetchedMagic >= 0) {
+                console.log(`[MATRIX-PDF] Fiche PrintP récupérée via requête authentifiée (${fetchedBuffer.length} octets)`);
+                finish(null, fetchedMagic ? fetchedBuffer.subarray(fetchedMagic) : fetchedBuffer);
+                return;
+              }
+            }
+          } catch (error) {
+            lastDiagnostic = `printp-fetch=${safeErrorMessage(error).substring(0, 80)}`;
+          }
+        }
         const buffer = await response.body();
         if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
           finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
