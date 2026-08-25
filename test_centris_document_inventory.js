@@ -289,6 +289,10 @@ assert.ok(botCode.includes("category: 'centris-matrix-annexes'"), 'l’envoi des
 assert.ok(botCode.includes('Aucun email envoyé pour éviter un dossier partiel'), 'un téléchargement partiel doit bloquer l’email');
 assert.ok(botCode.includes("url.startsWith('/admin/matrix-test') || url.startsWith('/admin/zone-test')"), 'le diagnostic historique Zone doit être redirigé vers Matrix global');
 assert.ok(!botCode.includes('Exception preview Zone:'), 'les erreurs de preview ne doivent plus attribuer Matrix à la Zone');
+assert.match(botCode, /bot\.onText\(\/\^\\\/matrix\[-_\]\?preview/, 'une commande Matrix déterministe doit déclencher le preview sans sélection de tool par le modèle');
+assert.match(botCode, /Aucun courriel ne sera envoyé par cette commande/, 'la commande Matrix doit annoncer explicitement son mode preview-only');
+assert.match(botCode, /executeMatrixAnnexesTool\(\{[\s\S]*?userMessage: msg\.text \|\| ''/, 'la commande Matrix doit réutiliser le garde canonique des annexes');
+assert.doesNotMatch(botCode, /matrix\[-_\]\?preview[\s\S]{0,2500}sendEmailLogged/, 'la commande Matrix ne doit pas appeler directement le fournisseur courriel');
 assert.ok(cuaCode.includes('Recherche globale exacte'), 'le chemin Matrix global doit journaliser la recherche exacte');
 assert.ok(cuaCode.includes('for (const frame of page.frames())'), 'la recherche et l’inventaire doivent couvrir les frames Matrix');
 assert.ok(cuaCode.includes('a,button,[role="link"],[data-href]'), 'le résultat exact ne doit pas dépendre d’un lien texte unique');
@@ -311,4 +315,3 @@ assert.ok(cuaCode.includes("data.taxes_provenance = 'pdf-text-fallback'"));
 assert.ok(cuaCode.includes('data.taxes_ambiguous'));
 
 console.log('✅ Inventaire Centris sans perte + compatibilité + manifestes OK');
-
