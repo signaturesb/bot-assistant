@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const { EventEmitter } = require('events');
+const { Readable } = require('stream');
 const cua = require('./cua_driver');
 
 const pdf = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(1500, 1)]);
@@ -202,6 +203,68 @@ const context = {
     'une DV principale sans URL/id doit être téléchargée par son libellé exact',
   );
   assert.strictEqual(labelClicks, 1);
+  const reportContext = new EventEmitter();
+  let reportPhase = 0;
+  const reportControl = (label, onClick) => ({
+    async isVisible() { return true; },
+    async evaluate() { return label; },
+    async click() { await onClick(); },
+  });
+  const reportFrame = {
+    locator(selector) {
+      assert.strictEqual(selector, 'a,button,input');
+      const controls = reportPhase === 0
+        ? [reportControl('Imprimer', async () => { reportPhase = 1; })]
+        : [reportControl('Imprimer en PDF', async () => {
+          reportContext.emit('response', {
+            url: () => 'https://matrix.centris.ca/Matrix/Printing/report.pdf',
+            headers: () => ({ 'content-type': 'application/pdf' }),
+            body: async () => pdf,
+          });
+        })];
+      return { count: async () => controls.length, nth: (index) => controls[index] };
+    },
+    async evaluate(_fn, title) {
+      return /Détaillé client/.test(String(title));
+    },
+  };
+  const reportPage = {
+    frames: () => [reportFrame],
+    url: () => reportPhase === 0
+      ? 'https://matrix.centris.ca/Matrix/Results.aspx'
+      : 'https://matrix.centris.ca/Matrix/Printing/PrintOptions.aspx',
+    async waitForURL(pattern) { assert.match('/Matrix/Printing/PrintOptions.aspx', pattern); },
+    async waitForTimeout() {},
+  };
+  assert.deepStrictEqual(
+    await cua._downloadMatrixListingReport(reportContext, reportPage),
+    pdf,
+    'la fiche détaillée officielle doit être capturée par Imprimer en PDF',
+  );
+  const retryReportContext = new EventEmitter();
+  reportPhase = 1;
+  const originalEmit = reportContext.emit.bind(reportContext);
+  reportContext.emit = (...args) => retryReportContext.emit(...args);
+  assert.deepStrictEqual(
+    await cua._downloadMatrixListingReport(retryReportContext, reportPage),
+    pdf,
+    'une reprise déjà rendue sur PrintOptions ne doit pas rechercher le bouton Imprimer de la fiche',
+  );
+  reportContext.emit = originalEmit;
+  const downloadOnlyContext = new EventEmitter();
+  let downloadTriggered = false;
+  const downloadOnlyPage = {
+    async waitForEvent(event) {
+      assert.strictEqual(event, 'download');
+      while (!downloadTriggered) await new Promise((resolve) => setImmediate(resolve));
+      return { async createReadStream() { return Readable.from([pdf]); } };
+    },
+  };
+  assert.deepStrictEqual(
+    await cua._waitForMatrixPdfOrDownload(downloadOnlyContext, downloadOnlyPage, async () => { downloadTriggered = true; }, 100),
+    pdf,
+    'un vrai événement download doit être capturé même sans corps de réponse réseau exploitable',
+  );
   assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_TOO_LARGE')), false);
   assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_URL_REJECTED')), false);
   assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_ACTION_MISSING')), false);

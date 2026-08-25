@@ -156,6 +156,10 @@ const referenceOnly = cua._mergeMatrixDocumentSnapshots([{
 assert.strictEqual(referenceOnly.docs.length, 8, 'une référence DV sans contrôle ne devient jamais un PDF fictif');
 assert.deepStrictEqual(referenceOnly.documentReferences, ['DV-50037']);
 
+const nineDownloadables = cua._matrixDownloadableDocs({ docs: fixture28936167, printControlCount: 1 });
+assert.strictEqual(nineDownloadables.length, 9, 'la fiche PDF officielle + huit documents additionnels forment le lot réel de neuf');
+assert.ok(nineDownloadables.some((doc) => doc.source_section === 'matrix_print_report'));
+
 // Les documents visibles mais sans URL/action sont conservés individuellement:
 // ils deviendront des échecs explicites au téléchargement au lieu de disparaître.
 const unresolvedTwins = cua._buildCentrisDocumentInventory('X', [
