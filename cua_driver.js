@@ -2255,7 +2255,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       return { success: false, annexes: [], message: filtre ? `Aucune annexe correspondant à « ${filtre} »` : 'Aucune annexe téléchargeable trouvée dans Matrix' };
     }
 
-    const selectedDocs = matchedDocs.filter((doc) => doc.url || doc.action_id || doc.action_label);
+    const selectedDocs = matchedDocs
+      .filter((doc) => doc.url || doc.action_id || doc.action_label)
+      // Les liens PDF certains passent avant les contrôles ASP.NET ambigus. Un
+      // contrôle DV défectueux ne doit jamais faire perdre les autres fichiers.
+      .sort((left, right) => Number(Boolean(right.url)) - Number(Boolean(left.url)));
     // Fail closed: un document affiché dans Matrix mais dont le lien n'a pas
     // été résolu (notamment une DV principale rendue en postback) ne doit
     // jamais disparaître silencieusement du lot envoyé au client.
@@ -2535,8 +2539,31 @@ async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = 
       if (control) break;
     }
   }
-  if (!control) throw new Error('MATRIX_DOCUMENT_ACTION_MISSING');
-  return waitForMatrixPdfResponse(context, () => control.click(), 45000);
+  if (!control) {
+    let diagnostic = '';
+    if (label) {
+      for (const frame of page.frames()) {
+        if (typeof frame.getByText !== 'function') continue;
+        const partial = frame.getByText(label, { exact: false }).first();
+        if (!(await partial.isVisible().catch(() => false))) continue;
+        diagnostic = await partial.evaluate((element) => {
+          const chain = [];
+          let current = element;
+          for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+            chain.push(`${current.tagName}${current.id ? `#${current.id.slice(0, 50)}` : ''}${current.getAttribute('href') ? '[href]' : ''}${current.getAttribute('onclick') ? '[onclick]' : ''}`);
+          }
+          const scope = element.closest('tr,li,[role="row"]') || element.parentElement?.parentElement || element.parentElement;
+          const controls = [...(scope?.querySelectorAll('a,button,[role="link"],[onclick]') || [])].slice(0, 8).map((item) =>
+            `${item.tagName}${item.id ? `#${item.id.slice(0, 40)}` : ''}:${String(item.innerText || item.textContent || item.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 30)}${item.getAttribute('href') ? '[href]' : ''}${item.getAttribute('onclick') ? '[onclick]' : ''}`
+          );
+          return `${chain.join('>')}|controls=${controls.join(',')}`;
+        }).catch(() => 'inspect-failed');
+        break;
+      }
+    }
+    throw new Error(`MATRIX_DOCUMENT_ACTION_MISSING${diagnostic ? `:${diagnostic}` : ''}`);
+  }
+  return waitForMatrixPdfResponse(context, () => control.click(), 12000);
 }
 
 async function clickMatrixMediaAnchor(openerPage, targetHref) {
