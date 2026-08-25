@@ -113,6 +113,46 @@ const duplicatesB = cua._buildCentrisDocumentInventory('X', [...duplicatePlans].
 assert.strictEqual(category(duplicatesA, 'plan_autre').docs.length, 2);
 assert.strictEqual(duplicatesA.inventory_manifest_id, duplicatesB.inventory_manifest_id);
 
+// Un contrôle Matrix dupliqué entre la page et un iframe ne doit pas produire
+// deux pièces jointes. Des homonymes avec des URL distinctes restent deux docs.
+const renderedDuplicates = cua._buildCentrisDocumentInventory('X', [
+  { name: 'Plan', size: '100 KB', url: 'https://mediaserver.centris.ca/media.ashx?id=1#preview' },
+  { name: 'Plan', size: '100 KB', url: 'https://mediaserver.centris.ca/media.ashx?id=1' },
+  { name: 'Plan', size: '100 KB', url: 'https://mediaserver.centris.ca/media.ashx?id=2' },
+]);
+assert.strictEqual(renderedDuplicates.docs.length, 2);
+assert.strictEqual(new Set(renderedDuplicates.docs.map((doc) => doc.id)).size, 2);
+
+// La DV principale peut vivre dans le frame parent tandis que les documents
+// additionnels sont dans un iframe. L'inventaire final doit unir les deux.
+const mergedFrames = cua._mergeMatrixDocumentSnapshots([
+  {
+    url: 'https://matrix.centris.ca/Matrix/Results.aspx', exactListingMentioned: true,
+    docs: [{ name: 'Oui DV-50037', action_id: 'DV_Link', source_section: 'principal_dv' }],
+    mediaLinkCount: 0,
+  },
+  {
+    url: 'https://matrix.centris.ca/Matrix/Annexes.aspx', exactListingMentioned: false,
+    docs: [
+      { name: 'Plan cadastral', url: 'https://mediaserver.centris.ca/media.ashx?id=plan', source_section: 'additional_documents' },
+      { name: 'Oui DV-50037', action_id: 'DV_Link', source_section: 'principal_dv' },
+    ],
+    mediaLinkCount: 1,
+  },
+]);
+assert.strictEqual(mergedFrames.docs.length, 2);
+assert.ok(mergedFrames.docs.some((doc) => doc.action_id === 'DV_Link'));
+assert.ok(mergedFrames.docs.some((doc) => /id=plan/.test(doc.url)));
+
+// Les documents visibles mais sans URL/action sont conservés individuellement:
+// ils deviendront des échecs explicites au téléchargement au lieu de disparaître.
+const unresolvedTwins = cua._buildCentrisDocumentInventory('X', [
+  { name: 'Annexe sans lien', size: null, source_section: 'additional_documents' },
+  { name: 'Annexe sans lien', size: null, source_section: 'additional_documents' },
+]);
+assert.strictEqual(unresolvedTwins.docs.length, 2);
+assert.strictEqual(new Set(unresolvedTwins.docs.map((doc) => doc.id)).size, 2);
+
 const reordered = cua._buildCentrisDocumentInventory('28936167', [...fixture28936167].reverse(), {
   expectedCategories: ['declaration_vendeur_principale', 'certificat_localisation'],
 });

@@ -46,11 +46,14 @@ assert(autoLoginSource.includes('process.env.CENTRIS_PASS'), 'Le script autonome
 assert(autoLoginSource.includes('process.env.WEBHOOK_SECRET'), 'Le script autonome doit lire WEBHOOK_SECRET depuis l’environnement');
 assert(!autoLoginSource.includes('.env.shared'), 'Le script autonome ne doit pas extraire un secret depuis un fichier local');
 assert(!/const\s+(?:USER|PASS)\s*=\s*['"][^'"]+['"]/.test(autoLoginSource), 'Aucun identifiant Centris ne doit être codé en dur');
+assert(autoLoginSource.includes('centris-mfa-code?after=${startWait}'), 'Le login autonome doit borner le courriel MFA à la tentative courante');
+assert(!autoLoginSource.includes('chat.db'), 'Le login autonome ne doit pas accepter un code Messages sans validation d’expéditeur');
 
 const {
   _browserlessEndpointWithTimeout,
   _cookieHeaderFromPlaywrightCookies,
   _isAuthenticatedCentrisUrl,
+  _isAuthenticatedMatrixPage,
   _hasExplicitCentrisSendConfirmation,
 } = require('./cua_driver');
 const endpoint = _browserlessEndpointWithTimeout('wss://example.invalid/chromium?token=test-token&foo=bar', 175000);
@@ -79,6 +82,23 @@ assert(_isAuthenticatedCentrisUrl('https://matrix.centris.ca/Matrix/'), 'Une pag
 assert(_isAuthenticatedCentrisUrl('https://zone.centris.ca/Dashboard'), 'Une page Zone connectée doit être reconnue');
 assert(!_isAuthenticatedCentrisUrl('https://accounts.centris.ca/Account/Login'), 'La page comptes ne doit jamais être considérée connectée');
 assert(!_isAuthenticatedCentrisUrl('chrome-error://chromewebdata/'), 'Une page d’erreur Chrome ne doit jamais être considérée connectée');
+
+assert(
+  _isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Recherche', 0, 'Matrix — Recherche Critères Résultats Déconnexion'),
+  'Une vraie page de recherche Matrix doit valider la session'
+);
+assert(
+  !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Recherche', 0, 'Votre session est expirée. Connexion'),
+  'Une URL Matrix avec contenu de session expirée doit être refusée'
+);
+assert(
+  !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Recherche', 1, 'Matrix Recherche'),
+  'Un formulaire de mot de passe visible doit invalider la session'
+);
+assert(
+  !_isAuthenticatedMatrixPage('https://matrix.centris.ca/Matrix/Recherche', 0, ''),
+  'Un shell Matrix vide ne doit jamais prouver une authentification'
+);
 
 assert(_hasExplicitCentrisSendConfirmation('envoie'), '« envoie » doit autoriser une seule tentative Centris');
 assert(_hasExplicitCentrisSendConfirmation('send!'), '« send! » doit être accepté');

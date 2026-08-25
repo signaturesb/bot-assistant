@@ -11,6 +11,7 @@ const { evaluateSmsHmacSelfTest, evaluateActiveTemplate } = require('./lib/prefl
 const { AsyncLocalStorage } = require('async_hooks');
 const leadParser  = require('./lead_parser');
 const { createOneShotAuthorization, consumeOneShotAuthorization } = require('./lib/email_send_guard');
+const { isAmbiguousTransportError, verifyEmailProviderReceipt } = require('./lib/email_delivery_receipt');
 const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
 const { messageExplicitlyAuthorizesGitHubWrite, verifyProtectedStateWrite } = require('./lib/deployment_truth_guard');
@@ -879,14 +880,14 @@ async function sendEmailLogged(opts) {
     }
     const res = await opts.sendFn();
     entry.durationMs = Date.now() - t0;
-    if (res && typeof res.ok === 'boolean') {
-      entry.outcome = res.ok ? 'sent' : 'failed';
-      entry.status = res.status;
-      if (!res.ok) {
-        try { entry.error = (await res.clone().text()).substring(0, 300); } catch {}
-      }
-    } else {
-      entry.outcome = 'sent'; // pas de Response standard mais pas d'exception → succès
+    const proof = await verifyEmailProviderReceipt(entry.via, res);
+    entry.outcome = proof.outcome;
+    entry.status = proof.status;
+    entry.code = proof.code;
+    entry.error = proof.error;
+    entry.receipt = proof.receipt;
+    if (entry.outcome === 'failed' && !entry.error && res?.clone) {
+      try { entry.error = (await res.clone().text()).substring(0, 300); } catch {}
     }
     saveEmailOutbox();
 
@@ -913,13 +914,16 @@ async function sendEmailLogged(opts) {
       }
     }
 
-    return { ok: entry.outcome === 'sent', status: entry.status, durationMs: entry.durationMs, entryId: entry.id, error: entry.error };
+    return { ok: entry.outcome === 'sent', uncertain: entry.outcome === 'uncertain', code: entry.code,
+      receipt: entry.receipt, status: entry.status, durationMs: entry.durationMs, entryId: entry.id, error: entry.error };
   } catch (e) {
-    entry.outcome = 'exception';
+    entry.outcome = isAmbiguousTransportError(e) ? 'uncertain' : 'exception';
+    entry.code = entry.outcome === 'uncertain' ? 'EMAIL_DELIVERY_UNCERTAIN' : 'EMAIL_PROVIDER_EXCEPTION';
     entry.error = e.message?.substring(0, 300) || String(e);
     entry.durationMs = Date.now() - t0;
     saveEmailOutbox();
-    return { ok: false, error: entry.error, entryId: entry.id, durationMs: entry.durationMs };
+    return { ok: false, uncertain: entry.outcome === 'uncertain', code: entry.code,
+      error: entry.error, entryId: entry.id, durationMs: entry.durationMs };
   }
 }
 
@@ -7470,9 +7474,11 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     return `⚠️ Les ${documents.length} pièces jointes dépassent la limite sécuritaire Gmail (22 MB encodés). Aucun email envoyé; aucun document omis silencieusement.`;
   }
 
-  const token = await getGmailToken();
-  if (!token) return `❌ Gmail indisponible. Les PDF ont été récupérés, mais aucun email n'a été envoyé.`;
-  const subject = `Documents Centris #${num}${filtre ? ` — ${filtre}` : ''}`;
+  // Les valeurs utilisées dans les en-têtes MIME doivent être sur une seule
+  // ligne. Le filtre vient de Telegram et ne doit jamais pouvoir injecter un
+  // nouvel en-tête (Cc/Bcc notamment).
+  const mimeHeader = (value) => String(value ?? '').replace(/[\r\n\0]+/g, ' ').trim();
+  const subject = mimeHeader(`Documents Centris #${num}${filtre ? ` — ${filtre}` : ''}`);
   const cc = emailDestination.toLowerCase() === AGENT.email.toLowerCase() ? [] : [AGENT.email];
   const bodyText = `Bonjour,\n\nVoici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.\n\n${documents.map((doc) => `• ${doc.label}`).join('\n')}\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.telephone}`;
   const contentHtml = `<p style="color:#cccccc;font-size:14px;line-height:1.7;">Voici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;">${documents.map((doc) => `<div style="color:#f5f5f7;margin:6px 0;">📎 ${escapeHtml(doc.label)} <span style="color:#888;">(${Math.round(doc.size / 1024)} KB)</span></div>`).join('')}</div>`;
@@ -7484,12 +7490,18 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     INTRO_TEXTE: contentHtml,
     CITATION: 'Je reste disponible pour répondre à toutes vos questions sur ce dossier.',
   });
-  if (!html) html = `<!doctype html><html><body style="background:#0a0a0a;color:#f5f5f7;font-family:Arial,sans-serif;padding:24px;">${contentHtml}</body></html>`;
+  // Un courriel client sans le modèle officiel n'est pas un résultat valide.
+  // On échoue fermé au lieu d'envoyer un fallback qui ne porte pas l'identité
+  // SignatureSB présentée dans l'aperçu.
+  if (!html) {
+    return `❌ Le modèle officiel SignatureSB est indisponible. Les PDF sont validés, mais aucun aperçu n'est armé et aucun email n'a été envoyé.`;
+  }
 
   const enc = (value) => `=?UTF-8?B?${Buffer.from(String(value)).toString('base64')}?=`;
   const boundary = `sbMatrix${Date.now()}`;
+  const alternativeBoundary = `sbMatrixAlt${Date.now()}`;
   const lines = [
-    `From: ${AGENT.nom} <${AGENT.email}>`,
+    `From: ${mimeHeader(AGENT.nom)} <${mimeHeader(AGENT.email)}>`,
     `To: ${emailDestination}`,
     ...(cc.length ? [`Cc: ${cc.join(', ')}`] : []),
     `Reply-To: ${AGENT.email}`,
@@ -7499,23 +7511,40 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     `Content-Type: multipart/mixed; boundary="${boundary}"`,
     '',
     `--${boundary}`,
+    `Content-Type: multipart/alternative; boundary="${alternativeBoundary}"`,
+    '',
+    `--${alternativeBoundary}`,
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(bodyText, 'utf8').toString('base64'),
+    `--${alternativeBoundary}`,
     'Content-Type: text/html; charset=UTF-8',
     'Content-Transfer-Encoding: base64',
     '',
     Buffer.from(html, 'utf8').toString('base64'),
+    `--${alternativeBoundary}--`,
   ];
   for (const doc of documents) {
+    const safeFilename = mimeHeader(doc.filename).replace(/["\\]/g, '_') || 'document.pdf';
+    const filenameUtf8 = encodeURIComponent(safeFilename).replace(/['()]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
     lines.push(
       `--${boundary}`,
-      'Content-Type: application/pdf',
-      `Content-Disposition: attachment; filename="${enc(doc.filename)}"`,
+      `Content-Type: application/pdf; name="${enc(safeFilename)}"`,
+      `Content-Disposition: attachment; filename="${enc(safeFilename)}"; filename*=UTF-8''${filenameUtf8}`,
       'Content-Transfer-Encoding: base64',
       '',
       doc.buffer.toString('base64'),
     );
   }
   lines.push(`--${boundary}--`);
-  const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const mimeMessage = lines.join('\r\n');
+  // Inclut le modèle HTML, les en-têtes et les séparateurs dans le calcul;
+  // aucune pièce jointe ne sera retirée silencieusement pour passer la limite.
+  if (Buffer.byteLength(mimeMessage, 'utf8') > 24 * 1024 * 1024) {
+    return `⚠️ Le courriel complet dépasse la limite sécuritaire Gmail de 24 MB après encodage MIME. Aucun email envoyé; aucun document omis silencieusement.`;
+  }
+  const raw = Buffer.from(mimeMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const renderedHtmlSha256 = crypto.createHash('sha256').update(html, 'utf8').digest('hex');
   const emailPayload = {
     via: 'gmail', to: emailDestination, cc, bcc: [], subject, body: bodyText,
@@ -7532,21 +7561,36 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   })).digest('hex');
 
   if (!isSendConfirmation) {
-    pendingExternalEmailActions.set(chatId, {
+    // Un aperçu ne dépend pas de Gmail: une panne OAuth temporaire ne doit pas
+    // forcer Shawn à recommencer la recherche Matrix/Browserless. En revanche,
+    // sans conversation Telegram vérifiable, aucune confirmation ne peut être
+    // liée au bon aperçu.
+    if (!chatId) {
+      return `❌ Identifiant Telegram absent: impossible de remettre et lier l’aperçu Matrix #${num}. Aucun courriel n'est armé et aucun email n'a été envoyé.`;
+    }
+    const pendingMatrixPreview = {
       name: 'telecharger_annexes_centris',
       input: { centris_num: num, email_destination: emailDestination, filtre: filtre || '' },
       createdAt: Date.now(),
       inFlight: false,
       matrixFingerprint: payloadFingerprint,
       matrixPreviewExpiresAt: Date.now() + 15 * 60 * 1000,
-    });
-    savePendingEmailState();
-    if (chatId) {
-      await bot.sendDocument(chatId, Buffer.from(html, 'utf8'), {
+    };
+    try {
+      const previewReceipt = await bot.sendDocument(chatId, Buffer.from(html, 'utf8'), {
         caption: `APERÇU COURRIEL — aucun envoi\nÀ: ${emailDestination}\nCc: ${cc.join(', ') || 'aucune'}\nObjet: ${subject}\nPièces jointes: ${documents.length}\nValide 15 minutes; réponds exactement « envoie ».`,
-      }, { filename: `apercu_courriel_centris_${num}.html`, contentType: 'text/html' })
-        .catch((error) => log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Telegram: ${error.message}`));
+      }, { filename: `apercu_courriel_centris_${num}.html`, contentType: 'text/html' });
+      if (!previewReceipt?.message_id) throw new Error('accusé Telegram sans message_id');
+      pendingMatrixPreview.telegramPreviewMessageId = previewReceipt.message_id;
+    } catch (error) {
+      log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Telegram: ${error.message}`);
+      auditLogEvent('centris', 'matrix-email-preview-delivery-failed', {
+        num, to: emailDestination, error: String(error?.message || error).substring(0, 180),
+      });
+      return `❌ L’aperçu courriel Matrix #${num} n’a pas été confirmé par Telegram. Aucun courriel n'est armé et aucun email n'a été envoyé.`;
     }
+    pendingExternalEmailActions.set(chatId, pendingMatrixPreview);
+    savePendingEmailState();
     return `📂 ${documents.length} PDF(s) Matrix #${num} récupérés et validés.\n🔍 Aperçu SignatureSB remis dans Telegram pour ${emailDestination}.\n🔒 Aucun email envoyé; réponds exactement « envoie » dans les 15 minutes.`;
   }
 
@@ -7558,6 +7602,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   if (approvedPreview.matrixFingerprint !== payloadFingerprint) {
     return `🔒 Confirmation refusée: le destinataire, le modèle ou les PDF ont changé depuis l’aperçu. Demande un nouvel aperçu; aucun email envoyé.`;
   }
+  // OAuth est requis seulement au moment de l'unique tentative approuvée.
+  // Une indisponibilité ici est déterministe et survient avant le fournisseur.
+  const token = await getGmailToken();
+  if (!token) return `❌ Gmail indisponible. Les PDF et l’aperçu restent validés, mais aucun email n'a été envoyé.`;
   let authorization;
   try {
     authorization = createOneShotAuthorization({ message: userMessage, ...emailPayload });
@@ -9847,6 +9895,15 @@ async function handleEmailConfirmation(chatId, text) {
       );
       const resultText = String(result || '');
       if (/^✅/u.test(resultText) || /\n✅/u.test(resultText)) {
+        pendingExternalEmailActions.delete(chatId);
+        savePendingEmailState();
+        const next = promoteNextPendingEmailDraft(chatId);
+        await send(chatId, resultText);
+        if (next) await send(chatId, pendingEmailPreview(next));
+      } else if (external.name === 'telecharger_annexes_centris' &&
+                 /^🔒 Confirmation refusée:/u.test(resultText)) {
+        // Refus déterministe avant toute tentative Gmail: il est sûr de
+        // supprimer l'autorisation expirée ou liée à un ancien contenu.
         pendingExternalEmailActions.delete(chatId);
         savePendingEmailState();
         const next = promoteNextPendingEmailDraft(chatId);

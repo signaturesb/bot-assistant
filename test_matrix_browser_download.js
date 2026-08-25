@@ -105,6 +105,24 @@ const context = {
     await cua._downloadMatrixPdfAuthenticated(authenticatedContext, 'https://mediaserver.centris.ca/media.ashx?id=direct', navigation.options.referer),
     pdf
   );
+  let oversizedFallbackPages = 0;
+  const authenticatedOversizedContext = {
+    request: {
+      async get() {
+        return { ok: () => true, status: () => 200, headers: () => ({ 'content-length': String(26 * 1024 * 1024) }) };
+      },
+    },
+    async newPage() { oversizedFallbackPages += 1; throw new Error('fallback interdit'); },
+  };
+  await assert.rejects(
+    () => cua._downloadMatrixPdfAuthenticated(
+      authenticatedOversizedContext,
+      'https://mediaserver.centris.ca/media.ashx?id=oversized-direct',
+      navigation.options.referer,
+    ),
+    /MATRIX_DOCUMENT_TOO_LARGE/,
+  );
+  assert.strictEqual(oversizedFallbackPages, 0, 'un fichier trop volumineux ne doit pas ouvrir un onglet Browserless');
   const authenticatedFallbackContext = new EventEmitter();
   authenticatedFallbackContext.request = {
     async get() {
@@ -160,6 +178,11 @@ const context = {
     'une DV ASP.NET sans URL directe doit être téléchargée par son vrai clic',
   );
   assert.strictEqual(actionClicks, 1);
+  assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_TOO_LARGE')), false);
+  assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_URL_REJECTED')), false);
+  assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_ACTION_MISSING')), false);
+  assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_PDF_TIMEOUT:wrapper=html')), true);
+  assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('ECONNRESET')), true);
   console.log('✅ Téléchargement PDF Matrix par navigation authentifiée validé');
 })().catch((error) => {
   console.error(error);

@@ -31,6 +31,7 @@ const {
   removeSessionFile,
   writeSessionFile,
 } = require('./lib/centris_session_store');
+const { validatePdfBuffer } = require('./lib/pdf_validation');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -53,6 +54,15 @@ const MATRIX_DOCUMENT_FILE_MAX_BYTES = 25 * 1024 * 1024;
 const MATRIX_DOCUMENT_TOTAL_MAX_BYTES = 120 * 1024 * 1024;
 const MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS = 3;
 const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
+
+// Ces erreurs sont déterministes: les répéter charge Matrix sans augmenter les
+// chances de succès. Les erreurs réseau, timeouts et wrappers HTML restent, eux,
+// réessayables car une nouvelle requête authentifiée peut alors réussir.
+const MATRIX_DOCUMENT_NON_RETRYABLE_RE = /MATRIX_DOCUMENT_(?:TOO_LARGE|URL_REJECTED|ACTION_INVALID|ACTION_MISSING)/;
+
+function isMatrixDocumentRetryable(error) {
+  return !MATRIX_DOCUMENT_NON_RETRYABLE_RE.test(safeErrorMessage(error));
+}
 
 function clampDurationMs(value, fallback, min, max) {
   const parsed = Number(value);
@@ -153,6 +163,35 @@ function stableCentrisManifestId(payload) {
   return nodeCrypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
+function canonicalCentrisDocumentLocator(doc = {}) {
+  if (doc.action_id) return `action:${String(doc.action_id).trim()}`;
+  if (!doc.url) return null;
+  try {
+    const parsed = new URL(String(doc.url));
+    parsed.hash = '';
+    return `url:${parsed.toString()}`;
+  } catch {
+    return `url:${String(doc.url).trim().replace(/#.*$/, '')}`;
+  }
+}
+
+// Matrix peut rendre le même contrôle dans le document principal et dans un
+// iframe. On retire uniquement les copies qui pointent vers le même contrôle;
+// deux fichiers de même nom/taille mais avec des liens distincts sont conservés.
+function dedupeCentrisDiscoveredDocs(docs = []) {
+  const seenLocators = new Set();
+  const result = [];
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    const locator = canonicalCentrisDocumentLocator(doc);
+    const label = normalizeCentrisMatchKey(doc?.label_original || doc?.name || '');
+    const key = locator ? `${locator}|${label}` : null;
+    if (key && seenLocators.has(key)) continue;
+    if (key) seenLocators.add(key);
+    result.push(doc);
+  }
+  return result;
+}
+
 function canonicalManifestDocs(docs, { includeContent = false } = {}) {
   return docs.map((doc) => {
     const item = {
@@ -222,15 +261,21 @@ function addCentrisContentMetadata(doc, bytes, pageCount) {
 }
 
 function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
-  const rawList = Array.isArray(docs) ? docs : [];
+  const rawList = dedupeCentrisDiscoveredDocs(docs);
+  const identityOccurrences = new Map();
   const normalizedDocs = rawList.map((doc, index) => {
     const labelOriginal = String(doc?.label_original || doc?.name || '').trim();
     const sizeDisplay = doc?.size_display ?? doc?.size ?? null;
     const labelNormalized = normalizeCentrisLabel(labelOriginal);
     const sourceSection = String(doc?.source_section || '').trim() || null;
     const provenance = String(doc?.provenance || '').trim() || 'unknown';
+    const locator = canonicalCentrisDocumentLocator(doc);
+    const identity = [normalizeCentrisMatchKey(labelOriginal), String(sizeDisplay || ''),
+      sourceSection || '', provenance, locator || 'unresolved'].join('|');
+    const occurrence = identityOccurrences.get(identity) || 0;
+    identityOccurrences.set(identity, occurrence + 1);
     return {
-      id: nodeCrypto.createHash('sha256').update(`${index}|${labelOriginal}|${sizeDisplay || ''}`).digest('hex').slice(0, 16),
+      id: nodeCrypto.createHash('sha256').update(`${identity}|${occurrence}`).digest('hex').slice(0, 16),
       name: labelOriginal,
       size: sizeDisplay === null ? null : String(sizeDisplay).trim(),
       label_original: labelOriginal,
@@ -313,6 +358,20 @@ function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
     manifest_id: inventoryManifestId,
     content_manifest_id: contentManifest.content_manifest_id,
     content_validation_complete: contentManifest.complete,
+  };
+}
+
+function mergeMatrixDocumentSnapshots(snapshots = []) {
+  const ranked = [...snapshots].sort((left, right) => {
+    const score = (item) => (item.exactListingMentioned ? 1000 : 0) + (item.docs?.length || 0) * 10;
+    return score(right) - score(left);
+  });
+  const primary = ranked[0] || null;
+  if (!primary) return null;
+  return {
+    ...primary,
+    docs: dedupeCentrisDiscoveredDocs(ranked.flatMap((snapshot) => snapshot.docs || [])),
+    mediaLinkCount: ranked.reduce((total, snapshot) => total + Number(snapshot.mediaLinkCount || 0), 0),
   };
 }
 
@@ -481,18 +540,6 @@ function classifyMatrixPageSnapshot(snapshot = {}, centrisNum = '') {
 }
 
 async function findMatrixGlobalSearch(page) {
-  const selectors = [
-    '#QueryText',
-    'input[id*="Query"]',
-    'input[id*="Search" i]',
-    'input[name*="Query" i]',
-    'input[name*="Search" i]',
-    'input[type="search"]',
-    'input[placeholder*="recherch" i]',
-    'input[placeholder*="centris" i]',
-    'input[placeholder*="mls" i]',
-  ];
-
   // Matrix est une application ASP.NET dont l'identifiant du champ global
   // peut varier entre les déploiements. Chercher d'abord les attributs
   // sémantiques, puis choisir le grand champ éditable placé dans l'en-tête.
@@ -500,13 +547,6 @@ async function findMatrixGlobalSearch(page) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     for (const frame of page.frames()) {
-      for (const selector of selectors) {
-        const locator = frame.locator(selector).first();
-        if (await locator.isVisible().catch(() => false) &&
-            await locator.isEnabled().catch(() => false) &&
-            await locator.isEditable().catch(() => false)) return locator;
-      }
-
       const inputs = frame.locator('input:not([type]), input[type="text"], input[type="search"]');
       const count = Math.min(await inputs.count().catch(() => 0), 50);
       let best = null;
@@ -522,19 +562,32 @@ async function findMatrixGlobalSearch(page) {
           el.id, el.getAttribute('name'), el.getAttribute('placeholder'),
           el.getAttribute('aria-label'), el.getAttribute('class'), el.getAttribute('type'),
         ].filter(Boolean).join(' ')).catch(() => '');
-        let score = 0;
-        if (/query|search|recherch|centris|mls|quick|global|keyword|crit[eè]re/i.test(meta)) score += 100;
-        if (/\bsearch\b/i.test(meta)) score += 50;
-        if (box.width >= 600) score += 50;
-        if (box.y >= 40 && box.y <= 450) score += 30;
-        if (String(meta).includes('password')) score -= 500;
+        const score = scoreMatrixSearchCandidate(meta, box);
         if (score > bestScore) { best = input; bestScore = score; }
       }
-      if (best && bestScore >= 50) return best;
+      // Un champ de formulaire ordinaire (ville, prix, nom du client, etc.) ne
+      // doit jamais être choisi seulement parce qu'il est large ou dans le haut
+      // de la page. Il faut une preuve sémantique qu'il s'agit de la recherche
+      // globale Matrix.
+      if (best && bestScore >= 100) return best;
     }
     await page.waitForTimeout(500);
   }
   return null;
+}
+
+function scoreMatrixSearchCandidate(meta = '', box = {}) {
+  const value = String(meta || '');
+  let score = 0;
+  if (/\bquerytext\b/i.test(value)) score += 250;
+  if (/global|omni|quick/i.test(value)) score += 140;
+  if (/centris|\bmls\b/i.test(value)) score += 130;
+  if (/query|search|recherch|keyword/i.test(value)) score += 100;
+  if (/\bcrit[eè]re/i.test(value)) score += 40;
+  if (Number(box.width) >= 600) score += 35;
+  if (Number(box.y) >= 40 && Number(box.y) <= 450) score += 20;
+  if (/password|courriel|email|client|municipalit|ville|prix|adresse|telephone|phone/i.test(value)) score -= 300;
+  return score;
 }
 
 function matrixTextContainsExactNumber(value, centrisNum) {
@@ -554,16 +607,25 @@ async function openExactMatrixListing(page, centrisNum) {
     for (let index = 0; index < count; index += 1) {
       const candidate = candidates.nth(index);
       if (!(await candidate.isVisible().catch(() => false))) continue;
-      const metadata = await candidate.evaluate((element) => [
-        element.innerText, element.textContent, element.getAttribute('aria-label'),
-        element.getAttribute('title'), element.getAttribute('href'),
-        element.getAttribute('data-href'), element.closest('tr,[role="row"]')?.innerText,
-      ].filter(Boolean).join(' ')).catch(() => '');
-      if (!matrixTextContainsExactNumber(metadata, centrisNum)) continue;
+      const metadata = await candidate.evaluate((element) => ({
+        own: [element.innerText, element.textContent, element.getAttribute('aria-label'),
+          element.getAttribute('title'), element.getAttribute('href'),
+          element.getAttribute('data-href')].filter(Boolean).join(' '),
+        row: element.closest('tr,[role="row"]')?.innerText || '',
+        navigates: element.matches('a,[role="link"]') &&
+          !!(element.getAttribute('href') || element.getAttribute('data-href')),
+      })).catch(() => null);
+      if (!metadata) continue;
+      // Préférer un contrôle qui porte lui-même le numéro exact. Un contrôle
+      // générique dans une ligne voisine (menu, étoile, imprimer) n'est accepté
+      // que s'il navigue réellement et que sa ligne contient le numéro exact.
+      if (!matrixTextContainsExactNumber(metadata.own, centrisNum) &&
+          !(metadata.navigates && matrixTextContainsExactNumber(metadata.row, centrisNum))) continue;
       await candidate.click().catch(() => null);
       await page.waitForTimeout(3000);
       state = await inspectMatrixListingPage(page, centrisNum);
-      if (state.exactListingMentioned) return state;
+      if (state.exactListingMentioned &&
+          ['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) return state;
     }
   }
   return state;
@@ -640,10 +702,8 @@ async function inspectMatrixListingPage(page, centrisNum) {
     const snapshot = await inspectFrame(frame).catch(() => null);
     if (snapshot) snapshots.push(snapshot);
   }
-  const snapshot = snapshots.sort((left, right) => {
-    const score = (item) => (item.exactListingMentioned || matrixTextContainsExactNumber(item.text, centrisNum) ? 1000 : 0) + (item.docs?.length || 0) * 10;
-    return score(right) - score(left);
-  })[0] || { url: page.url(), text: '', docs: [], mediaLinkCount: 0, passwordInputs: 0 };
+  const snapshot = mergeMatrixDocumentSnapshots(snapshots) ||
+    { url: page.url(), text: '', docs: [], mediaLinkCount: 0, passwordInputs: 0 };
   return { ...snapshot, ...classifyMatrixPageSnapshot(snapshot, centrisNum) };
 }
 
@@ -953,6 +1013,19 @@ function isAuthenticatedCentrisUrl(rawUrl) {
   }
 }
 
+// Une URL Matrix seule ne prouve pas une session: Centris peut servir une page
+// d'erreur ou un shell vide avec HTTP 200. Exiger aussi un marqueur applicatif
+// et refuser les marqueurs d'authentification/accès.
+function isAuthenticatedMatrixPage(rawUrl, passwordVisible, bodyText) {
+  if (passwordVisible || !isAuthenticatedCentrisUrl(rawUrl)) return false;
+  const text = normalizeCentrisMatchKey(String(bodyText || '').slice(0, 200000));
+  if (!text) return false;
+  if (/(?:^|\s)connexion(?:\s|$)|se connecter|sign in|log in|mot de passe|password|acces refuse|access denied|session expiree/.test(text)) {
+    return false;
+  }
+  return /recherche|criteres|resultats|matrix|deconnexion|logout|fiche/.test(text);
+}
+
 function cookieHeaderFromPlaywrightCookies(cookies, targetHost = 'matrix.centris.ca') {
   const host = String(targetHost || '').toLowerCase();
   return (Array.isArray(cookies) ? cookies : [])
@@ -1061,7 +1134,8 @@ async function loginCentris(context) {
     await page.waitForTimeout(1800);
     const probeUrl = page.url();
     const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
-    if (!passwordVisible && isAuthenticatedCentrisUrl(probeUrl)) {
+    const probeText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+    if (isAuthenticatedMatrixPage(probeUrl, passwordVisible, probeText)) {
       const cookies = await context.cookies();
       saveSession(cookies);
       await saveBrowserStorageState(context, page);
@@ -1170,7 +1244,9 @@ async function loginCentris(context) {
   }
 
   const finalUrl = page.url();
-  if (!isAuthenticatedCentrisUrl(finalUrl)) {
+  const finalPasswordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+  const finalText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+  if (!isAuthenticatedMatrixPage(finalUrl, finalPasswordVisible, finalText)) {
     throw new Error(`Login Centris échoué — URL finale: ${finalUrl.substring(0, 200)}`);
   }
 
@@ -1722,10 +1798,12 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
   initDirs();
 
   let browser = null;
+  let context = null;
+  const operationStartedAt = Date.now();
   try {
     browser = await launchBrowser();
 
-    const context = await newStealthContext(browser);
+    context = await newStealthContext(browser);
     const page = await loginCentris(context);
     const exactNum = String(centrisNum || '').replace(/\D/g, '');
     if (!/^\d{7,9}$/.test(exactNum)) throw new Error('Numéro Centris invalide');
@@ -1769,6 +1847,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     // Séquentiel volontairement: Matrix ouvre les documents depuis la fiche
     // et certains contrôles de session sont propres à l'onglet parent.
     let downloadAbortReason = null;
+    let runningDownloadedBytes = 0;
+    let batchTooLarge = false;
+    const downloadedContentHashes = new Set();
     const downloaded = await mapWithConcurrency(candidates, 1, async (doc, index) => {
       if (downloadAbortReason) {
         return { ok: false, failure: {
@@ -1787,18 +1868,33 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
             break;
           } catch (error) {
             lastError = error;
+            if (!isMatrixDocumentRetryable(error)) break;
             if (attempt < MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS) await page.waitForTimeout(400 * attempt);
           }
         }
         if (!buffer) throw lastError || new Error('MATRIX_DOWNLOAD_FAILED');
-        const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+        const magicIndex = buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-'));
         if (buffer.length < 1000 || magicIndex === -1) {
           const signature = buffer.subarray(0, 16).toString('hex');
           throw new Error(`réponse non-PDF (bytes=${buffer.length}, signature=${signature || 'vide'})`);
         }
-        if (magicIndex > 0) buffer = buffer.subarray(magicIndex);
+        const validatedPdf = await validatePdfBuffer(buffer, { maxBytes: MATRIX_DOCUMENT_FILE_MAX_BYTES, minBytes: 1000 });
+        buffer = validatedPdf.buffer;
+        if (downloadedContentHashes.has(validatedPdf.sha256)) {
+          throw new Error('MATRIX_DOCUMENT_DUPLICATE_CONTENT');
+        }
+        downloadedContentHashes.add(validatedPdf.sha256);
         const parsed = await parsePDFText(buffer);
-        const enriched = addCentrisContentMetadata(doc, buffer, parsed.pages);
+        // Deux parseurs indépendants doivent s'accorder sur un nombre de pages
+        // positif. pdf-lib protège l'enveloppe; pdf-parse alimente l'extraction.
+        if (parsed.pages !== validatedPdf.pageCount) throw new Error('MATRIX_DOCUMENT_PAGE_COUNT_MISMATCH');
+        const enriched = addCentrisContentMetadata(doc, buffer, validatedPdf.pageCount);
+        runningDownloadedBytes += buffer.length;
+        if (runningDownloadedBytes > MATRIX_DOCUMENT_TOTAL_MAX_BYTES) {
+          batchTooLarge = true;
+          downloadAbortReason = 'MATRIX_DOCUMENT_BATCH_TOO_LARGE';
+          throw new Error(downloadAbortReason);
+        }
         const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
         return { ok: true, document: {
           buffer,
@@ -1824,6 +1920,13 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
         console.warn(`[MATRIX-PDF] ${item.failure.label}: ${item.failure.error}`);
       }
     }
+    if (batchTooLarge) {
+      return {
+        success: false, annexes: [], failures,
+        discovered_count: matchedDocs.length, validated_count: 0,
+        message: `Lot Matrix trop volumineux (maximum ${Math.floor(MATRIX_DOCUMENT_TOTAL_MAX_BYTES / 1024 / 1024)} MB). Téléchargement interrompu; aucun envoi effectué.`,
+      };
+    }
     const totalDownloadedBytes = annexes.reduce((total, doc) => total + Number(doc.size || 0), 0);
     if (totalDownloadedBytes > MATRIX_DOCUMENT_TOTAL_MAX_BYTES) {
       return {
@@ -1841,6 +1944,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       message: annexes.length > 0
         ? `${annexes.length}/${matchedDocs.length} annexe(s) Matrix téléchargée(s) et validée(s)`
         : `Aucune annexe PDF validée (${failures.length} échec(s)): ${failures.slice(0, 3).map((item) => item.error).join(' | ')}`,
+      duration_ms: Date.now() - operationStartedAt,
     };
 
   } catch (e) {
@@ -1848,6 +1952,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     if (/login|auth/i.test(e.message)) clearSession();
     return { success: false, annexes: [], message: e.message };
   } finally {
+    // Fermer explicitement le contexte libère pages, réponses et buffers avant
+    // de rendre la session Browserless. browser.close() reste le filet final.
+    if (context) try { await context.close(); } catch {}
     if (browser) try { await browser.close(); } catch {}
   }
 }
@@ -1911,14 +2018,15 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
           const formUrl = new URL(formActionRaw, responseUrl.origin);
           formPath = `${formUrl.hostname}${formUrl.pathname}`;
         } catch {}
-        const visibleText = htmlHead
-          .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-          .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&')
-          .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
-          .replace(/\b\d{6,}\b/g, '[nombre]')
-          .replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 140);
+        // Le corps HTML peut contenir adresse, nom de client ou jetons rendus.
+        // Le diagnostic expose seulement une classe de wrapper, jamais son texte.
+        const wrapperKind = /mot de passe|password|connectez-vous|sign[ -]?in/i.test(htmlHead)
+          ? 'auth'
+          : /__viewstate|__doPostBack/i.test(htmlHead)
+            ? 'postback'
+            : /<html|<!doctype/i.test(htmlHead)
+              ? 'html'
+              : 'non-pdf';
         const status = typeof response.status === 'function' ? response.status() : 'inconnu';
         // Ne jamais journaliser la query media.ashx: elle contient des
         // identifiants propres à la session. Hôte + chemin + titre suffisent.
@@ -1930,7 +2038,7 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
           `signature=${buffer.subarray(0, 16).toString('hex') || 'vide'}`,
           title ? `title=${title}` : null,
           formPath ? `form=${formPath}` : null,
-          visibleText ? `texte=${visibleText}` : null,
+          `wrapper=${wrapperKind}`,
         ].filter(Boolean).join(',');
       } catch (error) {
         lastDiagnostic = safeErrorMessage(error).substring(0, 100);
@@ -2050,11 +2158,16 @@ async function downloadMatrixPdfAuthenticated(context, url, referer, openerPage 
     }
     return buffer;
   } catch (error) {
+    // Une URL rejetée ou un fichier annoncé trop volumineux ne deviendra pas
+    // valide en ouvrant un nouvel onglet. Éviter ce fallback coûteux et sa
+    // seconde allocation mémoire.
+    if (!isMatrixDocumentRetryable(error)) throw error;
     requestError = safeErrorMessage(error).substring(0, 100);
   }
   try {
     return await downloadMatrixPdfInBrowser(context, target.href, referer, openerPage);
   } catch (browserError) {
+    if (!isMatrixDocumentRetryable(browserError)) throw browserError;
     throw new Error(`MATRIX_DOWNLOAD_FAILED:request=${requestError};browser=${safeErrorMessage(browserError).substring(0, 100)}`);
   }
 }
@@ -3348,9 +3461,12 @@ module.exports = {
   _newStealthContext: newStealthContext,
   _browserlessEndpointWithTimeout: browserlessEndpointWithTimeout,
   _isAuthenticatedCentrisUrl: isAuthenticatedCentrisUrl,
+  _isAuthenticatedMatrixPage: isAuthenticatedMatrixPage,
   _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
   _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
   _buildCentrisDocumentInventory: buildCentrisDocumentInventory,
+  _dedupeCentrisDiscoveredDocs: dedupeCentrisDiscoveredDocs,
+  _mergeMatrixDocumentSnapshots: mergeMatrixDocumentSnapshots,
   _buildCentrisContentManifest: buildCentrisContentManifest,
   _addCentrisContentMetadata: addCentrisContentMetadata,
   _parseCentrisDisplaySize: parseCentrisDisplaySize,
@@ -3358,10 +3474,12 @@ module.exports = {
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _matrixTextContainsExactNumber: matrixTextContainsExactNumber,
+  _scoreMatrixSearchCandidate: scoreMatrixSearchCandidate,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
   _downloadMatrixPdfAuthenticated: downloadMatrixPdfAuthenticated,
   _downloadMatrixPdfByAction: downloadMatrixPdfByAction,
+  _isMatrixDocumentRetryable: isMatrixDocumentRetryable,
   _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,

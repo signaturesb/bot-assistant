@@ -51,8 +51,14 @@ runScript('Workflow/backups audit', path.join(__dirname, 'scripts/audit-runtime-
 
 // 2. Firecrawl tests
 runScript('Firecrawl tests', path.join(__dirname, 'test_firecrawl.js'));
+runScript('Matrix exact search', path.join(__dirname, 'test_matrix_exact_search.js'));
+runScript('Matrix authentication', path.join(__dirname, 'test_centris_playwright_auth.js'));
+runScript('Matrix document inventory', path.join(__dirname, 'test_centris_document_inventory.js'));
 runScript('Matrix authenticated browser download', path.join(__dirname, 'test_matrix_browser_download.js'));
+runScript('Matrix PDF structural validation', path.join(__dirname, 'test_pdf_validation.js'));
 runScript('Matrix email preview guard', path.join(__dirname, 'test_matrix_email_preview_guard.js'));
+runScript('Email provider delivery receipt', path.join(__dirname, 'test_email_delivery_receipt.js'));
+runScript('Matrix email MIME', path.join(__dirname, 'test_matrix_email_mime.js'));
 runScript('Tool batch write serialization', path.join(__dirname, 'test_tool_batch.js'));
 
 // 3. Plan quotas inline test
