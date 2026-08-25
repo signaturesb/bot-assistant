@@ -214,12 +214,24 @@ assert.strictEqual(cua._classifyZonePageSnapshot({
 assert.strictEqual(cua._classifyMatrixPageSnapshot({
   url: 'https://matrix.centris.ca/Matrix/Results.aspx',
   text: 'No Centris 28936167 (En vigueur) Document(s) additionnel(s)',
+  detailEvidence: true,
+  docs: [{ name: 'Plan' }],
   mediaLinkCount: 8,
   passwordInputs: 0,
 }, '28936167').code, 'MATRIX_DOCUMENTS_READY');
 assert.strictEqual(cua._classifyMatrixPageSnapshot({
   url: 'https://matrix.centris.ca/Matrix/Results.aspx',
+  text: 'No Centris 28936167 (En vigueur) Consultez le guide',
+  detailEvidence: false,
+  docs: [{ name: 'Consultez le guide' }],
+  mediaLinkCount: 1,
+  passwordInputs: 0,
+}, '28936167').code, 'MATRIX_NAVIGATION_UNVERIFIED', 'une page de résultats avec un lien média générique doit encore ouvrir la fiche exacte');
+assert.strictEqual(cua._classifyMatrixPageSnapshot({
+  url: 'https://matrix.centris.ca/Matrix/Results.aspx',
   text: 'No Centris 28939185 (En vigueur) Document(s) additionnel(s)',
+  detailEvidence: true,
+  docs: [{ name: 'Plan' }],
   mediaLinkCount: 8,
   passwordInputs: 0,
 }, '28936167').code, 'MATRIX_NAVIGATION_UNVERIFIED');
