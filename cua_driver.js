@@ -2505,6 +2505,13 @@ async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = 
       if (await direct.isVisible().catch(() => false)) { control = direct; break; }
     }
     if (label) {
+      if (typeof frame.getByText === 'function') {
+        const exactText = frame.getByText(label, { exact: true }).first();
+        if (await exactText.isVisible().catch(() => false)) {
+          control = exactText;
+          break;
+        }
+      }
       const candidates = frame.locator('a,button,[role="link"]');
       const count = Math.min(await candidates.count().catch(() => 0), 400);
       for (let index = 0; index < count; index += 1) {

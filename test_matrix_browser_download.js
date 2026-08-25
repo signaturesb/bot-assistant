@@ -192,7 +192,10 @@ const context = {
       });
     },
   };
-  const labelPage = { frames: () => [{ locator: () => ({ count: async () => 1, nth: () => labelControl }) }] };
+  const labelPage = { frames: () => [{
+    getByText: () => ({ first: () => labelControl }),
+    locator: () => ({ count: async () => 0, nth: () => labelControl }),
+  }] };
   assert.deepStrictEqual(
     await cua._downloadMatrixPdfByAction(labelContext, labelPage, null, 'DV-50037'),
     pdf,
