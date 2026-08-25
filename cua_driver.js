@@ -545,6 +545,18 @@ function classifyMatrixPageSnapshot(snapshot = {}, centrisNum = '') {
 }
 
 async function findMatrixGlobalSearch(page) {
+  const selectors = [
+    '#QueryText',
+    'input[id*="QueryText" i]',
+    'input[name*="QueryText" i]',
+    'input[id*="Search" i]',
+    'input[name*="Search" i]',
+    'input[type="search"]',
+    'input[placeholder*="recherch" i]',
+    'input[placeholder*="centris" i]',
+    'input[placeholder*="mls" i]',
+  ];
+
   // Matrix est une application ASP.NET dont l'identifiant du champ global
   // peut varier entre les déploiements. Chercher d'abord les attributs
   // sémantiques, puis choisir le grand champ éditable placé dans l'en-tête.
@@ -552,6 +564,28 @@ async function findMatrixGlobalSearch(page) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     for (const frame of page.frames()) {
+      // Ne pas limiter ce chemin aux 50 premiers champs: la page Recherche
+      // Matrix contient beaucoup de critères et la barre globale peut être
+      // rendue plus loin dans le DOM. Les sélecteurs ciblés ont déjà prouvé
+      // leur fonctionnement sur l'interface réelle.
+      for (const selector of selectors) {
+        const candidates = frame.locator(selector);
+        const selectorCount = Math.min(await candidates.count().catch(() => 0), 20);
+        for (let index = 0; index < selectorCount; index += 1) {
+          const candidate = candidates.nth(index);
+          if (!(await candidate.isVisible().catch(() => false)) ||
+              !(await candidate.isEnabled().catch(() => false)) ||
+              !(await candidate.isEditable().catch(() => false))) continue;
+          const box = await candidate.boundingBox().catch(() => null);
+          if (!box || box.width < 240 || box.height < 18) continue;
+          const meta = await candidate.evaluate((el) => [
+            el.id, el.getAttribute('name'), el.getAttribute('placeholder'),
+            el.getAttribute('aria-label'), el.getAttribute('class'), el.getAttribute('type'),
+          ].filter(Boolean).join(' ')).catch(() => '');
+          if (scoreMatrixSearchCandidate(meta, box) >= 100) return candidate;
+        }
+      }
+
       const inputs = frame.locator('input:not([type]), input[type="text"], input[type="search"]');
       const count = Math.min(await inputs.count().catch(() => 0), 50);
       let best = null;
