@@ -5,9 +5,22 @@
 
 'use strict';
 
-const { parseLeadEmail, isJunkLeadEmail, detectLeadSource } = require('./lead_parser');
+const { parseLeadEmail, isJunkLeadEmail, detectLeadSource, isLikelyPropertyAddress } = require('./lead_parser');
 
 const samples = [
+  {
+    name: 'Lead direct — disclaimer destinataire ne devient jamais une adresse',
+    subject: `Demande directe`,
+    from: 'Sara Faucher-Virumbrales <sarafavi1985@gmail.com>',
+    body: `Bonjour, ceci est une demande adressée à Shawn Barrette. Si vous n'êtes pas le destinataire, veuillez supprimer ce courriel.`,
+    expect: {
+      email: 'sarafavi1985@gmail.com',
+      adresse: '',
+      centris: '',
+    },
+    junk: false,
+    source: 'direct',
+  },
   {
     name: 'Centris contact form — format officiel',
     subject: `Centris.ca - Demande d'information pour le Rue de Rawdon Park, Rawdon (# 28939185)`,
@@ -183,6 +196,10 @@ function runTests() {
   let passed = 0;
   let failed = 0;
   const fails = [];
+
+  // Garde-fou utilisé avant toute recherche Dropbox par adresse.
+  if (!isLikelyPropertyAddress('123 rue Principale, Rawdon')) fails.push({ name: 'Adresse civique valide', errors: ['rejetée'] });
+  if (isLikelyPropertyAddress(`à Shawn Barrette. Si vous n'êtes pas le destinataire`)) fails.push({ name: 'Disclaimer faux positif', errors: ['accepté'] });
 
   console.log(`\n🧪 Test suite parser — ${samples.length} cas\n`);
 
