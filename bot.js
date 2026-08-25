@@ -546,7 +546,18 @@ function prepareScheduledPipedriveAction(name, input, userMessage, chatId) {
 try {
   if (fs.existsSync(PENDING_DOCS_FILE)) {
     const arr = JSON.parse(fs.readFileSync(PENDING_DOCS_FILE, 'utf8')) || [];
-    for (const [k, v] of arr) pendingDocSends.set(k, v);
+    for (const [k, v] of arr) {
+      // Migration fail-closed: les anciens pendings sans identité prouvée sont
+      // supprimés. Une correspondance exacte du Centris reste récupérable.
+      const exactCentris = v?.centris && v?.match?.folder?.centris &&
+        String(v.centris).trim() === String(v.match.folder.centris).trim();
+      const completeClient = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v?.email || '')) &&
+        /^\d{10}$/.test(String(v?.telephone || '').replace(/\D/g, '').replace(/^1/, ''));
+      if (completeClient && (v?.match?.identityVerified === true || exactCentris)) {
+        if (v?.match) v.match.identityVerified = true;
+        pendingDocSends.set(k, v);
+      }
+    }
   }
 } catch { /* silent: bad json → start fresh */ }
 {
@@ -4025,6 +4036,15 @@ function _addrTokens(s) {
   return { numero, mots: new Set(mots), raw: n };
 }
 
+// Seul un numéro Centris exact autorise la préparation automatique de docs.
+// Les adresses, recherches live, noms de fichiers et scores fuzzy ne sont que
+// des pistes de vérification et ne doivent jamais devenir « prêts à envoyer ».
+function isDropboxIdentityVerified(match, centris) {
+  const requested = String(centris || '').trim();
+  const folderCentris = String(match?.folder?.centris || '').trim();
+  return /^\d{7,9}$/.test(requested) && requested === folderCentris;
+}
+
 // FALLBACK TEMPS RÉEL — Dropbox search_v2 API quand l'index ne trouve pas.
 // Cherche Centris# ou adresse dans TOUT Dropbox (pas juste les paths indexés)
 // et retourne le dossier parent du premier match. Utile si terrain ajouté après
@@ -4075,9 +4095,12 @@ async function dropboxLiveSearch(query) {
 }
 
 async function matchDropboxAvance(centris, adresse) {
+  // Ne jamais envoyer une phrase libre à Dropbox comme si c'était une adresse.
+  // C'est précisément ce qui a transformé « à Shawn Barrette... » en faux match.
+  const safeAdresse = leadParser.isLikelyPropertyAddress(adresse) ? adresse : '';
   // FAST PATH 1 — index précalculé (O(1) par Centris#)
   if (dropboxIndex.folders?.length) {
-    const fast = fastDropboxMatch({ centris, adresse, rue: adresse });
+    const fast = fastDropboxMatch({ centris, adresse: safeAdresse, rue: safeAdresse });
     if (fast) {
       const indexedFiles = (fast.folder.files || [])
         .filter(x => DOC_EXTS.includes(x.ext))
@@ -4099,8 +4122,8 @@ async function matchDropboxAvance(centris, adresse) {
       return { ...liveRes, candidates: [{ folder: liveRes.folder, score: liveRes.score }], sources: [liveRes.folder.source] };
     }
   }
-  if (adresse && adresse.length >= 5) {
-    const liveRes = await dropboxLiveSearch(adresse);
+  if (safeAdresse) {
+    const liveRes = await dropboxLiveSearch(safeAdresse);
     if (liveRes?.folder && liveRes.pdfs?.length) {
       return { ...liveRes, candidates: [{ folder: liveRes.folder, score: Math.max(70, liveRes.score - 10) }], sources: [liveRes.folder.source] };
     }
@@ -4121,8 +4144,8 @@ async function matchDropboxAvance(centris, adresse) {
 
   // STRATÉGIE 2 — Fuzzy adresse normalisée (score 0-95)
   const scored = [];
-  if (adresse) {
-    const q = _addrTokens(adresse);
+  if (safeAdresse) {
+    const q = _addrTokens(safeAdresse);
     for (const d of dossiers) {
       const t = _addrTokens(d.adresse || d.name);
       let score = 0;
@@ -4150,8 +4173,8 @@ async function matchDropboxAvance(centris, adresse) {
   }
 
   // STRATÉGIE 4 — Substring fallback (confidence 50-70)
-  if ((!best || best.score < 50) && adresse) {
-    const q = adresse.toLowerCase().split(/[\s,]+/).filter(w => w.length > 3)[0];
+  if ((!best || best.score < 50) && safeAdresse) {
+    const q = safeAdresse.toLowerCase().split(/[\s,]+/).filter(w => w.length > 3)[0];
     if (q) {
       const hit = dossiers.find(d => (d.name + ' ' + d.adresse).toLowerCase().includes(q));
       if (hit) {
@@ -4267,12 +4290,21 @@ async function convertDocsToPDF(docs, folderLabel) {
 // ═══════════════════════════════════════════════════════════════════════════
 let autoEnvoiState = loadJSON(AUTOENVOI_FILE, { sent: {}, log: [], totalAuto: 0, totalFails: 0 });
 
-async function envoyerDocsAuto({ email, nom, centris, dealId, deal, match, confirmationMessage = '' }) {
+async function envoyerDocsAuto({ email, nom, telephone, centris, dealId, deal, match, confirmationMessage = '' }) {
   // Un click Telegram autorisé est converti en confirmation exacte "envoie".
   // Chaque tentative provider reconstruit puis consomme une autorisation one-shot.
   if (CONSENT_REQUIRED && !CONFIRM_REGEX.test(String(confirmationMessage).trim())) {
     log('WARN', 'AUTOENVOI', `BLOQUÉ — envoi sans consent Shawn pour ${email}`);
     return { sent: false, skipped: true, reason: 'CONSENT_REQUIRED — confirmation Shawn manquante', match };
+  }
+  const clientPhone = String(telephone || '').replace(/\D/g, '').replace(/^1/, '');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '')) || !/^\d{10}$/.test(clientPhone)) {
+    log('WARN', 'AUTOENVOI', `BLOQUÉ — courriel + téléphone client requis pour ${email}`);
+    return { sent: false, skipped: true, reason: 'CLIENT_CONTACT_INCOMPLETE — courriel et téléphone valides requis', match };
+  }
+  if (!match?.identityVerified || !isDropboxIdentityVerified(match, centris)) {
+    log('WARN', 'AUTOENVOI', `BLOQUÉ — identité Dropbox non vérifiée pour ${email}`);
+    return { sent: false, skipped: true, reason: 'DROPBOX_IDENTITY_NOT_VERIFIED — Centris exact requis', match };
   }
   const dedupKey = `${email}|${centris || match?.folder?.centris || ''}`;
   const last = autoEnvoiState.sent[dedupKey];
@@ -17415,7 +17447,10 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   }
 
   if (dbxMatch?.folder) {
-    docsTxt = `📁 Match Dropbox: *${dbxMatch.folder.adresse || dbxMatch.folder.name}* (${dbxMatch.strategy}, score ${dbxMatch.score}, ${dbxMatch.pdfs.length} doc${dbxMatch.pdfs.length > 1 ? 's' : ''})`;
+    const verified = isDropboxIdentityVerified(dbxMatch, centris);
+    docsTxt = verified
+      ? `📁 Match Dropbox vérifié: *${dbxMatch.folder.adresse || dbxMatch.folder.name}* (Centris exact, ${dbxMatch.pdfs.length} doc${dbxMatch.pdfs.length > 1 ? 's' : ''})`
+      : `🔎 Candidat Dropbox non vérifié: *${dbxMatch.folder.adresse || dbxMatch.folder.name}* — aucun document préparé; vérification Centris exacte requise`;
   } else if (dbxMatch?.candidates?.length) {
     docsTxt = `📁 Candidats Dropbox: ${dbxMatch.candidates.map(c => `${c.folder.adresse || c.folder.name} (${c.score})`).join(', ')}`;
   }
@@ -17459,6 +17494,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   if (dbxMatch && /centris_index|live_search_folder_name|filename_centris/i.test(dbxMatch.strategy || '')) {
     dbxMatch.score = Math.max(dbxMatch.score || 0, 95);
   }
+  if (dbxMatch) dbxMatch.identityVerified = isDropboxIdentityVerified(dbxMatch, centris);
 
   // AUDIT TRAIL complet — un event par lead avec tout son parcours pour /lead-audit
   const leadAudit = {
@@ -17514,9 +17550,9 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     }
     leadAudit.decision = 'blocked_suspect_name';
     leadAudit.suspectName = nom;
-    if (email) {
-      pendingDocSends.set(email, { email, nom: '', centris, dealId, deal: dealFullObj, match: dbxMatch });
-      firePreviewDocs({ email, nom: '', centris, deal: dealFullObj, match: dbxMatch });
+    if (email && dbxMatch?.identityVerified) {
+      pendingDocSends.set(email, { email, nom: '', telephone, centris, dealId, deal: dealFullObj, match: dbxMatch });
+      firePreviewDocs({ email, nom: '', telephone, centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Aucun email preview envoyé — validation dans Telegram requise.`;
     return { decision: 'blocked_suspect_name', dealId };
@@ -17529,11 +17565,11 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   const sourceTrusted = /^(centris|remax|realtor|duproprio)$/i.test(source?.source || '');
   const exactMatch = dbxMatch?.score === 100;
   const completeContact = !!(email && (telephone || centris));
-  if (email && hasMatch) {
+  if (email && telephone && hasMatch && dbxMatch.identityVerified) {
     // Mode preview + pending (consent click obligatoire)
     leadAudit.decision = 'pending_no_email_sent';
-    pendingDocSends.set(email, { email, nom, centris, dealId, deal: dealFullObj, match: dbxMatch });
-    firePreviewDocs({ email, nom, centris, deal: dealFullObj, match: dbxMatch });
+    pendingDocSends.set(email, { email, nom, telephone, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    firePreviewDocs({ email, nom, telephone, centris, deal: dealFullObj, match: dbxMatch });
     // Explique POURQUOI ce n'est pas auto-safe (transparence pour Shawn)
     const reasons = [];
     if (!exactMatch) reasons.push(`match ${dbxMatch.score}/100 (pas exact)`);
@@ -17549,9 +17585,10 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
                    `   ${dbxMatch.pdfs.length} docs:\n${docsList}\n` +
                    `   🔒 Preview email désactivé — aucun email envoyé\n` +
                    `   ✅ Click le bouton ci-dessous OU dis \`envoie les docs à ${email}\``;
-  } else if (email && dbxMatch?.candidates?.length) {
-    leadAudit.decision = 'multiple_candidates';
-    autoEnvoiMsg = `\n🔍 Plusieurs candidats Dropbox — check lequel est le bon avant d'envoyer`;
+  } else if (email && (dbxMatch?.folder || dbxMatch?.candidates?.length)) {
+    leadAudit.decision = 'unverified_dropbox_candidate';
+    const missingContact = !telephone ? ' Le numéro de téléphone du client est absent.' : '';
+    autoEnvoiMsg = `\n🔒 *Documents bloqués* — courriel + téléphone client + numéro Centris exact sont obligatoires.${missingContact} Aucun fichier listé, aucun bouton d'envoi, aucune préparation.`;
   } else if (dealId && email) {
     // Aucun match Dropbox du tout mais deal créé — alerte pour visibilité
     leadAudit.decision = 'no_dropbox_match';
