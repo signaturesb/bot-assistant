@@ -37,17 +37,30 @@ const context = {
 
   const popupContext = new EventEmitter();
   let popupClosed = false;
+  let trustedAnchorClicked = false;
   const popup = { async close() { popupClosed = true; } };
   const opener = {
-    async waitForEvent(event) { assert.strictEqual(event, 'popup'); return popup; },
-    async evaluate(_fn, href) {
-      assert.match(href, /^https:\/\/mediaserver\.centris\.ca\//);
-      popupContext.emit('response', {
-        url: () => href,
-        headers: () => ({ 'content-type': 'application/pdf' }),
-        body: async () => pdf,
-      });
+    url: () => navigation.options.referer,
+    locator(selector) {
+      assert.match(selector, /media\.ashx/);
+      return {
+        count: async () => 1,
+        nth() {
+          return {
+            getAttribute: async () => 'https://mediaserver.centris.ca/media.ashx?id=popup',
+            async click() {
+              trustedAnchorClicked = true;
+              popupContext.emit('response', {
+                url: () => 'https://mediaserver.centris.ca/media.ashx?id=popup',
+                headers: () => ({ 'content-type': 'application/pdf' }),
+                body: async () => pdf,
+              });
+            },
+          };
+        },
+      };
     },
+    async waitForEvent(event) { assert.strictEqual(event, 'popup'); return popup; },
   };
   const popupResult = await cua._downloadMatrixPdfInBrowser(
     popupContext,
@@ -56,6 +69,7 @@ const context = {
     opener,
   );
   assert.deepStrictEqual(popupResult, pdf);
+  assert.strictEqual(trustedAnchorClicked, true, 'le vrai lien Matrix doit être cliqué');
   assert.strictEqual(popupClosed, true, 'le popup Matrix doit être fermé');
   const oversizedContext = {
     async newPage() {
