@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const { EventEmitter } = require('events');
 const cua = require('./cua_driver');
 
 const pdf = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(1500, 1)]);
@@ -33,6 +34,29 @@ const context = {
   assert.strictEqual(navigation.options.referer, 'https://matrix.centris.ca/Matrix/Results.aspx?c=xyz');
   assert.strictEqual(navigation.options.waitUntil, 'commit');
   assert.strictEqual(closed, true);
+
+  const popupContext = new EventEmitter();
+  let popupClosed = false;
+  const popup = { async close() { popupClosed = true; } };
+  const opener = {
+    async waitForEvent(event) { assert.strictEqual(event, 'popup'); return popup; },
+    async evaluate(_fn, href) {
+      assert.match(href, /^https:\/\/mediaserver\.centris\.ca\//);
+      popupContext.emit('response', {
+        url: () => href,
+        headers: () => ({ 'content-type': 'application/pdf' }),
+        body: async () => pdf,
+      });
+    },
+  };
+  const popupResult = await cua._downloadMatrixPdfInBrowser(
+    popupContext,
+    'https://mediaserver.centris.ca/media.ashx?id=popup',
+    navigation.options.referer,
+    opener,
+  );
+  assert.deepStrictEqual(popupResult, pdf);
+  assert.strictEqual(popupClosed, true, 'le popup Matrix doit être fermé');
   const oversizedContext = {
     async newPage() {
       return {

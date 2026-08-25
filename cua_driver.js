@@ -1715,9 +1715,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     // elles partagent les cookies. Ouvrir le lien comme un vrai onglet Matrix
     // conserve la navigation authentifiée utilisée par un clic manuel.
     const candidates = selectedDocs.slice(0, 20);
-    const downloaded = await mapWithConcurrency(candidates, 4, async (doc, index) => {
+    // Séquentiel volontairement: Matrix ouvre les documents depuis la fiche
+    // et certains contrôles de session sont propres à l'onglet parent.
+    const downloaded = await mapWithConcurrency(candidates, 1, async (doc, index) => {
       try {
-        let buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url);
+        let buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url, page);
         const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
         if (buffer.length < 1000 || magicIndex === -1) {
           const signature = buffer.subarray(0, 16).toString('hex');
@@ -1788,10 +1790,68 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-async function downloadMatrixPdfInBrowser(context, url, referer) {
+async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
+  let lastDiagnostic = 'aucune réponse candidate';
+  let settled = false;
+  let timer;
+  let handler;
+  const result = new Promise((resolve, reject) => {
+    const finish = (error, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      context.off?.('response', handler);
+      if (error) reject(error); else resolve(buffer);
+    };
+    handler = async (response) => {
+      try {
+        const responseUrl = new URL(response.url());
+        if (!/(^|\.)centris\.ca$/i.test(responseUrl.hostname)) return;
+        const contentType = String(response.headers()['content-type'] || '').toLowerCase();
+        if (!contentType.includes('pdf') && !/media\.ashx/i.test(responseUrl.pathname)) return;
+        const buffer = await response.body();
+        const magicIndex = buffer.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+        if (buffer.length >= 1000 && magicIndex >= 0) {
+          finish(null, magicIndex ? buffer.subarray(magicIndex) : buffer);
+          return;
+        }
+        lastDiagnostic = `bytes=${buffer.length}, signature=${buffer.subarray(0, 16).toString('hex') || 'vide'}`;
+      } catch (error) {
+        lastDiagnostic = safeErrorMessage(error).substring(0, 100);
+      }
+    };
+    context.on('response', handler);
+    timer = setTimeout(() => finish(new Error(`MATRIX_DOCUMENT_PDF_TIMEOUT:${lastDiagnostic}`)), timeoutMs);
+  });
+  try {
+    await trigger();
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      clearTimeout(timer);
+      context.off?.('response', handler);
+    }
+    throw error;
+  }
+  return result;
+}
+
+async function downloadMatrixPdfInBrowser(context, url, referer, openerPage = null) {
   const target = new URL(String(url));
   if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname)) {
     throw new Error('MATRIX_DOCUMENT_URL_REJECTED');
+  }
+  if (openerPage) {
+    let popup = null;
+    try {
+      const popupPromise = openerPage.waitForEvent('popup', { timeout: 10000 }).catch(() => null);
+      const bufferPromise = waitForMatrixPdfResponse(context, () =>
+        openerPage.evaluate((href) => { window.open(href, '_blank'); }, target.href), 30000);
+      popup = await popupPromise;
+      return await bufferPromise;
+    } finally {
+      await popup?.close().catch(() => {});
+    }
   }
   const tab = await context.newPage();
   try {
@@ -3112,6 +3172,7 @@ module.exports = {
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
+  _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
