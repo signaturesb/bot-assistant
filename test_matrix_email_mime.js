@@ -23,5 +23,11 @@ assert.match(handler, /const cc = emailDestination\.toLowerCase\(\) === AGENT\.e
   'Shawn doit être en Cc visible pour un client externe');
 assert.match(handler, /attachments: documents\.map/,
   'le manifeste d’autorisation doit contenir toutes les pièces jointes');
+assert.match(handler, /const clientInstruction = String\(messagePerso/,
+  'les informations données après le numéro doivent devenir le message client');
+assert.match(handler, /escapeHtml\(introText\)/,
+  'le message personnalisé doit être échappé dans le template HTML');
+assert.match(code, /UN SEUL courriel avec le modèle officiel SignatureSB/,
+  'le routage doit demander un seul courriel contenant tous les PDF');
 
 console.log('✅ Courriel Matrix: template obligatoire, MIME texte+HTML, UTF-8, Cc et limite Gmail');

@@ -7341,7 +7341,7 @@ const TOOLS = [
   { name: 'verifier_listing_centris', description: 'ÉTAPE OBLIGATOIRE, PREVIEW SANS ENVOI — recherche le numéro exact dans la barre globale Matrix, y compris les inscriptions d’autres courtiers, ouvre la fiche et inventorie la DV principale ainsi que tous les Document(s) additionnel(s). Produit une empreinte. ZÉRO email et ZÉRO téléchargement.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris exact (7-9 chiffres)' } }, required: ['centris_num'] } },
   { name: 'telecharger_docs_centris_complet', description: 'TOUT-EN-UN: envoie au client la fiche Centris officielle (PDF portail courtier) + TOUS les docs Dropbox matchant (match auto par Centris#). Cas d\'usage: "Envoie tout ce qui est dispo sur #12345678 à client@email.com". Toi en Cc auto sur les 2 envois. Le client reçoit 2 emails (1 avec fiche, 1 avec docs Dropbox).', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris (7-9 chiffres)' }, email_destination: { type: 'string', description: 'Email du client' }, cc: { type: 'string', description: 'OPTIONNEL — CCs additionnels' }, message_perso: { type: 'string', description: 'OPTIONNEL — message dans email fiche' } }, required: ['centris_num', 'email_destination'] } },
   { name: 'analyser_zonage_adresse', description: 'Trouve et envoie la grille de zonage PDF officielle pour une adresse Lanaudière. Scrape page urbanisme municipal → trouve liens PDF zonage → télécharge → envoie dans Telegram comme document. Optionnellement forward au client par email avec Cc Shawn. Cas d\'usage: "Marges de construction au 123 Ch. Lac Gratten Rawdon" ou "Grille zonage 456 Rue Sarine Sainte-Julienne, envoie à client@email.com".', input_schema: { type: 'object', properties: { adresse: { type: 'string', description: 'Adresse complète avec ville (ex: "123 Chemin Lac Gratten, Rawdon")' }, forward_email: { type: 'string', description: 'OPTIONNEL — email client si demande explicite forward (Shawn dit "envoie à X")' } }, required: ['adresse'] } },
-  { name: 'telecharger_annexes_centris', description: 'Récupère les PDF par le chemin déterministe Matrix global: barre blanche → numéro exact → fiche → Document(s) additionnel(s). Fonctionne pour les inscriptions de Shawn et des autres courtiers. Valide chaque PDF (signature, pages, SHA-256). Cas d’usage: DV, certificat, plans ou toutes les annexes.', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS exact (7-9 chiffres)' }, email_destination: { type: 'string', description: 'OPTIONNEL — email client, soumis à confirmation one-shot; sans email les PDF vont seulement à Shawn dans Telegram.' }, filtre: { type: 'string', description: 'OPTIONNEL — filtre exact par mots du libellé (DV, localisation, plan, etc.). Vide = toutes.' } }, required: ['centris_num'] } },
+  { name: 'telecharger_annexes_centris', description: 'Récupère TOUS les PDF par le chemin Matrix global, puis les regroupe dans UN SEUL courriel avec le modèle officiel SignatureSB. Toute information donnée après le numéro doit aller dans message_perso et ne doit jamais être tapée dans Matrix. Produit toujours un aperçu Telegram avant la confirmation exacte « envoie ».', input_schema: { type: 'object', properties: { centris_num: { type: 'string', description: 'Numéro Centris/MLS exact (7-9 chiffres)' }, email_destination: { type: 'string', description: 'OPTIONNEL — email client; sans email les PDF vont seulement à Shawn dans Telegram.' }, filtre: { type: 'string', description: 'OPTIONNEL — seulement si Shawn demande explicitement certains documents. Vide = TOUS les PDF.' }, message_perso: { type: 'string', description: 'OPTIONNEL — informations ou message donnés après le numéro; intégrer au corps du courriel dans le template SignatureSB, jamais dans Matrix.' } }, required: ['centris_num'] } },
 ];
 
 // Cache les tools (statiques) — Anthropic prompt caching sur le dernier tool
@@ -7406,7 +7406,7 @@ function externalEmailActionSummary(name, input = {}) {
   return { to, label: labels[name] || name };
 }
 
-async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId, userMessage }) {
+async function executeMatrixAnnexesTool({ num, emailDestination, filtre, messagePerso, chatId, userMessage }) {
   const cuaMod = getCUA();
   if (!cuaMod || !cuaMod.CUA_AVAILABLE() || !cuaMod.cuaGetCentrisAnnexes) {
     return `❌ Matrix/Playwright indisponible — aucune annexe récupérée et aucun envoi effectué.`;
@@ -7414,6 +7414,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
 
   const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
   const normalizedFilter = String(filtre || '');
+  const clientInstruction = String(messagePerso || '').replace(/[\r\0]+/g, ' ').trim().substring(0, 2000);
   const cachedArtifact = pendingMatrixArtifacts.get(chatId);
   let result;
   if (isSendConfirmation) {
@@ -7494,8 +7495,9 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   const mimeHeader = (value) => String(value ?? '').replace(/[\r\n\0]+/g, ' ').trim();
   const subject = mimeHeader(`Documents Centris #${num}${filtre ? ` — ${filtre}` : ''}`);
   const cc = emailDestination.toLowerCase() === AGENT.email.toLowerCase() ? [] : [AGENT.email];
-  const bodyText = `Bonjour,\n\nVoici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.\n\n${documents.map((doc) => `• ${doc.label}`).join('\n')}\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.telephone}`;
-  const contentHtml = `<p style="color:#cccccc;font-size:14px;line-height:1.7;">Voici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;">${documents.map((doc) => `<div style="color:#f5f5f7;margin:6px 0;">📎 ${escapeHtml(doc.label)} <span style="color:#888;">(${Math.round(doc.size / 1024)} KB)</span></div>`).join('')}</div>`;
+  const introText = clientInstruction || `Voici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.`;
+  const bodyText = `Bonjour,\n\n${introText}\n\n${documents.map((doc) => `• ${doc.label}`).join('\n')}\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.telephone}`;
+  const contentHtml = `<p style="color:#cccccc;font-size:14px;line-height:1.7;">${escapeHtml(introText).replace(/\n/g, '<br>')}</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;">${documents.map((doc) => `<div style="color:#f5f5f7;margin:6px 0;">📎 ${escapeHtml(doc.label)} <span style="color:#888;">(${Math.round(doc.size / 1024)} KB)</span></div>`).join('')}</div>`;
   let html = await buildEmailFromMasterTpl({
     TITRE_EMAIL: `Documents Centris #${num}`,
     LABEL_SECTION: 'Documents officiels',
@@ -7584,7 +7586,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     }
     const pendingMatrixPreview = {
       name: 'telecharger_annexes_centris',
-      input: { centris_num: num, email_destination: emailDestination, filtre: filtre || '' },
+      input: { centris_num: num, email_destination: emailDestination, filtre: filtre || '', message_perso: clientInstruction },
       createdAt: Date.now(),
       inFlight: false,
       matrixFingerprint: payloadFingerprint,
@@ -8283,7 +8285,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
       }
 
       case 'telecharger_annexes_centris': {
-        const { centris_num, email_destination, filtre } = input || {};
+        const { centris_num, email_destination, filtre, message_perso } = input || {};
         const num = String(centris_num || '').replace(/\D/g, '').trim();
         if (!num || num.length < 7) return `❌ Numéro Centris invalide`;
         if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) return `❌ CENTRIS_USER/PASS absents`;
@@ -8295,6 +8297,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
           num,
           emailDestination: email_destination,
           filtre,
+          messagePerso: message_perso,
           chatId,
           userMessage,
         });
