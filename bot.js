@@ -7509,7 +7509,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     result = { success: true, annexes: cachedArtifact.documents, failures: [] };
   } else {
     log('INFO', 'CENTRIS-MATRIX-ANNEXES', `Recherche globale exacte #${num}${filtre ? ` · filtre=${filtre}` : ''}`);
-    result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null);
+    // Une demande humaine peut arriver pendant le smoke de démarrage. Elle
+    // attend le verrou un maximum de 90 s, mais deux sessions Matrix ne sont
+    // jamais lancées en parallèle et aucune relance fournisseur n'est faite.
+    result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null, { waitForLockMs: 90000 });
   }
   if (!result?.success || !Array.isArray(result.annexes) || result.annexes.length === 0) {
     return `❌ Annexes Matrix #${num} non récupérées: ${String(result?.message || 'aucun PDF validé').substring(0, 220)}\nAucun email envoyé. Aucun numéro substitut n'a été utilisé.`;
