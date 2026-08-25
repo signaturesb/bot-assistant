@@ -1709,21 +1709,20 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       label: doc.name,
       error: 'lien de téléchargement Matrix non résolu',
     }));
-    for (const [index, doc] of selectedDocs.slice(0, 20).entries()) {
+    // mediaserver.centris.ca refuse parfois les requêtes API directes même si
+    // elles partagent les cookies. Ouvrir le lien comme un vrai onglet Matrix
+    // conserve la navigation authentifiée utilisée par un clic manuel.
+    const candidates = selectedDocs.slice(0, 20);
+    const downloaded = await mapWithConcurrency(candidates, 4, async (doc, index) => {
       try {
-        const response = await context.request.get(doc.url, {
-          headers: { Referer: state.url, Accept: 'application/pdf,*/*' },
-          timeout: 45000,
-        });
-        if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
-        const buffer = await response.body();
+        const buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url);
         if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
           throw new Error('réponse non-PDF');
         }
         const parsed = await parsePDFText(buffer);
         const enriched = addCentrisContentMetadata(doc, buffer, parsed.pages);
         const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
-        annexes.push({
+        return { ok: true, document: {
           buffer,
           filename: `${safeBase}_${exactNum}.pdf`,
           label: doc.name,
@@ -1731,10 +1730,14 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           page_count: enriched.page_count,
           sha256: enriched.sha256,
           source: 'matrix-global',
-        });
+        } };
       } catch (error) {
-        failures.push({ label: doc.name, error: safeErrorMessage(error).substring(0, 120) });
+        return { ok: false, failure: { label: doc.name, error: safeErrorMessage(error).substring(0, 120) } };
       }
+    });
+    for (const item of downloaded) {
+      if (item.ok) annexes.push(item.document);
+      else failures.push(item.failure);
     }
     return {
       success: annexes.length > 0,
@@ -1753,6 +1756,40 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     return { success: false, annexes: [], message: e.message };
   } finally {
     if (browser) try { await browser.close(); } catch {}
+  }
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+async function downloadMatrixPdfInBrowser(context, url, referer) {
+  const target = new URL(String(url));
+  if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname)) {
+    throw new Error('MATRIX_DOCUMENT_URL_REJECTED');
+  }
+  const tab = await context.newPage();
+  try {
+    const response = await tab.goto(target.href, { referer, waitUntil: 'commit', timeout: 30000 });
+    if (!response) throw new Error('MATRIX_DOCUMENT_NO_RESPONSE');
+    if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
+    const contentType = String(response.headers()['content-type'] || '').toLowerCase();
+    const buffer = await response.body();
+    if (!contentType.includes('pdf') && buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+      throw new Error(`MATRIX_DOCUMENT_NOT_PDF:${contentType || 'unknown'}`);
+    }
+    return buffer;
+  } finally {
+    await tab.close().catch(() => {});
   }
 }
 
@@ -3054,6 +3091,8 @@ module.exports = {
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
+  _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
+  _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
   ingestManualMFACode,
