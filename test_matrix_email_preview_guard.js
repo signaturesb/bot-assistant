@@ -29,6 +29,10 @@ assert.match(handler, /renderedHtmlSha256/);
 assert.match(code, /const pendingMatrixArtifacts = new Map\(\)/);
 assert.match(handler, /les PDF figés de l’aperçu Matrix/);
 assert.match(handler, /pendingMatrixArtifacts\.set\(chatId/);
+assert.match(handler, /listing: result\.listing \|\| null/,
+  'l’adresse Matrix doit être figée avec les PDF du preview');
+assert.match(handler, /listing: cachedArtifact\.listing \|\| null/,
+  'la confirmation doit réutiliser la même adresse sans nouvelle recherche');
 assert.match(handler, /pendingMatrixArtifacts\.delete\(chatId\)/);
 assert.match(handler, /gmailProviderReceipt\?\.id/);
 assert.match(handler, /Preuve Gmail:/);
