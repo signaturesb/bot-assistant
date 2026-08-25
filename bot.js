@@ -371,6 +371,9 @@ const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
 const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
 const pendingExternalEmailActions = new Map(); // chatId → { name, input, createdAt, inFlight }
+// PDF Matrix figés entre l'aperçu et la confirmation. Mémoire seulement:
+// jamais écrits sur disque, supprimés après 15 minutes ou après l'envoi.
+const pendingMatrixArtifacts = new Map();
 const pendingPipedriveActivityActions = new Map(); // chatId → aperçu figé + confirmation one-shot
 let pendingEmailDraftQueue = []; // brouillons additionnels, jamais écrasés
 let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match, _firstSeen }
@@ -7409,8 +7412,21 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     return `❌ Matrix/Playwright indisponible — aucune annexe récupérée et aucun envoi effectué.`;
   }
 
-  log('INFO', 'CENTRIS-MATRIX-ANNEXES', `Recherche globale exacte #${num}${filtre ? ` · filtre=${filtre}` : ''}`);
-  const result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null);
+  const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
+  const normalizedFilter = String(filtre || '');
+  const cachedArtifact = pendingMatrixArtifacts.get(chatId);
+  let result;
+  if (isSendConfirmation) {
+    if (!cachedArtifact || cachedArtifact.expiresAt < Date.now() ||
+        cachedArtifact.num !== num || cachedArtifact.filtre !== normalizedFilter) {
+      pendingMatrixArtifacts.delete(chatId);
+      return `🔒 Confirmation refusée: les PDF figés de l’aperçu Matrix #${num} sont absents ou expirés. Demande un nouvel aperçu; aucun email envoyé.`;
+    }
+    result = { success: true, annexes: cachedArtifact.documents, failures: [] };
+  } else {
+    log('INFO', 'CENTRIS-MATRIX-ANNEXES', `Recherche globale exacte #${num}${filtre ? ` · filtre=${filtre}` : ''}`);
+    result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null);
+  }
   if (!result?.success || !Array.isArray(result.annexes) || result.annexes.length === 0) {
     return `❌ Annexes Matrix #${num} non récupérées: ${String(result?.message || 'aucun PDF validé').substring(0, 220)}\nAucun email envoyé. Aucun numéro substitut n'a été utilisé.`;
   }
@@ -7425,8 +7441,6 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
     source: 'matrix-global',
   }));
   const failures = Array.isArray(result.failures) ? result.failures : [];
-
-  const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
 
   // Telegram est le canal privé de Shawn: livraison interne des PDFs validés.
   // Ne pas renvoyer les mêmes pièces lors de la confirmation finale.
@@ -7590,6 +7604,12 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
       return `❌ L’aperçu courriel Matrix #${num} n’a pas été confirmé par Telegram. Aucun courriel n'est armé et aucun email n'a été envoyé.`;
     }
     pendingExternalEmailActions.set(chatId, pendingMatrixPreview);
+    pendingMatrixArtifacts.set(chatId, {
+      num,
+      filtre: normalizedFilter,
+      documents,
+      expiresAt: pendingMatrixPreview.matrixPreviewExpiresAt,
+    });
     savePendingEmailState();
     return `📂 ${documents.length} PDF(s) Matrix #${num} récupérés et validés.\n🔍 Aperçu SignatureSB remis dans Telegram pour ${emailDestination}.\n🔒 Aucun email envoyé; réponds exactement « envoie » dans les 15 minutes.`;
   }
@@ -7597,9 +7617,11 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   const approvedPreview = pendingExternalEmailActions.get(chatId);
   if (!approvedPreview || approvedPreview.name !== 'telecharger_annexes_centris' ||
       approvedPreview.matrixPreviewExpiresAt < Date.now()) {
+    pendingMatrixArtifacts.delete(chatId);
     return `🔒 Confirmation refusée: l’aperçu Matrix #${num} est absent ou expiré. Demande un nouvel aperçu; aucun email envoyé.`;
   }
   if (approvedPreview.matrixFingerprint !== payloadFingerprint) {
+    pendingMatrixArtifacts.delete(chatId);
     return `🔒 Confirmation refusée: le destinataire, le modèle ou les PDF ont changé depuis l’aperçu. Demande un nouvel aperçu; aucun email envoyé.`;
   }
   // OAuth est requis seulement au moment de l'unique tentative approuvée.
@@ -7634,6 +7656,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, chatId,
   });
   if (!sent.ok) return `❌ Les PDF ont été validés, mais Gmail a refusé l'envoi: ${sent.error || sent.status}. Aucune relance automatique.`;
 
+  pendingMatrixArtifacts.delete(chatId);
   auditLogEvent('centris', 'matrix-annexes-sent', {
     num, to: emailDestination, count: documents.length,
     manifest: emailPayload.attachments.map((doc) => doc.sha256),

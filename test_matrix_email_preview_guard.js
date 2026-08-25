@@ -26,6 +26,10 @@ assert.ok(
   'la confirmation ne doit être armée qu’après un accusé Telegram vérifié',
 );
 assert.match(handler, /renderedHtmlSha256/);
+assert.match(code, /const pendingMatrixArtifacts = new Map\(\)/);
+assert.match(handler, /les PDF figés de l’aperçu Matrix/);
+assert.match(handler, /pendingMatrixArtifacts\.set\(chatId/);
+assert.match(handler, /pendingMatrixArtifacts\.delete\(chatId\)/);
 assert.match(handler, /gmailProviderReceipt\?\.id/);
 assert.match(handler, /Preuve Gmail:/);
 assert.match(handler, /APERÇU COURRIEL — aucun envoi/);
