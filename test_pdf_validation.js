@@ -34,8 +34,11 @@ const { inspectPdfEnvelope, validatePdfBuffer } = require('./lib/pdf_validation'
   const corrupt = Buffer.from(`%PDF-1.7\n%${'x'.repeat(80)}\nCORRUPT /Count 2\n%%EOF\n`);
   await assert.rejects(() => validatePdfBuffer(corrupt), /PDF_CORRUPT|PDF_PAGE_COUNT_INVALID/);
 
-  const encryptedMarker = Buffer.from(`%PDF-1.7\n%${'x'.repeat(80)}\n1 0 obj <</Encrypt 2 0 R>> endobj\n%%EOF`);
+  const encryptedMarker = Buffer.from(`%PDF-1.7\n%${'x'.repeat(80)}\n1 0 obj <</Encrypt 2 0 R /Count 1>> endobj\n%%EOF`);
   await assert.rejects(() => validatePdfBuffer(encryptedMarker), /PDF_ENCRYPTED/);
+  const protectedMatrixPdf = await validatePdfBuffer(encryptedMarker, { allowEncrypted: true });
+  assert.strictEqual(protectedMatrixPdf.encrypted, true);
+  assert.strictEqual(protectedMatrixPdf.pageCount, 1);
   Module._load = originalLoad;
   console.log('✅ Validation PDF réelle: enveloppe, pages, corruption, chiffrement, hash et limites OK');
 })().catch((error) => { console.error(error); process.exit(1); });

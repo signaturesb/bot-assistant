@@ -178,6 +178,27 @@ const context = {
     'une DV ASP.NET sans URL directe doit être téléchargée par son vrai clic',
   );
   assert.strictEqual(actionClicks, 1);
+  let labelClicks = 0;
+  const labelContext = new EventEmitter();
+  const labelControl = {
+    async isVisible() { return true; },
+    async innerText() { return 'DV-50037'; },
+    async click() {
+      labelClicks += 1;
+      labelContext.emit('response', {
+        url: () => 'https://mediaserver.centris.ca/media.ashx?id=dv-label',
+        headers: () => ({ 'content-type': 'application/pdf' }),
+        body: async () => pdf,
+      });
+    },
+  };
+  const labelPage = { frames: () => [{ locator: () => ({ count: async () => 1, nth: () => labelControl }) }] };
+  assert.deepStrictEqual(
+    await cua._downloadMatrixPdfByAction(labelContext, labelPage, null, 'DV-50037'),
+    pdf,
+    'une DV principale sans URL/id doit être téléchargée par son libellé exact',
+  );
+  assert.strictEqual(labelClicks, 1);
   assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_TOO_LARGE')), false);
   assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_URL_REJECTED')), false);
   assert.strictEqual(cua._isMatrixDocumentRetryable(new Error('MATRIX_DOCUMENT_ACTION_MISSING')), false);

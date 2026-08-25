@@ -927,6 +927,7 @@ async function inspectMatrixListingPage(page, centrisNum) {
     if (principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))) {
       docs.unshift({
         name: principalMatch[1].replace(/\s+/g, ''), size: null, url: null,
+        action_label: principalMatch[1].replace(/\s+/g, ''),
         provenance: 'matrix_principal_dv', source_section: 'principal_dv',
       });
     }
@@ -2254,11 +2255,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       return { success: false, annexes: [], message: filtre ? `Aucune annexe correspondant à « ${filtre} »` : 'Aucune annexe téléchargeable trouvée dans Matrix' };
     }
 
-    const selectedDocs = matchedDocs.filter((doc) => doc.url || doc.action_id);
+    const selectedDocs = matchedDocs.filter((doc) => doc.url || doc.action_id || doc.action_label);
     // Fail closed: un document affiché dans Matrix mais dont le lien n'a pas
     // été résolu (notamment une DV principale rendue en postback) ne doit
     // jamais disparaître silencieusement du lot envoyé au client.
-    const unresolvedDocs = matchedDocs.filter((doc) => !doc.url && !doc.action_id);
+    const unresolvedDocs = matchedDocs.filter((doc) => !doc.url && !doc.action_id && !doc.action_label);
 
     const annexes = [];
     const failures = unresolvedDocs.map((doc) => ({
@@ -2289,7 +2290,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           try {
             buffer = doc.url
               ? await downloadMatrixPdfAuthenticated(context, doc.url, state.url, page)
-              : await downloadMatrixPdfByAction(context, page, doc.action_id);
+              : await downloadMatrixPdfByAction(context, page, doc.action_id, doc.action_label);
             break;
           } catch (error) {
             lastError = error;
@@ -2303,16 +2304,19 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           const signature = buffer.subarray(0, 16).toString('hex');
           throw new Error(`réponse non-PDF (bytes=${buffer.length}, signature=${signature || 'vide'})`);
         }
-        const validatedPdf = await validatePdfBuffer(buffer, { maxBytes: MATRIX_DOCUMENT_FILE_MAX_BYTES, minBytes: 1000 });
+        const validatedPdf = await validatePdfBuffer(buffer, {
+          maxBytes: MATRIX_DOCUMENT_FILE_MAX_BYTES, minBytes: 1000,
+          allowEncrypted: true,
+        });
         buffer = validatedPdf.buffer;
         if (downloadedContentHashes.has(validatedPdf.sha256)) {
           throw new Error('MATRIX_DOCUMENT_DUPLICATE_CONTENT');
         }
         downloadedContentHashes.add(validatedPdf.sha256);
-        const parsed = await parsePDFText(buffer);
+        const parsed = validatedPdf.encrypted ? null : await parsePDFText(buffer);
         // Deux parseurs indépendants doivent s'accorder sur un nombre de pages
         // positif. pdf-lib protège l'enveloppe; pdf-parse alimente l'extraction.
-        if (parsed.pages !== validatedPdf.pageCount) throw new Error('MATRIX_DOCUMENT_PAGE_COUNT_MISMATCH');
+        if (parsed && parsed.pages !== validatedPdf.pageCount) throw new Error('MATRIX_DOCUMENT_PAGE_COUNT_MISMATCH');
         const enriched = addCentrisContentMetadata(doc, buffer, validatedPdf.pageCount);
         runningDownloadedBytes += buffer.length;
         if (runningDownloadedBytes > MATRIX_DOCUMENT_TOTAL_MAX_BYTES) {
@@ -2489,14 +2493,31 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
   return result;
 }
 
-async function downloadMatrixPdfByAction(context, page, actionId) {
+async function downloadMatrixPdfByAction(context, page, actionId, actionLabel = null) {
   const id = String(actionId || '').trim();
-  if (!id || id.length > 300) throw new Error('MATRIX_DOCUMENT_ACTION_INVALID');
+  const label = normalizeCentrisLabel(actionLabel);
+  if ((!id && !label) || id.length > 300 || label.length > 120) throw new Error('MATRIX_DOCUMENT_ACTION_INVALID');
   let control = null;
   for (const frame of page.frames()) {
     // XPath avec chaîne JSON évite d'interpréter l'id ASP.NET comme CSS.
-    const direct = frame.locator(`xpath=//*[@id=${JSON.stringify(id)}]`).first();
-    if (await direct.isVisible().catch(() => false)) { control = direct; break; }
+    if (id) {
+      const direct = frame.locator(`xpath=//*[@id=${JSON.stringify(id)}]`).first();
+      if (await direct.isVisible().catch(() => false)) { control = direct; break; }
+    }
+    if (label) {
+      const candidates = frame.locator('a,button,[role="link"]');
+      const count = Math.min(await candidates.count().catch(() => 0), 400);
+      for (let index = 0; index < count; index += 1) {
+        const candidate = candidates.nth(index);
+        if (!(await candidate.isVisible().catch(() => false))) continue;
+        const candidateLabel = normalizeCentrisLabel(await candidate.innerText().catch(() => ''));
+        if (candidateLabel === label || candidateLabel.replace(/\s+/g, '') === label.replace(/\s+/g, '')) {
+          control = candidate;
+          break;
+        }
+      }
+      if (control) break;
+    }
   }
   if (!control) throw new Error('MATRIX_DOCUMENT_ACTION_MISSING');
   return waitForMatrixPdfResponse(context, () => control.click(), 45000);
