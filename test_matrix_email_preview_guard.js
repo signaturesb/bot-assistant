@@ -41,4 +41,16 @@ assert.ok(code.includes('ne jamais déclarer les documents inaccessibles à caus
 assert.ok(code.includes("name !== 'telecharger_annexes_centris'"), 'le preview Matrix doit passer avant le garde générique');
 assert.match(code, /external\.name === 'telecharger_annexes_centris'[\s\S]*?\^🔒 Confirmation refusée:[\s\S]*?pendingExternalEmailActions\.delete\(chatId\)/);
 
+// Le mot seul « envoie » ne reconstruit jamais le numéro ou le destinataire:
+// il reprend l'action exacte figée dans pendingExternalEmailActions.
+const confirmationHandler = code.match(/async function handleEmailConfirmation[\s\S]*?\n}\n\n\/\/ ─── Handlers Telegram/)?.[0] || '';
+assert.ok(confirmationHandler, 'handleEmailConfirmation absent');
+assert.match(confirmationHandler, /if \(!CONFIRM_REGEX\.test\(text\.trim\(\)\)\) return false/);
+assert.match(confirmationHandler, /const external = pendingExternalEmailActions\.get\(chatId\)/);
+assert.match(confirmationHandler, /executeTool\(\s*external\.name,\s*external\.input,\s*chatId,\s*text/);
+assert.doesNotMatch(confirmationHandler, /external\.input\s*=|email_destination\s*=|centris_num\s*=/,
+  'la confirmation ne doit pas reconstruire ou modifier le destinataire/numéro du preview');
+assert.match(code, /telecharger_annexes_centris:\s*360000/,
+  'le délai du tool doit couvrir l’attente du verrou et les sessions Matrix séquentielles');
+
 console.log('✅ Aperçu Matrix lié au destinataire, modèle et PDF avant confirmation');
