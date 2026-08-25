@@ -1852,6 +1852,26 @@ function getPdfParse() {
   return _pdfParse || null;
 }
 
+async function parsePdfBufferWithModule(pdfModule, pdfBuffer) {
+  const legacyParser = typeof pdfModule === 'function'
+    ? pdfModule
+    : typeof pdfModule?.default === 'function'
+      ? pdfModule.default
+      : null;
+  if (legacyParser) return legacyParser(pdfBuffer);
+
+  if (typeof pdfModule?.PDFParse === 'function') {
+    const parser = new pdfModule.PDFParse({ data: pdfBuffer });
+    try {
+      // pdf-parse v2: getRaw() conserve la structure v1 utilisée par le bot.
+      return await parser.getRaw();
+    } finally {
+      await parser.destroy?.();
+    }
+  }
+  throw new Error('API pdf-parse non supportée');
+}
+
 /**
  * Extrait du texte + données structurées d'un PDF Centris.
  * @param {Buffer} pdfBuffer
@@ -1861,12 +1881,14 @@ async function parsePDFText(pdfBuffer) {
   const pdfParse = getPdfParse();
   if (!pdfParse) throw new Error('pdf-parse non installé');
   try {
-    const data = await pdfParse(pdfBuffer);
+    const data = await parsePdfBufferWithModule(pdfParse, pdfBuffer);
+    const text = String(data?.text || '');
+    const pages = Number(data?.numpages || data?.numPages || data?.total || data?.pages?.length || 0);
     return {
-      text: data.text,
-      pages: data.numpages,
-      info: data.info,
-      length: data.text.length,
+      text,
+      pages,
+      info: data?.info || data?.infoData || null,
+      length: text.length,
     };
   } catch (e) {
     console.error('[CUA] parsePDF error:', e.message);
@@ -3032,6 +3054,7 @@ module.exports = {
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
+  _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
   ingestManualMFACode,
   isAwaitingCentrisMFA,
