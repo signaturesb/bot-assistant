@@ -988,6 +988,10 @@ async function previewCentrisMatrixDocuments(opts = {}) {
   if (!/^\d{7,9}$/.test(centrisNum)) {
     return { success: false, error_code: 'MATRIX_INVALID_CENTRIS_NUMBER', message: 'Numéro Centris invalide (7-9 chiffres)' };
   }
+  const operationOwner = Symbol('matrix-preview');
+  if (!acquireMatrixOperation(operationOwner)) {
+    return { success: false, error_code: 'MATRIX_OPERATION_IN_PROGRESS', message: 'Une autre opération Matrix est déjà en cours. Aucun envoi effectué.' };
+  }
   let browser = null;
   try {
     browser = await launchBrowser();
@@ -1048,6 +1052,7 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     return { success: false, error_code: 'MATRIX_PREVIEW_TECHNICAL_ERROR', message: safeErrorMessage(error).substring(0, 240) };
   } finally {
     if (browser) try { await browser.close(); } catch {}
+    releaseMatrixOperation(operationOwner);
   }
 }
 
@@ -1078,6 +1083,56 @@ function browserlessEndpointWithTimeout(endpoint, timeoutMs = 60000) {
   const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs) || 60000, 60000));
   url.searchParams.set('timeout', String(safeTimeout));
   return url.toString();
+}
+
+// Empreinte privée du plan réel de téléchargement. Le manifeste public décrit
+// les documents sans exposer leurs liens; cette empreinte ajoute les locators
+// Matrix afin qu'une reprise dans un second navigateur ne puisse pas imprimer
+// une fiche après un changement silencieux de résultat.
+function matrixDownloadPlanFingerprint(docs = []) {
+  const plan = (Array.isArray(docs) ? docs : []).map((doc) => ({
+    label: normalizeCentrisMatchKey(doc?.label_original || doc?.name || ''),
+    provenance: String(doc?.provenance || ''),
+    source_section: String(doc?.source_section || ''),
+    locator: canonicalMatrixPlanLocator(doc),
+  })).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  return stableCentrisManifestId(plan);
+}
+
+function canonicalMatrixPlanLocator(doc = {}) {
+  if (doc.action_id) return `action:${String(doc.action_id).trim()}`;
+  if (!doc.url) return null;
+  try {
+    const parsed = new URL(String(doc.url));
+    const identityParams = [];
+    for (const [key, value] of parsed.searchParams.entries()) {
+      if (!/^(?:id|t|documentid|mediaid|fileid)$/i.test(key)) continue;
+      identityParams.push([key.toLowerCase(), value]);
+    }
+    identityParams.sort(([leftKey, leftValue], [rightKey, rightValue]) =>
+      leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue));
+    const query = identityParams.length
+      ? `?${identityParams.map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join('&')}`
+      : '';
+    return `url:${parsed.hostname.toLowerCase()}${parsed.pathname}${query}`;
+  } catch {
+    return `url:${String(doc.url).trim().replace(/[?#].*$/, '')}`;
+  }
+}
+
+function expectedCentrisDocumentCount(centrisNum, filtre = null) {
+  if (filtre) return 0;
+  const exactNum = String(centrisNum || '').replace(/\D/g, '');
+  try {
+    const configured = JSON.parse(process.env.CENTRIS_EXPECTED_DOCUMENTS_JSON || '{}');
+    const expected = Number(configured?.[exactNum] || 0);
+    if (Number.isInteger(expected) && expected > 0) return expected;
+  } catch {
+    console.warn('[MATRIX-CONFIG] CENTRIS_EXPECTED_DOCUMENTS_JSON invalide; utilisation du garde smoke');
+  }
+  const smokeNum = String(process.env.CENTRIS_SMOKE_TEST_LISTING || '').replace(/\D/g, '');
+  const smokeExpected = Number(process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS || 0);
+  return exactNum === smokeNum && Number.isInteger(smokeExpected) && smokeExpected > 0 ? smokeExpected : 0;
 }
 
 function safeErrorMessage(error) {
@@ -1240,6 +1295,22 @@ async function newStealthContext(browser, opts = {}) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 let _cuaAvailable = null;
+let matrixOperationOwner = null;
+
+function acquireMatrixOperation(owner) {
+  if (matrixOperationOwner) return false;
+  matrixOperationOwner = owner;
+  return true;
+}
+
+function releaseMatrixOperation(owner) {
+  if (matrixOperationOwner === owner) matrixOperationOwner = null;
+}
+
+function isMatrixOperationInProgress() {
+  return Boolean(matrixOperationOwner);
+}
+
 function CUA_AVAILABLE() {
   if (_cuaAvailable !== null) return _cuaAvailable;
   try {
@@ -1874,6 +1945,8 @@ async function cuaLoginCentris() {
   if (activeCentrisLoginPromise) return activeCentrisLoginPromise;
   activeCentrisLoginPromise = (async () => {
     if (!CUA_AVAILABLE()) return { ok: false, error: 'Playwright non disponible' };
+    const operationOwner = Symbol('matrix-login');
+    if (!acquireMatrixOperation(operationOwner)) return { ok: false, skipped: 'MATRIX_OPERATION_IN_PROGRESS', error: 'Une opération Matrix est déjà en cours' };
     initDirs();
     let browser = null;
     try {
@@ -1898,6 +1971,7 @@ async function cuaLoginCentris() {
       return { ok: false, error: safeErrorMessage(e).substring(0, 240) };
     } finally {
       if (browser) try { await browser.close(); } catch {}
+      releaseMatrixOperation(operationOwner);
     }
   })();
   try { return await activeCentrisLoginPromise; }
@@ -2283,6 +2357,41 @@ async function tryCUAPrintCapture(page, centrisNum) {
 // API PUBLIQUE — cuaGetCentrisAnnexes
 // ═══════════════════════════════════════════════════════════════════════════
 
+async function openVerifiedMatrixListingForDownload(page, exactNum) {
+  const search = await openMatrixGlobalSearch(page);
+  if (!search) {
+    if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+      throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+    }
+    console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
+    throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
+  }
+  const submitted = await submitMatrixGlobalSearch(page, search, exactNum);
+  if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
+    throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+  }
+  if (!submitted.exactListingMentioned) {
+    console.warn('[MATRIX-RESULT-DIAG]', JSON.stringify(await matrixResultDiagnostics(page, exactNum, submitted)));
+  }
+  const state = await openExactMatrixListing(page, exactNum);
+  if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
+  return state;
+}
+
+async function resumeVerifiedCentrisSession(context) {
+  const page = await context.newPage();
+  await page.setViewportSize(VIEWPORT);
+  await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+  await page.waitForTimeout(1200);
+  const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+  const bodyText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
+  if (!isAuthenticatedMatrixPage(page.url(), passwordVisible, bodyText)) {
+    throw new Error(`MATRIX_RESUME_AUTH_REQUIRED:${safeCentrisPageLocation(page.url())}`);
+  }
+  if (isMatrixMultipleLoginPage(page.url(), bodyText)) throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+  return page;
+}
+
 /**
  * Télécharge toutes les annexes (DV, certificat, plans) d'un listing via CUA.
  * @param {string} centrisNum
@@ -2293,44 +2402,40 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
   if (!CUA_AVAILABLE()) {
     return { success: false, annexes: [], message: 'Playwright non disponible' };
   }
-
-  loadDeps();
-  initDirs();
+  const operationOwner = Symbol('matrix-annexes');
+  if (!acquireMatrixOperation(operationOwner)) {
+    return { success: false, annexes: [], error_code: 'MATRIX_OPERATION_IN_PROGRESS', message: 'Une autre opération Matrix est déjà en cours. Aucun envoi effectué.' };
+  }
 
   let browser = null;
   let context = null;
   const operationStartedAt = Date.now();
   try {
+    loadDeps();
+    initDirs();
     browser = await launchBrowser();
 
     context = await newStealthContext(browser);
-    const page = await loginCentris(context);
+    let page = await loginCentris(context);
     const exactNum = String(centrisNum || '').replace(/\D/g, '');
     if (!/^\d{7,9}$/.test(exactNum)) throw new Error('Numéro Centris invalide');
 
     // Chemin déterministe identique au geste humain montré par Shawn:
     // recherche globale blanche → numéro exact → fiche détaillée → liens PDF.
-    const search = await openMatrixGlobalSearch(page);
-    if (!search) {
-      if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
-        throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
-      }
-      console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
-      throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
-    }
-    const submitted = await submitMatrixGlobalSearch(page, search, exactNum);
-    if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
-      throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
-    }
-    if (!submitted.exactListingMentioned) {
-      console.warn('[MATRIX-RESULT-DIAG]', JSON.stringify(await matrixResultDiagnostics(page, exactNum, submitted)));
-    }
-    const state = await openExactMatrixListing(page, exactNum);
-    if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
+    let state = await openVerifiedMatrixListingForDownload(page, exactNum);
 
     const downloadableDocs = matrixDownloadableDocs(state);
     const fullInventory = buildCentrisDocumentInventory(exactNum, downloadableDocs);
     const publicInventory = redactCentrisDocumentInventory(fullInventory);
+    const expectedDocumentCount = expectedCentrisDocumentCount(exactNum, filtre);
+    if (expectedDocumentCount > 0 && downloadableDocs.length !== expectedDocumentCount) {
+      return {
+        success: false, annexes: [], error_code: 'MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH',
+        docs_count: downloadableDocs.length, discovered_count: downloadableDocs.length, validated_count: 0,
+        document_inventory: publicInventory, manifest_id: fullInventory.manifest_id,
+        message: `Inventaire Matrix incomplet: ${downloadableDocs.length}/${expectedDocumentCount} document(s) attendu(s). Aucun envoi effectué.`,
+      };
+    }
 
     let matchedDocs = downloadableDocs;
     if (filtre) {
@@ -2369,7 +2474,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     let runningDownloadedBytes = 0;
     let batchTooLarge = false;
     const downloadedContentHashes = new Set();
-    const downloaded = await mapWithConcurrency(candidates, 1, async (doc, index) => {
+    const downloadDocuments = async (docs, activeContext, activePage, activeState, indexOffset = 0) => mapWithConcurrency(docs, 1, async (doc, index) => {
       if (downloadAbortReason) {
         return { ok: false, failure: {
           label: doc.name,
@@ -2382,13 +2487,13 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
         for (let attempt = 1; attempt <= MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS; attempt += 1) {
           try {
             buffer = doc.url
-              ? await downloadMatrixPdfAuthenticated(context, doc.url, state.url, page)
-              : await downloadMatrixPdfByAction(context, page, doc.action_id, doc.action_label);
+              ? await downloadMatrixPdfAuthenticated(activeContext, doc.url, activeState.url, activePage)
+              : await downloadMatrixPdfByAction(activeContext, activePage, doc.action_id, doc.action_label);
             break;
           } catch (error) {
             lastError = error;
             if (!isMatrixDocumentRetryable(error)) break;
-            if (attempt < MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS) await page.waitForTimeout(400 * attempt);
+            if (attempt < MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS) await activePage.waitForTimeout(400 * attempt);
           }
         }
         if (!buffer) throw lastError || new Error('MATRIX_DOWNLOAD_FAILED');
@@ -2421,7 +2526,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           downloadAbortReason = 'MATRIX_DOCUMENT_BATCH_TOO_LARGE';
           throw new Error(downloadAbortReason);
         }
-        const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
+        const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${indexOffset + index + 1}`;
         return { ok: true, document: {
           buffer,
           filename: `${safeBase}_${exactNum}.pdf`,
@@ -2430,6 +2535,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
           page_count: enriched.page_count,
           sha256: enriched.sha256,
           source: 'matrix-global',
+          provenance: doc.provenance || null,
+          source_section: doc.source_section || null,
+          is_matrix_listing_report: doc.action_id === MATRIX_LISTING_REPORT_ACTION,
         } };
       } catch (error) {
         const message = safeErrorMessage(error).substring(0, 120);
@@ -2439,11 +2547,64 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
         return { ok: false, failure: { label: doc.name, error: message } };
       }
     });
-    for (const item of downloaded) {
-      if (item.ok) annexes.push(item.document);
-      else {
-        failures.push(item.failure);
-        console.warn(`[MATRIX-PDF] ${item.failure.label}: ${item.failure.error}`);
+
+    const collectDownloaded = (downloaded) => {
+      for (const item of downloaded) {
+        if (item.ok) annexes.push(item.document);
+        else {
+          failures.push(item.failure);
+          console.warn(`[MATRIX-PDF] ${item.failure.label}: ${item.failure.error}`);
+        }
+      }
+    };
+
+    // Le forfait Browserless observé coupe une connexion à 60 s. Les huit
+    // liens certains sont donc téléchargés dans la première connexion. La
+    // fiche officielle est générée dans une deuxième connexion strictement
+    // séquentielle, avec le storageState capturé en mémoire (aucun nouveau
+    // login, mot de passe ou MFA).
+    const reportCandidates = candidates.filter((doc) => doc.action_id === MATRIX_LISTING_REPORT_ACTION);
+    const primaryCandidates = candidates.filter((doc) => doc.action_id !== MATRIX_LISTING_REPORT_ACTION);
+    const primaryDownloaded = await downloadDocuments(primaryCandidates, context, page, state, 0);
+    collectDownloaded(primaryDownloaded);
+
+    if (reportCandidates.length && failures.length === 0 && !downloadAbortReason) {
+      const checkpointUserAgent = await page.evaluate(() => navigator.userAgent).catch(() => '');
+      if (!checkpointUserAgent) throw new Error('MATRIX_RESUME_USER_AGENT_MISSING');
+      const checkpoint = {
+        storageState: await context.storageState(),
+        userAgent: checkpointUserAgent,
+      };
+      const expectedPlanFingerprint = matrixDownloadPlanFingerprint(downloadableDocs);
+
+      // La fermeture complète de A avant le lancement de B garantit qu'un
+      // seul navigateur touche Matrix à la fois.
+      await context.close();
+      context = null;
+      await browser.close();
+      browser = null;
+
+      browser = await launchBrowser();
+      context = await newStealthContext(browser, checkpoint);
+      page = await resumeVerifiedCentrisSession(context);
+      const resumedState = await openVerifiedMatrixListingForDownload(page, exactNum);
+      const resumedDocs = matrixDownloadableDocs(resumedState);
+      const resumedInventory = buildCentrisDocumentInventory(exactNum, resumedDocs);
+      const resumedPlanFingerprint = matrixDownloadPlanFingerprint(resumedDocs);
+      if (resumedInventory.manifest_id !== fullInventory.manifest_id ||
+          resumedPlanFingerprint !== expectedPlanFingerprint) {
+        throw new Error('MATRIX_RESUME_INVENTORY_CHANGED');
+      }
+      if (!resumedDocs.some((doc) => doc.action_id === MATRIX_LISTING_REPORT_ACTION)) {
+        throw new Error('MATRIX_RESUME_PRINT_CONTROL_MISSING');
+      }
+      state = resumedState;
+      const reportDownloaded = await downloadDocuments(reportCandidates, context, page, state, primaryCandidates.length);
+      collectDownloaded(reportDownloaded);
+    } else if (reportCandidates.length) {
+      const reason = downloadAbortReason || failures[0]?.error || 'phase principale incomplète';
+      for (const doc of reportCandidates) {
+        failures.push({ label: doc.name, error: `non tenté après erreur de phase A: ${reason}`.substring(0, 120) });
       }
     }
     if (batchTooLarge) {
@@ -2461,7 +2622,22 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
         message: `Lot Matrix trop volumineux (${Math.ceil(totalDownloadedBytes / 1024 / 1024)} MB; maximum 120 MB). Aucun envoi effectué.`,
       };
     }
+    // Présentation client: fiche officielle d'abord, puis les documents dans
+    // l'ordre Matrix. Le téléchargement reste 8 puis 1 pour respecter les
+    // limites de session sans modifier le lot remis.
+    annexes.sort((left, right) => Number(Boolean(right.is_matrix_listing_report)) - Number(Boolean(left.is_matrix_listing_report)));
+    const contentManifest = buildCentrisContentManifest(exactNum, annexes.map((doc) => ({
+      category: doc.is_matrix_listing_report ? 'fiche_detaillee' : 'document_autre',
+      match_key: normalizeCentrisMatchKey(doc.label),
+      lot: extractCentrisLotNumber(doc.label),
+      size_bytes: null,
+      actual_size_bytes: doc.size,
+      page_count: doc.page_count,
+      sha256: doc.sha256,
+    })));
+    const uniqueHashes = new Set(annexes.map((doc) => String(doc.sha256 || '')));
     const complete = failures.length === 0 && annexes.length === matchedDocs.length &&
+      uniqueHashes.size === annexes.length && contentManifest.complete &&
       annexes.every((doc) => Number(doc.page_count) > 0 && /^[a-f0-9]{64}$/.test(String(doc.sha256 || '')));
     return {
       success: complete,
@@ -2475,6 +2651,9 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       document_references: state.documentReferences || [],
       document_inventory: publicInventory,
       manifest_id: fullInventory.manifest_id,
+      inventory_manifest_id: fullInventory.manifest_id,
+      content_manifest_id: complete ? contentManifest.content_manifest_id : null,
+      content_validation_complete: complete,
       message: complete
         ? `${annexes.length}/${matchedDocs.length} annexe(s) Matrix téléchargée(s) et validée(s)`
         : `Lot Matrix incomplet: ${annexes.length}/${matchedDocs.length} PDF validé(s), ${failures.length} échec(s). Aucun envoi autorisé.`,
@@ -2489,6 +2668,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     // de rendre la session Browserless. browser.close() reste le filet final.
     if (context) try { await context.close(); } catch {}
     if (browser) try { await browser.close(); } catch {}
+    releaseMatrixOperation(operationOwner);
   }
 }
 
@@ -4180,6 +4360,8 @@ module.exports = {
   _downloadMatrixPdfByAction: downloadMatrixPdfByAction,
   _downloadMatrixListingReport: downloadMatrixListingReport,
   _matrixDownloadableDocs: matrixDownloadableDocs,
+  _matrixDownloadPlanFingerprint: matrixDownloadPlanFingerprint,
+  _isMatrixOperationInProgress: isMatrixOperationInProgress,
   _isMatrixDocumentRetryable: isMatrixDocumentRetryable,
   _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
   _waitForMatrixPdfOrDownload: waitForMatrixPdfOrDownload,
@@ -4189,3 +4371,4 @@ module.exports = {
   ingestManualMFACode,
   isAwaitingCentrisMFA,
 };
+

@@ -159,6 +159,17 @@ assert.deepStrictEqual(referenceOnly.documentReferences, ['DV-50037']);
 const nineDownloadables = cua._matrixDownloadableDocs({ docs: fixture28936167, printControlCount: 1 });
 assert.strictEqual(nineDownloadables.length, 9, 'la fiche PDF officielle + huit documents additionnels forment le lot réel de neuf');
 assert.ok(nineDownloadables.some((doc) => doc.source_section === 'matrix_print_report'));
+const planA = cua._matrixDownloadPlanFingerprint([
+  { name: 'Plan', url: 'https://mediaserver.centris.ca/media.ashx?t=di&id=abc&session=old', source_section: 'additional_documents' },
+]);
+const planB = cua._matrixDownloadPlanFingerprint([
+  { name: 'Plan', url: 'https://mediaserver.centris.ca/media.ashx?session=new&id=abc&t=di', source_section: 'additional_documents' },
+]);
+const planChanged = cua._matrixDownloadPlanFingerprint([
+  { name: 'Plan', url: 'https://mediaserver.centris.ca/media.ashx?id=other&t=di', source_section: 'additional_documents' },
+]);
+assert.strictEqual(planA, planB, 'les paramètres transitoires et leur ordre ne doivent pas casser une reprise identique');
+assert.notStrictEqual(planA, planChanged, 'un identifiant de document différent doit bloquer la reprise');
 
 // Les documents visibles mais sans URL/action sont conservés individuellement:
 // ils deviendront des échecs explicites au téléchargement au lieu de disparaître.
@@ -300,3 +311,4 @@ assert.ok(cuaCode.includes("data.taxes_provenance = 'pdf-text-fallback'"));
 assert.ok(cuaCode.includes('data.taxes_ambiguous'));
 
 console.log('✅ Inventaire Centris sans perte + compatibilité + manifestes OK');
+

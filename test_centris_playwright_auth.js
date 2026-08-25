@@ -34,7 +34,13 @@ assert(botSource.includes('bot.onText(/^\\/centris(?:@\\w+)?\\s*$/i'), 'La comma
 assert(botSource.includes("safeCron('centris-session-maintenance'"), 'La session Centris doit être entretenue automatiquement');
 assert(botSource.includes("maintainCentrisSession('boot-delayed')"), 'Le boot doit programmer un renouvellement différé');
 assert(botSource.includes("if (process.env.CENTRIS_SMOKE_TEST_LISTING) await runCentrisReadOnlySmokeTest('boot-delayed')"), 'Le smoke boot doit remplacer le renouvellement préalable pour éviter MultipleLoginBreach');
-assert(botSource.includes('Une seule session Matrix pour recherche + inventaire + téléchargement'), 'Le smoke téléchargement doit rester dans une seule session Matrix');
+assert(botSource.includes('deux connexions Browserless strictement séquentielles'), 'Le smoke peut fractionner Browserless sans ouvrir deux navigateurs Matrix à la fois');
+assert(cuaSource.includes('await context.close();\n      context = null;\n      await browser.close();\n      browser = null;\n\n      browser = await launchBrowser();'), 'La phase A doit être fermée avant le lancement Browserless B');
+assert(cuaSource.includes('resumeVerifiedCentrisSession(context)'), 'La phase B doit reprendre strictement la session, sans nouveau login/MFA');
+assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire modifié entre les phases doit bloquer la fiche');
+assert(cuaSource.includes("Symbol('matrix-annexes')"), 'Un verrou global doit couvrir toute l’opération Matrix A+B');
+assert(cuaSource.includes('MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH'), 'Un inventaire connu incomplet ne doit jamais devenir un faux succès');
+assert(cuaSource.includes("content_manifest_id: complete ? contentManifest.content_manifest_id : null"), 'Un lot partiel ne doit jamais exposer un manifeste de contenu complet');
 assert(cuaSource.includes('async function navigateToMatrixLogin(page)'), 'La navigation OAuth Matrix doit avoir une reprise dédiée');
 assert(cuaSource.includes("waitUntil: 'commit', timeout: 45000"), 'La redirection OAuth ne doit pas attendre indéfiniment domcontentloaded');
 assert(cuaSource.includes('if (step.kind !== \'missing\') return'), 'Un formulaire reconnu après timeout doit être conservé');
