@@ -656,16 +656,22 @@ async function submitMatrixGlobalSearch(page, search, centrisNum) {
   await page.waitForTimeout(2500);
 
   let state = await inspectMatrixListingPage(page, centrisNum);
-  if (state.exactListingMentioned) return state;
+  if (state.exactListingMentioned) return { ...state, submit_via: 'enter' };
+
+  // Matrix peut réhydrater l'en-tête après Enter. L'ancien locator devient
+  // alors détaché même si une nouvelle barre identique est visible. Toujours
+  // résoudre le contrôle dans le DOM courant avant le clic de repli.
+  const currentSearch = await findMatrixGlobalSearch(page) || search;
+  await currentSearch.fill(centrisNum).catch(() => {});
 
   // Identifiants observés directement dans Matrix v12.6 de Shawn.
   // Le nom du bouton est plus stable que son id ASP.NET (vide actuellement).
-  const exactSubmit = search.locator('xpath=..').locator('button[name="MagnifyingGlass"], button[aria-label="Recherche"]');
+  const exactSubmit = currentSearch.locator('xpath=..').locator('button[name="MagnifyingGlass"], button[aria-label="Recherche"]');
   if (await exactSubmit.first().isVisible().catch(() => false)) {
     await exactSubmit.first().click({ timeout: 10000 });
     await page.waitForTimeout(3500);
     state = await inspectMatrixListingPage(page, centrisNum);
-    if (state.exactListingMentioned) return state;
+    if (state.exactListingMentioned) return { ...state, submit_via: 'named-magnifying-glass' };
   }
 
   // Matrix v12.6 ne traite pas toujours Entrée. La vidéo de Shawn montre une
@@ -673,33 +679,51 @@ async function submitMatrixGlobalSearch(page, search, centrisNum) {
   // plus à droite dans les deux conteneurs parents, plutôt que des coordonnées
   // d'écran ou un identifiant ASP.NET instable. Le X d'effacement est à gauche
   // de la loupe; le bouton de recherche obtient donc le meilleur score.
-  const inputBox = await search.boundingBox().catch(() => null);
+  const inputBox = await currentSearch.boundingBox().catch(() => null);
   let best = null;
   let bestScore = -Infinity;
-  for (const scope of [search.locator('xpath=..'), search.locator('xpath=../..')]) {
+  for (const scope of [currentSearch.locator('xpath=..'), currentSearch.locator('xpath=../..')]) {
     const controls = scope.locator('button, input[type="submit"], a, [role="button"]');
     const count = Math.min(await controls.count().catch(() => 0), 20);
     for (let index = 0; index < count; index += 1) {
       const control = controls.nth(index);
       if (!(await control.isVisible().catch(() => false)) || !(await control.isEnabled().catch(() => false))) continue;
       const box = await control.boundingBox().catch(() => null);
-      if (!box || !inputBox || box.x < inputBox.x + inputBox.width - 40) continue;
+      if (!box || !inputBox) continue;
       const meta = await control.evaluate((el) => [
         el.id, el.getAttribute('name'), el.getAttribute('class'),
         el.getAttribute('title'), el.getAttribute('aria-label'), el.textContent,
       ].filter(Boolean).join(' ')).catch(() => '');
-      if (/clear|effacer|close|fermer|reset/i.test(meta)) continue;
-      let score = box.x;
-      if (/search|recherch|loupe|magnif|submit/i.test(meta)) score += 10000;
+      const score = scoreMatrixSubmitControl(meta, inputBox, box);
       if (score > bestScore) { best = control; bestScore = score; }
     }
   }
-  if (best) {
+  if (best && Number.isFinite(bestScore)) {
     await best.click({ timeout: 10000 });
-    await page.waitForTimeout(3500);
-    state = await inspectMatrixListingPage(page, centrisNum);
+    const deadline = Date.now() + 10000;
+    do {
+      await page.waitForTimeout(500);
+      state = await inspectMatrixListingPage(page, centrisNum);
+      if (state.exactListingMentioned) break;
+    } while (Date.now() < deadline);
+    return { ...state, submit_via: 'adjacent-search-button' };
   }
-  return state;
+  return { ...state, submit_via: 'no-adjacent-search-button' };
+}
+
+function scoreMatrixSubmitControl(meta = '', inputBox = {}, box = {}) {
+  const right = Number(inputBox.x) + Number(inputBox.width);
+  if (![right, inputBox.y, inputBox.height, box.x, box.y, box.width, box.height].every(Number.isFinite)) return -Infinity;
+  const visibleSize = box.width > 0 && box.height > 0 && box.width <= 140 && box.height <= 100;
+  const immediatelyRight = box.x >= right - 8 && box.x <= right + 160;
+  const verticallyAligned = box.y < Number(inputBox.y) + Number(inputBox.height) + 8 &&
+    box.y + box.height > Number(inputBox.y) - 8;
+  if (!visibleSize || !immediatelyRight || !verticallyAligned) return -Infinity;
+  const value = String(meta || '');
+  if (/clear|effacer|close|fermer|reset/i.test(value)) return -Infinity;
+  let score = 1000 - Math.abs(box.x - right);
+  if (/search|recherch|loupe|magnif|submit/i.test(value)) score += 10000;
+  return score;
 }
 
 function scoreMatrixSearchCandidate(meta = '', box = {}) {
@@ -747,6 +771,30 @@ async function matrixSearchDiagnostics(page) {
     frames.push({ page: safeCentrisPageLocation(frame.url()), controls });
   }
   return { page: safeCentrisPageLocation(page.url()), title: await page.title().catch(() => ''), frames };
+}
+
+async function matrixResultDiagnostics(page, centrisNum, submitState = {}) {
+  const frames = [];
+  for (const frame of page.frames()) {
+    const diagnostic = await frame.evaluate((expected) => {
+      const clean = (value) => String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
+      const body = clean(document.body?.innerText || '');
+      const controls = [...document.querySelectorAll('a,button,[role="link"]')];
+      return {
+        body_has_exact: new RegExp(`(^|\\D)${String(expected).replace(/\\D/g, '')}(\\D|$)`).test(body),
+        exact_link_count: controls.filter((element) => clean(element.textContent) === String(expected)).length,
+        numeric_link_count: controls.filter((element) => /^\d{7,9}$/.test(clean(element.textContent))).length,
+        result_marker: /r[ée]sultats?|1\s+de\s+1/i.test(body),
+        empty_marker: /aucun r[ée]sultat|no results?/i.test(body),
+      };
+    }, String(centrisNum)).catch(() => null);
+    frames.push({ page: safeCentrisPageLocation(frame.url()), ...(diagnostic || {}) });
+  }
+  return {
+    page: safeCentrisPageLocation(page.url()),
+    submit_via: String(submitState.submit_via || 'unknown'),
+    frames,
+  };
 }
 
 function matrixTextContainsExactNumber(value, centrisNum) {
@@ -937,7 +985,7 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     }
 
     console.log(`[MATRIX-PREVIEW] Recherche globale exacte #${centrisNum}`);
-    await submitMatrixGlobalSearch(page, search, centrisNum);
+    const submitted = await submitMatrixGlobalSearch(page, search, centrisNum);
     if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
       return {
         success: false,
@@ -945,6 +993,9 @@ async function previewCentrisMatrixDocuments(opts = {}) {
         message: 'Matrix refuse une deuxième session simultanée. Fermez les autres onglets Matrix, puis relancez. Aucun envoi effectué.',
         final_url: safeCentrisPageLocation(page.url()),
       };
+    }
+    if (!submitted.exactListingMentioned) {
+      console.warn('[MATRIX-RESULT-DIAG]', JSON.stringify(await matrixResultDiagnostics(page, centrisNum, submitted)));
     }
     const state = await openExactMatrixListing(page, centrisNum);
     if (!state.exactListingMentioned) {
@@ -2171,9 +2222,12 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
       throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
     }
-    await submitMatrixGlobalSearch(page, search, exactNum);
+    const submitted = await submitMatrixGlobalSearch(page, search, exactNum);
     if (isMatrixMultipleLoginPage(page.url(), await page.locator('body').innerText({ timeout: 3000 }).catch(() => ''))) {
       throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+    }
+    if (!submitted.exactListingMentioned) {
+      console.warn('[MATRIX-RESULT-DIAG]', JSON.stringify(await matrixResultDiagnostics(page, exactNum, submitted)));
     }
     const state = await openExactMatrixListing(page, exactNum);
     if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
@@ -3845,6 +3899,7 @@ module.exports = {
   _matrixTextContainsExactNumber: matrixTextContainsExactNumber,
   _isExactMatrixListingLabel: isExactMatrixListingLabel,
   _scoreMatrixSearchCandidate: scoreMatrixSearchCandidate,
+  _scoreMatrixSubmitControl: scoreMatrixSubmitControl,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
   _downloadMatrixPdfAuthenticated: downloadMatrixPdfAuthenticated,

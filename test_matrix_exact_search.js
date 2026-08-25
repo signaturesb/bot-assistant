@@ -6,6 +6,7 @@ const {
   _matrixTextContainsExactNumber: containsExact,
   _isExactMatrixListingLabel: isExactLabel,
   _scoreMatrixSearchCandidate: scoreSearch,
+  _scoreMatrixSubmitControl: scoreSubmit,
   _classifyMatrixPageSnapshot: classify,
 } = require('./cua_driver');
 
@@ -35,6 +36,14 @@ assert(scoreSearch('', { width: 700, height: 42, y: 500 }) < 100,
 assert(scoreSearch('adresse', { width: 700, height: 42, y: 100 }) < 100,
   'un champ métier explicite reste exclu même s’il ressemble géométriquement à la barre globale');
 
+const inputBox = { x: 310, y: 275, width: 1175, height: 45 };
+assert(scoreSubmit('SearchButton loupe', inputBox, { x: 1485, y: 275, width: 48, height: 45 }) > 10000,
+  'la loupe immédiatement à droite du champ doit être sélectionnée');
+assert.strictEqual(scoreSubmit('ClearButton close', inputBox, { x: 1440, y: 275, width: 45, height: 45 }), -Infinity,
+  'le X d’effacement ne doit jamais être sélectionné');
+assert.strictEqual(scoreSubmit('Recherches récentes', inputBox, { x: 1675, y: 275, width: 250, height: 45 }), -Infinity,
+  'un contrôle éloigné ou trop large ne doit jamais être sélectionné');
+
 assert.strictEqual(classify({
   url: 'https://matrix.centris.ca/Matrix/Results',
   text: 'Résultats comprenant 28936167',
@@ -62,5 +71,9 @@ assert.ok(!driverCode.includes("state.exactListingMentioned || /\\/Matrix\\/Resu
   'une URL Results.aspx sans numéro exact ne doit jamais compter comme succès');
 assert.match(driverCode, /clear\|effacer\|close\|fermer\|reset/,
   'le repli ne doit jamais cliquer le X d’effacement');
+assert.match(driverCode, /const currentSearch = await findMatrixGlobalSearch\(page\) \|\| search/,
+  'le champ doit être résolu de nouveau après la réhydratation Matrix');
+assert.match(driverCode, /\[MATRIX-RESULT-DIAG\]/,
+  'un échec doit laisser un diagnostic structurel sans URL de session');
 
 console.log('✅ Matrix exact search: semantic selector and exact-listing guards passed');
