@@ -1407,6 +1407,7 @@ GESTION D'ERREURS (non négociable):
 • Session expirée → re-login auto déjà câblé (TOTP→SMS→Email Gmail cascade)
 • Bot detection → escalade Browserless stealth (rebrowser-playwright)
 • JAMAIS de succès simulé. ÉCHEC = cause technique précise + suggestion fix.
+• Ne jamais conclure « courtier concurrent / accès restreint » sans un code HTTP 401/403 observé. Une erreur de lecture ou validation PDF est technique et doit être rapportée telle quelle; ne jamais proposer le scrape public ou Dropbox comme remplacement automatique.
 • JAMAIS inventer, corriger ou suggérer un autre numéro Centris. Réutiliser uniquement le numéro exact fourni par Shawn.
 
 WORKFLOW AVANT ENVOI (préférer dry-run):

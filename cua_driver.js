@@ -1747,7 +1747,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       validated_count: annexes.length,
       message: annexes.length > 0
         ? `${annexes.length}/${matchedDocs.length} annexe(s) Matrix téléchargée(s) et validée(s)`
-        : `Aucune annexe PDF validée (${failures.length} échec(s))`,
+        : `Aucune annexe PDF validée (${failures.length} échec(s)): ${failures.slice(0, 3).map((item) => item.error).join(' | ')}`,
     };
 
   } catch (e) {
@@ -1900,8 +1900,9 @@ async function parsePdfBufferWithModule(pdfModule, pdfBuffer) {
   if (typeof pdfModule?.PDFParse === 'function') {
     const parser = new pdfModule.PDFParse({ data: pdfBuffer });
     try {
-      // pdf-parse v2: getRaw() conserve la structure v1 utilisée par le bot.
-      return await parser.getRaw();
+      // pdf-parse 2.4.x expose getText(); getRaw() n'existe pas dans cette API.
+      if (typeof parser.getText !== 'function') throw new Error('API pdf-parse v2 getText absente');
+      return await parser.getText();
     } finally {
       await parser.destroy?.();
     }

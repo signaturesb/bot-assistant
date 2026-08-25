@@ -15,12 +15,12 @@ const cua = require('./cua_driver');
   let destroyed = false;
   class PDFParse {
     constructor({ data }) { assert.strictEqual(data, input); }
-    async getRaw() { return { text: 'v2', numpages: 2 }; }
+    async getText() { return { text: 'v2', total: 2, pages: [{}, {}] }; }
     async destroy() { destroyed = true; }
   }
   assert.deepStrictEqual(
     await cua._parsePdfBufferWithModule({ PDFParse }, input),
-    { text: 'v2', numpages: 2 },
+    { text: 'v2', total: 2, pages: [{}, {}] },
   );
   assert.strictEqual(destroyed, true, 'le parseur v2 doit toujours être détruit');
 
