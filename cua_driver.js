@@ -361,6 +361,20 @@ function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
   };
 }
 
+function redactCentrisDocumentInventory(inventory = {}) {
+  const redactDoc = (doc = {}) => {
+    const { url, action_id, match_key, ...safeDoc } = doc;
+    return safeDoc;
+  };
+  const safeDocs = (Array.isArray(inventory.docs) ? inventory.docs : []).map(redactDoc);
+  const safeById = new Map(safeDocs.map((doc) => [doc.id, doc]));
+  const present = (Array.isArray(inventory.present) ? inventory.present : []).map((entry) => ({
+    ...entry,
+    docs: (Array.isArray(entry.docs) ? entry.docs : []).map((doc) => safeById.get(doc.id) || redactDoc(doc)),
+  }));
+  return { ...inventory, docs: safeDocs, present };
+}
+
 function mergeMatrixDocumentSnapshots(snapshots = []) {
   const ranked = [...snapshots].sort((left, right) => {
     const score = (item) => (item.exactListingMentioned ? 1000 : 0) + (item.docs?.length || 0) * 10;
@@ -424,7 +438,7 @@ async function inspectZonePage(page, centrisNum) {
         tag: el.tagName.toLowerCase(),
         type: el.getAttribute('type') || '',
         text: String(el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim().substring(0, 80),
-        href: String(el.getAttribute('href') || '').substring(0, 120),
+        href: String(el.getAttribute('href') || '').split('?')[0].split('#')[0].substring(0, 120),
       })),
   }));
   return { ...snapshot, ...classifyZonePageSnapshot(snapshot, centrisNum) };
@@ -449,8 +463,9 @@ async function navigateToZoneDocuments(page, centrisNum) {
   const attempts = [];
   const inspect = async (label) => {
     const state = await inspectZonePage(page, centrisNum);
-    attempts.push({ label, code: state.code, url: state.url, title: state.title });
-    console.log(`[ZONE-NAV] ${label}: ${state.code} url=${String(state.url).substring(0, 140)}`);
+    const safeLocation = safeCentrisPageLocation(state.url);
+    attempts.push({ label, code: state.code, url: safeLocation, title: state.title });
+    console.log(`[ZONE-NAV] ${label}: ${state.code} page=${safeLocation}`);
     if (state.code === 'ZONE_NAVIGATION_UNVERIFIED') {
       // Diagnostic sans secret: seulement titre, extrait de texte et contrôles
       // visibles. Permet d'adapter les sélecteurs si Centris change son UI.
@@ -817,18 +832,19 @@ async function previewCentrisMatrixDocuments(opts = {}) {
         success: false,
         error_code: state.code === 'MATRIX_AUTH_REQUIRED' ? state.code : 'MATRIX_LISTING_NOT_FOUND',
         message: `Le résultat exact #${centrisNum} n'a pas été trouvé dans Matrix. Aucun numéro substitut n'a été utilisé.`,
-        final_url: state.url,
+        final_url: safeCentrisPageLocation(state.url),
       };
     }
     if (!['MATRIX_DOCUMENTS_READY', 'MATRIX_LISTING_READY_NO_DOCUMENTS'].includes(state.code)) {
-      return { success: false, error_code: state.code, message: `Listing #${centrisNum} ouvert, mais la section des documents n'a pas pu être vérifiée. Aucun envoi effectué.`, final_url: state.url };
+      return { success: false, error_code: state.code, message: `Listing #${centrisNum} ouvert, mais la section des documents n'a pas pu être vérifiée. Aucun envoi effectué.`, final_url: safeCentrisPageLocation(state.url) };
     }
     const inventory = buildCentrisDocumentInventory(centrisNum, state.docs);
+    const publicInventory = redactCentrisDocumentInventory(inventory);
     return {
       success: true, dry_run: true, via: 'matrix-global', listing: state.listing,
-      docs_count: inventory.docs.length, docs_list: inventory.docs,
-      document_inventory: inventory, manifest_id: inventory.manifest_id,
-      listing_url: state.url,
+      docs_count: publicInventory.docs.length, docs_list: publicInventory.docs,
+      document_inventory: publicInventory, manifest_id: inventory.manifest_id,
+      listing_url: safeCentrisPageLocation(state.url),
       message: inventory.docs.length
         ? `PREVIEW Matrix — ${inventory.docs.length} document(s) trouvé(s). Aucun envoi effectué.`
         : `Listing #${centrisNum} trouvé dans Matrix, mais aucun document n'est affiché. Aucun envoi effectué.`,
@@ -1106,6 +1122,157 @@ function isAuthenticatedMatrixPage(rawUrl, passwordVisible, bodyText) {
   return /recherche|criteres|resultats|matrix|deconnexion|logout|fiche/.test(text);
 }
 
+function safeCentrisPageLocation(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return `${url.hostname.toLowerCase()}${url.pathname}`;
+  } catch {
+    return 'invalid-url';
+  }
+}
+
+function classifyCentrisLoginSnapshot(snapshot = {}) {
+  const rawUrl = String(snapshot.url || '');
+  let url;
+  try { url = new URL(rawUrl); } catch { return 'missing'; }
+  const host = url.hostname.toLowerCase();
+  const pathAndQuery = `${url.pathname}${url.search}`;
+  const passwordVisible = Number(snapshot.passwordVisible || 0);
+  const userCodeVisible = Number(snapshot.userCodeVisible || 0);
+  const identifierVisible = Number(snapshot.identifierVisible || 0);
+  const mfaVisible = Number(snapshot.mfaVisible || 0);
+  const bodyText = String(snapshot.bodyText || '');
+
+  if (isAuthenticatedMatrixPage(rawUrl, passwordVisible, bodyText)) return 'authenticated';
+  if (mfaVisible && new Set(['accounts.centris.ca', 'centris-prod.ca.auth0.com']).has(host)) return 'mfa';
+  if (host === 'accounts.centris.ca' && /\/account\/login/i.test(url.pathname) && userCodeVisible && passwordVisible) {
+    return 'credentials';
+  }
+  if (host === 'centris-prod.ca.auth0.com' && /\/u\/login\/identifier/i.test(pathAndQuery) && identifierVisible) {
+    return 'identifier';
+  }
+  if (host === 'centris-prod.ca.auth0.com' && /\/u\/login(?:\/password)?/i.test(pathAndQuery) && passwordVisible) {
+    return 'password';
+  }
+  return 'missing';
+}
+
+async function inspectCentrisLoginStep(page) {
+  const userCode = page.locator([
+    'input[id="UserCode"]',
+    'input[name="UserCode"]',
+    'input[id*="UserCode" i]',
+    'input[name*="UserCode" i]',
+    'input[autocomplete="username"]',
+  ].join(', '));
+  const identifier = page.locator([
+    'input[name="username"]',
+    'input[name="email"]',
+    'input[id*="username" i]',
+    'input[id*="identifier" i]',
+    'input[autocomplete="username"]',
+  ].join(', '));
+  const password = page.locator([
+    'input[id="Password"]',
+    'input[name="Password"]',
+    'input[type="password"]',
+    'input[autocomplete="current-password"]',
+  ].join(', '));
+  const mfa = page.locator('input[autocomplete="one-time-code"], input[name="code"], input[id="code"], input[name*="verification" i], input[id*="verification" i], input[type="tel"]');
+  const visibleCount = async (locator) => {
+    const count = Math.min(await locator.count().catch(() => 0), 10);
+    let visible = 0;
+    for (let index = 0; index < count; index += 1) {
+      if (await locator.nth(index).isVisible().catch(() => false)) visible += 1;
+    }
+    return visible;
+  };
+  const snapshot = {
+    url: page.url(),
+    userCodeVisible: await visibleCount(userCode),
+    identifierVisible: await visibleCount(identifier),
+    passwordVisible: await visibleCount(password),
+    mfaVisible: await visibleCount(mfa),
+    bodyText: await page.locator('body').innerText({ timeout: 2500 }).catch(() => ''),
+  };
+  return {
+    kind: classifyCentrisLoginSnapshot(snapshot),
+    location: safeCentrisPageLocation(snapshot.url),
+    userCode,
+    identifier,
+    password,
+    mfa,
+  };
+}
+
+async function waitForCentrisLoginStep(page, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  let step = await inspectCentrisLoginStep(page);
+  while (step.kind === 'missing' && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    step = await inspectCentrisLoginStep(page);
+  }
+  return step;
+}
+
+async function clickCentrisLoginSubmit(page) {
+  const submit = page.locator([
+    'button[type="submit"]',
+    'input[type="submit"]',
+    'button:has-text("Connect")',
+    'button:has-text("Connexion")',
+    'button:has-text("Continue")',
+    'button:has-text("Sign In")',
+    'button:has-text("Log In")',
+  ].join(', ')).first();
+  if (!(await submit.isVisible().catch(() => false)) || !(await submit.isEnabled().catch(() => false))) {
+    throw new Error(`CENTRIS_LOGIN_SUBMIT_MISSING:${safeCentrisPageLocation(page.url())}`);
+  }
+  await submit.click({ timeout: 10000 });
+}
+
+async function submitCentrisLogin(page, user, pass) {
+  // Supporte le formulaire Centris actuel (UserCode + Password) et le flux
+  // Auth0 fractionné observé lors de migrations. Aucun repli vers "le premier
+  // champ visible": une page inconnue échoue sans jamais y injecter de secret.
+  const submitted = new Set();
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const step = await waitForCentrisLoginStep(page, attempt === 0 ? 12000 : 8000);
+    if (step.kind === 'authenticated') return 'authenticated';
+    if (step.kind === 'mfa') return 'mfa';
+    if (step.kind === 'credentials') {
+      if (submitted.has('credentials')) throw new Error(`CENTRIS_LOGIN_REJECTED:${step.location}`);
+      submitted.add('credentials');
+      await step.userCode.first().fill(user, { timeout: 10000 });
+      await step.password.first().fill(pass, { timeout: 10000 });
+      await clickCentrisLoginSubmit(page);
+      await page.waitForTimeout(3500);
+      continue;
+    }
+    if (step.kind === 'identifier') {
+      if (submitted.has('identifier')) throw new Error(`CENTRIS_IDENTIFIER_REJECTED:${step.location}`);
+      submitted.add('identifier');
+      await step.identifier.first().fill(user, { timeout: 10000 });
+      await clickCentrisLoginSubmit(page);
+      await page.waitForTimeout(2500);
+      continue;
+    }
+    if (step.kind === 'password') {
+      if (submitted.has('password')) throw new Error(`CENTRIS_PASSWORD_REJECTED:${step.location}`);
+      submitted.add('password');
+      await step.password.first().fill(pass, { timeout: 10000 });
+      await clickCentrisLoginSubmit(page);
+      await page.waitForTimeout(3500);
+      continue;
+    }
+    throw new Error(`CENTRIS_LOGIN_FORM_MISSING:${step.location}`);
+  }
+  const finalStep = await inspectCentrisLoginStep(page);
+  if (finalStep.kind === 'authenticated') return 'authenticated';
+  if (finalStep.kind === 'mfa') return 'mfa';
+  throw new Error(`CENTRIS_LOGIN_NOT_COMPLETED:${finalStep.location}`);
+}
+
 function cookieHeaderFromPlaywrightCookies(cookies, targetHost = 'matrix.centris.ca') {
   const host = String(targetHost || '').toLowerCase();
   return (Array.isArray(cookies) ? cookies : [])
@@ -1219,11 +1386,14 @@ async function loginCentris(context) {
       const cookies = await context.cookies();
       saveSession(cookies);
       await saveBrowserStorageState(context, page);
-      console.log('[CUA] Session persistante vérifiée dans Matrix ✅', probeUrl.substring(0, 80));
+      console.log('[CUA] Session persistante vérifiée dans Matrix ✅', safeCentrisPageLocation(probeUrl));
       return page;
     }
-    console.log('[CUA] Session persistante refusée par Matrix — renouvellement automatique');
-    clearSession({ includeStorageState: true });
+    // Ne jamais détruire une session persistée sur la seule foi d'une sonde
+    // refusée ou d'un shell Matrix incomplet. Une nouvelle session validée la
+    // remplacera atomiquement; en cas de panne transitoire, l'ancienne reste
+    // disponible pour un futur renouvellement ou un nouveau push du Mac.
+    console.log('[CUA] Session persistante non vérifiée par Matrix — renouvellement sans suppression');
   } catch (e) {
     console.warn('[CUA] Vérification session échouée:', safeErrorMessage(e));
   }
@@ -1233,40 +1403,17 @@ async function loginCentris(context) {
   await page.goto(`${MATRIX_BASE}/Matrix/Login.aspx`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(2500);
 
-  const currentUrl = page.url();
-  console.log('[CUA] URL login:', currentUrl.substring(0, 100));
-
-  // Centris form: UserCode + Password sur même page (pas Auth0 split)
-  let loginDeterministicOK = false;
-  try {
-    const userField = page.locator('input[id*="UserCode"], input[name*="UserCode"], input[id="UserCode"], input[placeholder*="user" i], input[placeholder*="code" i]').first();
-    await userField.waitFor({ timeout: 10000 });
-    await userField.fill(user);
-
-    const passField = page.locator('input[id="Password"], input[type="password"], input[name="Password"]').first();
-    await passField.fill(pass);
-
-    const submitBtn = page.locator('button[type="submit"], input[type="submit"], button:has-text("Connect"), button:has-text("Connexion"), button:has-text("Sign In"), button:has-text("Log In")').first();
-    await submitBtn.click();
-    console.log('[CUA] Login form rempli (deterministic) ✅');
-    await page.waitForTimeout(4500);
-    loginDeterministicOK = true;
-  } catch (e) {
-    console.warn(`[CUA] Login deterministic échoué: ${safeErrorMessage(e)}. Fallback DOM...`);
+  console.log('[CUA] Page login:', safeCentrisPageLocation(page.url()));
+  const loginResult = await submitCentrisLogin(page, user, pass);
+  if (loginResult === 'authenticated') {
+    const cookies = await context.cookies();
+    saveSession(cookies);
+    await saveBrowserStorageState(context, page);
+    try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
+    console.log('[CUA] SSO Centris déjà authentifié ✅', safeCentrisPageLocation(page.url()));
+    return page;
   }
-
-  // Fallback DOM large — les identifiants restent dans Playwright et ne sont
-  // jamais envoyés à un modèle externe.
-  if (!loginDeterministicOK) {
-    console.log('[CUA] Fallback DOM pour login...');
-    const passField = page.locator('input[type="password"]:visible').first();
-    const userField = page.locator('input:visible:not([type="password"]):not([type="hidden"]):not([type="submit"]):not([type="button"])').first();
-    await userField.fill(user);
-    await passField.fill(pass);
-    await page.locator('button[type="submit"], input[type="submit"]').first().click();
-    await page.waitForTimeout(4500);
-    console.log('[CUA] Login DOM fallback soumis ✅');
-  }
+  console.log('[CUA] Identifiants Centris soumis via formulaire reconnu ✅');
 
   // Si Centris propose le courriel, le privilégier: le bot peut lire le code
   // automatiquement dans Gmail. Sinon, le SMS reste disponible via /mfa.
@@ -1327,7 +1474,7 @@ async function loginCentris(context) {
   const finalPasswordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
   const finalText = await page.locator('body').innerText({ timeout: 3000 }).catch(() => '');
   if (!isAuthenticatedMatrixPage(finalUrl, finalPasswordVisible, finalText)) {
-    throw new Error(`Login Centris échoué — URL finale: ${finalUrl.substring(0, 200)}`);
+    throw new Error(`Login Centris échoué — page finale: ${safeCentrisPageLocation(finalUrl)}`);
   }
 
   // Sauvegarder la session sur le disque persistant. La durée locale est un
@@ -1337,7 +1484,7 @@ async function loginCentris(context) {
   await saveBrowserStorageState(context, page);
   // Push aussi vers bot principal pour partage
   try { await pushCookiesToBot(cookies); } catch (e) { console.warn('[CUA] push cookies bot:', safeErrorMessage(e)); }
-  console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', finalUrl.substring(0, 80));
+  console.log('[CUA] Login Centris réussi ✅ Cookies sauvegardés.', safeCentrisPageLocation(finalUrl));
   return page;
 }
 
@@ -1827,7 +1974,6 @@ Le PDF sera capturé automatiquement dès que le téléchargement commence.
 
   } catch (e) {
     console.error('[CUA] cuaGetCentrisPDF error:', e.message);
-    if (/session|login|auth/i.test(e.message)) clearSession();
     return { success: false, buffer: null, message: e.message };
   } finally {
     if (browser) try { await browser.close(); } catch {}
@@ -2029,7 +2175,6 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
 
   } catch (e) {
     console.error('[CUA] cuaGetCentrisAnnexes error:', e.message);
-    if (/login|auth/i.test(e.message)) clearSession();
     return { success: false, annexes: [], message: e.message };
   } finally {
     // Fermer explicitement le contexte libère pages, réponses et buffers avant
@@ -2951,7 +3096,7 @@ async function loginCentrisZone(context) {
     throw new Error(`ZONE_APP_BLANK — Centris Zone n'a rendu aucun contrôle après la connexion`);
   }
   if (!/Dashboard|Directory|Listings/i.test(page.url()) || loggedState.code === 'ZONE_AUTH_REQUIRED') {
-    throw new Error(`Zone login échoué — URL: ${page.url().substring(0, 100)}`);
+    throw new Error(`Zone login échoué — page: ${safeCentrisPageLocation(page.url())}`);
   }
   console.log('[ZONE] Logged ✅');
   // Save cookies pour reuse
@@ -3069,7 +3214,7 @@ async function runCentrisZoneDocuments(opts = {}) {
         message: `Accès Zone non confirmé (${zoneState.code}). Aucun envoi effectué.`,
         broker_info: broker,
         listing_public_found: broker.source === 'centris.ca-public',
-        final_url: zoneState.url,
+        final_url: safeCentrisPageLocation(zoneState.url),
         navigation_attempts: navigation.attempts,
       };
     }
@@ -3111,20 +3256,21 @@ async function runCentrisZoneDocuments(opts = {}) {
           : `Page Documents trouvée pour #${centris_num}, mais l’inventaire n’a pas pu être lu. Aucun envoi effectué.`,
         broker_info: broker,
         listing_public_found: broker.source === 'centris.ca-public',
-        final_url: zoneState.url,
+        final_url: safeCentrisPageLocation(zoneState.url),
         navigation_attempts: navigation.attempts,
       };
     }
 
     // DRY-RUN: short-circuit ici, pas d'envoi
     if (dry_run) {
+      const publicInventory = redactCentrisDocumentInventory(inventory);
       return {
         success: true,
         dry_run: true,
         broker_info: broker,
         docs_count: checkedCount,
-        docs_list: inventory.docs,
-        document_inventory: inventory,
+        docs_list: publicInventory.docs,
+        document_inventory: publicInventory,
         manifest_id: inventory.manifest_id,
         listing_url: `https://zone.centris.ca/Listings/${centris_num}/Documents`,
         message: `PREVIEW — ${checkedCount} docs prêts à partager. Confirme avec envoyer_tous_documents_zone pour livrer.`,
@@ -3145,7 +3291,7 @@ async function runCentrisZoneDocuments(opts = {}) {
         message: 'Partage Zone bloqué: la liste des documents a changé depuis l’aperçu. Une nouvelle vérification est requise.',
         expected_manifest_id: expectedManifestId,
         actual_manifest_id: inventory.manifest_id,
-        document_inventory: inventory,
+        document_inventory: redactCentrisDocumentInventory(inventory),
       };
     }
 
@@ -3186,8 +3332,8 @@ async function runCentrisZoneDocuments(opts = {}) {
       success: true,
       broker_info: broker,
       docs_shared: checkedCount,
-      docs_list: inventory.docs,
-      document_inventory: inventory,
+      docs_list: redactCentrisDocumentInventory(inventory).docs,
+      document_inventory: redactCentrisDocumentInventory(inventory),
       manifest_id: inventory.manifest_id,
       sent_to: email,
       send_self_copy: sendSelfCopy,
@@ -3542,9 +3688,12 @@ module.exports = {
   _browserlessEndpointWithTimeout: browserlessEndpointWithTimeout,
   _isAuthenticatedCentrisUrl: isAuthenticatedCentrisUrl,
   _isAuthenticatedMatrixPage: isAuthenticatedMatrixPage,
+  _safeCentrisPageLocation: safeCentrisPageLocation,
+  _classifyCentrisLoginSnapshot: classifyCentrisLoginSnapshot,
   _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
   _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
   _buildCentrisDocumentInventory: buildCentrisDocumentInventory,
+  _redactCentrisDocumentInventory: redactCentrisDocumentInventory,
   _dedupeCentrisDiscoveredDocs: dedupeCentrisDiscoveredDocs,
   _mergeMatrixDocumentSnapshots: mergeMatrixDocumentSnapshots,
   _buildCentrisContentManifest: buildCentrisContentManifest,
