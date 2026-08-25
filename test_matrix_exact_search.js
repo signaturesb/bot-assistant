@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
 const {
   _matrixTextContainsExactNumber: containsExact,
   _isExactMatrixListingLabel: isExactLabel,
@@ -49,5 +50,13 @@ assert.strictEqual(classify({
   docs: [],
   mediaLinkCount: 0,
 }, '28936167').code, 'MATRIX_LISTING_READY_NO_DOCUMENTS');
+
+const driverCode = fs.readFileSync('./cua_driver.js', 'utf8');
+assert.match(driverCode, /async function submitMatrixGlobalSearch/,
+  'le parcours doit encapsuler la soumission de la recherche Matrix');
+assert.match(driverCode, /search\.press\('Enter'\)[\s\S]*?best\.click/,
+  'la loupe Matrix doit servir de repli quand Entrée ne navigue pas');
+assert.match(driverCode, /clear\|effacer\|close\|fermer\|reset/,
+  'le repli ne doit jamais cliquer le X d’effacement');
 
 console.log('✅ Matrix exact search: semantic selector and exact-listing guards passed');

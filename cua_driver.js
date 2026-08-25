@@ -650,6 +650,48 @@ async function openMatrixGlobalSearch(page) {
   return findMatrixGlobalSearch(page);
 }
 
+async function submitMatrixGlobalSearch(page, search, centrisNum) {
+  await search.fill(centrisNum);
+  await search.press('Enter');
+  await page.waitForTimeout(2500);
+
+  let state = await inspectMatrixListingPage(page, centrisNum);
+  if (state.exactListingMentioned || /\/Matrix\/Results\.aspx/i.test(page.url())) return state;
+
+  // Matrix v12.6 ne traite pas toujours Entrée. La vidéo de Shawn montre une
+  // loupe immédiatement à droite de la barre. Repérer le contrôle visible le
+  // plus à droite dans les deux conteneurs parents, plutôt que des coordonnées
+  // d'écran ou un identifiant ASP.NET instable. Le X d'effacement est à gauche
+  // de la loupe; le bouton de recherche obtient donc le meilleur score.
+  const inputBox = await search.boundingBox().catch(() => null);
+  let best = null;
+  let bestScore = -Infinity;
+  for (const scope of [search.locator('xpath=..'), search.locator('xpath=../..')]) {
+    const controls = scope.locator('button, input[type="submit"], a, [role="button"]');
+    const count = Math.min(await controls.count().catch(() => 0), 20);
+    for (let index = 0; index < count; index += 1) {
+      const control = controls.nth(index);
+      if (!(await control.isVisible().catch(() => false)) || !(await control.isEnabled().catch(() => false))) continue;
+      const box = await control.boundingBox().catch(() => null);
+      if (!box || !inputBox || box.x < inputBox.x + inputBox.width - 40) continue;
+      const meta = await control.evaluate((el) => [
+        el.id, el.getAttribute('name'), el.getAttribute('class'),
+        el.getAttribute('title'), el.getAttribute('aria-label'), el.textContent,
+      ].filter(Boolean).join(' ')).catch(() => '');
+      if (/clear|effacer|close|fermer|reset/i.test(meta)) continue;
+      let score = box.x;
+      if (/search|recherch|loupe|magnif|submit/i.test(meta)) score += 10000;
+      if (score > bestScore) { best = control; bestScore = score; }
+    }
+  }
+  if (best) {
+    await best.click({ timeout: 10000 });
+    await page.waitForTimeout(3500);
+    state = await inspectMatrixListingPage(page, centrisNum);
+  }
+  return state;
+}
+
 function scoreMatrixSearchCandidate(meta = '', box = {}) {
   const value = String(meta || '');
   let score = 0;
@@ -885,9 +927,7 @@ async function previewCentrisMatrixDocuments(opts = {}) {
     }
 
     console.log(`[MATRIX-PREVIEW] Recherche globale exacte #${centrisNum}`);
-    await search.fill(centrisNum);
-    await search.press('Enter');
-    await page.waitForTimeout(3500);
+    await submitMatrixGlobalSearch(page, search, centrisNum);
     const state = await openExactMatrixListing(page, centrisNum);
     if (!state.exactListingMentioned) {
       return {
@@ -2113,9 +2153,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
       console.warn('[MATRIX-DIAG] Recherche globale absente:', JSON.stringify(await matrixSearchDiagnostics(page)));
       throw new Error('MATRIX_SEARCH_CONTROL_MISSING');
     }
-    await search.fill(exactNum);
-    await search.press('Enter');
-    await page.waitForTimeout(3500);
+    await submitMatrixGlobalSearch(page, search, exactNum);
     const state = await openExactMatrixListing(page, exactNum);
     if (!state.exactListingMentioned) throw new Error(`MATRIX_EXACT_LISTING_NOT_VERIFIED:${exactNum}`);
 
