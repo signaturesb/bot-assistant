@@ -2839,8 +2839,8 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
             const cookieHeader = cookieHeaderFromPlaywrightCookies(authenticatedState.cookies, responseUrl.hostname);
             if (!cookieHeader) throw new Error('MATRIX_PRINT_COOKIE_MISSING');
             clearTimeout(timer);
-            timer = setTimeout(() => finish(new Error(`MATRIX_PRINT_DETACHED_TIMEOUT:${lastDiagnostic}`)), 90000);
-            const fetchedBuffer = await streamMatrixPdfUntilEof(response.url(), cookieHeader, 75000);
+            timer = setTimeout(() => finish(new Error(`MATRIX_PRINT_DETACHED_TIMEOUT:${lastDiagnostic}`)), 270000);
+            const fetchedBuffer = await streamMatrixPdfUntilEof(response.url(), cookieHeader, 240000);
             console.log(`[MATRIX-PDF] Fiche PrintP récupérée jusqu'à %%EOF (${fetchedBuffer.length} octets)`);
             finish(null, fetchedBuffer);
             return;
@@ -2910,7 +2910,7 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
   return result;
 }
 
-async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 75000) {
+async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 240000) {
   const target = new URL(String(rawUrl || ''));
   if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
       !/^\/Matrix\/PrintP/i.test(target.pathname)) {
@@ -2918,6 +2918,7 @@ async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 75000) 
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let progress = null;
   try {
     const response = await fetch(target.href, {
       method: 'GET',
@@ -2940,6 +2941,8 @@ async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 75000) 
     const chunks = [];
     let total = 0;
     let tail = Buffer.alloc(0);
+    console.log('[MATRIX-PDF] Flux PrintP autonome ouvert; attente de %%EOF');
+    progress = setInterval(() => console.log(`[MATRIX-PDF] Flux PrintP en cours: ${total} octets reçus`), 30000);
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -2961,6 +2964,7 @@ async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 75000) 
     throw new Error('MATRIX_PRINT_STREAM_EOF_MISSING');
   } finally {
     clearTimeout(timeout);
+    if (progress) clearInterval(progress);
   }
 }
 

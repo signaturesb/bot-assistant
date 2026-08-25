@@ -42,7 +42,7 @@ assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire mod
 assert(cuaSource.includes('reopenVerifiedMatrixListing(page, exactNum, state.url)'), 'La phase fiche doit rouvrir directement le listing vérifié sans répéter la recherche globale');
 assert(cuaSource.includes('doc.action_id === MATRIX_LISTING_REPORT_ACTION ? 1'), 'La fiche doit être générée avec une seule tentative longue sous la limite Browserless');
 assert(cuaSource.includes('pdfControl.click({ timeout: 10000 }), 40000'), 'La fiche doit disposer de 40 s de génération dans sa session dédiée');
-assert(cuaSource.includes('streamMatrixPdfUntilEof(response.url(), cookieHeader, 75000)'),
+assert(cuaSource.includes('streamMatrixPdfUntilEof(response.url(), cookieHeader, 240000)'),
   'une réponse PrintP doit être lue par un flux HTTP autonome borné');
 assert(cuaSource.includes("scan.indexOf(Buffer.from('%%EOF'))") && cuaSource.includes("full.lastIndexOf(Buffer.from('%%EOF'))"),
   'le flux PrintP doit s’arrêter sur la vraie fin PDF sans attendre la fermeture Matrix');
