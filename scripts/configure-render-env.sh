@@ -56,7 +56,7 @@ fi
 
 # 4. Ajout des env vars
 echo ""
-echo "📝 Ajout des 3 env vars à Render..."
+echo "📝 Ajout des env vars Centris à Render..."
 
 add_env_var() {
   local key="$1"
@@ -82,9 +82,14 @@ if [ -z "$CENTRIS_PASS" ]; then
   read -r -s -p "CENTRIS_PASS (mot de passe Centris): " CENTRIS_PASS
   echo
 fi
+if [ -z "$CENTRIS_SESSION_KEY" ]; then
+  CENTRIS_SESSION_KEY="$(openssl rand -hex 32)"
+fi
 
 add_env_var "CENTRIS_USER" "$CENTRIS_USER"
 add_env_var "CENTRIS_PASS" "$CENTRIS_PASS"
+add_env_var "CENTRIS_SESSION_KEY" "$CENTRIS_SESSION_KEY"
+add_env_var "CENTRIS_AUTO_LOGIN" "true"
 add_env_var "SMS_BRIDGE_SECRET" "$SMS_BRIDGE_SECRET"
 
 echo ""
@@ -99,6 +104,6 @@ echo ""
 echo "═══ TERMINÉ ═══"
 echo ""
 echo "Render redéploie maintenant (~90s). Quand fini:"
-echo "1. Tape /login_centris dans Telegram"
-echo "2. SMS arrive sur ton iPhone → bridge → bot → login complet"
-echo "3. Puis /fiche <#> <email> marche pour n'importe quel listing"
+echo "1. Le bot vérifie et renouvelle automatiquement la session Centris"
+echo "2. Si Centris exige un MFA, Gmail/TOTP/pont Messages le transmet automatiquement"
+echo "3. /login_centris reste seulement un diagnostic manuel de secours"

@@ -26,6 +26,11 @@
 const fs   = require('fs');
 const path = require('path');
 const nodeCrypto = require('crypto');
+const {
+  readSessionFile,
+  removeSessionFile,
+  writeSessionFile,
+} = require('./lib/centris_session_store');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -33,9 +38,10 @@ const nodeCrypto = require('crypto');
 
 const DATA_DIR       = fs.existsSync('/data') ? '/data' : '/tmp';
 const SESSION_FILE   = path.join(DATA_DIR, 'cua_session.json');
+const STORAGE_STATE_FILE = path.join(DATA_DIR, 'centris_storage_state.json');
 const SCREENSHOT_DIR = path.join(DATA_DIR, 'cua_screenshots');
 const PDF_DIR        = path.join(DATA_DIR, 'cua_pdfs');
-const SESSION_TTL    = 12 * 60 * 60 * 1000;   // 12h — refresh auto
+const SESSION_TTL    = clampDurationMs(process.env.CENTRIS_SESSION_TTL_MS, 25 * 24 * 60 * 60 * 1000, 60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000);
 const MAX_STEPS      = 25;                      // iterations max par tâche
 const VIEWPORT       = { width: 1280, height: 900 };
 // Centris a migré 2026: agent.centris.ca retiré → matrix.centris.ca
@@ -44,6 +50,11 @@ const MATRIX_BASE    = 'https://matrix.centris.ca';
 const PUBLIC_BASE    = 'https://www.centris.ca';
 const MANUAL_MFA_TTL = 2 * 60 * 1000;
 const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
+
+function clampDurationMs(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Math.max(min, Math.min(Number.isFinite(parsed) && parsed > 0 ? parsed : fallback, max));
+}
 
 // Pont MFA en mémoire entre Telegram (/mfa) et la session Playwright active.
 // Le code est accepté uniquement pendant une attente MFA, consommé une fois,
@@ -75,39 +86,229 @@ function hasExplicitCentrisSendConfirmation(value) {
   return EXPLICIT_CENTRIS_SEND_RE.test(String(value || '').trim());
 }
 
-const CENTRIS_STANDARD_DOCUMENTS = Object.freeze([
-  { key: 'fiche_detaillee', label: 'Fiche détaillée', patterns: [/fiche/i, /descriptive/i, /detail/i] },
-  { key: 'declaration_vendeur', label: 'Déclaration du vendeur (DV)', patterns: [/d[ée]claration.*vendeur/i, /\bDV\b/i] },
-  { key: 'taxes_municipales', label: 'Taxes municipales', patterns: [/taxe.*municip/i] },
-  { key: 'taxes_scolaires', label: 'Taxes scolaires', patterns: [/taxe.*scolair/i] },
-  { key: 'certificat_localisation', label: 'Certificat de localisation', patterns: [/certificat.*localisation/i, /\bcert\.?\s*loc/i] },
-  { key: 'plans', label: 'Plans', patterns: [/\bplan/i, /implantation/i, /cadastr/i] },
+const CENTRIS_DASH_RE = /[\u2010-\u2015\u2212]/g;
+
+function normalizeCentrisLabel(label, { stripAccents = false } = {}) {
+  let normalized = String(label || '')
+    .normalize('NFC')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(CENTRIS_DASH_RE, '-')
+    .replace(/[\u00A0\u2000-\u200B\s]+/g, ' ')
+    .trim();
+  if (stripAccents) {
+    normalized = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  }
+  return normalized;
+}
+
+function normalizeCentrisMatchKey(label) {
+  return normalizeCentrisLabel(label, { stripAccents: true }).toLowerCase();
+}
+
+function extractCentrisLotNumber(label) {
+  const match = normalizeCentrisLabel(label).match(/\blot\s*([0-9][0-9\s]*[0-9]|[0-9])\b/i);
+  return match ? match[1].replace(/\s+/g, '') : null;
+}
+
+function parseCentrisDisplaySize(sizeDisplay) {
+  if (sizeDisplay === null || sizeDisplay === undefined || sizeDisplay === '') return null;
+  const match = String(sizeDisplay).trim().match(/^([0-9]+(?:[.,][0-9]+)?)\s*([kmg])(?:o|b)?$/i);
+  if (!match) return null;
+  const amount = Number.parseFloat(match[1].replace(',', '.'));
+  if (!Number.isFinite(amount)) return null;
+  const unit = match[2].toLowerCase();
+  const multiplier = unit === 'k' ? 1024 : unit === 'm' ? 1024 ** 2 : 1024 ** 3;
+  return Math.round(amount * multiplier);
+}
+
+const CENTRIS_DOCUMENT_CATEGORIES = Object.freeze([
+  {
+    key: 'declaration_vendeur_principale',
+    label: 'Déclaration du vendeur (principale)',
+    test: (doc) => doc.source_section === 'principal_dv' || (
+      doc.source_section !== 'additional_documents' &&
+      !/modification/.test(doc.match_key) &&
+      (/declaration.*vendeur/.test(doc.match_key) || /(^|\s)oui\s+dv[-\s]?\d+/.test(doc.match_key) || /^dv[-\s]?\d+/.test(doc.match_key) || /\bdv\b/.test(doc.match_key))
+    ),
+  },
+  { key: 'modification_dv', label: 'Modification de la déclaration du vendeur', test: (doc) => /modification/.test(doc.match_key) && (/\bdv\b/.test(doc.match_key) || /declaration/.test(doc.match_key)) },
+  { key: 'fiche_detaillee', label: 'Fiche détaillée', test: (doc) => /fiche/.test(doc.match_key) || /descriptive/.test(doc.match_key) || /\bdetail/.test(doc.match_key) },
+  { key: 'plan_cadastral', label: 'Plan cadastral', test: (doc) => /cadastr/.test(doc.match_key) },
+  { key: 'plan_autre', label: 'Autre plan', test: (doc) => /\bplan\b/.test(doc.match_key) || /implantation/.test(doc.match_key) },
+  { key: 'certificat_localisation', label: 'Certificat de localisation', test: (doc) => /certificat.*localisation/.test(doc.match_key) || /\bcert\.?\s*loc/.test(doc.match_key) },
+  { key: 'taxes_scolaires', label: 'Taxes scolaires', test: (doc) => /taxe.*scolair/.test(doc.match_key) },
+  { key: 'taxes_municipales', label: 'Taxes municipales', test: (doc) => /taxe.*municip/.test(doc.match_key) },
+  { key: 'role_evaluation', label: "Rôle d'évaluation", test: (doc) => /role.*evaluation/.test(doc.match_key) },
+  { key: 'obligation_courtier', label: 'Obligation du courtier', test: (doc) => /obligation.*courtier/.test(doc.match_key) },
 ]);
 
-function buildCentrisDocumentInventory(centrisNum, docs = []) {
-  const normalizedDocs = (Array.isArray(docs) ? docs : [])
-    .map((doc) => ({
-      name: String(doc?.name || '').trim(),
-      size: doc?.size ? String(doc.size).trim() : null,
-    }))
-    .filter((doc) => doc.name)
-    .sort((a, b) => `${a.name}|${a.size || ''}`.localeCompare(`${b.name}|${b.size || ''}`, 'fr'));
-  const present = [];
-  const missing = [];
-  for (const expected of CENTRIS_STANDARD_DOCUMENTS) {
-    const matches = normalizedDocs.filter((doc) => expected.patterns.some((pattern) => pattern.test(doc.name)));
-    (matches.length ? present : missing).push({
-      key: expected.key,
-      label: expected.label,
-      matches: matches.map((doc) => doc.name),
+const CENTRIS_CATEGORY_LABELS = Object.freeze(Object.fromEntries(
+  CENTRIS_DOCUMENT_CATEGORIES.map((category) => [category.key, category.label])
+));
+
+function stableCentrisManifestId(payload) {
+  return nodeCrypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function canonicalManifestDocs(docs, { includeContent = false } = {}) {
+  return docs.map((doc) => {
+    const item = {
+      category: doc.category,
+      label_key: doc.match_key,
+      lot: doc.lot,
+      size_bytes: doc.size_bytes,
+    };
+    if (includeContent) {
+      item.actual_size_bytes = doc.actual_size_bytes;
+      item.page_count = doc.page_count;
+      item.sha256 = doc.sha256;
+    }
+    return item;
+  }).sort((a, b) => {
+    const left = JSON.stringify(a);
+    const right = JSON.stringify(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+}
+
+function buildCentrisContentManifest(centrisNum, docs = []) {
+  const list = Array.isArray(docs) ? docs : [];
+  if (!list.length) {
+    return {
+      complete: false,
+      content_manifest_id: null,
+      incomplete_document_ids: [],
+      error_code: 'CENTRIS_DOCUMENT_LIST_EMPTY',
+    };
+  }
+  const incomplete = list.filter((doc) =>
+    !/^[a-f0-9]{64}$/i.test(String(doc?.sha256 || '')) ||
+    !Number.isInteger(doc?.page_count) || doc.page_count < 1 ||
+    !Number.isInteger(doc?.actual_size_bytes) || doc.actual_size_bytes < 1
+  );
+  if (incomplete.length) {
+    return {
+      complete: false,
+      content_manifest_id: null,
+      incomplete_document_ids: incomplete.map((doc) => doc?.id || null),
+    };
+  }
+  return {
+    complete: true,
+    content_manifest_id: stableCentrisManifestId({
+      centris_num: String(centrisNum || ''),
+      docs: canonicalManifestDocs(list, { includeContent: true }),
+    }),
+    incomplete_document_ids: [],
+  };
+}
+
+function addCentrisContentMetadata(doc, bytes, pageCount) {
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || '');
+  if (!buffer.length) throw new Error('CENTRIS_DOCUMENT_EMPTY');
+  if (buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+    throw new Error('CENTRIS_DOCUMENT_NOT_PDF');
+  }
+  if (!Number.isInteger(pageCount) || pageCount < 1) throw new Error('CENTRIS_DOCUMENT_PAGE_COUNT_INVALID');
+  return {
+    ...doc,
+    actual_size_bytes: buffer.length,
+    page_count: pageCount,
+    sha256: nodeCrypto.createHash('sha256').update(buffer).digest('hex'),
+  };
+}
+
+function buildCentrisDocumentInventory(centrisNum, docs = [], options = {}) {
+  const rawList = Array.isArray(docs) ? docs : [];
+  const normalizedDocs = rawList.map((doc, index) => {
+    const labelOriginal = String(doc?.label_original || doc?.name || '').trim();
+    const sizeDisplay = doc?.size_display ?? doc?.size ?? null;
+    const labelNormalized = normalizeCentrisLabel(labelOriginal);
+    const sourceSection = String(doc?.source_section || '').trim() || null;
+    const provenance = String(doc?.provenance || '').trim() || 'unknown';
+    return {
+      id: nodeCrypto.createHash('sha256').update(`${index}|${labelOriginal}|${sizeDisplay || ''}`).digest('hex').slice(0, 16),
+      name: labelOriginal,
+      size: sizeDisplay === null ? null : String(sizeDisplay).trim(),
+      label_original: labelOriginal,
+      label_normalized: labelNormalized,
+      match_key: normalizeCentrisMatchKey(labelOriginal),
+      category: null,
+      subtype: doc?.subtype || null,
+      size_display: sizeDisplay === null ? null : String(sizeDisplay).trim(),
+      size_bytes: parseCentrisDisplaySize(sizeDisplay),
+      actual_size_bytes: Number.isInteger(doc?.actual_size_bytes) ? doc.actual_size_bytes : null,
+      lot: extractCentrisLotNumber(labelOriginal),
+      order: index,
+      provenance,
+      source_section: sourceSection,
+      url: doc?.url || null,
+      page_count: Number.isInteger(doc?.page_count) ? doc.page_count : null,
+      sha256: /^[a-f0-9]{64}$/i.test(String(doc?.sha256 || '')) ? String(doc.sha256).toLowerCase() : null,
+    };
+  }).filter((doc) => doc.label_original);
+
+  const claimed = new Set();
+  const byCategory = new Map(CENTRIS_DOCUMENT_CATEGORIES.map((category) => [category.key, []]));
+  for (const category of CENTRIS_DOCUMENT_CATEGORIES) {
+    for (const doc of normalizedDocs) {
+      if (claimed.has(doc.id) || !category.test(doc)) continue;
+      doc.category = category.key;
+      claimed.add(doc.id);
+      byCategory.get(category.key).push(doc);
+    }
+  }
+
+  const unclassified = normalizedDocs.filter((doc) => !claimed.has(doc.id));
+  for (const doc of unclassified) doc.category = 'document_autre';
+
+  const present = CENTRIS_DOCUMENT_CATEGORIES.flatMap((category) => {
+    const categoryDocs = byCategory.get(category.key);
+    return categoryDocs.length ? [{
+      key: category.key,
+      label: category.label,
+      docs: categoryDocs,
+      matches: categoryDocs.map((doc) => doc.label_original),
+    }] : [];
+  });
+  if (unclassified.length) {
+    present.push({
+      key: 'document_autre',
+      label: 'Autre document',
+      docs: unclassified,
+      matches: unclassified.map((doc) => doc.label_original),
     });
   }
-  const manifestPayload = JSON.stringify({ centris_num: String(centrisNum || ''), docs: normalizedDocs });
+
+  const requestedExpectedCategories = [...new Set(
+    Array.isArray(options.expectedCategories) ? options.expectedCategories : []
+  )];
+  const invalidExpectedCategories = requestedExpectedCategories
+    .filter((key) => !Object.prototype.hasOwnProperty.call(CENTRIS_CATEGORY_LABELS, key));
+  const expectedCategories = requestedExpectedCategories
+    .filter((key) => Object.prototype.hasOwnProperty.call(CENTRIS_CATEGORY_LABELS, key));
+  const missingExpectedDocuments = expectedCategories
+    .filter((key) => !(byCategory.get(key) || []).length)
+    .map((key) => ({ key, label: CENTRIS_CATEGORY_LABELS[key] }));
+
+  const inventoryManifestId = stableCentrisManifestId({
+    centris_num: String(centrisNum || ''),
+    docs: canonicalManifestDocs(normalizedDocs),
+  });
+  const contentManifest = buildCentrisContentManifest(centrisNum, normalizedDocs);
   return {
     docs: normalizedDocs,
     present,
-    missing,
-    manifest_id: nodeCrypto.createHash('sha256').update(manifestPayload).digest('hex'),
+    known_categories: Object.keys(CENTRIS_CATEGORY_LABELS),
+    expected_documents: expectedCategories,
+    invalid_expected_categories: invalidExpectedCategories,
+    inventory_valid: invalidExpectedCategories.length === 0,
+    missing_expected_documents: missingExpectedDocuments,
+    missing: missingExpectedDocuments,
+    inventory_manifest_id: inventoryManifestId,
+    manifest_id: inventoryManifestId,
+    content_manifest_id: contentManifest.content_manifest_id,
+    content_validation_complete: contentManifest.complete,
   };
 }
 
@@ -479,9 +680,10 @@ function initDirs() {
 function loadSession() {
   try {
     if (!fs.existsSync(SESSION_FILE)) return null;
-    const s = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-    if (Date.now() - s.ts > SESSION_TTL) {
-      fs.unlinkSync(SESSION_FILE);
+    const s = readSessionFile(SESSION_FILE);
+    const expiresAt = Number(s?.expiry || ((s?.ts || 0) + SESSION_TTL));
+    if (!s || !Array.isArray(s.cookies) || Date.now() > expiresAt) {
+      removeSessionFile(SESSION_FILE);
       return null;
     }
     return s.cookies || null;
@@ -490,16 +692,17 @@ function loadSession() {
 
 function saveSession(cookies) {
   try {
-    fs.writeFileSync(SESSION_FILE, JSON.stringify({ ts: Date.now(), cookies }));
-  } catch (e) { console.warn('[CUA] session save error:', e.message); }
+    const capturedAt = Date.now();
+    writeSessionFile(SESSION_FILE, { ts: capturedAt, capturedAt, expiry: capturedAt + SESSION_TTL, cookies });
+  } catch (e) { console.warn('[CUA] session save error:', safeErrorMessage(e)); }
 }
 
 function isAuthenticatedCentrisUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
     const host = url.hostname.toLowerCase();
-    if (!/(^|\.)centris\.ca$/.test(host) || host === 'accounts.centris.ca') return false;
-    return !/\/(?:login|auth|signin)(?:[/.?]|$)|LoginIntermediate/i.test(`${url.pathname}${url.search}`);
+    if (!new Set(['matrix.centris.ca', 'zone.centris.ca']).has(host)) return false;
+    return !/\/(?:login|auth|signin|error|accessdenied)(?:[/.?]|$)|LoginIntermediate/i.test(`${url.pathname}${url.search}`);
   } catch {
     return false;
   }
@@ -521,20 +724,20 @@ async function saveBrowserStorageState(context, page) {
   try {
     const storageState = await context.storageState();
     const userAgent = await page.evaluate(() => navigator.userAgent).catch(() => null);
-    const stateFile = path.join(DATA_DIR, 'centris_storage_state.json');
-    fs.writeFileSync(stateFile, JSON.stringify({
+    writeSessionFile(STORAGE_STATE_FILE, {
       storageState,
       userAgent,
       capturedAt: Date.now(),
       expiry: Date.now() + SESSION_TTL,
-    }));
+    });
   } catch (e) {
     console.warn('[CUA] storageState save error:', safeErrorMessage(e));
   }
 }
 
-function clearSession() {
-  try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch {}
+function clearSession(options = {}) {
+  removeSessionFile(SESSION_FILE);
+  if (options.includeStorageState) removeSessionFile(STORAGE_STATE_FILE);
 }
 
 // Récupère cookies du bot principal (centris_cookies.json) si CUA n'a pas sa propre session
@@ -543,11 +746,11 @@ function clearSession() {
 // Plus fiable que juste cookies. Source: LaunchAgent Mac centris-auto-login push.
 function loadBotCentrisStorageState() {
   try {
-    const stateFile = path.join(DATA_DIR, 'centris_storage_state.json');
-    if (!fs.existsSync(stateFile)) return null;
-    const data = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    const data = readSessionFile(STORAGE_STATE_FILE);
+    if (!data) return null;
     if (data.expiry && Date.now() > data.expiry) {
       console.log('[CUA] storageState expiré');
+      removeSessionFile(STORAGE_STATE_FILE);
       return null;
     }
     if (!data.storageState || !data.storageState.cookies) return null;
@@ -566,8 +769,8 @@ function loadBotCentrisCookies() {
     ];
     const botCookieFile = candidates.find(f => fs.existsSync(f));
     if (!botCookieFile) return null;
-    const data = JSON.parse(fs.readFileSync(botCookieFile, 'utf8'));
-    console.log(`[CUA] Loaded cookies from ${botCookieFile}`);
+    const data = readSessionFile(botCookieFile);
+    console.log(`[CUA] Loaded cookies from ${path.basename(botCookieFile)}`);
     // Format bot.js: { cookies: "name1=val1; name2=val2", expiry: timestamp }
     // Format Playwright requis: [{ name, value, domain, path }, ...]
     if (!data.cookies || typeof data.cookies !== 'string') return null;
@@ -601,21 +804,29 @@ async function loginCentris(context) {
   const page = await context.newPage();
   await page.setViewportSize(VIEWPORT);
 
-  // Essayer session cachée d'abord (CUA propre OU cookies bot principal partagés)
+  // Essayer toute session persistée d'abord. Le storageState complet a déjà
+  // été injecté par newStealthContext; les cookies simples restent un fallback.
   const savedCookies = loadSession() || loadBotCentrisCookies();
   if (savedCookies && savedCookies.length > 0) {
-    try {
-      await context.addCookies(savedCookies);
-      await page.goto(`${MATRIX_BASE}/Matrix`, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await page.waitForTimeout(2000);
-      const url = page.url();
-      if (isAuthenticatedCentrisUrl(url)) {
-        console.log('[CUA] Session cachée valide ✅', url.substring(0, 80));
-        return page;
-      }
-      console.log('[CUA] Session expirée, re-login...');
-      clearSession();
-    } catch (e) { console.warn('[CUA] Cookie session échouée:', e.message); clearSession(); }
+    try { await context.addCookies(savedCookies); }
+    catch (e) { console.warn('[CUA] Injection cookies échouée:', safeErrorMessage(e)); }
+  }
+  try {
+    await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.waitForTimeout(1800);
+    const probeUrl = page.url();
+    const passwordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+    if (!passwordVisible && isAuthenticatedCentrisUrl(probeUrl)) {
+      const cookies = await context.cookies();
+      saveSession(cookies);
+      await saveBrowserStorageState(context, page);
+      console.log('[CUA] Session persistante vérifiée dans Matrix ✅', probeUrl.substring(0, 80));
+      return page;
+    }
+    console.log('[CUA] Session persistante refusée par Matrix — renouvellement automatique');
+    clearSession({ includeStorageState: true });
+  } catch (e) {
+    console.warn('[CUA] Vérification session échouée:', safeErrorMessage(e));
   }
 
   // Login frais — page Centris Matrix qui redirige vers accounts.centris.ca
@@ -718,7 +929,8 @@ async function loginCentris(context) {
     throw new Error(`Login Centris échoué — URL finale: ${finalUrl.substring(0, 200)}`);
   }
 
-  // Sauvegarder session pour reuse 12h
+  // Sauvegarder la session sur le disque persistant. La durée locale est un
+  // plafond; chaque réutilisation est d'abord vérifiée réellement dans Matrix.
   const cookies = await context.cookies();
   saveSession(cookies);
   await saveBrowserStorageState(context, page);
@@ -2134,7 +2346,12 @@ async function runCentrisZoneDocuments(opts = {}) {
         const name = txt.split('\n').filter(Boolean)[0]?.substring(0, 120) || '(sans nom)';
         // Skip ligne sans contenu utile
         if (!name || name.toLowerCase().includes('description')) continue;
-        docs.push({ name: name.trim(), size: sizeMatch?.[0] || null });
+        docs.push({
+          name: name.trim(),
+          size: sizeMatch?.[0] || null,
+          provenance: 'zone',
+          source_section: 'zone_documents',
+        });
         if (!isDryRun && !cb.checked) cb.click();
       }
       return docs;
@@ -2593,6 +2810,10 @@ module.exports = {
   _cookieHeaderFromPlaywrightCookies: cookieHeaderFromPlaywrightCookies,
   _hasExplicitCentrisSendConfirmation: hasExplicitCentrisSendConfirmation,
   _buildCentrisDocumentInventory: buildCentrisDocumentInventory,
+  _buildCentrisContentManifest: buildCentrisContentManifest,
+  _addCentrisContentMetadata: addCentrisContentMetadata,
+  _parseCentrisDisplaySize: parseCentrisDisplaySize,
+  _normalizeCentrisLabel: normalizeCentrisLabel,
   _classifyZonePageSnapshot: classifyZonePageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   cuaLoginCentris,

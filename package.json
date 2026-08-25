@@ -37,7 +37,9 @@
     "test-centris-query": "node test_centris_query.js",
     "test-centris-auth-bridge": "node test_centris_playwright_auth.js",
     "test-centris-mfa": "node test_centris_mfa.js",
-    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-outbound-url-guard && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-centris-query && npm run test-centris-auth-bridge && npm run test-centris-mfa && npm run test-brevo-readonly && npm run security-status"
+    "test-centris-session-store": "node test_centris_session_store.js",
+    "test-centris-document-inventory": "node test_centris_document_inventory.js",
+    "preflight": "npm run validate && npm run audit-memory && npm run audit-dangerous-surfaces && npm run audit-runtime-workflows && npm run test-email-guard && npm run test-pipedrive-guard && npm run test-admin-auth && npm run test-outbound-url-guard && npm run test-runtime-safety && npm run test-calendar-guard && npm run test-centris-query && npm run test-centris-auth-bridge && npm run test-centris-mfa && npm run test-centris-session-store && npm run test-centris-document-inventory && npm run test-brevo-readonly && npm run security-status"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

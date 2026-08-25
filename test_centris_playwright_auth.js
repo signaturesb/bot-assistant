@@ -26,7 +26,14 @@ assert(botSource.includes('await cua.cuaLoginCentris()'), 'Le runtime Centris do
 assert.strictEqual((botSource.match(/centrisOAuthLoginWithMFA\(/g) || []).length, 1, 'L’ancien parseur OAuth ne doit plus être appelé');
 assert(!botSource.includes('bot.onText(/\\/centris/'), 'Un handler /centris trop large ne doit pas intercepter /centris-status');
 assert(botSource.includes('bot.onText(/^\\/centris(?:@\\w+)?\\s*$/i'), 'La commande /centris doit être strictement délimitée');
-assert(botSource.includes('Pré-login réseau désactivé au boot'), 'Un déploiement ne doit jamais déclencher un MFA Centris');
+assert(botSource.includes("safeCron('centris-session-maintenance'"), 'La session Centris doit être entretenue automatiquement');
+assert(botSource.includes("maintainCentrisSession('boot-delayed')"), 'Le boot doit programmer un renouvellement différé');
+assert(botSource.includes('consecutiveFailures >= 3'), 'Les alertes de renouvellement doivent avoir un seuil anti-bruit');
+assert(botSource.includes('failure-cooldown'), 'Une panne ne doit jamais créer une boucle MFA rapide');
+assert(botSource.includes('sessionKey.length >= 32'), 'La maintenance automatique doit exiger une clé de session robuste');
+assert(cuaSource.includes('/Matrix/Recherche'), 'La réutilisation doit être vérifiée sur une vraie page Matrix');
+assert(cuaSource.includes('25 * 24 * 60 * 60 * 1000'), 'Le plafond local de session doit être de 25 jours');
+assert(botSource.includes('centrisResponseNeedsLogin'), 'Les redirections vers accounts.centris.ca doivent déclencher un seul renouvellement');
 
 assert(cuaSource.includes('/admin/centris-mfa-code?after=${start}'), 'La récupération Gmail doit limiter les codes à la tentative courante');
 assert(botSource.includes('internalDate < afterMs - 30000'), 'Les codes Gmail périmés doivent être ignorés');
