@@ -53,6 +53,20 @@ const context = {
   );
   const ordered = await cua._mapWithConcurrency([1, 2, 3, 4], 2, async (value) => value * 2);
   assert.deepStrictEqual(ordered, [2, 4, 6, 8]);
+  const authenticatedContext = {
+    request: {
+      async get(url, options) {
+        assert.match(url, /^https:\/\/mediaserver\.centris\.ca\//);
+        assert.strictEqual(options.headers.Referer, navigation.options.referer);
+        return { ok: () => true, status: () => 200, headers: () => ({ 'content-type': 'application/pdf' }), body: async () => pdf };
+      },
+    },
+    async newPage() { throw new Error('fallback navigateur ne doit pas être utilisé'); },
+  };
+  assert.deepStrictEqual(
+    await cua._downloadMatrixPdfAuthenticated(authenticatedContext, 'https://mediaserver.centris.ca/media.ashx?id=direct', navigation.options.referer),
+    pdf
+  );
   console.log('✅ Téléchargement PDF Matrix par navigation authentifiée validé');
 })().catch((error) => {
   console.error(error);

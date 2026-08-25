@@ -1717,10 +1717,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null) {
     const candidates = selectedDocs.slice(0, 20);
     const downloaded = await mapWithConcurrency(candidates, 4, async (doc, index) => {
       try {
-        const buffer = await downloadMatrixPdfInBrowser(context, doc.url, state.url);
-        if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
-          throw new Error('réponse non-PDF');
-        }
+        const buffer = await downloadMatrixPdfAuthenticated(context, doc.url, state.url);
         const parsed = await parsePDFText(buffer);
         const enriched = addCentrisContentMetadata(doc, buffer, parsed.pages);
         const safeBase = normalizeCentrisMatchKey(doc.name).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 70) || `document_${index + 1}`;
@@ -1800,12 +1797,42 @@ async function downloadMatrixPdfInBrowser(context, url, referer) {
     if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
     const buffer = await response.body();
     if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
-    if (!contentType.includes('pdf') && buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+    if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
       throw new Error(`MATRIX_DOCUMENT_NOT_PDF:${contentType || 'unknown'}`);
     }
     return buffer;
   } finally {
     await tab.close().catch(() => {});
+  }
+}
+
+async function downloadMatrixPdfAuthenticated(context, url, referer) {
+  const target = new URL(String(url));
+  if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname)) {
+    throw new Error('MATRIX_DOCUMENT_URL_REJECTED');
+  }
+  let requestError = null;
+  try {
+    const response = await context.request.get(target.href, {
+      headers: { Referer: referer, Accept: 'application/pdf,*/*' },
+      timeout: 30000,
+    });
+    if (!response.ok()) throw new Error(`HTTP ${response.status()}`);
+    const contentLength = Number(response.headers()['content-length'] || 0);
+    if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    const buffer = await response.body();
+    if (buffer.length > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    if (buffer.length < 1000 || buffer.subarray(0, 1024).indexOf(Buffer.from('%PDF-')) === -1) {
+      throw new Error(`MATRIX_DOCUMENT_NOT_PDF:${String(response.headers()['content-type'] || 'unknown')}`);
+    }
+    return buffer;
+  } catch (error) {
+    requestError = safeErrorMessage(error).substring(0, 100);
+  }
+  try {
+    return await downloadMatrixPdfInBrowser(context, target.href, referer);
+  } catch (browserError) {
+    throw new Error(`MATRIX_DOWNLOAD_FAILED:request=${requestError};browser=${safeErrorMessage(browserError).substring(0, 100)}`);
   }
 }
 
@@ -3109,6 +3136,7 @@ module.exports = {
   _classifyMatrixPageSnapshot: classifyMatrixPageSnapshot,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
+  _downloadMatrixPdfAuthenticated: downloadMatrixPdfAuthenticated,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
