@@ -35,6 +35,12 @@ const {
   assertMatrixRequestParserReady,
 } = require('./lib/matrix_request_parser');
 assertMatrixRequestParserReady();
+const { matrixClientEligibility } = require('./lib/matrix_client_eligibility');
+const {
+  initMatrixObservability,
+  captureMatrixWorkflowError,
+} = require('./lib/matrix_observability');
+const MATRIX_OBSERVABILITY = initMatrixObservability();
 const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
 const { messageExplicitlyAuthorizesGitHubWrite, verifyProtectedStateWrite } = require('./lib/deployment_truth_guard');
@@ -187,6 +193,11 @@ if (!PD_KEY)    { console.warn('⚠️  PIPEDRIVE_API_KEY absent'); }
 if (!BREVO_KEY) { console.warn('⚠️  BREVO_API_KEY absent'); }
 if (!process.env.GMAIL_CLIENT_ID)  { console.warn('⚠️  GMAIL_CLIENT_ID absent — Gmail désactivé'); }
 if (!process.env.OPENAI_API_KEY)   { console.warn('⚠️  OPENAI_API_KEY absent — Whisper désactivé'); }
+if (MATRIX_OBSERVABILITY.enabled) {
+  console.log('✅ Sentry Matrix actif — télémétrie confidentielle filtrée');
+} else if (MATRIX_OBSERVABILITY.reason !== 'SENTRY_DSN_MISSING') {
+  console.warn(`⚠️  Sentry Matrix inactif (${MATRIX_OBSERVABILITY.reason}) — workflow non bloqué`);
+}
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 const bootStartTs = Date.now();
@@ -397,12 +408,12 @@ const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
 const EMAIL_CONFIRMATION_VERSION = 3;
 const FINAL_EMAIL_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
-const MATRIX_PREVIEW_TTL_MS = 15 * 60 * 1000;
+const MATRIX_PREVIEW_TTL_MS = 30 * 60 * 1000;
 const MATRIX_REQUEST_ID_BYTES = 8;
 const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte, confirmationVersion }
 const pendingExternalEmailActions = new Map(); // chatId → transaction email unique et versionnée
 // Les buffers Matrix vivent en mémoire pendant le traitement et possèdent une
-// copie temporaire privée sous DATA_DIR. Cette copie bornée à 15 minutes permet
+// copie temporaire privée sous DATA_DIR. Cette copie bornée à 30 minutes permet
 // de survivre à un redéploiement sans réutiliser un PDF non vérifié.
 const pendingMatrixArtifacts = new Map();
 const pendingPipedriveActivityActions = new Map(); // chatId → aperçu figé + confirmation one-shot
@@ -7647,12 +7658,27 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   if (!Number.isInteger(ALLOWED_ID) || ALLOWED_ID <= 0 || String(chatId) !== String(ALLOWED_ID)) {
     return `🔒 Conversation Telegram non autorisée ou non configurée. Aucun accès Matrix, aucun PDF remis et aucun email envoyé.`;
   }
+  const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
+  const activeMatrixTransaction = pendingExternalEmailActions.get(chatId);
+  const workflowRequestId = String(
+    confirmationContext.requestId || activeMatrixTransaction?.requestId || matrixRequestId(),
+  );
+  const observeFailure = (stage, errorCode, extra = {}) => captureMatrixWorkflowError(
+    Object.assign(new Error(errorCode), { code: errorCode }),
+    {
+      stage,
+      errorCode,
+      requestId: workflowRequestId,
+      centrisNum: num,
+      ...extra,
+    },
+  );
   const cuaMod = getCUA();
   if (!cuaMod || !cuaMod.CUA_AVAILABLE() || !cuaMod.cuaGetCentrisAnnexes) {
+    observeFailure('matrix-bootstrap', 'MATRIX_BROWSER_UNAVAILABLE');
     return `❌ Matrix/Playwright indisponible — aucune annexe récupérée et aucun envoi effectué.`;
   }
 
-  const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
   if (emailDestination) {
     const normalizedDestination = normalizeSingleRecipientEmail(emailDestination);
     if (!normalizedDestination) {
@@ -7671,7 +7697,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
         contextPromptId !== Number(transaction.finalConfirmationMessageId || 0) ||
         String(confirmationContext.requestId || '') !== String(transaction.requestId || '') ||
         !matrixClientEligibility(transaction.client || {}).eligible) {
-      return `🔒 Double confirmation Matrix absente, ambiguë ou liée à un autre aperçu. Aucun email envoyé à ${emailDestination || 'aucun destinataire'}.`;
+      return `🔒 Confirmation Matrix unique absente, ambiguë ou liée à un autre aperçu. Aucun email envoyé à ${emailDestination || 'aucun destinataire'}.`;
     }
   }
   if (!isSendConfirmation && emailDestination && pendingExternalEmailActions.has(chatId)) {
@@ -7694,6 +7720,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     if (!cachedArtifact || cachedArtifact.expiresAt < Date.now() ||
         cachedArtifact.num !== num || cachedArtifact.filtre !== normalizedFilter) {
       pendingMatrixArtifacts.delete(chatId);
+      observeFailure('artifact-reload', 'MATRIX_ARTIFACT_EXPIRED_OR_MISSING', { result: 'expired' });
       return `🔒 Confirmation refusée: les PDF figés de l’aperçu Matrix #${num} sont absents ou expirés. Demande un nouvel aperçu; aucun email envoyé.`;
     }
     result = { success: true, annexes: cachedArtifact.documents, failures: [], listing: cachedArtifact.listing || null };
@@ -7702,9 +7729,23 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     // Une demande humaine peut arriver pendant le smoke de démarrage. Elle
     // attend le verrou un maximum de 90 s, mais deux sessions Matrix ne sont
     // jamais lancées en parallèle et aucune relance fournisseur n'est faite.
-    result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null, { waitForLockMs: 90000 });
+    try {
+      result = await cuaMod.cuaGetCentrisAnnexes(num, filtre || null, { waitForLockMs: 90000 });
+    } catch (error) {
+      captureMatrixWorkflowError(error, {
+        stage: 'matrix-download',
+        errorCode: error?.code || 'MATRIX_DOWNLOAD_EXCEPTION',
+        requestId: workflowRequestId,
+        centrisNum: num,
+      });
+      throw error;
+    }
   }
   if (!result?.success || !Array.isArray(result.annexes) || result.annexes.length === 0) {
+    observeFailure('matrix-download', result?.code || 'MATRIX_DOWNLOAD_INCOMPLETE', {
+      document_count: Array.isArray(result?.annexes) ? result.annexes.length : 0,
+      failure_count: Array.isArray(result?.failures) ? result.failures.length : 0,
+    });
     return `❌ Annexes Matrix #${num} non récupérées: ${String(result?.message || 'aucun PDF validé').substring(0, 220)}\nAucun email envoyé. Aucun numéro substitut n'a été utilisé.`;
   }
 
@@ -7733,6 +7774,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     };
   });
   if (documentIntegrityFailures.length) {
+    observeFailure('pdf-validation', 'MATRIX_PDF_INTEGRITY_MISMATCH', {
+      document_count: documents.length,
+      failure_count: documentIntegrityFailures.length,
+    });
     return `🔒 Intégrité PDF refusée pour Matrix #${num}: ${documentIntegrityFailures.length} pièce(s) ne correspondent pas aux octets validés. Aucun aperçu armé, aucun PDF remis et aucun email envoyé.`;
   }
   const failures = Array.isArray(result.failures) ? result.failures : [];
@@ -7742,9 +7787,11 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   const listingAddressComplete = result?.listing?.address_complete === true;
   const listingAddressSource = String(result?.listing?.address_source || '');
   if (returnedCentris !== String(num)) {
+    observeFailure('listing-validation', 'MATRIX_LISTING_NUMBER_MISMATCH');
     return `🔒 Listing Matrix refusé: le résultat vérifié (${returnedCentris || 'numéro absent'}) ne correspond pas exactement au Centris #${num}. Aucun aperçu armé et aucun email envoyé.`;
   }
   if (!listingAddress || !listingAddressComplete || listingAddressSource !== 'matrix-listing-report-pdf') {
+    observeFailure('address-extraction', 'MATRIX_COMPLETE_ADDRESS_UNVERIFIED');
     return `🔒 Listing Matrix #${num} refusé: l’adresse complète (rue et municipalité) n’a pas été confirmée dans la fiche PDF portant ce numéro Centris exact. Aucun aperçu armé, aucun PDF remis et aucun email envoyé.`;
   }
 
@@ -7764,6 +7811,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       }
     }
     if (telegramDeliveryFailures.length) {
+      observeFailure('telegram-preview', 'MATRIX_TELEGRAM_PDF_PREVIEW_INCOMPLETE', {
+        document_count: documents.length,
+        failure_count: telegramDeliveryFailures.length,
+      });
       auditLogEvent('centris', 'matrix-telegram-preview-incomplete', {
         num, expected: documents.length, failed: telegramDeliveryFailures.map((item) => item.filename),
       });
@@ -7784,6 +7835,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     return `❌ Adresse courriel invalide. Les ${documents.length} PDF(s) ont seulement été remis dans Telegram; aucun email envoyé.`;
   }
   if (failures.length) {
+    observeFailure('document-inventory', 'MATRIX_DOCUMENT_BATCH_INCOMPLETE', {
+      document_count: documents.length,
+      failure_count: failures.length,
+    });
     return `⚠️ Preview incomplet pour #${num}: ${documents.length} PDF(s) validé(s), ${failures.length} échec(s).\nAucun email envoyé pour éviter un dossier partiel.\n\n${list}${failureText}`;
   }
 
@@ -7791,6 +7846,9 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   // plutôt que de retirer silencieusement une pièce jointe.
   const encodedBytes = documents.reduce((total, doc) => total + Math.ceil(doc.size * 4 / 3), 0);
   if (encodedBytes > 22 * 1024 * 1024) {
+    observeFailure('mime-build', 'MATRIX_GMAIL_SIZE_LIMIT_EXCEEDED', {
+      document_count: documents.length,
+    });
     return `⚠️ Les ${documents.length} pièces jointes dépassent la limite sécuritaire Gmail (22 MB encodés). Aucun email envoyé; aucun document omis silencieusement.`;
   }
 
@@ -7841,6 +7899,9 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   // On échoue fermé au lieu d'envoyer un fallback qui ne porte pas l'identité
   // SignatureSB présentée dans l'aperçu.
   if (!html) {
+    observeFailure('template-build', 'MATRIX_COMPANY_TEMPLATE_UNAVAILABLE', {
+      document_count: documents.length,
+    });
     return `❌ Le modèle officiel SignatureSB est indisponible. Les PDF sont validés, mais aucun aperçu n'est armé et aucun email n'a été envoyé.`;
   }
 
@@ -7920,7 +7981,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     const client = clientOverride && normalizeSingleRecipientEmail(clientOverride.email) === emailDestination
       ? { ...clientOverride, ...matrixClientEligibility(clientOverride) }
       : await resolveMatrixClientContext(emailDestination, num);
-    const requestId = matrixRequestId();
+    const requestId = workflowRequestId;
     const pendingMatrixPreview = {
       confirmationVersion: EMAIL_CONFIRMATION_VERSION,
       confirmationStage: 'preview',
@@ -7944,11 +8005,15 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     let htmlPreviewMessageId = null;
     try {
       const previewReceipt = await bot.sendDocument(chatId, Buffer.from(html, 'utf8'), {
-        caption: `APERÇU HTML — aucun envoi\nDemande: ${requestId}\nCentris #${num} · ${listingAddress}\nÀ: ${emailDestination}\nCc: ${cc.join(', ') || 'aucune'}\nPièces jointes: ${documents.length}\nValide 15 minutes.`,
+        caption: `APERÇU HTML — aucun envoi\nDemande: ${requestId}\nCentris #${num} · ${listingAddress}\nÀ: ${emailDestination}\nCc: ${cc.join(', ') || 'aucune'}\nPièces jointes: ${documents.length}\nValide 30 minutes.`,
       }, { filename: `apercu_courriel_centris_${num}.html`, contentType: 'text/html' });
       if (!previewReceipt?.message_id) throw new Error('accusé Telegram sans message_id');
       htmlPreviewMessageId = previewReceipt.message_id;
     } catch (error) {
+      captureMatrixWorkflowError(error, {
+        stage: 'telegram-preview', errorCode: 'MATRIX_HTML_PREVIEW_DELIVERY_FAILED',
+        requestId, centrisNum: num, document_count: documents.length,
+      });
       log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Telegram: ${error.message}`);
       auditLogEvent('centris', 'matrix-email-preview-delivery-failed', {
         num, to: emailDestination, error: String(error?.message || error).substring(0, 180),
@@ -7984,6 +8049,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
         listing: result.listing || null,
       });
     } catch (error) {
+      captureMatrixWorkflowError(error, {
+        stage: 'artifact-cache', errorCode: error?.code || 'MATRIX_ARTIFACT_CACHE_WRITE_FAILED',
+        requestId, centrisNum: num, document_count: documents.length,
+      });
       log('WARN', 'MATRIX-CACHE', `Écriture cache privé: ${String(error?.message || error).substring(0, 160)}`);
       removeMatrixArtifactCache(DATA_DIR, requestId);
       return `🔒 Aperçu Matrix #${num} bloqué: les PDF n’ont pas pu être figés dans le cache privé vérifié. Aucun courriel n’est armé et aucun email n’a été envoyé.`;
@@ -7991,6 +8060,9 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     pendingExternalEmailActions.set(chatId, pendingMatrixPreview);
     pendingMatrixArtifacts.set(chatId, matrixArtifact);
     if (!savePendingEmailState()) {
+      observeFailure('transaction-state', 'MATRIX_TRANSACTION_PERSIST_FAILED', {
+        document_count: documents.length,
+      });
       clearMatrixTransaction(chatId, requestId);
       return `🔒 Aperçu Matrix #${num} bloqué: impossible de persister la transaction ${requestId}. Aucun email envoyé.`;
     }
@@ -8004,12 +8076,16 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       pendingMatrixPreview.telegramHtmlPreviewMessageId = htmlPreviewMessageId;
       if (!savePendingEmailState()) throw new Error('transaction impossible à repersister après reçu Telegram');
     } catch (error) {
+      captureMatrixWorkflowError(error, {
+        stage: 'telegram-preview', errorCode: 'MATRIX_SUMMARY_DELIVERY_FAILED',
+        requestId, centrisNum: num, document_count: documents.length,
+      });
       clearMatrixTransaction(chatId, requestId);
       log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Résumé Telegram: ${error.message}`);
       return `❌ Le résumé transactionnel Matrix #${num} n’a pas été confirmé par Telegram. Aucun email n'est armé et aucun email n'a été envoyé.`;
     }
     const eligibilityLine = client.eligible
-      ? 'Identité client admissible.'
+      ? `Destinataire et propriété admissibles.${client.enrichmentMissing?.length ? ` Enrichissement CRM facultatif absent: ${client.enrichmentMissing.join(', ')}.` : ''}`
       : `Envoi bloqué jusqu’à correction: ${client.missing.join(', ')}.`;
     return `📂 ${documents.length} PDF(s) Matrix #${num} récupérés et validés.\n🔍 Aperçu ${requestId} remis dans Telegram pour ${emailDestination}.\n${eligibilityLine}\n🔒 Aucun email envoyé.`;
   }
@@ -8021,6 +8097,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     return `🔒 Confirmation refusée: l’aperçu Matrix #${num} est absent ou expiré. Demande un nouvel aperçu; aucun email envoyé.`;
   }
   if (approvedPreview.matrixFingerprint !== payloadFingerprint) {
+    observeFailure('confirmation-guard', 'MATRIX_PREVIEW_FINGERPRINT_CHANGED');
     clearMatrixTransaction(chatId, approvedPreview.requestId);
     return `🔒 Confirmation refusée: le destinataire, le modèle ou les PDF ont changé depuis l’aperçu. Demande un nouvel aperçu; aucun email envoyé.`;
   }
@@ -8031,7 +8108,12 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   // OAuth est requis seulement au moment de l'unique tentative approuvée.
   // Une indisponibilité ici est déterministe et survient avant le fournisseur.
   const token = await getGmailToken();
-  if (!token) return `❌ Gmail indisponible. Les PDF et l’aperçu restent validés, mais aucun email n'a été envoyé.`;
+  if (!token) {
+    observeFailure('gmail-auth', 'MATRIX_GMAIL_TOKEN_UNAVAILABLE', {
+      document_count: documents.length,
+    });
+    return `❌ Gmail indisponible. Les PDF et l’aperçu restent validés, mais aucun email n'a été envoyé.`;
+  }
   let authorization;
   try {
     authorization = createOneShotAuthorization({ message: userMessage, ...emailPayload });
@@ -8060,11 +8142,20 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   });
   if (!sent.ok) {
     if (sent.uncertain) {
+      observeFailure('gmail-send', 'MATRIX_GMAIL_DELIVERY_UNCERTAIN', {
+        result: 'uncertain', document_count: documents.length,
+      });
       return `⚠️ État Gmail incertain pour la demande ${approvedPreview.requestId || '?'}: ${sent.error || sent.status}. Aucune relance automatique; vérifie le dossier Envoyés.`;
     }
     if (sent.blocked) {
+      observeFailure('gmail-send', 'MATRIX_GMAIL_SEND_BLOCKED', {
+        result: 'blocked', document_count: documents.length,
+      });
       return `🔒 Gmail bloqué avant livraison pour la demande ${approvedPreview.requestId || '?'}: ${sent.error || sent.code}. Aucun email envoyé.`;
     }
+    observeFailure('gmail-send', 'MATRIX_GMAIL_SEND_REJECTED', {
+      result: 'rejected', document_count: documents.length,
+    });
     return `❌ Gmail a refusé la demande ${approvedPreview.requestId || '?'} avec un échec confirmé: ${sent.error || sent.status}. Aucun email envoyé; réponds de nouveau « envoie » pour réessayer.`;
   }
 
@@ -10334,20 +10425,6 @@ function formatClientPhone(value) {
   return digits ? `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}` : '';
 }
 
-function matrixClientEligibility(client = {}) {
-  const missing = [];
-  const nameValid = client.testMode
-    ? String(client.name || '').trim().split(/\s+/).filter(Boolean).length >= 2
-    : isValidProspectName(String(client.name || ''));
-  if (!nameValid) missing.push('nom complet fiable');
-  if (!normalizeSingleRecipientEmail(client.email)) missing.push('adresse courriel unique');
-  if (!normalizeClientPhone(client.phone)) missing.push('numéro de téléphone valide');
-  if (!String(client.context || '').trim()) missing.push('contexte immobilier clair');
-  if (!client.propertyIdentified) missing.push('propriété exacte');
-  if (client.ambiguous) missing.push('correspondance client non ambiguë');
-  return { eligible: missing.length === 0, missing };
-}
-
 async function resolveMatrixClientContext(email, centrisNum) {
   const normalizedEmail = normalizeSingleRecipientEmail(email);
   const isAuthorizedTest = matrixTestAddresses().has(normalizedEmail);
@@ -10436,7 +10513,7 @@ function matrixPreviewButtons(requestId) {
         { text: '🔄 RAFRAÎCHIR LES DOCUMENTS', callback_data: `mxrefresh:${requestId}` },
       ],
       [
-        { text: '👤 CORRIGER LE CLIENT', callback_data: `mxclient:${requestId}` },
+        { text: '👤 ENRICHIR LE CLIENT', callback_data: `mxclient:${requestId}` },
         { text: '✉️ CORRIGER LE COURRIEL', callback_data: `mxemail:${requestId}` },
       ],
     ],
@@ -10447,15 +10524,16 @@ function matrixPreviewSummary(action = {}) {
   const client = action.client || {};
   const docs = Array.isArray(action.documentsManifest) ? action.documentsManifest : [];
   const missing = Array.isArray(client.missing) ? client.missing : [];
+  const enrichmentMissing = Array.isArray(client.enrichmentMissing) ? client.enrichmentMissing : [];
   return [
     `🔎 APERÇU MATRIX — AUCUN ENVOI`,
     `Demande: ${action.requestId || '(absente)'}`,
     `Mode: ${client.testMode ? 'TEST INTERNE AUTORISÉ' : 'CLIENT'}`,
     '',
-    `Client: ${client.name || '⚠️ MANQUANT'}`,
+    `Client: ${client.name || 'non fourni (facultatif)'}`,
     `Courriel: ${client.email || '⚠️ MANQUANT'}`,
-    `Téléphone: ${formatClientPhone(client.phone) || '⚠️ MANQUANT — ne sera jamais inventé'}`,
-    `Contexte: ${client.context || '⚠️ MANQUANT'}`,
+    `Téléphone: ${formatClientPhone(client.phone) || 'non fourni (facultatif — jamais inventé)'}`,
+    `Contexte: ${client.context || 'demande Telegram explicite'}`,
     '',
     `Centris: #${action.input?.centris_num || ''}`,
     `Propriété: ${action.listingAddress || '⚠️ ADRESSE NON VALIDÉE'}`,
@@ -10470,7 +10548,12 @@ function matrixPreviewSummary(action = {}) {
     '────────────────────────',
     action.emailBody || '',
     '────────────────────────',
-    missing.length ? `🔒 ENVOI BLOQUÉ — à corriger: ${missing.join(', ')}` : '✅ Identité et dossier admissibles pour la confirmation.',
+    missing.length
+      ? `🔒 ENVOI BLOQUÉ — à corriger: ${missing.join(', ')}`
+      : '✅ Destinataire et propriété exacts: admissibles pour la confirmation unique.',
+    !missing.length && enrichmentMissing.length
+      ? `ℹ️ Enrichissement CRM facultatif absent: ${enrichmentMissing.join(', ')}.`
+      : '',
     '',
     'Réponds exactement « envoie » ou utilise le bouton CONFIRMER pour envoyer maintenant.',
   ].join('\n');
@@ -11052,7 +11135,7 @@ function registerHandlers() {
           const artifact = hydrateMatrixArtifactForAction(chatId, pendingMatrix);
           if (!eligibility.eligible) {
             await bot.answerCallbackQuery(cbq.id, { text: '🔒 Client incomplet — correction requise' });
-            await send(chatId, `🔒 Demande ${arg} bloquée: ${eligibility.missing.join(', ')}. Utilise CORRIGER LE CLIENT ou CORRIGER LE COURRIEL; aucun email envoyé.`);
+            await send(chatId, `🔒 Demande ${arg} bloquée: ${eligibility.missing.join(', ')}. Utilise ENRICHIR LE CLIENT ou CORRIGER LE COURRIEL; aucun email envoyé.`);
             return;
           }
           if (!artifact || artifact.expiresAt < Date.now() || artifact.num !== pendingMatrix.input?.centris_num) {
@@ -12723,7 +12806,7 @@ function registerHandlers() {
   // Chemin déterministe pour le flux critique Matrix: aucun choix de tool par
   // le modèle, aucun envoi fournisseur. Cette commande récupère et valide les
   // PDF, les remet dans Telegram, construit l'aperçu SignatureSB et arme la
-  // confirmation one-shot « envoie » pour 15 minutes.
+  // confirmation one-shot « envoie » pour 30 minutes.
   bot.onText(/^\/matrix[-_]?preview\s+(\d{7,9})\s+(\S+@\S+)(?:\s+([\s\S]+))?$/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const chatId = msg.chat.id;

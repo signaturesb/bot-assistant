@@ -2,6 +2,8 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const cuaModule = require('./cua_driver');
+const { matrixClientEligibility } = require('./lib/matrix_client_eligibility');
 const {
   createOneShotAuthorization,
   consumeOneShotAuthorization,
@@ -28,18 +30,21 @@ scenario('Listing externe inaccessible produit un blocage technique précis', ()
 scenario('Numéro Centris invalide refusé', () => {
   assert.match(cua, /MATRIX_INVALID_CENTRIS_NUMBER/);
 });
-scenario('Client complet et admissible', () => {
-  assert.match(bot, /function matrixClientEligibility/);
-  assert.match(bot, /const nameValid = client\.testMode/);
-  assert.match(bot, /nom complet fiable[\s\S]*?adresse courriel unique[\s\S]*?numéro de téléphone valide[\s\S]*?contexte immobilier clair/);
+scenario('Commande explicite numéro + courriel admissible sans dépendre du CRM', () => {
+  const eligibility = matrixClientEligibility({
+    email: 'client@example.com', propertyIdentified: true, ambiguous: false,
+  });
+  assert.strictEqual(eligibility.eligible, true);
+  assert.deepStrictEqual(eligibility.missing, []);
+  assert.deepStrictEqual(eligibility.enrichmentMissing, ['nom complet', 'téléphone', 'contexte CRM']);
 });
-scenario('Courriel général sans client identifié bloqué', () => {
-  assert.match(bot, /pipedrive-not-found/);
-  assert.match(bot, /client\.ambiguous/);
+scenario('Courriel invalide ou correspondance réellement ambiguë bloqués', () => {
+  assert.strictEqual(matrixClientEligibility({ email: 'invalide', propertyIdentified: true }).eligible, false);
+  assert.strictEqual(matrixClientEligibility({ email: 'client@example.com', propertyIdentified: true, ambiguous: true }).eligible, false);
 });
-scenario('Client sans téléphone clairement bloqué', () => {
-  assert.match(bot, /Téléphone:.*MANQUANT — ne sera jamais inventé/);
-  assert.match(bot, /if \(!normalizeClientPhone\(client\.phone\)\) missing\.push/);
+scenario('Téléphone et nom facultatifs restent visibles sans être inventés', () => {
+  assert.match(bot, /Téléphone:.*non fourni \(facultatif — jamais inventé\)/);
+  assert.match(bot, /Enrichissement CRM facultatif absent/);
 });
 scenario('Correspondance Dropbox approximative ne remplace pas Matrix exact', () => {
   const matrixHandler = bot.match(/async function executeMatrixAnnexesTool[\s\S]*?\n}\n\nasync function executeTool/)?.[0] || '';
@@ -57,6 +62,22 @@ scenario('Document manquant, corrompu ou incomplet bloqué', () => {
   assert.match(cua, /MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH/);
   assert.match(cua, /MATRIX_DOCUMENT_PAGE_COUNT_MISMATCH/);
   assert.match(cua, /MATRIX_PRINT_STREAM_INVALID_PDF/);
+  const configuredCounts = process.env.CENTRIS_EXPECTED_DOCUMENTS_JSON;
+  const smokeListing = process.env.CENTRIS_SMOKE_TEST_LISTING;
+  const smokeCount = process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS;
+  delete process.env.CENTRIS_EXPECTED_DOCUMENTS_JSON;
+  delete process.env.CENTRIS_SMOKE_TEST_LISTING;
+  delete process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS;
+  assert.strictEqual(cuaModule._expectedCentrisDocumentCount('28936167'), 0,
+    'aucun compte historique ne doit être imposé à une inscription réelle');
+  if (configuredCounts === undefined) delete process.env.CENTRIS_EXPECTED_DOCUMENTS_JSON;
+  else process.env.CENTRIS_EXPECTED_DOCUMENTS_JSON = configuredCounts;
+  if (smokeListing === undefined) delete process.env.CENTRIS_SMOKE_TEST_LISTING;
+  else process.env.CENTRIS_SMOKE_TEST_LISTING = smokeListing;
+  if (smokeCount === undefined) delete process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS;
+  else process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS = smokeCount;
+  assert.doesNotMatch(cua, /selectedDocs\.slice\(0,\s*20\)/,
+    'aucun plafond arbitraire de 20 documents ne doit tronquer le lot');
 });
 scenario('Double clic et commandes concurrentes bloqués', () => {
   assert.match(bot, /if \(action\.inFlight\)/);

@@ -16,3 +16,7 @@ services:
         sync: false
       - key: NODE_ENV
         value: production
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production

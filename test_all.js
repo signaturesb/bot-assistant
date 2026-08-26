@@ -59,6 +59,7 @@ runScript('Matrix authenticated browser download', path.join(__dirname, 'test_ma
 runScript('Matrix PDF structural validation', path.join(__dirname, 'test_pdf_validation.js'));
 runScript('Matrix email preview guard', path.join(__dirname, 'test_matrix_email_preview_guard.js'));
 runScript('Matrix durable preview artifact cache', path.join(__dirname, 'test_matrix_artifact_cache.js'));
+runScript('Matrix privacy-safe observability', path.join(__dirname, 'test_matrix_observability.js'));
 runScript('Email provider delivery receipt', path.join(__dirname, 'test_email_delivery_receipt.js'));
 runScript('Matrix email MIME', path.join(__dirname, 'test_matrix_email_mime.js'));
 runScript('Matrix 15 required scenarios', path.join(__dirname, 'test_matrix_required_scenarios.js'));

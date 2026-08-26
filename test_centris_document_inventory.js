@@ -218,6 +218,24 @@ assert.strictEqual(
   'la municipalité doit être réunie à la rue vérifiée',
 );
 assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\nNo Centris 28936167',
+    '',
+    '28936167',
+  ),
+  '440, Rue du Bord-de-l’Eau, Saint-Alphonse-Rodriguez',
+  'la fiche PDF exacte doit suffire lorsque le DOM Matrix omet la rue',
+);
+assert.strictEqual(
+  extractAddress(
+    'No Centris 28936167\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\n441, Rue du Bord-de-l’Eau\nRawdon',
+    '',
+    '28936167',
+  ),
+  '',
+  'deux rues proches du même numéro Centris doivent rester ambiguës',
+);
+assert.strictEqual(
   extractAddress('440, Rue du Bord-de-l’Eau\nDocuments additionnels\nNo Centris 28936167', '440, Rue du Bord-de-l’Eau', '28936167'),
   '',
   'un titre Matrix ne doit jamais devenir une municipalité',
@@ -282,6 +300,29 @@ assert.strictEqual(
   ),
   '28, Rue Pierre-Rivière, Repentigny (Repentigny)',
   'la fiche réelle #16934036 doit utiliser le code postal comme ancre sans confondre région, quartier ou courtier',
+);
+assert.strictEqual(
+  extractAddress(
+    [
+      'RE/MAX PRESTIGE, Agence immobilière',
+      'Shawn Barrette, Courtier immobilier résidentiel',
+      '16934036 (En vigueur)\tNo Centris',
+      '28 Rue Pierre-Rivière',
+      'Région',
+      'Quartier',
+      'Près de',
+      "Plan d'eau",
+      'Lanaudière',
+      '569 900 $',
+      'J6A 3N7',
+      'Repentigny (Repentigny)',
+      'Bonaventure',
+    ].join('\n'),
+    '',
+    '16934036',
+  ),
+  '28, Rue Pierre-Rivière, Repentigny (Repentigny)',
+  'la fiche PDF réelle #16934036 doit suffire même si le DOM Matrix ne fournit aucune rue',
 );
 assert.strictEqual(
   extractAddress(

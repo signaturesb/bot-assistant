@@ -48,7 +48,10 @@ assert.match(handler, /pendingMatrixArtifacts\.delete\(chatId\)/);
 assert.match(handler, /gmailProviderReceipt\?\.id/);
 assert.match(handler, /Preuve Gmail:/);
 assert.match(handler, /APERÇU HTML — aucun envoi/);
-assert.match(handler, /const requestId = matrixRequestId\(\)/);
+assert.match(handler, /const workflowRequestId = String\([\s\S]*?matrixRequestId\(\)/,
+  'un seul identifiant de corrélation doit être créé avant Matrix puis réutilisé par l’aperçu');
+assert.match(handler, /const requestId = workflowRequestId/,
+  'l’aperçu doit conserver le même identifiant que le téléchargement et la télémétrie');
 assert.match(handler, /clientOverride[\s\S]*?resolveMatrixClientContext\(emailDestination, num\)/,
   'le client vient de Pipedrive ou d’une correction Telegram explicite revalidée');
 assert.match(handler, /returnedCentris !== String\(num\)/);

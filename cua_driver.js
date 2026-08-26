@@ -1260,11 +1260,10 @@ function expectedCentrisDocumentCount(centrisNum, filtre = null) {
   const smokeNum = String(process.env.CENTRIS_SMOKE_TEST_LISTING || '').replace(/\D/g, '');
   const smokeExpected = Number(process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS || 0);
   if (exactNum === smokeNum && Number.isInteger(smokeExpected) && smokeExpected > 0) return smokeExpected;
-  // Référence réelle déjà vérifiée indépendamment: 1 fiche détaillée Matrix +
-  // 8 documents additionnels. Ce garde intégré empêche un faux succès 8/8 si
-  // une variable Render est supprimée accidentellement.
-  const verifiedReferenceCounts = Object.freeze({ '28936167': 9 });
-  return verifiedReferenceCounts[exactNum] || 0;
+  // Hors smoke explicitement configuré, l'inventaire courant de Matrix fait
+  // foi. Un compte historique codé en dur finirait par bloquer une inscription
+  // dès que le courtier ajoute ou retire légitimement un document.
+  return 0;
 }
 
 function safeErrorMessage(error) {
@@ -2632,9 +2631,10 @@ async function reopenVerifiedMatrixListing(page, exactNum, rawListingUrl) {
 }
 
 // Matrix affiche souvent la rue et la municipalité sur deux lignes distinctes.
-// La fiche détaillée PDF sert de seconde preuve, après validation du numéro
-// Centris exact. Cette extraction reste volontairement stricte: au moindre
-// doute, elle retourne une chaîne vide et le workflow refuse l'aperçu.
+// La fiche détaillée PDF portant le numéro Centris exact est la preuve finale.
+// La page d'inscription authentifiée peut fournir la rue comme aide de lecture,
+// mais elle ne suffit jamais seule à autoriser le courriel. Cette extraction
+// reste volontairement stricte: au moindre doute, elle retourne une chaîne vide.
 function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCentrisNum = '') {
   const cleanLine = (value) => String(value || '')
     .replace(/\u00a0/g, ' ')
@@ -2693,15 +2693,6 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
   // La valeur DOM peut déjà inclure « municipalité (quartier) ». Elle doit
   // être séparée avant de calculer les jetons distinctifs de la RUE; autrement
   // Repentigny deviendrait à tort un jeton obligatoire du nom « Rue Laval ».
-  const base = parseAddress(fallbackStreet);
-  const baseStreetTokens = streetTokens(base?.streetName || '');
-  if (!base || !baseStreetTokens.length) return '';
-  const matchesVerifiedStreet = (parsed) => {
-    if (!parsed || parsed.civic !== base.civic) return false;
-    const candidateTokens = streetTokens(parsed.streetName);
-    return baseStreetTokens.every((token) => candidateTokens.includes(token));
-  };
-
   const exactLineIndexes = [];
   for (let index = 0; index < lines.length; index += 1) {
     if (matrixTextContainsExactNumber(lines[index], exactNum)) exactLineIndexes.push(index);
@@ -2709,6 +2700,35 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
   const distanceFromExact = (index) => exactLineIndexes.length
     ? Math.min(...exactLineIndexes.map((exactIndex) => Math.abs(exactIndex - index)))
     : Number.POSITIVE_INFINITY;
+
+  let base = parseAddress(fallbackStreet);
+  // Si le DOM Matrix omet ou mal découpe la rue, la fiche détaillée exacte
+  // peut devenir la source primaire. On n'accepte alors qu'une seule rue
+  // candidate à proximité immédiate du numéro Centris; deux rues = ambiguïté.
+  if (!base) {
+    const pdfStreetCandidates = new Map();
+    for (let index = 0; index < lines.length; index += 1) {
+      const parsed = parseAddress(lines[index]);
+      if (!parsed || distanceFromExact(index) > 3) continue;
+      const nearby = lines.slice(Math.max(0, index - 3), index + 4).join(' ');
+      const exactNearby = lines
+        .slice(Math.max(0, index - 2), index + 3)
+        .some((line) => matrixTextContainsExactNumber(line, exactNum));
+      if (!exactNearby && /(?:courtier|courtage|agence|bureau|re\/max|t[ée]l[ée]phone|courriel)/i.test(nearby)) continue;
+      const key = `${parsed.civic}|${normalizeCentrisMatchKey(parsed.streetName)}`;
+      pdfStreetCandidates.set(key, parsed);
+    }
+    if (pdfStreetCandidates.size !== 1) return '';
+    base = [...pdfStreetCandidates.values()][0];
+  }
+  const baseStreetTokens = streetTokens(base?.streetName || '');
+  if (!baseStreetTokens.length) return '';
+  const matchesVerifiedStreet = (parsed) => {
+    if (!parsed || parsed.civic !== base.civic) return false;
+    const candidateTokens = streetTokens(parsed.streetName);
+    return baseStreetTokens.every((token) => candidateTokens.includes(token));
+  };
+
   const candidates = [];
   const addCandidate = (parsed, localityValue, lineIndex, source) => {
     if (!matchesVerifiedStreet(parsed)) return;
@@ -2895,10 +2915,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
     // mediaserver.centris.ca refuse parfois les requêtes API directes même si
     // elles partagent les cookies. Ouvrir le lien comme un vrai onglet Matrix
     // conserve la navigation authentifiée utilisée par un clic manuel.
-    const candidates = selectedDocs.slice(0, 20);
-    for (const doc of selectedDocs.slice(20)) {
-      failures.push({ label: doc.name, error: 'MATRIX_DOCUMENT_BATCH_LIMIT' });
-    }
+    // Tous les documents découverts sont tentés. Les limites par fichier et
+    // par volume total restent les garde-fous; aucun PDF ne disparaît à cause
+    // d'un ancien plafond arbitraire de 20 pièces.
+    const candidates = selectedDocs;
     // Séquentiel volontairement: Matrix ouvre les documents depuis la fiche
     // et certains contrôles de session sont propres à l'onglet parent.
     let downloadAbortReason = null;
@@ -5586,6 +5606,7 @@ module.exports = {
   _downloadMatrixPdfByAction: downloadMatrixPdfByAction,
   _downloadMatrixListingReport: downloadMatrixListingReport,
   _matrixDownloadableDocs: matrixDownloadableDocs,
+  _expectedCentrisDocumentCount: expectedCentrisDocumentCount,
   _matrixDownloadPlanFingerprint: matrixDownloadPlanFingerprint,
   _extractCompleteMatrixAddressFromText: extractCompleteMatrixAddressFromText,
   _isMatrixOperationInProgress: isMatrixOperationInProgress,
