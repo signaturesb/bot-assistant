@@ -280,31 +280,30 @@ const context = {
     },
     100,
   );
-  assert.strictEqual(installedRoute.pattern, '**/Matrix/**');
+  assert.strictEqual(installedRoute.pattern, '**/Matrix/PrintP*');
   assert.strictEqual(removedRoute.handler, installedRoute.handler, 'la route temporaire doit toujours être retirée');
   assert.strictEqual(abortedPrintRequest, true, 'le PrintP navigateur concurrent doit être annulé');
   assert.strictEqual(capturedPrintRequest.method, 'POST');
   assert.strictEqual(capturedPrintRequest.body.toString(), 'format=album');
 
-  let printOptionsRoute = null;
-  const printOptionsContext = {
-    async route(pattern, handler) { printOptionsRoute = { pattern, handler }; },
-    async unroute() {},
-  };
-  const capturedPrintOptions = await cua._captureMatrixPrintPRequest(
-    printOptionsContext,
-    async () => printOptionsRoute.handler({ async abort() {} }, {
-      url: () => 'https://matrix.centris.ca/Matrix/Printing/PrintOptions.aspx',
-      method: () => 'POST',
-      isNavigationRequest: () => true,
-      resourceType: () => 'document',
-      postDataBuffer: () => Buffer.from('__EVENTTARGET=PrintPdf'),
-      headers: () => ({ 'content-type': 'application/x-www-form-urlencoded' }),
+  const responseCaptureContext = new EventEmitter();
+  responseCaptureContext.route = async () => {};
+  responseCaptureContext.unroute = async () => {};
+  const responseCapturedRequest = await cua._captureMatrixPrintPRequest(
+    responseCaptureContext,
+    async () => responseCaptureContext.emit('response', {
+      url: () => 'https://matrix.centris.ca/Matrix/PrintP?id=redirect-chain',
+      request: () => ({
+        url: () => 'https://matrix.centris.ca/Matrix/PrintP?id=redirect-chain',
+        method: () => 'GET',
+        postDataBuffer: () => null,
+        headers: () => ({ referer: 'https://matrix.centris.ca/Matrix/Printing/PrintOptions.aspx' }),
+      }),
     }),
     100,
   );
-  assert.match(capturedPrintOptions.url, /\/Matrix\/Printing\/PrintOptions\.aspx$/);
-  assert.strictEqual(capturedPrintOptions.method, 'POST');
+  assert.match(responseCapturedRequest.url, /\/Matrix\/PrintP\?id=redirect-chain$/);
+  assert.strictEqual(responseCapturedRequest.method, 'GET');
 
   const nativeAlbumPdf = Buffer.concat([
     Buffer.from('%PDF-1.7\n'),
@@ -353,8 +352,8 @@ const context = {
     );
     assert.match(replayedRequest.url, /\/Matrix\/PrintP\?id=redirected-album$/);
     assert.strictEqual(replayedRequest.options.method, 'GET', 'un POST suivi d’un 302 doit devenir un GET sans corps');
-
     let liveRoute = null;
+    let nativeFlowPageClosed = false;
     const nativeFlowContext = {
       async storageState() {
         return { cookies: [{ name: 'matrix', value: 'session-cookie', domain: '.matrix.centris.ca' }] };
@@ -379,12 +378,14 @@ const context = {
         async evaluate(_fn, title) { return /Détaillé client avec album/.test(String(title)); },
       }],
       async waitForTimeout() {},
+      async close() { nativeFlowPageClosed = true; },
     };
     assert.deepStrictEqual(
       await cua._downloadMatrixListingReport(nativeFlowContext, nativeFlowPage),
       nativeAlbumPdf,
       'le parcours complet doit retourner la fiche album native et non une capture de page',
     );
+    assert.strictEqual(nativeFlowPageClosed, true, 'la page d’impression doit libérer toute réponse PrintP avant la lecture unique');
     assert.strictEqual(replayedRequest.options.method, 'GET');
     assert.strictEqual(replayedRequest.options.headers.Cookie, 'matrix=session-cookie');
   } finally {

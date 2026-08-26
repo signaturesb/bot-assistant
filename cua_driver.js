@@ -3187,14 +3187,12 @@ async function captureMatrixPrintPRequest(context, trigger, timeoutMs = 15000) {
   if (typeof context?.route !== 'function' || typeof context?.unroute !== 'function') {
     throw new Error('MATRIX_PRINT_INTERCEPTION_UNSUPPORTED');
   }
-  // Le bouton PDF soumet souvent PrintOptions.aspx, puis Matrix redirige vers
-  // PrintP. Playwright ne route pas toujours le deuxième saut d'une chaîne de
-  // redirection; on capture donc la première navigation d'impression fiable.
-  const routePattern = '**/Matrix/**';
+  const routePattern = '**/Matrix/PrintP*';
   let timer = null;
   let settled = false;
   let requestCaptured = false;
   let handler;
+  let responseHandler;
   let finish;
   const capturedRequest = new Promise((resolve, reject) => {
     finish = (error, value) => {
@@ -3205,46 +3203,54 @@ async function captureMatrixPrintPRequest(context, trigger, timeoutMs = 15000) {
     };
     timer = setTimeout(() => finish(new Error('MATRIX_PRINT_REQUEST_CAPTURE_TIMEOUT')), timeoutMs);
   });
+  const serializeRequest = async (request) => {
+    const target = new URL(String(request?.url?.() || ''));
+    if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
+        !/^\/Matrix\/PrintP/i.test(target.pathname)) {
+      throw new Error('MATRIX_PRINT_STREAM_URL_REJECTED');
+    }
+    const method = String(request?.method?.() || 'GET').toUpperCase();
+    if (!['GET', 'POST'].includes(method)) throw new Error('MATRIX_PRINT_STREAM_METHOD_REJECTED');
+    let body = request?.postDataBuffer?.() || null;
+    if (!body) {
+      const postData = request?.postData?.();
+      if (typeof postData === 'string') body = Buffer.from(postData);
+    }
+    if (body && body.length > 2 * 1024 * 1024) throw new Error('MATRIX_PRINT_STREAM_BODY_TOO_LARGE');
+    const requestHeaders = typeof request?.allHeaders === 'function'
+      ? await request.allHeaders()
+      : (request?.headers?.() || {});
+    return { url: target.href, method, body, headers: requestHeaders };
+  };
   handler = async (route, routedRequest) => {
     const request = routedRequest || route.request?.();
     try {
-      const target = new URL(String(request?.url?.() || ''));
-      const method = String(request?.method?.() || 'GET').toUpperCase();
-      const resourceType = String(request?.resourceType?.() || '').toLowerCase();
-      const navigationRequest = request?.isNavigationRequest?.() === true || resourceType === 'document';
-      const printP = /^\/Matrix\/PrintP/i.test(target.pathname);
-      const printOptions = /^\/Matrix\/Printing\/PrintOptions\.aspx$/i.test(target.pathname);
-      if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
-          (!printP && !(printOptions && navigationRequest))) {
-        await route.continue().catch(() => {});
-        return;
-      }
-      if (!['GET', 'POST'].includes(method)) throw new Error('MATRIX_PRINT_STREAM_METHOD_REJECTED');
-      let body = request?.postDataBuffer?.() || null;
-      if (!body) {
-        const postData = request?.postData?.();
-        if (typeof postData === 'string') body = Buffer.from(postData);
-      }
-      if (body && body.length > 2 * 1024 * 1024) throw new Error('MATRIX_PRINT_STREAM_BODY_TOO_LARGE');
-      const requestHeaders = typeof request?.allHeaders === 'function'
-        ? await request.allHeaders()
-        : (request?.headers?.() || {});
+      const serialized = await serializeRequest(request);
       requestCaptured = true;
       await route.abort('blockedbyclient').catch(() => {});
-      finish(null, {
-        url: target.href,
-        method,
-        body,
-        headers: requestHeaders,
-      });
+      finish(null, serialized);
     } catch (error) {
       requestCaptured = true;
       await route.abort('blockedbyclient').catch(() => {});
       finish(error);
     }
   };
+  responseHandler = async (response) => {
+    try {
+      const target = new URL(String(response?.url?.() || ''));
+      if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
+          !/^\/Matrix\/PrintP/i.test(target.pathname)) return;
+      const serialized = await serializeRequest(response.request?.());
+      requestCaptured = true;
+      finish(null, serialized);
+    } catch (error) {
+      requestCaptured = true;
+      finish(error);
+    }
+  };
 
   await context.route(routePattern, handler);
+  context.on?.('response', responseHandler);
   // L'annulation volontaire de la navigation PrintP peut faire rejeter click().
   // Une fois la requête capturée, cette erreur de navigation est attendue.
   void Promise.resolve().then(trigger).catch((error) => {
@@ -3254,6 +3260,7 @@ async function captureMatrixPrintPRequest(context, trigger, timeoutMs = 15000) {
     return await capturedRequest;
   } finally {
     clearTimeout(timer);
+    try { context.off?.('response', responseHandler); } catch {}
     await context.unroute(routePattern, handler).catch(() => {});
   }
 }
@@ -3490,6 +3497,11 @@ async function downloadMatrixListingReport(context, page) {
         () => pdfControl.click({ timeout: 10000 }),
         15000,
       );
+      // Si PrintP provenait d'une redirection que Playwright ne pouvait pas
+      // router, sa réponse navigateur est encore ouverte. Fermer seulement la
+      // page d'impression libère cette connexion avant la lecture HTTP unique.
+      await page.close?.({ runBeforeUnload: false }).catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, 250));
       const nativeReport = await streamMatrixPdfUntilEof(
         printRequest.url,
         cookieHeader,
