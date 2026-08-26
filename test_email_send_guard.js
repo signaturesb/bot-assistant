@@ -72,8 +72,8 @@ assert.strictEqual(
 );
 assert.deepStrictEqual(
   selectFirstEmailConfirmation({ external: matrixPreview, repliedMessageId: 1234 }),
-  { ok: false, reason: 'matrix-reply-required' },
-  'répondre au mauvais aperçu Matrix doit faire zéro sélection',
+  { ok: true, kind: 'external', action: matrixPreview },
+  'une seule transaction Matrix active doit être sélectionnée par « envoie » sans Reply Telegram',
 );
 assert.deepStrictEqual(
   selectFirstEmailConfirmation({}),
@@ -107,8 +107,8 @@ assert.match(
 );
 assert.ok(botCode.includes('pendingExternalEmailActions'), 'external provider actions need a two-step pending confirmation');
 assert.ok(botCode.includes('if (action.inFlight)'), 'email confirmation must suppress concurrent duplicate attempts');
-assert.ok(botCode.includes("action.confirmationStage = 'awaiting-final'"), 'email send must require a second confirmation stage');
-assert.ok(botCode.includes('finalConfirmationMessageId'), 'second confirmation must bind to the exact Telegram prompt');
+assert.ok(botCode.includes("action.confirmationStage = 'awaiting-final'"), 'email send must bind the direct confirmation to a transaction stage');
+assert.ok(botCode.includes('directSelection'), 'the exact word « envoie » must directly consume the unique active transaction');
 assert.ok(botCode.includes('PENDING_EMAILS_FILE'), 'pending drafts must survive a Render restart');
 assert.ok(botCode.includes('queuePendingEmailDraft'), 'automatic drafts must use a non-overwriting queue');
 assert.ok(botCode.includes('deliveryUncertain'), 'provider uncertainty must block duplicate retries');

@@ -80,17 +80,15 @@ assert.match(confirmationHandler, /executeTool\(\s*action\.name,\s*action\.input
 assert.doesNotMatch(confirmationHandler, /action\.input\s*=|email_destination\s*=|centris_num\s*=/,
   'la confirmation ne doit pas reconstruire ou modifier le destinataire/numéro du preview');
 assert.match(confirmationHandler, /reply_to_message\?\.message_id/,
-  'la confirmation doit être liée au message Telegram exact');
-assert.match(confirmationHandler, /Pour Matrix, réponds « envoie » directement au résumé APERÇU MATRIX/,
-  'Matrix doit refuser une première confirmation non liée au bon aperçu');
+  'les anciens prompts de confirmation déjà émis restent vérifiables');
+assert.match(confirmationHandler, /const directSelection = firstConfirmation/,
+  '« envoie » doit sélectionner directement la transaction unique active');
 assert.match(confirmationHandler, /finalConfirmationMessageId/);
 assert.match(confirmationHandler, /confirmationStage === 'awaiting-final'/);
 assert.match(confirmationHandler, /Plusieurs actions courriel sont en attente[\s\S]*?Aucune priorité automatique/,
   'deux actions simultanées ne doivent jamais choisir un destinataire par ordre de Map');
-const firstConfirmationBranch = confirmationHandler.split('// Première confirmation: elle ne peut JAMAIS appeler Gmail/Centris.')[1] || '';
-assert.match(firstConfirmationBranch, /await requestFinalEmailConfirmation/);
-assert.doesNotMatch(firstConfirmationBranch, /executeTool\(|envoyerEmailGmail\(|sendEmailLogged\(/,
-  'la première confirmation doit seulement créer la deuxième étape avant tout provider');
+assert.match(confirmationHandler, /if \(finalMatch \|\| directSelection\?\.ok\)/,
+  'une confirmation exacte doit entrer immédiatement dans la transaction d’envoi');
 assert.match(code, /telecharger_annexes_centris:\s*360000/,
   'le délai du tool doit couvrir l’attente du verrou et les sessions Matrix séquentielles');
 assert.match(code, /function matrixPreviewButtons[\s\S]*?mxconfirm:[\s\S]*?mxcancel:[\s\S]*?mxrefresh:[\s\S]*?mxclient:[\s\S]*?mxemail:/,

@@ -477,7 +477,7 @@ function savePendingEmailState() {
 
 if (quarantinedLegacyEmailActions > 0) {
   savePendingEmailState();
-  log('WARN', 'EMAIL', `${quarantinedLegacyEmailActions} ancienne(s) autorisation(s) email invalidée(s) par la double confirmation v${EMAIL_CONFIRMATION_VERSION}`);
+  log('WARN', 'EMAIL', `${quarantinedLegacyEmailActions} ancienne(s) autorisation(s) email invalidée(s) par la confirmation transactionnelle v${EMAIL_CONFIRMATION_VERSION}`);
 }
 
 function queuePendingEmailDraft(chatId, draft, { replace = false, source = 'automatic' } = {}) {
@@ -543,7 +543,7 @@ function promoteNextPendingEmailDraft(chatId) {
 
 function pendingEmailPreview(draft, title = 'PROCHAIN BROUILLON PRÊT') {
   if (!draft) return '';
-  return `📧 *${title}*\n\n*À:* ${draft.toName ? `${draft.toName} <${draft.to}>` : draft.to}\n*Objet:* ${draft.sujet}\n\n---\n${draft.texte}\n---\n\n1️⃣ Réponds *« envoie »*.\n2️⃣ Le bot réaffichera l’adresse exacte et exigera *« confirme adresse@courriel »*.\nAucun fournisseur n’est appelé avant les deux confirmations.`;
+  return `📧 *${title}*\n\n*À:* ${draft.toName ? `${draft.toName} <${draft.to}>` : draft.to}\n*Objet:* ${draft.sujet}\n\n---\n${draft.texte}\n---\n\nRéponds exactement *« envoie »* pour envoyer ce brouillon maintenant, ou *« annule »*.`;
 }
 
 try {
@@ -7670,7 +7670,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   if (!isSendConfirmation && emailDestination && pendingExternalEmailActions.has(chatId)) {
     const current = pendingExternalEmailActions.get(chatId);
     const currentSummary = externalEmailActionSummary(current.name, current.input);
-    return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Réponds « annule » ou termine sa double confirmation avant de créer un nouvel aperçu. Aucun email envoyé.`;
+    return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Réponds « envoie » pour la terminer ou « annule » avant de créer un nouvel aperçu. Aucun email envoyé.`;
   }
   const normalizedFilter = String(filtre || '');
   const clientInstruction = String(messagePerso || '').replace(/[\r\0]+/g, ' ').trim().substring(0, 2000);
@@ -8035,7 +8035,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     if (sent.blocked) {
       return `🔒 Gmail bloqué avant livraison pour la demande ${approvedPreview.requestId || '?'}: ${sent.error || sent.code}. Aucun email envoyé.`;
     }
-    return `❌ Gmail a refusé la demande ${approvedPreview.requestId || '?'} avec un échec confirmé: ${sent.error || sent.status}. Aucun email envoyé; une nouvelle double confirmation sera requise pour réessayer.`;
+    return `❌ Gmail a refusé la demande ${approvedPreview.requestId || '?'} avec un échec confirmé: ${sent.error || sent.status}. Aucun email envoyé; réponds de nouveau « envoie » pour réessayer.`;
   }
 
   pendingMatrixArtifacts.delete(chatId);
@@ -10442,7 +10442,7 @@ function matrixPreviewSummary(action = {}) {
     '────────────────────────',
     missing.length ? `🔒 ENVOI BLOQUÉ — à corriger: ${missing.join(', ')}` : '✅ Identité et dossier admissibles pour la confirmation.',
     '',
-    'Le bouton CONFIRMER est seulement l’étape 1/2. Une deuxième confirmation liée à cette demande sera exigée.',
+    'Réponds exactement « envoie » ou utilise le bouton CONFIRMER pour envoyer maintenant.',
   ].join('\n');
 }
 
@@ -10748,27 +10748,42 @@ async function handleEmailConfirmation(msg) {
   const pending = pendingEmails.get(chatId);
   const external = pendingExternalEmailActions.get(chatId);
   const repliedMessageId = Number(msg?.reply_to_message?.message_id || 0);
+  const directSelection = firstConfirmation
+    ? selectFirstEmailConfirmation({ pending, external, repliedMessageId })
+    : null;
 
-  if (finalMatch) {
-    const confirmedRecipient = normalizeSingleRecipientEmail(finalMatch[1]);
+  if (finalMatch || directSelection?.ok) {
+    const confirmedRecipient = finalMatch
+      ? normalizeSingleRecipientEmail(finalMatch[1])
+      : pendingEmailTransactionRecipient(directSelection.kind, directSelection.action);
     if (external?.name === 'telecharger_annexes_centris' && external.correctionMode) {
       await send(chatId, '🔒 Confirmation finale révoquée: une correction est en cours. Termine la correction et utilise le nouvel aperçu; aucun email envoyé.');
       return true;
     }
-    const candidates = [
-      pending && pending.confirmationStage === 'awaiting-final' &&
-        pendingEmailTransactionRecipient('draft', pending) === confirmedRecipient
-        ? { kind: 'draft', action: pending } : null,
-      external && external.confirmationStage === 'awaiting-final' &&
-        pendingEmailTransactionRecipient('external', external) === confirmedRecipient
-        ? { kind: 'external', action: external } : null,
-    ].filter(Boolean);
+    const candidates = directSelection?.ok
+      ? [directSelection]
+      : [
+          pending && pending.confirmationStage === 'awaiting-final' &&
+            pendingEmailTransactionRecipient('draft', pending) === confirmedRecipient
+            ? { kind: 'draft', action: pending } : null,
+          external && external.confirmationStage === 'awaiting-final' &&
+            pendingEmailTransactionRecipient('external', external) === confirmedRecipient
+            ? { kind: 'external', action: external } : null,
+        ].filter(Boolean);
     if (!confirmedRecipient || candidates.length !== 1) {
       await send(chatId, '🔒 Confirmation finale refusée: aucune transaction unique ne correspond exactement à cette adresse. Aucun email envoyé.');
       return true;
     }
     const chosen = candidates[0];
     const action = chosen.action;
+    if (directSelection?.ok) {
+      // « envoie » est l'unique confirmation exigée. On lie atomiquement cette
+      // confirmation au message Telegram courant avant l'appel fournisseur.
+      action.confirmationStage = 'awaiting-final';
+      action.finalConfirmationRecipient = confirmedRecipient;
+      action.finalConfirmationMessageId = msg.message_id;
+      action.finalConfirmationExpiresAt = Date.now() + FINAL_EMAIL_CONFIRMATION_TTL_MS;
+    }
     if (Number(action.confirmationVersion || 0) !== EMAIL_CONFIRMATION_VERSION ||
         Date.now() > Number(action.finalConfirmationExpiresAt || 0)) {
       if (chosen.kind === 'external') {
@@ -10782,7 +10797,8 @@ async function handleEmailConfirmation(msg) {
       await send(chatId, '⌛ Deuxième confirmation expirée ou ancienne. Redemande un aperçu; aucun email envoyé.');
       return true;
     }
-    if (!repliedMessageId || repliedMessageId !== Number(action.finalConfirmationMessageId || 0)) {
+    if (!directSelection?.ok &&
+        (!repliedMessageId || repliedMessageId !== Number(action.finalConfirmationMessageId || 0))) {
       await send(chatId, `🔒 Réponds directement au message « DEUXIÈME CONFIRMATION » pour ${confirmedRecipient}. Aucun email envoyé.`);
       return true;
     }
@@ -10908,12 +10924,10 @@ async function handleEmailConfirmation(msg) {
     return true;
   }
 
-  const selection = selectFirstEmailConfirmation({ pending, external, repliedMessageId });
+  const selection = directSelection || selectFirstEmailConfirmation({ pending, external, repliedMessageId });
   if (!selection.ok) {
     if (selection.reason === 'ambiguous') {
       await send(chatId, '🔒 Plusieurs actions courriel sont en attente. Aucune priorité automatique: réponds directement au bon aperçu Matrix ou annule. Aucun email envoyé.');
-    } else if (selection.reason === 'matrix-reply-required') {
-      await send(chatId, '🔒 Pour Matrix, réponds « envoie » directement au résumé APERÇU MATRIX correspondant, ou utilise son bouton CONFIRMER. Aucun email envoyé.');
     } else {
       await send(chatId, '🔒 Aucune transaction courriel sélectionnable. Aucun email envoyé.');
     }
@@ -10943,18 +10957,10 @@ async function handleEmailConfirmation(msg) {
     await send(chatId, '⚠️ Transaction incertaine ou déjà en cours. Aucun nouvel envoi; vérifie Gmail puis annule et reconstruis au besoin.');
     return true;
   }
-  try {
-    await requestFinalEmailConfirmation(chatId, chosenKind, chosen);
-  } catch (error) {
-    const code = String(error?.message || error);
-    if (code.startsWith('MATRIX_CLIENT_NOT_ELIGIBLE:')) {
-      const missing = code.split(':').slice(1).join(':').split('|').filter(Boolean);
-      await send(chatId, `🔒 Client non admissible: ${missing.join(', ')}. Utilise CORRIGER LE CLIENT ou CORRIGER LE COURRIEL; aucun email envoyé.`);
-    } else {
-      if (chosenKind === 'external' && chosen.name === 'telecharger_annexes_centris') clearMatrixTransaction(chatId, chosen.requestId);
-      await send(chatId, `🔒 Deuxième confirmation non créée: ${code.substring(0, 160)}. Aucun email envoyé.`);
-    }
-  }
+  // Une sélection valide est normalement consommée plus haut par la branche
+  // d'envoi direct. Ce repli ne doit être atteint que pour une transaction
+  // devenue non sélectionnable entre les deux lectures.
+  await send(chatId, '🔒 Transaction courriel modifiée pendant la confirmation. Redemande un aperçu; aucun email envoyé.');
   return true;
 }
 
@@ -11025,12 +11031,13 @@ function registerHandlers() {
             await send(chatId, `🔒 Les PDF figés de ${arg} sont absents ou expirés. Demande nettoyée; aucun email envoyé.`);
             return;
           }
-          await bot.answerCallbackQuery(cbq.id, { text: 'Étape 1/2 reçue — confirme maintenant l’adresse' });
-          try {
-            await requestFinalEmailConfirmation(chatId, 'external', pendingMatrix);
-          } catch (error) {
-            await send(chatId, `🔒 Deuxième confirmation impossible: ${String(error?.message || error).substring(0, 160)}. Aucun email envoyé.`);
-          }
+          await bot.answerCallbackQuery(cbq.id, { text: 'Envoi confirmé' });
+          await handleEmailConfirmation({
+            chat: { id: chatId },
+            message_id: msgId,
+            text: 'envoie',
+            from: cbq.from,
+          });
           return;
         }
 
