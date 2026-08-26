@@ -2,6 +2,7 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
 const {
   createNonOverlappingRunner,
   telegramPlainText,
@@ -62,6 +63,19 @@ async function run() {
   assert.strictEqual(shouldRestoreFromGist(10, undefined), false, 'ne jamais écraser des données locales');
   assert.strictEqual(shouldRestoreFromGist(0, undefined), true);
   assert.strictEqual(shouldRestoreFromGist(0, 'false'), false);
+
+  const botCode = fs.readFileSync('./bot.js', 'utf8');
+  const telegramWebhook = botCode.match(/if \(req\.method === 'POST' && url === '\/webhook\/telegram'\)[\s\S]*?\n  }/)?.[0] || '';
+  assert.match(telegramWebhook, /const telegramRemoteIp =/,
+    'le webhook Telegram doit définir l’IP avant toute journalisation d’un secret invalide');
+  assert.doesNotMatch(telegramWebhook, /\$\{ip\}/,
+    'un rejet de secret Telegram ne doit jamais provoquer ip is not defined');
+  const internalPreviewRoute = botCode.match(/if \(req\.method === 'POST' && url\.startsWith\('\/admin\/matrix-preview-test'\)\)[\s\S]*?\n  }/)?.[0] || '';
+  assert.match(internalPreviewRoute, /email !== REQUIRED_VISIBLE_CC_EMAIL/);
+  assert.match(internalPreviewRoute, /userMessage: 'aperçu interne seulement'/,
+    'la route de test interne ne doit jamais contenir la confirmation Gmail');
+  assert.doesNotMatch(internalPreviewRoute, /sendEmailLogged|messages\/send/,
+    'la route de test interne doit réutiliser uniquement le workflow preview');
 
   console.log('✅ runtime safety: timeout, overlap, Telegram, HMAC et persistance OK');
 }
