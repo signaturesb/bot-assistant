@@ -3515,6 +3515,7 @@ async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000
   const pending = new Map();
   const childSessions = new Set();
   const targetReady = [];
+  let activeStream = null;
   let attachedHandler = null;
   let messageHandler = null;
   let finish;
@@ -3550,6 +3551,10 @@ async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000
     if (total > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
     chunks.push(chunk);
     const scan = Buffer.concat([tail, chunk]);
+    if (total >= 4096) {
+      const prefix = Buffer.concat(chunks, total).subarray(0, 4096);
+      if (prefix.indexOf(Buffer.from('%PDF-')) < 0) throw new Error('MATRIX_PRINT_BROWSER_CDP_NOT_PDF');
+    }
     if (scan.indexOf(Buffer.from('%%EOF')) >= 0) {
       const full = Buffer.concat(chunks, total);
       const magic = full.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
@@ -3570,7 +3575,13 @@ async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000
         const part = await sendToTarget(sessionId, 'IO.read', { handle, size: 64 * 1024 });
         const pdfBuffer = consumeChunk(part?.data || '', Boolean(part?.base64Encoded));
         if (pdfBuffer) {
-          void sendToTarget(sessionId, 'Page.stopLoading').catch(() => {});
+          // Une réponse passée à takeResponseBodyAsStream ne peut plus être
+          // continuée telle quelle. Annuler uniquement cette requête après
+          // %%EOF libère le transport Matrix sans toucher aux autres pages.
+          await sendToTarget(sessionId, 'Fetch.failRequest', {
+            requestId: pausedRequestId,
+            errorReason: 'Aborted',
+          }).catch(() => {});
           finish(null, pdfBuffer);
           return;
         }
@@ -3603,6 +3614,36 @@ async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000
         void sendToTarget(event.sessionId, 'Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
         return;
       }
+      const status = Number(params.responseStatusCode || 0);
+      if ([301, 302, 303, 307, 308].includes(status)) {
+        void sendToTarget(event.sessionId, 'Fetch.continueRequest', { requestId: params.requestId }).catch(finish);
+        return;
+      }
+      const headers = Object.fromEntries((params.responseHeaders || []).map((header) => [
+        String(header?.name || '').toLowerCase(),
+        String(header?.value || ''),
+      ]));
+      const contentType = String(headers['content-type'] || '').toLowerCase();
+      const contentLength = Number(headers['content-length'] || 0);
+      if (![200, 206].includes(status)) {
+        void sendToTarget(event.sessionId, 'Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
+        finish(new Error(`MATRIX_PRINT_BROWSER_CDP_HTTP_${status || 'UNKNOWN'}`));
+        return;
+      }
+      if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+        void sendToTarget(event.sessionId, 'Fetch.failRequest', {
+          requestId: params.requestId,
+          errorReason: 'Aborted',
+        }).catch(() => {});
+        finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+        return;
+      }
+      if (activeStream && (activeStream.sessionId !== event.sessionId || activeStream.requestId !== params.requestId)) {
+        void sendToTarget(event.sessionId, 'Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
+        return;
+      }
+      activeStream = { sessionId: event.sessionId, requestId: params.requestId };
+      console.log(`[MATRIX-PDF] Réponse PrintP unique suspendue (HTTP ${status}, ${contentType || 'type inconnu'})`);
       void readPausedStream(event.sessionId, params.requestId);
     } catch (error) {
       finish(error);
@@ -3639,22 +3680,31 @@ async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000
     // doit être confirmé avant le clic pour ne perdre aucune réponse unique.
     await new Promise(resolve => setTimeout(resolve, 75));
     await Promise.all(targetReady);
-    await trigger();
+    try {
+      await trigger();
+    } catch (error) {
+      // Une navigation popup suspendue au stade Response peut faire rejeter le
+      // clic Playwright alors que son flux exact est déjà sous notre contrôle.
+      await new Promise(resolve => setTimeout(resolve, 250));
+      if (!activeStream) finish(error);
+    }
     return await result;
   } catch (error) {
     finish(error);
     return await result;
   } finally {
     clearTimeout(timer);
-    for (const waiter of pending.values()) waiter.reject(new Error('MATRIX_PRINT_BROWSER_CDP_CLOSED'));
-    pending.clear();
-    try { root.off?.('Target.receivedMessageFromTarget', messageHandler); } catch {}
-    try { root.off?.('Target.attachedToTarget', attachedHandler); } catch {}
+    // Désactiver d'abord l'auto-attach tant que les handlers savent encore
+    // reprendre une nouvelle target éventuellement pausée par Chrome.
     await root.send('Target.setAutoAttach', {
       autoAttach: false,
       waitForDebuggerOnStart: false,
       flatten: false,
     }).catch(() => {});
+    for (const waiter of pending.values()) waiter.reject(new Error('MATRIX_PRINT_BROWSER_CDP_CLOSED'));
+    pending.clear();
+    try { root.off?.('Target.receivedMessageFromTarget', messageHandler); } catch {}
+    try { root.off?.('Target.attachedToTarget', attachedHandler); } catch {}
     await root.detach?.().catch(() => {});
   }
 }

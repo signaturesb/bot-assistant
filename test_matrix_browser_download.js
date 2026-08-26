@@ -315,6 +315,7 @@ const context = {
   let browserFetchEnabled = false;
   let browserStreamRead = false;
   let browserAutoAttachDisabled = false;
+  let browserHandlerPresentOnDisable = false;
   browserRootSession.detach = async () => { browserRootDetached = true; };
   browserRootSession.send = async (method, params) => {
     if (method === 'Target.setDiscoverTargets') return {};
@@ -326,6 +327,7 @@ const context = {
         });
       } else {
         browserAutoAttachDisabled = true;
+        browserHandlerPresentOnDisable = browserRootSession.listenerCount('Target.attachedToTarget') > 0;
       }
       return {};
     }
@@ -340,7 +342,7 @@ const context = {
       assert.strictEqual(command.params.handle, 'print-stream-1');
       browserStreamRead = true;
       result = { data: nativeAlbumPdf.toString('base64'), base64Encoded: true, eof: false };
-    } else if (!['Runtime.runIfWaitingForDebugger', 'Page.stopLoading', 'IO.close'].includes(command.method)) {
+    } else if (!['Runtime.runIfWaitingForDebugger', 'Fetch.failRequest', 'IO.close'].includes(command.method)) {
       throw new Error(`commande enfant CDP inattendue: ${command.method}`);
     }
     browserRootSession.emit('Target.receivedMessageFromTarget', {
@@ -355,17 +357,21 @@ const context = {
   assert.deepStrictEqual(
     await cua._waitForMatrixPdfViaBrowserCdp(
       browserCdpContext,
-      async () => browserRootSession.emit('Target.receivedMessageFromTarget', {
-        sessionId: 'page-session-1',
-        message: JSON.stringify({
-          method: 'Fetch.requestPaused',
-          params: {
-            requestId: 'paused-print-1',
-            request: { url: 'https://matrix.centris.ca/Matrix/PrintP?id=single-use' },
-            responseStatusCode: 200,
-          },
-        }),
-      }),
+      async () => {
+        browserRootSession.emit('Target.receivedMessageFromTarget', {
+          sessionId: 'page-session-1',
+          message: JSON.stringify({
+            method: 'Fetch.requestPaused',
+            params: {
+              requestId: 'paused-print-1',
+              request: { url: 'https://matrix.centris.ca/Matrix/PrintP?id=single-use' },
+              responseStatusCode: 200,
+              responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+            },
+          }),
+        });
+        throw new Error('le clic popup peut rejeter après la capture');
+      },
       1000,
     ),
     nativeAlbumPdf,
@@ -374,6 +380,7 @@ const context = {
   assert.strictEqual(browserFetchEnabled, true);
   assert.strictEqual(browserStreamRead, true);
   assert.strictEqual(browserAutoAttachDisabled, true);
+  assert.strictEqual(browserHandlerPresentOnDisable, true, 'autoAttach doit être désactivé avant le retrait des handlers');
   assert.strictEqual(browserRootDetached, true);
 
   const cdpSession = new EventEmitter();
