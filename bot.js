@@ -16,7 +16,11 @@ const {
   makeEmailFingerprint,
   selectFirstEmailConfirmation,
 } = require('./lib/email_send_guard');
-const { isAmbiguousTransportError, verifyEmailProviderReceipt } = require('./lib/email_delivery_receipt');
+const {
+  isAmbiguousTransportError,
+  verifyEmailProviderReceipt,
+  verifyGmailSentMetadata,
+} = require('./lib/email_delivery_receipt');
 const {
   safeRemoveRequest: removeMatrixArtifactCache,
   writeMatrixArtifactCache,
@@ -5374,6 +5378,112 @@ async function gmailAPI(endpoint, options = {}) {
   } finally { clearTimeout(t); }
 }
 
+function updateEmailDeliveryVerification(entryId, patch) {
+  const entry = emailOutbox.find(item => item.id === entryId);
+  if (!entry) return false;
+  entry.deliveryVerification = {
+    ...(entry.deliveryVerification || {}),
+    ...patch,
+    checkedAt: new Date().toISOString(),
+  };
+  return saveEmailOutbox();
+}
+
+async function readGmailMessageMetadata(messageId) {
+  const id = encodeURIComponent(String(messageId || ''));
+  if (!id) throw new Error('GMAIL_MESSAGE_ID_MISSING');
+  return gmailAPI(`/messages/${id}?format=metadata&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Message-ID`);
+}
+
+async function verifyGmailSentFolder({ messageId, expectedTo, entryId }) {
+  try {
+    const message = await retryReadOnly(
+      () => readGmailMessageMetadata(messageId),
+      { attempts: 3, delayMs: 750 },
+    );
+    const verification = verifyGmailSentMetadata(message, expectedTo);
+    updateEmailDeliveryVerification(entryId, {
+      state: verification.ok ? 'sent_folder_verified' : 'sent_folder_unverified',
+      code: verification.code || null,
+      gmailMessageId: messageId,
+      inboxVisible: Boolean(verification.inboxVisible),
+      rfc822MessageId: verification.rfc822MessageId || null,
+    });
+    return verification;
+  } catch (error) {
+    updateEmailDeliveryVerification(entryId, {
+      state: 'sent_folder_unverified',
+      code: 'GMAIL_SENT_METADATA_UNAVAILABLE',
+      gmailMessageId: messageId,
+      error: String(error?.message || error).substring(0, 160),
+    });
+    return { ok: false, code: 'GMAIL_SENT_METADATA_UNAVAILABLE' };
+  }
+}
+
+// Shawn est toujours destinataire ou Cc visible. Cette surveillance confirme
+// donc la copie de contrôle dans SA boîte Gmail sans prétendre lire la boîte
+// d'un client externe. Elle ne renvoie jamais le courriel.
+function scheduleGmailControlCopyVerification({
+  messageId, entryId, centrisNum, rfc822MessageId,
+}) {
+  const maxAttempts = 12;
+  const intervalMs = 20 * 1000;
+  let attempts = 0;
+  const check = async () => {
+    attempts += 1;
+    try {
+      let candidateIds = [String(messageId)];
+      if (rfc822MessageId) {
+        const query = encodeURIComponent(`rfc822msgid:${rfc822MessageId}`);
+        const listed = await gmailAPI(`/messages?q=${query}&maxResults=10`);
+        const found = Array.isArray(listed?.messages) ? listed.messages.map(item => String(item.id || '')).filter(Boolean) : [];
+        if (found.length) candidateIds = [...new Set(found)];
+      }
+      for (const candidateId of candidateIds) {
+        const message = await readGmailMessageMetadata(candidateId);
+        const labels = new Set(Array.isArray(message?.labelIds) ? message.labelIds.map(String) : []);
+        if (!labels.has('INBOX')) continue;
+        updateEmailDeliveryVerification(entryId, {
+          state: 'control_copy_inbox_verified',
+          gmailMessageId: messageId,
+          inboxMessageId: candidateId,
+          attempts,
+        });
+        auditLogEvent('email', 'gmail-control-copy-inbox-verified', {
+          centrisNum, entryId, gmailMessageId: messageId, attempts,
+        });
+        await sendTelegramWithFallback(
+          `📥 *Copie Gmail confirmée*\nMatrix #${centrisNum} · copie visible dans votre boîte de réception.\nLa livraison au client externe ne constitue pas une preuve de lecture.`,
+          { category: 'matrix-gmail-control-copy', centrisNum, entryId },
+        );
+        return;
+      }
+    } catch (error) {
+      log('WARN', 'GMAIL-DELIVERY', `Vérification copie ${attempts}/${maxAttempts}: ${String(error?.message || error).substring(0, 140)}`);
+    }
+    if (attempts < maxAttempts) {
+      const timer = setTimeout(check, intervalMs);
+      timer.unref?.();
+      return;
+    }
+    updateEmailDeliveryVerification(entryId, {
+      state: 'control_copy_inbox_timeout',
+      gmailMessageId: messageId,
+      attempts,
+    });
+    auditLogEvent('email', 'gmail-control-copy-inbox-timeout', {
+      centrisNum, entryId, gmailMessageId: messageId, attempts,
+    });
+    sendTelegramWithFallback(
+      `⚠️ *Livraison Gmail à vérifier*\nMatrix #${centrisNum}: le message est confirmé dans Envoyés, mais la copie de contrôle n’est pas apparue dans votre boîte après 4 minutes.\nAucune relance automatique.`,
+      { category: 'matrix-gmail-control-copy-timeout', centrisNum, entryId },
+    ).catch(() => {});
+  };
+  const timer = setTimeout(check, intervalMs);
+  timer.unref?.();
+}
+
 function gmailDecodeBase64(str) {
   try { return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'); } catch { return ''; }
 }
@@ -8165,6 +8275,27 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     return `❌ Gmail a refusé la demande ${approvedPreview.requestId || '?'} avec un échec confirmé: ${sent.error || sent.status}. Aucun email envoyé; réponds de nouveau « envoie » pour réessayer.`;
   }
 
+  // Le reçu de messages/send prouve l'acceptation par Gmail, pas la présence
+  // dans la boîte du destinataire. Confirmer immédiatement le message exact
+  // dans Envoyés et surveiller ensuite la copie Shawn (To ou Cc) sans jamais
+  // relancer l'envoi.
+  const sentFolderVerification = await verifyGmailSentFolder({
+    messageId: gmailProviderReceipt.id,
+    expectedTo: emailDestination,
+    entryId: sent.entryId,
+  });
+  scheduleGmailControlCopyVerification({
+    messageId: gmailProviderReceipt.id,
+    entryId: sent.entryId,
+    centrisNum: num,
+    rfc822MessageId: sentFolderVerification.rfc822MessageId || null,
+  });
+  if (sentFolderVerification.ok) {
+    log('OK', 'GMAIL-DELIVERY', `#${num} message ${gmailProviderReceipt.id} confirmé dans Envoyés avec destinataire exact`);
+  } else {
+    log('WARN', 'GMAIL-DELIVERY', `#${num} message ${gmailProviderReceipt.id} accepté, confirmation Envoyés différée (${sentFolderVerification.code})`);
+  }
+
   pendingMatrixArtifacts.delete(chatId);
   removeMatrixArtifactCache(DATA_DIR, approvedPreview.requestId);
   auditLogEvent('centris', 'matrix-annexes-sent', {
@@ -8172,8 +8303,12 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     manifest: emailPayload.attachments.map((doc) => doc.sha256),
     gmail_message_id: gmailProviderReceipt.id,
     gmail_thread_id: gmailProviderReceipt.threadId || null,
+    sent_folder_verified: Boolean(sentFolderVerification.ok),
   });
-  return `✅ ${documents.length} documents Matrix #${num} envoyés à *${emailDestination}*${cc.length ? ` (Cc ${REQUIRED_VISIBLE_CC_EMAIL})` : ''}.\nPreuve Gmail: \`${gmailProviderReceipt.id}\`\nAucun document omis; aucune relance automatique.`;
+  const providerState = sentFolderVerification.ok
+    ? '✅ Gmail a accepté le message et le destinataire exact est confirmé dans Envoyés.'
+    : '⚠️ Gmail a accepté le message; la confirmation dans Envoyés est encore en cours.';
+  return `${providerState}\n${documents.length} documents Matrix #${num} remis à *${emailDestination}*${cc.length ? ` (Cc ${REQUIRED_VISIBLE_CC_EMAIL})` : ''}.\nPreuve Gmail: \`${gmailProviderReceipt.id}\`\n📥 Vérification de la copie dans votre boîte en arrière-plan. Aucun document omis; aucune relance automatique.`;
 }
 
 async function executeTool(name, input, chatId, userMessage = '', actionContext = {}) {

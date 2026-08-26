@@ -47,6 +47,14 @@ assert.match(handler, /listing: cachedArtifact\.listing \|\| null/,
 assert.match(handler, /pendingMatrixArtifacts\.delete\(chatId\)/);
 assert.match(handler, /gmailProviderReceipt\?\.id/);
 assert.match(handler, /Preuve Gmail:/);
+assert.match(handler, /verifyGmailSentFolder\(/,
+  'un reçu messages\/send doit être suivi d’une vérification en lecture seule du message exact dans Envoyés');
+assert.match(handler, /scheduleGmailControlCopyVerification\(/,
+  'la copie Shawn doit être surveillée en arrière-plan sans relance fournisseur');
+assert.match(handler, /Gmail a accepté le message et le destinataire exact est confirmé dans Envoyés/,
+  'le résultat utilisateur doit distinguer acceptation Gmail, dossier Envoyés et livraison finale');
+assert.match(handler, /Aucune relance automatique/,
+  'une vérification de livraison ne doit jamais réexpédier les pièces jointes');
 assert.match(handler, /APERÇU HTML — aucun envoi/);
 assert.match(handler, /const workflowRequestId = String\([\s\S]*?matrixRequestId\(\)/,
   'un seul identifiant de corrélation doit être créé avant Matrix puis réutilisé par l’aperçu');

@@ -1,7 +1,11 @@
 'use strict';
 
 const assert = require('assert');
-const { isAmbiguousTransportError, verifyEmailProviderReceipt } = require('./lib/email_delivery_receipt');
+const {
+  isAmbiguousTransportError,
+  verifyEmailProviderReceipt,
+  verifyGmailSentMetadata,
+} = require('./lib/email_delivery_receipt');
 
 (async () => {
   assert.deepStrictEqual(
@@ -31,5 +35,33 @@ const { isAmbiguousTransportError, verifyEmailProviderReceipt } = require('./lib
   assert.strictEqual(isAmbiguousTransportError(new Error('fetch failed: socket closed')), true);
   assert.strictEqual(isAmbiguousTransportError(new Error('HTTP 400')), false);
 
-  console.log('✅ Preuve fournisseur Gmail/Brevo et états incertains OK');
+  const sentMessage = {
+    id: 'g-3',
+    labelIds: ['SENT'],
+    payload: { headers: [
+      { name: 'To', value: 'Client Test <client@example.com>' },
+      { name: 'Message-ID', value: '<matrix-123@example.com>' },
+    ] },
+  };
+  assert.deepStrictEqual(
+    verifyGmailSentMetadata(sentMessage, 'client@example.com'),
+    {
+      ok: true,
+      state: 'sent_folder_verified',
+      id: 'g-3',
+      recipients: ['client@example.com'],
+      inboxVisible: false,
+      rfc822MessageId: '<matrix-123@example.com>',
+    },
+  );
+  assert.strictEqual(
+    verifyGmailSentMetadata({ ...sentMessage, labelIds: ['INBOX'] }, 'client@example.com').code,
+    'GMAIL_SENT_LABEL_MISSING',
+  );
+  assert.strictEqual(
+    verifyGmailSentMetadata(sentMessage, 'autre@example.com').code,
+    'GMAIL_SENT_RECIPIENT_MISMATCH',
+  );
+
+  console.log('✅ Preuve Gmail/Brevo: acceptation fournisseur, Envoyés exact et états incertains OK');
 })().catch(error => { console.error(error); process.exit(1); });
