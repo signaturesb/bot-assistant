@@ -115,7 +115,9 @@ requireText("'duplicate-confirm-blocked'", 'Blocage anti-rejeu des confirmations
 if (bot.includes('shawnConsent')) errors.push('Ancien consentement email réutilisable encore présent.');
 requireText('consumeOneShotAuthorization(opts.authorization, emailPayload)', 'Wrapper email central non fail-closed.');
 requireText('pendingExternalEmailActions', 'File pending des providers email externes absente.');
-requireText('if (external.inFlight)', 'Garde anti-doublon des confirmations email absente.');
+requireText('if (action.inFlight)', 'Garde anti-doublon atomique des confirmations email absente.');
+requireText("action.confirmationStage = 'awaiting-final'", 'Deuxième confirmation email absente.');
+requireText('finalConfirmationMessageId', 'Liaison de la deuxième confirmation au message Telegram absente.');
 requireText('PENDING_EMAILS_FILE', 'Persistance des brouillons email absente.');
 requireText('queuePendingEmailDraft', 'File non destructive des brouillons email absente.');
 requireText('deliveryUncertain', 'Blocage anti-doublon après résultat fournisseur incertain absent.');
