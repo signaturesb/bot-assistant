@@ -10,7 +10,12 @@ const crypto      = require('crypto');
 const { evaluateSmsHmacSelfTest, evaluateActiveTemplate } = require('./lib/preflight_checks');
 const { AsyncLocalStorage } = require('async_hooks');
 const leadParser  = require('./lead_parser');
-const { createOneShotAuthorization, consumeOneShotAuthorization } = require('./lib/email_send_guard');
+const {
+  createOneShotAuthorization,
+  consumeOneShotAuthorization,
+  makeEmailFingerprint,
+  selectFirstEmailConfirmation,
+} = require('./lib/email_send_guard');
 const { isAmbiguousTransportError, verifyEmailProviderReceipt } = require('./lib/email_delivery_receipt');
 const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
@@ -369,49 +374,79 @@ const claude = new Anthropic({ apiKey: API_KEY });
 const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
-const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte }
-const pendingExternalEmailActions = new Map(); // chatId → { name, input, createdAt, inFlight }
+const EMAIL_CONFIRMATION_VERSION = 2;
+const FINAL_EMAIL_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
+const MATRIX_PREVIEW_TTL_MS = 15 * 60 * 1000;
+const MATRIX_REQUEST_ID_BYTES = 8;
+const pendingEmails = new Map(); // chatId → { to, toName, sujet, texte, confirmationVersion }
+const pendingExternalEmailActions = new Map(); // chatId → transaction email unique et versionnée
 // PDF Matrix figés entre l'aperçu et la confirmation. Mémoire seulement:
 // jamais écrits sur disque, supprimés après 15 minutes ou après l'envoi.
 const pendingMatrixArtifacts = new Map();
 const pendingPipedriveActivityActions = new Map(); // chatId → aperçu figé + confirmation one-shot
 let pendingEmailDraftQueue = []; // brouillons additionnels, jamais écrasés
 let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match, _firstSeen }
+let quarantinedLegacyEmailActions = 0;
 
 try {
   if (fs.existsSync(PENDING_EMAILS_FILE)) {
     const saved = JSON.parse(fs.readFileSync(PENDING_EMAILS_FILE, 'utf8')) || {};
     for (const [chatId, draft] of saved.active || []) {
-      const restored = { ...draft };
+      if (Number(draft?.confirmationVersion || 0) !== EMAIL_CONFIRMATION_VERSION) {
+        quarantinedLegacyEmailActions += 1;
+        continue;
+      }
+      const restored = { ...draft, inFlight: false, confirmationPromptInFlight: false };
       if (restored.attemptStartedAt) restored.deliveryUncertain = true;
       pendingEmails.set(Number(chatId), restored);
     }
     for (const [chatId, action] of saved.external || []) {
+      if (Number(action?.confirmationVersion || 0) !== EMAIL_CONFIRMATION_VERSION) {
+        quarantinedLegacyEmailActions += 1;
+        continue;
+      }
+      // Les PDF Matrix sont volontairement gardés en mémoire seulement. Après
+      // un redémarrage, ne jamais restaurer une autorisation dont les pièces
+      // figées n'existent plus: elle serait impossible à confirmer honnêtement.
+      if (action?.name === 'telecharger_annexes_centris') {
+        quarantinedLegacyEmailActions += 1;
+        continue;
+      }
       if (Date.now() - Number(action?.createdAt || 0) <= 30 * 60 * 1000) {
         pendingExternalEmailActions.set(Number(chatId), {
           ...action,
           inFlight: false,
+          confirmationPromptInFlight: false,
           ambiguousAfterRestart: Boolean(action?.attemptStartedAt),
         });
       }
     }
-    pendingEmailDraftQueue = Array.isArray(saved.queue) ? saved.queue.slice(-100) : [];
+    pendingEmailDraftQueue = Array.isArray(saved.queue)
+      ? saved.queue.filter(item => Number(item?.draft?.confirmationVersion || 0) === EMAIL_CONFIRMATION_VERSION).slice(-100)
+      : [];
   }
 } catch {
   pendingEmailDraftQueue = [];
 }
 
 function savePendingEmailState() {
-  safeWriteJSON(PENDING_EMAILS_FILE, {
+  return safeWriteJSON(PENDING_EMAILS_FILE, {
     active: [...pendingEmails.entries()],
     external: [...pendingExternalEmailActions.entries()].map(([chatId, action]) => [chatId, { ...action, inFlight: false }]),
     queue: pendingEmailDraftQueue.slice(-100),
   });
 }
 
+if (quarantinedLegacyEmailActions > 0) {
+  savePendingEmailState();
+  log('WARN', 'EMAIL', `${quarantinedLegacyEmailActions} ancienne(s) autorisation(s) email invalidée(s) par la double confirmation v${EMAIL_CONFIRMATION_VERSION}`);
+}
+
 function queuePendingEmailDraft(chatId, draft, { replace = false, source = 'automatic' } = {}) {
   const item = {
     ...draft,
+    confirmationVersion: EMAIL_CONFIRMATION_VERSION,
+    confirmationStage: 'preview',
     source,
     createdAt: Date.now(),
     attemptStartedAt: null,
@@ -425,11 +460,18 @@ function queuePendingEmailDraft(chatId, draft, { replace = false, source = 'auto
     return { armed: false, dedup: true, item };
   }
   if (replace) {
-    pendingEmails.delete(chatId);
-    pendingExternalEmailActions.delete(chatId);
-    pendingEmails.set(chatId, item);
+    // Même une demande de remplacement ne peut jamais invalider silencieusement
+    // un aperçu déjà affiché: l'ancien message pourrait ensuite confirmer le
+    // nouveau destinataire. Toute nouvelle version attend dans la file.
+    if (!pendingEmails.has(chatId) && !pendingExternalEmailActions.has(chatId)) {
+      pendingEmails.set(chatId, item);
+      savePendingEmailState();
+      return { armed: true, item };
+    }
+    pendingEmailDraftQueue.push({ chatId, draft: item });
+    if (pendingEmailDraftQueue.length > 100) pendingEmailDraftQueue = pendingEmailDraftQueue.slice(-100);
     savePendingEmailState();
-    return { armed: true, item };
+    return { armed: false, queued: true, position: pendingEmailDraftQueue.length, item };
   }
   if (!pendingEmails.has(chatId) && !pendingExternalEmailActions.has(chatId)) {
     pendingEmails.set(chatId, item);
@@ -463,7 +505,7 @@ function promoteNextPendingEmailDraft(chatId) {
 
 function pendingEmailPreview(draft, title = 'PROCHAIN BROUILLON PRÊT') {
   if (!draft) return '';
-  return `📧 *${title}*\n\n*À:* ${draft.toName ? `${draft.toName} <${draft.to}>` : draft.to}\n*Objet:* ${draft.sujet}\n\n---\n${draft.texte}\n---\n\nRéponds exactement *« envoie »* pour UNE tentative, ou *« annule »*.`;
+  return `📧 *${title}*\n\n*À:* ${draft.toName ? `${draft.toName} <${draft.to}>` : draft.to}\n*Objet:* ${draft.sujet}\n\n---\n${draft.texte}\n---\n\n1️⃣ Réponds *« envoie »*.\n2️⃣ Le bot réaffichera l’adresse exacte et exigera *« confirme adresse@courriel »*.\nAucun fournisseur n’est appelé avant les deux confirmations.`;
 }
 
 try {
@@ -719,7 +761,7 @@ try {
 } catch { emailOutbox = []; }
 function saveEmailOutbox() {
   if (emailOutbox.length > 1000) emailOutbox = emailOutbox.slice(-1000);
-  safeWriteJSON(EMAIL_OUTBOX_FILE, emailOutbox);
+  return safeWriteJSON(EMAIL_OUTBOX_FILE, emailOutbox);
 }
 
 /**
@@ -853,6 +895,14 @@ async function sendEmailLogged(opts) {
     attachments: opts.attachments || [],
   };
   const internalOnly = isInternalEmailPayload(emailPayload);
+  const provider = String(emailPayload.via || opts.via || 'gmail').toLowerCase();
+  const toAddresses = extractEmailAddresses(emailPayload.to);
+  const ccAddresses = extractEmailAddresses(emailPayload.cc);
+  const shawnAddress = String(AGENT.email || 'shawn@signaturesb.com').trim().toLowerCase();
+  const hasExternalGmailRecipient = provider === 'gmail' && toAddresses.some(address =>
+    !isInternalEmailPayload({ to: address })
+  );
+  const hasVisibleShawnCc = ccAddresses.includes(shawnAddress);
   const entry = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     ts: Date.now(),
@@ -863,14 +913,37 @@ async function sendEmailLogged(opts) {
     bcc: opts.bcc || [],
     subject: String(opts.subject || '').substring(0, 200),
     category: opts.category || 'unknown',
+    fingerprint: makeEmailFingerprint(emailPayload),
     authorization: internalOnly ? 'internal-only' : 'required',
     outcome: 'pending',
   };
   emailOutbox.push(entry);
-  saveEmailOutbox(); // log AVANT envoi — capture intent même si crash
+  if (!saveEmailOutbox()) {
+    emailOutbox.pop();
+    log('ERR', 'EMAIL', `Envoi bloqué: intention durable impossible à écrire → ${entry.to}`);
+    return {
+      ok: false, blocked: true, code: 'EMAIL_OUTBOX_PERSIST_FAILED',
+      error: 'Impossible de persister l’intention avant le fournisseur', entryId: entry.id, durationMs: 0,
+    };
+  }
 
   const t0 = Date.now();
   try {
+    // Invariant central demandé par Shawn: pour tout Gmail envoyé à un tiers,
+    // Shawn doit être dans le Cc visible DU MÊME message. Une copie Bcc ou un
+    // second courriel ne satisfait pas cette règle et le provider n'est jamais appelé.
+    if (hasExternalGmailRecipient && !hasVisibleShawnCc) {
+      entry.outcome = 'blocked';
+      entry.code = 'EMAIL_SHAWN_VISIBLE_CC_REQUIRED';
+      entry.error = `${shawnAddress} absent du Cc visible`;
+      entry.durationMs = Date.now() - t0;
+      saveEmailOutbox();
+      log('WARN', 'EMAIL', `Envoi Gmail bloqué: Cc Shawn absent → ${entry.to}`);
+      return {
+        ok: false, blocked: true, code: entry.code, error: entry.error,
+        entryId: entry.id, durationMs: entry.durationMs,
+      };
+    }
     // Le contrôle est central et fail-closed: aucun caller ne peut déclarer
     // lui-même qu'il a le consentement. Une destination externe consomme une
     // autorisation liée au destinataire, contenu, canal et pièces jointes,
@@ -5056,8 +5129,13 @@ Au plaisir,<br>
     } catch (e) {
       log('WARN', 'DOCS', `Envoi client bloqué avant provider: ${e.code || e.message}`);
       if (opts.chatId) {
+        if (pendingExternalEmailActions.has(opts.chatId)) {
+          return `🔒 Une autre transaction courriel est déjà active. Aucun aperçu n’a été écrasé et aucun email n’est parti.`;
+        }
         deferActivePendingEmail(opts.chatId);
         pendingExternalEmailActions.set(opts.chatId, {
+          confirmationVersion: EMAIL_CONFIRMATION_VERSION,
+          confirmationStage: 'preview',
           name: 'envoyer_docs_prospect',
           input: {
             terme,
@@ -5071,7 +5149,7 @@ Au plaisir,<br>
         });
         savePendingEmailState();
       }
-      return `🔒 *Documents prêts pour ${realToEmail}*, mais aucun email n'est parti.\nRéponds exactement *"envoie"* pour autoriser UNE tentative avec ces ${ok.length} pièce(s) jointe(s).`;
+      return `🔒 *Documents prêts pour ${realToEmail}*, mais aucun email n'est parti.\n1️⃣ Réponds exactement *"envoie"*.\n2️⃣ Confirme ensuite l’adresse exacte demandée par le bot.`;
     }
   }
 
@@ -5329,6 +5407,8 @@ async function voirConversation(terme) {
 async function envoyerEmailGmail({ to, toName, sujet, texte, authorization }) {
   const token = await getGmailToken();
   if (!token) throw new Error('Gmail non configuré — vérifier GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN dans Render');
+  const safeTo = normalizeSingleRecipientEmail(to);
+  if (!safeTo) throw new Error('Adresse Gmail invalide ou ambiguë — un seul destinataire exact est requis');
 
   // HTML branded dynamique (utilise AGENT_CONFIG)
   const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;margin:0 auto;padding:20px;">
@@ -5342,7 +5422,12 @@ ${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` :
 </body></html>`;
 
   const boundary  = `sb_${Date.now()}`;
-  const toHeader  = toName ? `${toName} <${to}>` : to;
+  // Le MIME utilise uniquement l'adresse normalisée. Le nom d'affichage peut
+  // contenir des données CRM non fiables et ne doit jamais injecter un header.
+  const toHeader  = safeTo;
+  const cc = safeTo === String(AGENT.email || '').trim().toLowerCase()
+    ? []
+    : [AGENT.email];
   const encSubj   = s => {
     // Encoder chaque mot si nécessaire (robuste pour sujets longs)
     const b64 = Buffer.from(s, 'utf-8').toString('base64');
@@ -5352,7 +5437,7 @@ ${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` :
   const msgLines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${toHeader}`,
-    `Bcc: ${AGENT.email}`,
+    ...(cc.length ? [`Cc: ${cc.join(', ')}`] : []),
     `Reply-To: ${AGENT.email}`,
     `Subject: ${encSubj(sujet)}`,
     'MIME-Version: 1.0',
@@ -5377,10 +5462,10 @@ ${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` :
     .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
   const emailPayload = {
-    via: 'gmail', to, cc: [], bcc: [AGENT.email], subject: sujet, body: texte, attachments: []
+    via: 'gmail', to: safeTo, cc, bcc: [], subject: sujet, body: texte, attachments: []
   };
   const logged = await sendEmailLogged({
-    via: 'gmail', to, bcc: [AGENT.email], subject: sujet, body: texte,
+    via: 'gmail', to: safeTo, cc, bcc: [], subject: sujet, body: texte,
     category: 'approved-gmail-draft', authorization, emailPayload,
     sendFn: () => gmailAPI('/messages/send', { method: 'POST', body: JSON.stringify({ raw }) }),
   });
@@ -7288,10 +7373,12 @@ async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, 
   const boundary = `sb${Date.now()}`;
   const enc      = s => `=?UTF-8?B?${Buffer.from(s,'utf-8').toString('base64')}?=`;
   const plainTxt = `${typeLabel} ${modeLabel} — ${ville}\nSource: Centris.ca (agent ${process.env.CENTRIS_USER||''})\n\n${listings.map((l,i)=>`${i+1}. ${l.adresse||l.titre||'N/D'}${l.mls?' (#'+l.mls+')':''}${l.prix?' — '+Number(l.prix).toLocaleString('fr-CA')+' $':''}${l.superficie?' — '+Number(l.superficie).toLocaleString('fr-CA')+' pi²':''}${l.dateVente?' — '+l.dateVente:''}`).join('\n')}\n\n${AGENT.nom} · ${AGENT.telephone}`;
+  const reportCc = dest.toLowerCase() === String(AGENT.email).toLowerCase() ? [] : [AGENT.email];
 
   const msgLines = [
     `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
     `To: ${dest}`,
+    ...(reportCc.length ? [`Cc: ${reportCc.join(', ')}`] : []),
     `Reply-To: ${AGENT.email}`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
@@ -7313,7 +7400,7 @@ async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, 
   ];
   const raw = Buffer.from(msgLines.join('\r\n'),'utf-8').toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
   const emailPayload = {
-    via: 'gmail', to: dest, cc: [], bcc: [], subject: sujet,
+    via: 'gmail', to: dest, cc: reportCc, bcc: [], subject: sujet,
     body: plainTxt, attachments: [],
   };
   let authorization = null;
@@ -7325,7 +7412,7 @@ async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, 
     }
   }
   const logged = await sendEmailLogged({
-    via: 'gmail', to: dest, subject: sujet, category: 'rapport-comparables',
+    via: 'gmail', to: dest, cc: reportCc, subject: sujet, category: 'rapport-comparables',
     authorization, emailPayload,
     sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
@@ -7489,13 +7576,39 @@ function externalEmailActionSummary(name, input = {}) {
   return { to, label: labels[name] || name };
 }
 
-async function executeMatrixAnnexesTool({ num, emailDestination, filtre, messagePerso, chatId, userMessage }) {
+async function executeMatrixAnnexesTool({ num, emailDestination, filtre, messagePerso, chatId, userMessage, confirmationContext = {} }) {
   const cuaMod = getCUA();
   if (!cuaMod || !cuaMod.CUA_AVAILABLE() || !cuaMod.cuaGetCentrisAnnexes) {
     return `❌ Matrix/Playwright indisponible — aucune annexe récupérée et aucun envoi effectué.`;
   }
 
   const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
+  if (emailDestination) {
+    const normalizedDestination = normalizeSingleRecipientEmail(emailDestination);
+    if (!normalizedDestination) {
+      return `❌ Adresse courriel invalide ou ambiguë. Un seul destinataire exact est permis; aucun document récupéré et aucun email envoyé.`;
+    }
+    emailDestination = normalizedDestination;
+  }
+  if (isSendConfirmation) {
+    const transaction = pendingExternalEmailActions.get(chatId);
+    const transactionRecipient = pendingEmailTransactionRecipient('external', transaction);
+    const contextPromptId = Number(confirmationContext.finalPromptMessageId || 0);
+    if (!confirmationContext.doubleConfirmedExternalEmail ||
+        !transaction || transaction.name !== 'telecharger_annexes_centris' ||
+        transaction.confirmationStage !== 'awaiting-final' || !transaction.inFlight ||
+        transactionRecipient !== emailDestination ||
+        contextPromptId !== Number(transaction.finalConfirmationMessageId || 0) ||
+        String(confirmationContext.requestId || '') !== String(transaction.requestId || '') ||
+        !matrixClientEligibility(transaction.client || {}).eligible) {
+      return `🔒 Double confirmation Matrix absente, ambiguë ou liée à un autre aperçu. Aucun email envoyé à ${emailDestination || 'aucun destinataire'}.`;
+    }
+  }
+  if (!isSendConfirmation && emailDestination && pendingExternalEmailActions.has(chatId)) {
+    const current = pendingExternalEmailActions.get(chatId);
+    const currentSummary = externalEmailActionSummary(current.name, current.input);
+    return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Réponds « annule » ou termine sa double confirmation avant de créer un nouvel aperçu. Aucun email envoyé.`;
+  }
   const normalizedFilter = String(filtre || '');
   const clientInstruction = String(messagePerso || '').replace(/[\r\0]+/g, ' ').trim().substring(0, 2000);
   const cachedArtifact = pendingMatrixArtifacts.get(chatId);
@@ -7506,7 +7619,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       pendingMatrixArtifacts.delete(chatId);
       return `🔒 Confirmation refusée: les PDF figés de l’aperçu Matrix #${num} sont absents ou expirés. Demande un nouvel aperçu; aucun email envoyé.`;
     }
-    result = { success: true, annexes: cachedArtifact.documents, failures: [] };
+    result = { success: true, annexes: cachedArtifact.documents, failures: [], listing: cachedArtifact.listing || null };
   } else {
     log('INFO', 'CENTRIS-MATRIX-ANNEXES', `Recherche globale exacte #${num}${filtre ? ` · filtre=${filtre}` : ''}`);
     // Une demande humaine peut arriver pendant le smoke de démarrage. Elle
@@ -7526,8 +7639,19 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     page_count: Number.isFinite(doc.page_count) ? doc.page_count : null,
     sha256: doc.sha256 || crypto.createHash('sha256').update(doc.buffer).digest('hex'),
     source: 'matrix-global',
+    provenance: doc.provenance || null,
+    generation_method: doc.generation_method || null,
   }));
   const failures = Array.isArray(result.failures) ? result.failures : [];
+  const returnedCentris = String(result?.listing?.centris_num || '').replace(/\D/g, '');
+  const rawListingAddress = String(result?.listing?.address || '').replace(/[\r\n\0]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const listingAddress = /^\d{1,6}\s*,?\s+\S/.test(rawListingAddress) ? rawListingAddress.substring(0, 180) : '';
+  if (returnedCentris !== String(num)) {
+    return `🔒 Listing Matrix refusé: le résultat vérifié (${returnedCentris || 'numéro absent'}) ne correspond pas exactement au Centris #${num}. Aucun aperçu armé et aucun email envoyé.`;
+  }
+  if (!listingAddress) {
+    return `🔒 Listing Matrix #${num} refusé: l’adresse exacte n’a pas pu être validée dans la fiche authentifiée. Aucun aperçu armé et aucun email envoyé.`;
+  }
 
   // Telegram est le canal privé de Shawn: livraison interne des PDFs validés.
   // Ne pas renvoyer les mêmes pièces lors de la confirmation finale.
@@ -7579,19 +7703,45 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   // ligne. Le filtre vient de Telegram et ne doit jamais pouvoir injecter un
   // nouvel en-tête (Cc/Bcc notamment).
   const mimeHeader = (value) => String(value ?? '').replace(/[\r\n\0]+/g, ' ').trim();
-  const subject = mimeHeader(`Documents Centris #${num}${filtre ? ` — ${filtre}` : ''}`);
+  const listingLabel = listingAddress ? `${listingAddress} · Centris #${num}` : `Centris #${num}`;
+  const subject = mimeHeader(`Documents ${listingLabel}${filtre ? ` — ${filtre}` : ''}`);
   const cc = emailDestination.toLowerCase() === AGENT.email.toLowerCase() ? [] : [AGENT.email];
-  const introText = clientInstruction || `Voici les ${documents.length} documents officiels disponibles dans Matrix pour le listing Centris #${num}.`;
-  const bodyText = `Bonjour,\n\n${introText}\n\n${documents.map((doc) => `• ${doc.label}`).join('\n')}\n\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.telephone}`;
+  const introText = clientInstruction || `Voici les ${documents.length} documents officiels disponibles dans Matrix pour ${listingLabel}.`;
+  const totalPages = documents.reduce((total, doc) => total + Number(doc.page_count || 0), 0);
+  const capturedReportCount = documents.filter((doc) => doc.generation_method === 'matrix-detail-page-capture' || doc.provenance === 'matrix_listing_report_capture_pdf').length;
+  const nativeDocumentCount = documents.length - capturedReportCount;
+  const compositionText = capturedReportCount
+    ? `${nativeDocumentCount} document(s) Matrix natif(s) et ${capturedReportCount} fiche détaillée générée en PDF depuis la page Matrix authentifiée.`
+    : `${documents.length} document(s) PDF récupéré(s) depuis Matrix authentifié.`;
+  const bodyText = `Bonjour,\n\n${introText}\n\nPropriété: ${listingLabel}\n${documents.map((doc) => `• ${doc.label}`).join('\n')}\n\n${compositionText}\nN'hésitez pas si vous avez des questions.\n\nAu plaisir,\n${AGENT.nom}\n${AGENT.telephone}`;
   const contentHtml = `<p style="color:#cccccc;font-size:14px;line-height:1.7;">${escapeHtml(introText).replace(/\n/g, '<br>')}</p><div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;">${documents.map((doc) => `<div style="color:#f5f5f7;margin:6px 0;">📎 ${escapeHtml(doc.label)} <span style="color:#888;">(${Math.round(doc.size / 1024)} KB)</span></div>`).join('')}</div>`;
+  const verificationHtml = `<div style="color:#cccccc;font-size:14px;line-height:1.7;"><strong style="color:#f5f5f7;">${escapeHtml(listingLabel)}</strong><br>${escapeHtml(compositionText)}<br>Chaque PDF a été ouvert, analysé et lié à l’inventaire exact avant la création de cet aperçu.</div>`;
+  const guidanceHtml = `<p style="margin:0;color:#cccccc;font-size:14px;line-height:1.8;">Prenez le temps de consulter les pièces jointes. Je peux vous expliquer la déclaration du vendeur, les plans, les taxes et le certificat de localisation, puis vous accompagner pour la prochaine étape.</p>`;
   let html = await buildEmailFromMasterTpl({
-    TITRE_EMAIL: `Documents Centris #${num}`,
+    TITRE_EMAIL: `Documents ${listingLabel}`,
     LABEL_SECTION: 'Documents officiels',
-    TERRITOIRES: `Centris #${num}`,
-    HERO_TITRE: `Documents<br>Centris #${num}.`,
+    TERRITOIRES: listingAddress ? `Centris #${num} · ${escapeHtml(listingAddress)}` : `Centris #${num}`,
+    SOUS_TITRE_ANALYSE: escapeHtml(listingLabel),
+    HERO_TITRE: `Documents<br>${escapeHtml(listingLabel)}.`,
     INTRO_TEXTE: contentHtml,
+    TITRE_SECTION_1: 'Dossier complet et vérifié',
+    MARCHE_LABEL: 'Pièces jointes',
+    PRIX_MEDIAN: `${documents.length} PDF`,
+    VARIATION_PRIX: totalPages ? `${totalPages} pages validées` : 'Pages validées',
+    SOURCE_STAT: 'Source : Matrix Centris authentifié',
+    LABEL_TABLEAU: 'Vérification du dossier',
+    TABLEAU_STATS_HTML: verificationHtml,
+    TITRE_SECTION_2: 'Votre accompagnement',
     CITATION: 'Je reste disponible pour répondre à toutes vos questions sur ce dossier.',
+    CONTENU_STRATEGIE: guidanceHtml,
+    SOURCES: `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie} · Matrix Centris`,
   });
+  if (html) {
+    html = html
+      .replace(/01\s*·\s*Données du marché/gi, '01 · Dossier documentaire')
+      .replace(/02\s*·\s*Stratégie/gi, '02 · Accompagnement')
+      .replace(/Données Centris Matrix/g, 'Dossier Matrix authentifié');
+  }
   // Un courriel client sans le modèle officiel n'est pas un résultat valide.
   // On échoue fermé au lieu d'envoyer un fallback qui ne porte pas l'identité
   // SignatureSB présentée dans l'aperçu.
@@ -7653,14 +7803,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     renderedHtmlSha256,
     attachments: documents.map((doc) => ({ name: doc.filename, size: doc.size, sha256: doc.sha256 })),
   };
-  const payloadFingerprint = crypto.createHash('sha256').update(JSON.stringify({
-    to: emailPayload.to,
-    cc: emailPayload.cc,
-    subject: emailPayload.subject,
-    body: emailPayload.body,
-    renderedHtmlSha256: emailPayload.renderedHtmlSha256,
-    attachments: emailPayload.attachments,
-  })).digest('hex');
+  const payloadFingerprint = makeEmailFingerprint(emailPayload);
 
   if (!isSendConfirmation) {
     // Un aperçu ne dépend pas de Gmail: une panne OAuth temporaire ne doit pas
@@ -7670,20 +7813,44 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     if (!chatId) {
       return `❌ Identifiant Telegram absent: impossible de remettre et lier l’aperçu Matrix #${num}. Aucun courriel n'est armé et aucun email n'a été envoyé.`;
     }
+    const priorAttempt = emailOutbox.slice().reverse().find(entry =>
+      entry.category === 'centris-matrix-annexes' &&
+      entry.fingerprint === payloadFingerprint &&
+      Date.now() - Number(entry.ts || 0) < 24 * 60 * 60 * 1000 &&
+      ['pending', 'sent', 'uncertain'].includes(entry.outcome)
+    );
+    if (priorAttempt) {
+      return `🔒 Un envoi Gmail identique est déjà ${priorAttempt.outcome === 'sent' ? 'confirmé envoyé' : 'en cours ou incertain'} dans le registre durable (transaction ${priorAttempt.id}). Aucun nouvel aperçu n’est armé et aucune répétition fournisseur n’est permise.`;
+    }
+    const client = await resolveMatrixClientContext(emailDestination, num);
+    const requestId = matrixRequestId();
     const pendingMatrixPreview = {
+      confirmationVersion: EMAIL_CONFIRMATION_VERSION,
+      confirmationStage: 'preview',
+      requestId,
       name: 'telecharger_annexes_centris',
       input: { centris_num: num, email_destination: emailDestination, filtre: filtre || '', message_perso: clientInstruction },
       createdAt: Date.now(),
       inFlight: false,
       matrixFingerprint: payloadFingerprint,
-      matrixPreviewExpiresAt: Date.now() + 15 * 60 * 1000,
+      matrixPreviewExpiresAt: Date.now() + MATRIX_PREVIEW_TTL_MS,
+      listingAddress,
+      client,
+      documentsManifest: documents.map(doc => ({
+        label: doc.label, filename: doc.filename, size: doc.size,
+        page_count: doc.page_count, sha256: doc.sha256,
+      })),
+      emailSubject: subject,
+      emailBody: bodyText,
+      emailCc: cc,
     };
+    let htmlPreviewMessageId = null;
     try {
       const previewReceipt = await bot.sendDocument(chatId, Buffer.from(html, 'utf8'), {
-        caption: `APERÇU COURRIEL — aucun envoi\nÀ: ${emailDestination}\nCc: ${cc.join(', ') || 'aucune'}\nObjet: ${subject}\nPièces jointes: ${documents.length}\nValide 15 minutes; réponds exactement « envoie ».`,
+        caption: `APERÇU HTML — aucun envoi\nDemande: ${requestId}\nCentris #${num} · ${listingAddress}\nÀ: ${emailDestination}\nCc: ${cc.join(', ') || 'aucune'}\nPièces jointes: ${documents.length}\nValide 15 minutes.`,
       }, { filename: `apercu_courriel_centris_${num}.html`, contentType: 'text/html' });
       if (!previewReceipt?.message_id) throw new Error('accusé Telegram sans message_id');
-      pendingMatrixPreview.telegramPreviewMessageId = previewReceipt.message_id;
+      htmlPreviewMessageId = previewReceipt.message_id;
     } catch (error) {
       log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Telegram: ${error.message}`);
       auditLogEvent('centris', 'matrix-email-preview-delivery-failed', {
@@ -7691,15 +7858,42 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       });
       return `❌ L’aperçu courriel Matrix #${num} n’a pas été confirmé par Telegram. Aucun courriel n'est armé et aucun email n'a été envoyé.`;
     }
+    // Un ancien brouillon général ne doit jamais gagner sur l'aperçu Matrix.
+    // Il est remis en file; une autre action externe n'est jamais écrasée.
+    deferActivePendingEmail(chatId);
+    if (pendingExternalEmailActions.has(chatId)) {
+      return `🔒 Une autre action externe est déjà active. L’aperçu Matrix a été remis dans Telegram, mais aucune confirmation n’est armée et aucun email n’a été envoyé.`;
+    }
     pendingExternalEmailActions.set(chatId, pendingMatrixPreview);
     pendingMatrixArtifacts.set(chatId, {
       num,
       filtre: normalizedFilter,
       documents,
+      listing: result.listing || null,
       expiresAt: pendingMatrixPreview.matrixPreviewExpiresAt,
     });
-    savePendingEmailState();
-    return `📂 ${documents.length} PDF(s) Matrix #${num} récupérés et validés.\n🔍 Aperçu SignatureSB remis dans Telegram pour ${emailDestination}.\n🔒 Aucun email envoyé; réponds exactement « envoie » dans les 15 minutes.`;
+    if (!savePendingEmailState()) {
+      clearMatrixTransaction(chatId, requestId);
+      return `🔒 Aperçu Matrix #${num} bloqué: impossible de persister la transaction ${requestId}. Aucun email envoyé.`;
+    }
+    try {
+      const summaryReceipt = await bot.sendMessage(chatId, matrixPreviewSummary(pendingMatrixPreview), {
+        reply_markup: matrixPreviewButtons(requestId),
+        link_preview_options: { is_disabled: true },
+      });
+      if (!summaryReceipt?.message_id) throw new Error('résumé Telegram sans message_id');
+      pendingMatrixPreview.telegramPreviewMessageId = summaryReceipt.message_id;
+      pendingMatrixPreview.telegramHtmlPreviewMessageId = htmlPreviewMessageId;
+      if (!savePendingEmailState()) throw new Error('transaction impossible à repersister après reçu Telegram');
+    } catch (error) {
+      clearMatrixTransaction(chatId, requestId);
+      log('WARN', 'CENTRIS-MATRIX-PREVIEW', `Résumé Telegram: ${error.message}`);
+      return `❌ Le résumé transactionnel Matrix #${num} n’a pas été confirmé par Telegram. Aucun email n'est armé et aucun email n'a été envoyé.`;
+    }
+    const eligibilityLine = client.eligible
+      ? 'Identité client admissible.'
+      : `Envoi bloqué jusqu’à correction: ${client.missing.join(', ')}.`;
+    return `📂 ${documents.length} PDF(s) Matrix #${num} récupérés et validés.\n🔍 Aperçu ${requestId} remis dans Telegram pour ${emailDestination}.\n${eligibilityLine}\n🔒 Aucun email envoyé.`;
   }
 
   const approvedPreview = pendingExternalEmailActions.get(chatId);
@@ -7711,6 +7905,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   if (approvedPreview.matrixFingerprint !== payloadFingerprint) {
     pendingMatrixArtifacts.delete(chatId);
     return `🔒 Confirmation refusée: le destinataire, le modèle ou les PDF ont changé depuis l’aperçu. Demande un nouvel aperçu; aucun email envoyé.`;
+  }
+  const clientEligibility = matrixClientEligibility(approvedPreview.client || {});
+  if (!clientEligibility.eligible) {
+    return `🔒 Client non admissible pour la demande ${approvedPreview.requestId || '?'}: ${clientEligibility.missing.join(', ')}. Aucun fournisseur appelé.`;
   }
   // OAuth est requis seulement au moment de l'unique tentative approuvée.
   // Une indisponibilité ici est déterministe et survient avant le fournisseur.
@@ -7742,7 +7940,15 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       return response;
     },
   });
-  if (!sent.ok) return `❌ Les PDF ont été validés, mais Gmail a refusé l'envoi: ${sent.error || sent.status}. Aucune relance automatique.`;
+  if (!sent.ok) {
+    if (sent.uncertain) {
+      return `⚠️ État Gmail incertain pour la demande ${approvedPreview.requestId || '?'}: ${sent.error || sent.status}. Aucune relance automatique; vérifie le dossier Envoyés.`;
+    }
+    if (sent.blocked) {
+      return `🔒 Gmail bloqué avant livraison pour la demande ${approvedPreview.requestId || '?'}: ${sent.error || sent.code}. Aucun email envoyé.`;
+    }
+    return `❌ Gmail a refusé la demande ${approvedPreview.requestId || '?'} avec un échec confirmé: ${sent.error || sent.status}. Aucun email envoyé; une nouvelle double confirmation sera requise pour réessayer.`;
+  }
 
   pendingMatrixArtifacts.delete(chatId);
   auditLogEvent('centris', 'matrix-annexes-sent', {
@@ -7822,14 +8028,21 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
     }
 
     const externalRecipient = getExternalEmailToolRecipient(name, input);
-    if (externalRecipient && !isInternalEmailPayload({ to: externalRecipient }) && name !== 'telecharger_annexes_centris') {
+    if (externalRecipient && name !== 'telecharger_annexes_centris') {
       if (name === 'telecharger_docs_centris_complet') {
         return '🔒 Envoi multi-courriels désactivé: une confirmation ne peut autoriser qu’une tentative fournisseur. Demande séparément la fiche Centris, puis les documents Dropbox.';
       }
       if (!actionContext.confirmedExternalEmail) {
         const summary = externalEmailActionSummary(name, input);
+        if (pendingExternalEmailActions.has(chatId)) {
+          const current = pendingExternalEmailActions.get(chatId);
+          const currentSummary = externalEmailActionSummary(current.name, current.input);
+          return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Elle n’a pas été écrasée; termine-la ou annule-la d’abord.`;
+        }
         deferActivePendingEmail(chatId);
         pendingExternalEmailActions.set(chatId, {
+          confirmationVersion: EMAIL_CONFIRMATION_VERSION,
+          confirmationStage: 'preview',
           name,
           input: JSON.parse(JSON.stringify(input || {})),
           createdAt: Date.now(),
@@ -7837,7 +8050,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         });
         savePendingEmailState();
         auditLogEvent('email', 'external-action-pending', { tool: name, to: summary.to, chatId });
-        return `📧 *ACTION PRÊTE — AUCUN ENVOI EFFECTUÉ*\n\nÀ: ${summary.to}\nContenu: ${summary.label}\n\nRéponds exactement *« envoie »* pour autoriser UNE tentative, ou *« annule »*.`;
+        return `📧 *ACTION PRÊTE — AUCUN ENVOI EFFECTUÉ*\n\nÀ: ${summary.to}\nCc visible: ${summary.to === String(AGENT.email).toLowerCase() ? 'aucun (vous êtes le destinataire)' : AGENT.email}\nContenu: ${summary.label}\n\n1️⃣ Réponds *« envoie »*.\n2️⃣ Confirme ensuite l’adresse exacte demandée par le bot.`;
       }
       if (!CONFIRM_REGEX.test(String(userMessage || '').trim())) {
         return '🔒 Envoi externe bloqué: confirmation exacte « envoie » requise.';
@@ -8386,6 +8599,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
           messagePerso: message_perso,
           chatId,
           userMessage,
+          confirmationContext: actionContext,
         });
 
         /* c8 ignore start -- legacy rollback path, unreachable by design */
@@ -9974,116 +10188,620 @@ async function handlePipedriveActivityConfirmation(chatId, text) {
   return true;
 }
 
-async function handleEmailConfirmation(chatId, text) {
-  if (!CONFIRM_REGEX.test(text.trim())) return false;
+function normalizeSingleRecipientEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  return /^[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+$/.test(email) ? email : '';
+}
+
+function matrixRequestId() {
+  return `mx${crypto.randomBytes(MATRIX_REQUEST_ID_BYTES).toString('hex')}`;
+}
+
+function matrixTestAddresses() {
+  return new Set([
+    AGENT.email,
+    process.env.MATRIX_TEST_EMAIL,
+    ...(String(process.env.MATRIX_TEST_EMAILS || '').split(/[;,]/)),
+  ].map(normalizeSingleRecipientEmail).filter(Boolean));
+}
+
+function normalizeClientPhone(value) {
+  const digits = String(value || '').replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+  return /^\d{10}$/.test(digits) ? digits : '';
+}
+
+function formatClientPhone(value) {
+  const digits = normalizeClientPhone(value);
+  return digits ? `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}` : '';
+}
+
+function matrixClientEligibility(client = {}) {
+  const missing = [];
+  if (!isValidProspectName(String(client.name || ''))) missing.push('nom complet fiable');
+  if (!normalizeSingleRecipientEmail(client.email)) missing.push('adresse courriel unique');
+  if (!normalizeClientPhone(client.phone)) missing.push('numéro de téléphone valide');
+  if (!String(client.context || '').trim()) missing.push('contexte immobilier clair');
+  if (!client.propertyIdentified) missing.push('propriété exacte');
+  if (client.ambiguous) missing.push('correspondance client non ambiguë');
+  return { eligible: missing.length === 0, missing };
+}
+
+async function resolveMatrixClientContext(email, centrisNum) {
+  const normalizedEmail = normalizeSingleRecipientEmail(email);
+  const isAuthorizedTest = matrixTestAddresses().has(normalizedEmail);
+  if (isAuthorizedTest) {
+    const client = {
+      name: AGENT.nom || 'Shawn Barrette',
+      email: normalizedEmail,
+      phone: AGENT.telephone || '',
+      context: `Test interne autorisé du parcours Matrix pour Centris #${centrisNum}`,
+      propertyIdentified: true,
+      ambiguous: false,
+      source: 'authorized-test',
+      testMode: true,
+    };
+    return { ...client, ...matrixClientEligibility(client) };
+  }
+  if (!PD_KEY) {
+    const client = {
+      name: '', email: normalizedEmail, phone: '', context: '',
+      propertyIdentified: Boolean(centrisNum), ambiguous: false,
+      source: 'pipedrive-unavailable', testMode: false,
+    };
+    return { ...client, ...matrixClientEligibility(client) };
+  }
+
+  try {
+    const search = await pdGet(`/persons/search?term=${encodeURIComponent(normalizedEmail)}&fields=email&exact_match=true&limit=5`);
+    const candidates = [];
+    for (const row of search?.data?.items || []) {
+      const personId = row?.item?.id;
+      if (!personId) continue;
+      const detail = await pdGet(`/persons/${personId}`);
+      const person = detail?.data;
+      const exactEmails = (person?.email || []).map(item => normalizeSingleRecipientEmail(item?.value)).filter(Boolean);
+      if (exactEmails.includes(normalizedEmail)) candidates.push(person);
+    }
+    if (candidates.length !== 1) {
+      const client = {
+        name: candidates[0]?.name || '', email: normalizedEmail, phone: '', context: '',
+        propertyIdentified: Boolean(centrisNum), ambiguous: candidates.length > 1,
+        source: candidates.length ? 'pipedrive-ambiguous' : 'pipedrive-not-found', testMode: false,
+      };
+      return { ...client, ...matrixClientEligibility(client) };
+    }
+
+    const person = candidates[0];
+    const dealsResult = await pdGet(`/persons/${person.id}/deals?limit=50`);
+    const deals = Array.isArray(dealsResult?.data) ? dealsResult.data : [];
+    const exactPropertyDeal = deals.find(deal =>
+      String(deal?.[PD_FIELD_CENTRIS] || '').replace(/\D/g, '') === String(centrisNum) ||
+      new RegExp(`(?:^|\\D)${String(centrisNum)}(?:\\D|$)`).test(String(deal?.title || ''))
+    );
+    const phone = person?.phone?.find(item => item?.primary)?.value || person?.phone?.[0]?.value || '';
+    const client = {
+      personId: person.id,
+      name: String(person.name || '').trim(),
+      email: normalizedEmail,
+      phone,
+      context: exactPropertyDeal
+        ? `Dossier Pipedrive lié exactement au Centris #${centrisNum}: ${exactPropertyDeal.title || `deal #${exactPropertyDeal.id}`}`
+        : (deals.length ? `Client immobilier Pipedrive (${deals.length} dossier(s)); demande explicite pour Centris #${centrisNum}` : ''),
+      propertyIdentified: Boolean(centrisNum),
+      ambiguous: false,
+      source: exactPropertyDeal ? 'pipedrive-exact-property' : 'pipedrive-client',
+      exactPropertyDealId: exactPropertyDeal?.id || null,
+      testMode: false,
+    };
+    return { ...client, ...matrixClientEligibility(client) };
+  } catch (error) {
+    log('WARN', 'MATRIX-CLIENT', `Validation Pipedrive: ${String(error?.message || error).substring(0, 160)}`);
+    const client = {
+      name: '', email: normalizedEmail, phone: '', context: '',
+      propertyIdentified: Boolean(centrisNum), ambiguous: false,
+      source: 'pipedrive-error', testMode: false,
+    };
+    return { ...client, ...matrixClientEligibility(client) };
+  }
+}
+
+function matrixPreviewButtons(requestId) {
+  return {
+    inline_keyboard: [
+      [{ text: '✅ CONFIRMER L’ENVOI', callback_data: `mxconfirm:${requestId}` }],
+      [
+        { text: '🛑 ANNULER', callback_data: `mxcancel:${requestId}` },
+        { text: '🔄 RAFRAÎCHIR LES DOCUMENTS', callback_data: `mxrefresh:${requestId}` },
+      ],
+      [
+        { text: '👤 CORRIGER LE CLIENT', callback_data: `mxclient:${requestId}` },
+        { text: '✉️ CORRIGER LE COURRIEL', callback_data: `mxemail:${requestId}` },
+      ],
+    ],
+  };
+}
+
+function matrixPreviewSummary(action = {}) {
+  const client = action.client || {};
+  const docs = Array.isArray(action.documentsManifest) ? action.documentsManifest : [];
+  const missing = Array.isArray(client.missing) ? client.missing : [];
+  return [
+    `🔎 APERÇU MATRIX — AUCUN ENVOI`,
+    `Demande: ${action.requestId || '(absente)'}`,
+    `Mode: ${client.testMode ? 'TEST INTERNE AUTORISÉ' : 'CLIENT'}`,
+    '',
+    `Client: ${client.name || '⚠️ MANQUANT'}`,
+    `Courriel: ${client.email || '⚠️ MANQUANT'}`,
+    `Téléphone: ${formatClientPhone(client.phone) || '⚠️ MANQUANT — ne sera jamais inventé'}`,
+    `Contexte: ${client.context || '⚠️ MANQUANT'}`,
+    '',
+    `Centris: #${action.input?.centris_num || ''}`,
+    `Propriété: ${action.listingAddress || '⚠️ ADRESSE NON VALIDÉE'}`,
+    `PDF validés: ${docs.length}`,
+    ...docs.map((doc, index) => `${index + 1}. ${doc.label} (${Math.round(Number(doc.size || 0) / 1024)} KB${doc.page_count ? ` · ${doc.page_count} p.` : ''})`),
+    '',
+    `À: ${client.email || action.input?.email_destination || ''}`,
+    `Cc visible: ${(action.emailCc || []).join(', ') || 'aucun (vous êtes le destinataire)'}`,
+    `Objet: ${action.emailSubject || ''}`,
+    '',
+    `CONTENU COMPLET DU COURRIEL`,
+    '────────────────────────',
+    action.emailBody || '',
+    '────────────────────────',
+    missing.length ? `🔒 ENVOI BLOQUÉ — à corriger: ${missing.join(', ')}` : '✅ Identité et dossier admissibles pour la confirmation.',
+    '',
+    'Le bouton CONFIRMER est seulement l’étape 1/2. Une deuxième confirmation liée à cette demande sera exigée.',
+  ].join('\n');
+}
+
+function clearMatrixTransaction(chatId, expectedRequestId = null) {
+  const current = pendingExternalEmailActions.get(chatId);
+  if (expectedRequestId && current?.requestId !== expectedRequestId) return false;
+  if (current?.name === 'telecharger_annexes_centris') pendingExternalEmailActions.delete(chatId);
+  pendingMatrixArtifacts.delete(chatId);
+  savePendingEmailState();
+  return true;
+}
+
+function purgeExpiredMatrixTransactions(now = Date.now()) {
+  let purged = 0;
+  for (const [chatId, action] of pendingExternalEmailActions.entries()) {
+    if (action?.name === 'telecharger_annexes_centris' && now > Number(action.matrixPreviewExpiresAt || 0)) {
+      pendingExternalEmailActions.delete(chatId);
+      pendingMatrixArtifacts.delete(chatId);
+      promoteNextPendingEmailDraft(chatId);
+      purged += 1;
+    }
+  }
+  for (const [chatId, artifact] of pendingMatrixArtifacts.entries()) {
+    if (now > Number(artifact?.expiresAt || 0)) pendingMatrixArtifacts.delete(chatId);
+  }
+  if (purged) savePendingEmailState();
+  return purged;
+}
+
+async function resendMatrixPreviewSummary(chatId, action) {
+  const receipt = await bot.sendMessage(chatId, matrixPreviewSummary(action), {
+    reply_markup: matrixPreviewButtons(action.requestId),
+    link_preview_options: { is_disabled: true },
+  });
+  if (!receipt?.message_id) throw new Error('MATRIX_SUMMARY_RECEIPT_MISSING');
+  action.telegramPreviewMessageId = receipt.message_id;
+  action.correctionMode = null;
+  action.correctionPromptMessageId = null;
+  if (!savePendingEmailState()) throw new Error('MATRIX_SUMMARY_STATE_PERSIST_FAILED');
+  return receipt;
+}
+
+async function handleMatrixCorrectionReply(msg) {
+  const chatId = msg?.chat?.id;
+  const action = pendingExternalEmailActions.get(chatId);
+  if (!action || action.name !== 'telecharger_annexes_centris' || !action.correctionMode) return false;
+  const repliedMessageId = Number(msg?.reply_to_message?.message_id || 0);
+  if (!repliedMessageId || repliedMessageId !== Number(action.correctionPromptMessageId || 0)) return false;
+  if (Date.now() > Number(action.matrixPreviewExpiresAt || 0)) {
+    clearMatrixTransaction(chatId, action.requestId);
+    await send(chatId, '⌛ Aperçu expiré pendant la correction. Recrée la demande; aucun email envoyé.');
+    return true;
+  }
+
+  const value = String(msg?.text || '').trim();
+  if (action.correctionMode === 'client') {
+    const [nameRaw, phoneRaw, ...contextParts] = value.split('|').map(part => part.trim());
+    const context = contextParts.join(' | ').trim();
+    const client = {
+      name: nameRaw || '',
+      email: normalizeSingleRecipientEmail(action.input?.email_destination),
+      phone: phoneRaw || '',
+      context,
+      propertyIdentified: Boolean(action.input?.centris_num && action.listingAddress),
+      ambiguous: false,
+      source: 'manual-telegram-correction',
+      testMode: matrixTestAddresses().has(normalizeSingleRecipientEmail(action.input?.email_destination)),
+    };
+    Object.assign(client, matrixClientEligibility(client));
+    action.client = client;
+    action.confirmationStage = 'preview';
+    action.finalConfirmationMessageId = null;
+    action.finalConfirmationExpiresAt = null;
+    await resendMatrixPreviewSummary(chatId, action);
+    await send(chatId, client.eligible
+      ? `✅ Client corrigé pour ${action.requestId}. Vérifie le nouvel aperçu; aucun email envoyé.`
+      : `🔒 Client encore incomplet pour ${action.requestId}: ${client.missing.join(', ')}. Aucun email envoyé.`);
+    return true;
+  }
+
+  if (action.correctionMode === 'email') {
+    const correctedEmail = normalizeSingleRecipientEmail(value);
+    if (!correctedEmail) {
+      await send(chatId, '❌ Courriel invalide ou multiple. Réponds avec une seule adresse exacte; aucun email envoyé.');
+      return true;
+    }
+    const snapshot = {
+      num: action.input.centris_num,
+      filtre: action.input.filtre || '',
+      messagePerso: action.input.message_perso || '',
+      requestId: action.requestId,
+    };
+    clearMatrixTransaction(chatId, action.requestId);
+    await send(chatId, `🔄 Ancienne demande ${snapshot.requestId} invalidée. Reconstruction complète pour ${correctedEmail}; aucun email envoyé.`);
+    const stopTyping = startTypingIndicator(chatId, 6 * 60 * 1000);
+    try {
+      const result = await executeMatrixAnnexesTool({
+        num: snapshot.num,
+        emailDestination: correctedEmail,
+        filtre: snapshot.filtre,
+        messagePerso: snapshot.messagePerso,
+        chatId,
+        userMessage: `correction courriel ${correctedEmail}`,
+      });
+      await send(chatId, result);
+    } catch (error) {
+      await send(chatId, `❌ Reconstruction après correction non complétée: ${String(error?.message || error).substring(0, 180)}. Aucun email envoyé.`);
+    } finally {
+      stopTyping();
+    }
+    return true;
+  }
+  return false;
+}
+
+function pendingEmailTransactionRecipient(kind, action) {
+  if (!action) return '';
+  return normalizeSingleRecipientEmail(kind === 'external'
+    ? getExternalEmailToolRecipient(action.name, action.input)
+    : action.to);
+}
+
+function pendingEmailTransactionSummary(kind, action) {
+  const to = pendingEmailTransactionRecipient(kind, action);
+  const cc = to && to !== String(AGENT.email || '').toLowerCase() ? [AGENT.email] : [];
+  const detail = kind === 'external'
+    ? externalEmailActionSummary(action.name, action.input).label
+    : String(action.sujet || 'Brouillon Gmail');
+  return { to, cc, detail };
+}
+
+async function requestFinalEmailConfirmation(chatId, kind, action) {
+  const summary = pendingEmailTransactionSummary(kind, action);
+  if (!summary.to) throw new Error('EMAIL_RECIPIENT_INVALID');
+  if (kind === 'external' && action?.name === 'telecharger_annexes_centris') {
+    const eligibility = matrixClientEligibility(action.client || {});
+    const artifact = pendingMatrixArtifacts.get(chatId);
+    if (!action.requestId || !eligibility.eligible) {
+      throw new Error(`MATRIX_CLIENT_NOT_ELIGIBLE:${eligibility.missing.join('|')}`);
+    }
+    if (!artifact || artifact.expiresAt < Date.now() || artifact.num !== action.input?.centris_num) {
+      throw new Error('MATRIX_ARTIFACT_EXPIRED_OR_MISSING');
+    }
+  }
+  if (action.confirmationStage === 'awaiting-final' && action.finalConfirmationMessageId) {
+    await send(chatId, `🔒 La deuxième confirmation est déjà demandée pour ${summary.to}. Réponds au message de validation exactement « confirme ${summary.to} ».`);
+    return;
+  }
+  if (action.confirmationPromptInFlight) {
+    await send(chatId, '⏳ La demande de deuxième confirmation est déjà en préparation. Aucun email envoyé.');
+    return;
+  }
+  action.confirmationPromptInFlight = true;
+  savePendingEmailState();
+  try {
+    const receipt = await bot.sendMessage(chatId, [
+      '🛑 DEUXIÈME CONFIRMATION — AUCUN ENVOI',
+      '',
+      `À: ${summary.to}`,
+      `Cc visible: ${summary.cc.join(', ') || 'aucun (vous êtes le destinataire)'}`,
+      `Contenu: ${summary.detail}`,
+      action.requestId ? `Demande unique: ${action.requestId}` : '',
+      '',
+      `Répondez À CE MESSAGE exactement: confirme ${summary.to}`,
+      'Toute autre réponse est refusée.',
+    ].join('\n'), {
+      reply_markup: {
+        force_reply: true,
+        input_field_placeholder: `confirme ${summary.to}`.substring(0, 64),
+        selective: true,
+      },
+    });
+    if (!receipt?.message_id) throw new Error('TELEGRAM_FINAL_CONFIRMATION_RECEIPT_MISSING');
+    action.confirmationStage = 'awaiting-final';
+    action.finalConfirmationRecipient = summary.to;
+    action.finalConfirmationMessageId = receipt.message_id;
+    action.finalConfirmationExpiresAt = Date.now() + FINAL_EMAIL_CONFIRMATION_TTL_MS;
+    action.confirmationPromptInFlight = false;
+    savePendingEmailState();
+    auditLogEvent('email', 'second-confirmation-requested', {
+      chatId, kind, to: summary.to, cc: summary.cc, detail: summary.detail,
+      promptMessageId: receipt.message_id,
+    });
+  } catch (error) {
+    action.confirmationPromptInFlight = false;
+    savePendingEmailState();
+    throw error;
+  }
+}
+
+async function armPendingDocsFinalConfirmation(chatId, pending, pendingKey, previewMessageId = null) {
+  const recipient = normalizeSingleRecipientEmail(pending?.email || pendingKey);
+  if (!recipient) {
+    await send(chatId, '🔒 Adresse du dossier en attente invalide. Aucun email envoyé.');
+    return false;
+  }
+  if (!pending?.actionId || Date.now() - Number(pending?._firstSeen || 0) > 30 * 60 * 1000) {
+    if (pendingKey) pendingDocSends.delete(pendingKey);
+    await send(chatId, '⌛ Ce dossier en attente est ancien ou n’est pas lié à une transaction sécurisée. Recrée l’aperçu; aucun email envoyé.');
+    return false;
+  }
+  const existing = pendingExternalEmailActions.get(chatId);
+  if (existing) {
+    const summary = pendingEmailTransactionSummary('external', existing);
+    await send(chatId, `🔒 Une autre transaction courriel est déjà active pour ${summary.to || 'un autre destinataire'}. Termine-la ou réponds « annule »; aucun email envoyé.`);
+    return false;
+  }
+  deferActivePendingEmail(chatId);
+  const action = {
+    confirmationVersion: EMAIL_CONFIRMATION_VERSION,
+    confirmationStage: 'preview',
+    name: 'envoyer_docs_prospect',
+    input: {
+      terme: recipient,
+      email: recipient,
+      cc: '',
+      fichier: '',
+      centris: String(pending?.centris || ''),
+    },
+    pendingDocKey: pendingKey,
+    pendingDocActionId: pending.actionId,
+    telegramPreviewMessageId: previewMessageId || null,
+    createdAt: Date.now(),
+    inFlight: false,
+  };
+  pendingExternalEmailActions.set(chatId, action);
+  savePendingEmailState();
+  try {
+    await requestFinalEmailConfirmation(chatId, 'external', action);
+    return true;
+  } catch (error) {
+    pendingExternalEmailActions.delete(chatId);
+    savePendingEmailState();
+    await send(chatId, `❌ Deuxième confirmation non créée: ${String(error?.message || error).substring(0, 140)}. Aucun email envoyé.`);
+    return false;
+  }
+}
+
+async function handleEmailConfirmation(msg) {
+  const chatId = msg?.chat?.id;
+  const text = String(msg?.text || '').trim();
+  const firstConfirmation = CONFIRM_REGEX.test(text);
+  const finalMatch = text.match(/^confirme\s+([^\s]+@[^\s]+)$/i);
+  if (!firstConfirmation && !finalMatch) return false;
+
   const pending = pendingEmails.get(chatId);
   const external = pendingExternalEmailActions.get(chatId);
-  if (!pending && !external) return false;
+  const repliedMessageId = Number(msg?.reply_to_message?.message_id || 0);
 
-  if (!pending && external) {
-    if (Date.now() - external.createdAt > 30 * 60 * 1000) {
-      pendingExternalEmailActions.delete(chatId);
-      savePendingEmailState();
-      const next = promoteNextPendingEmailDraft(chatId);
-      await send(chatId, '⌛ Autorisation expirée: redemande l’action pour reconstruire un aperçu exact. Aucun envoi effectué.');
-      if (next) await send(chatId, pendingEmailPreview(next));
+  if (finalMatch) {
+    const confirmedRecipient = normalizeSingleRecipientEmail(finalMatch[1]);
+    const candidates = [
+      pending && pending.confirmationStage === 'awaiting-final' &&
+        pendingEmailTransactionRecipient('draft', pending) === confirmedRecipient
+        ? { kind: 'draft', action: pending } : null,
+      external && external.confirmationStage === 'awaiting-final' &&
+        pendingEmailTransactionRecipient('external', external) === confirmedRecipient
+        ? { kind: 'external', action: external } : null,
+    ].filter(Boolean);
+    if (!confirmedRecipient || candidates.length !== 1) {
+      await send(chatId, '🔒 Confirmation finale refusée: aucune transaction unique ne correspond exactement à cette adresse. Aucun email envoyé.');
       return true;
     }
-    if (external.ambiguousAfterRestart || external.deliveryUncertain) {
-      await send(chatId, '⚠️ *État de livraison incertain* — je bloque toute répétition pour éviter un doublon. Vérifie d’abord les éléments envoyés dans Gmail/Centris, puis réponds *« annule »* et reconstruis l’action si elle n’est pas partie.');
-      return true;
-    }
-    if (external.inFlight) {
-      await send(chatId, '⏳ Cette tentative est déjà en cours. Je n’en démarre pas une deuxième.');
-      return true;
-    }
-    external.inFlight = true;
-    external.attemptStartedAt = Date.now();
-    savePendingEmailState();
-    try {
-      const result = await executeTool(
-        external.name,
-        external.input,
-        chatId,
-        text,
-        { confirmedExternalEmail: true },
-      );
-      const resultText = String(result || '');
-      if (/^✅/u.test(resultText) || /\n✅/u.test(resultText)) {
+    const chosen = candidates[0];
+    const action = chosen.action;
+    if (Number(action.confirmationVersion || 0) !== EMAIL_CONFIRMATION_VERSION ||
+        Date.now() > Number(action.finalConfirmationExpiresAt || 0)) {
+      if (chosen.kind === 'external') {
         pendingExternalEmailActions.delete(chatId);
-        savePendingEmailState();
-        const next = promoteNextPendingEmailDraft(chatId);
-        await send(chatId, resultText);
-        if (next) await send(chatId, pendingEmailPreview(next));
-      } else if (external.name === 'telecharger_annexes_centris' &&
-                 /^🔒 Confirmation refusée:/u.test(resultText)) {
-        // Refus déterministe avant toute tentative Gmail: il est sûr de
-        // supprimer l'autorisation expirée ou liée à un ancien contenu.
-        pendingExternalEmailActions.delete(chatId);
-        savePendingEmailState();
-        const next = promoteNextPendingEmailDraft(chatId);
-        await send(chatId, resultText);
-        if (next) await send(chatId, pendingEmailPreview(next));
+        if (action.name === 'telecharger_annexes_centris') pendingMatrixArtifacts.delete(chatId);
       } else {
-        external.inFlight = false;
-        external.deliveryUncertain = true;
-        savePendingEmailState();
-        await send(chatId, `${resultText}\n\n⚠️ Je bloque une nouvelle tentative automatique: vérifie les éléments envoyés du fournisseur, puis réponds « annule » et reconstruis l’action si nécessaire.`);
+        pendingEmails.delete(chatId);
       }
-    } catch (e) {
-      external.inFlight = false;
-      external.deliveryUncertain = true;
       savePendingEmailState();
-      await send(chatId, `❌ Tentative non complétée: ${String(e.message || e).substring(0, 180)}\n⚠️ État de livraison incertain: aucune relance permise pour éviter un doublon. Vérifie les éléments envoyés, puis réponds « annule » et reconstruis l’action si nécessaire.`);
+      promoteNextPendingEmailDraft(chatId);
+      await send(chatId, '⌛ Deuxième confirmation expirée ou ancienne. Redemande un aperçu; aucun email envoyé.');
+      return true;
+    }
+    if (!repliedMessageId || repliedMessageId !== Number(action.finalConfirmationMessageId || 0)) {
+      await send(chatId, `🔒 Réponds directement au message « DEUXIÈME CONFIRMATION » pour ${confirmedRecipient}. Aucun email envoyé.`);
+      return true;
+    }
+    if (action.ambiguousAfterRestart || action.deliveryUncertain) {
+      await send(chatId, '⚠️ État de livraison incertain ou transaction restaurée après interruption. Aucune répétition permise; vérifie Gmail puis annule et reconstruis au besoin.');
+      return true;
+    }
+    if (action.pendingDocKey) {
+      const currentPendingDoc = pendingDocSends.get(action.pendingDocKey);
+      if (!currentPendingDoc || currentPendingDoc.actionId !== action.pendingDocActionId) {
+        pendingExternalEmailActions.delete(chatId);
+        savePendingEmailState();
+        await send(chatId, '🔒 Le dossier ou le bouton d’origine a été remplacé depuis l’aperçu. Transaction annulée; aucun email envoyé.');
+        return true;
+      }
+    }
+    if (action.inFlight) {
+      await send(chatId, '⏳ Cette transaction est déjà en cours. Aucun deuxième envoi lancé.');
+      return true;
+    }
+
+    // Transition atomique vers SENDING avant tout appel fournisseur.
+    action.inFlight = true;
+    action.attemptStartedAt = Date.now();
+    if (!savePendingEmailState()) {
+      action.inFlight = false;
+      action.attemptStartedAt = null;
+      await send(chatId, '🔒 Envoi bloqué: impossible de persister le verrou transactionnel avant Gmail. Aucun fournisseur appelé.');
+      return true;
+    }
+
+    if (chosen.kind === 'external') {
+      try {
+        const result = await executeTool(
+          action.name,
+          action.input,
+          chatId,
+          'envoie',
+          {
+            confirmedExternalEmail: true,
+            doubleConfirmedExternalEmail: true,
+            finalConfirmationMessage: text,
+            finalConfirmationMessageId: msg.message_id,
+            finalPromptMessageId: action.finalConfirmationMessageId,
+            confirmedRecipient,
+            requestId: action.requestId || null,
+          },
+        );
+        const resultText = String(result || '');
+        if (/^✅/u.test(resultText) || /\n✅/u.test(resultText)) {
+          pendingExternalEmailActions.delete(chatId);
+          if (action.pendingDocKey) pendingDocSends.delete(action.pendingDocKey);
+          savePendingEmailState();
+          const next = promoteNextPendingEmailDraft(chatId);
+          await send(chatId, resultText);
+          if (next) await send(chatId, pendingEmailPreview(next));
+        } else if (action.name === 'telecharger_annexes_centris' &&
+                   /^🔒 Confirmation refusée:/u.test(resultText)) {
+          pendingExternalEmailActions.delete(chatId);
+          pendingMatrixArtifacts.delete(chatId);
+          savePendingEmailState();
+          const next = promoteNextPendingEmailDraft(chatId);
+          await send(chatId, resultText);
+          if (next) await send(chatId, pendingEmailPreview(next));
+        } else if (/^⚠️ État Gmail incertain/u.test(resultText)) {
+          action.inFlight = false;
+          action.deliveryUncertain = true;
+          savePendingEmailState();
+          await send(chatId, `${resultText}\n\n⚠️ Je bloque toute répétition automatique. Vérifie Gmail/Centris, puis annule et reconstruis seulement si l’envoi est absent.`);
+        } else {
+          // Échec déterministe: le fournisseur n'a pas livré. La confirmation
+          // consommée ne peut pas être rejouée; on revient à l'aperçu et une
+          // nouvelle double confirmation sera nécessaire.
+          action.inFlight = false;
+          action.attemptStartedAt = null;
+          action.deliveryUncertain = false;
+          action.confirmationStage = 'preview';
+          action.finalConfirmationRecipient = null;
+          action.finalConfirmationMessageId = null;
+          action.finalConfirmationExpiresAt = null;
+          savePendingEmailState();
+          await send(chatId, `${resultText}\n\n🔁 Échec confirmé sans livraison. La demande reste en aperçu; utilise CONFIRMER pour recommencer une nouvelle double confirmation.`);
+        }
+      } catch (error) {
+        action.inFlight = false;
+        action.deliveryUncertain = true;
+        savePendingEmailState();
+        await send(chatId, `❌ Tentative non complétée: ${String(error?.message || error).substring(0, 180)}\n⚠️ État incertain: aucune relance automatique.`);
+      }
+      return true;
+    }
+
+    const cc = confirmedRecipient === String(AGENT.email || '').toLowerCase() ? [] : [AGENT.email];
+    let authorization;
+    try {
+      authorization = createOneShotAuthorization({
+        message: 'envoie', via: 'gmail', to: action.to, cc, bcc: [],
+        subject: action.sujet, body: action.texte, attachments: [],
+      });
+      await envoyerEmailGmail({ ...action, authorization });
+    } catch (error) {
+      log('ERR', 'EMAIL', `Gmail fail après double confirmation: ${error.message}`);
+      action.inFlight = false;
+      action.deliveryUncertain = true;
+      savePendingEmailState();
+      await send(chatId, `❌ Réponse Gmail non confirmée: ${String(error?.message || error).substring(0, 180)}\n⚠️ Vérifie le dossier Envoyés; aucune répétition automatique.`);
+      return true;
+    }
+
+    pendingEmails.delete(chatId);
+    savePendingEmailState();
+    const next = promoteNextPendingEmailDraft(chatId);
+    logActivity(`Email envoyé (Gmail) → ${action.to} — "${action.sujet.substring(0,60)}"`);
+    mTick('emailsSent', 0); metrics.emailsSent++;
+    await send(chatId, `✅ *Email envoyé* (Gmail)\nÀ: ${action.to}\nCc: ${cc.join(', ') || 'aucun (vous êtes le destinataire)'}\nObjet: ${action.sujet}`);
+    if (next) await send(chatId, pendingEmailPreview(next));
+    return true;
+  }
+
+  // Première confirmation: elle ne peut JAMAIS appeler Gmail/Centris.
+  if (!pending && !external) {
+    await send(chatId, '🔒 Aucune transaction courriel active. « envoie » ne réutilise jamais un ancien aperçu; aucun email envoyé.');
+    return true;
+  }
+
+  const selection = selectFirstEmailConfirmation({ pending, external, repliedMessageId });
+  if (!selection.ok) {
+    if (selection.reason === 'ambiguous') {
+      await send(chatId, '🔒 Plusieurs actions courriel sont en attente. Aucune priorité automatique: réponds directement au bon aperçu Matrix ou annule. Aucun email envoyé.');
+    } else if (selection.reason === 'matrix-reply-required') {
+      await send(chatId, '🔒 Pour Matrix, réponds « envoie » directement au résumé APERÇU MATRIX correspondant, ou utilise son bouton CONFIRMER. Aucun email envoyé.');
+    } else {
+      await send(chatId, '🔒 Aucune transaction courriel sélectionnable. Aucun email envoyé.');
     }
     return true;
   }
+  const chosenKind = selection.kind;
+  const chosen = selection.action;
 
-  if (pending.deliveryUncertain) {
-    await send(chatId, '⚠️ *État de livraison Gmail incertain* — je bloque une répétition qui pourrait créer un doublon. Vérifie le dossier Envoyés, puis réponds *« annule »* et recrée le brouillon seulement s’il n’est pas parti.');
+  if (Number(chosen.confirmationVersion || 0) !== EMAIL_CONFIRMATION_VERSION) {
+    await send(chatId, '🔒 Ancienne autorisation invalidée par la nouvelle sécurité. Redemande un aperçu; aucun email envoyé.');
     return true;
   }
-
-  // Une confirmation = UNE tentative Gmail précise. Aucune réutilisation, aucun fallback automatique.
-  let authorization;
-  try {
-    authorization = createOneShotAuthorization({
-      message: text,
-      via: 'gmail',
-      to: pending.to,
-      cc: [],
-      bcc: [AGENT.email],
-      subject: pending.sujet,
-      body: pending.texte,
-      attachments: [],
-    });
-  } catch (e) {
-    log('WARN', 'EMAIL', `Confirmation bloquée: ${e.code || e.message}`);
-    await send(chatId, '❌ Envoi bloqué — confirmation explicite requise pour cet email précis.');
-    return true;
-  }
-
-  try {
-    pending.attemptStartedAt = Date.now();
+  const previewExpiry = chosen.matrixPreviewExpiresAt || (Number(chosen.createdAt || 0) + 30 * 60 * 1000);
+  if (!previewExpiry || Date.now() > previewExpiry) {
+    if (chosenKind === 'external') {
+      pendingExternalEmailActions.delete(chatId);
+      if (chosen.name === 'telecharger_annexes_centris') pendingMatrixArtifacts.delete(chatId);
+    } else {
+      pendingEmails.delete(chatId);
+    }
     savePendingEmailState();
-    await envoyerEmailGmail({ ...pending, authorization });
-  } catch (e) {
-    log('ERR', 'EMAIL', `Gmail fail après autorisation one-shot: ${e.message}`);
-    // Après un timeout/crash, le provider peut avoir accepté le message même si
-    // sa réponse n'est jamais revenue. Fail closed jusqu'à inspection manuelle.
-    pending.deliveryUncertain = true;
-    savePendingEmailState();
-    await send(chatId, `❌ Réponse Gmail non confirmée: ${String(e.message || e).substring(0, 180)}\n⚠️ Vérifie le dossier Envoyés. Je bloque toute répétition; réponds « annule » et recrée le brouillon seulement s'il n'est pas parti.`);
+    promoteNextPendingEmailDraft(chatId);
+    await send(chatId, '⌛ Aperçu expiré. Redemande l’action; aucun email envoyé.');
     return true;
   }
-
-  pendingEmails.delete(chatId);
-  savePendingEmailState();
-  const next = promoteNextPendingEmailDraft(chatId);
-  logActivity(`Email envoyé (Gmail) → ${pending.to} — "${pending.sujet.substring(0,60)}"`);
-  mTick('emailsSent', 0); metrics.emailsSent++;
-  await send(chatId, `✅ *Email envoyé* (Gmail)\nÀ: ${pending.toName || pending.to}\nObjet: ${pending.sujet}`);
-  if (next) await send(chatId, pendingEmailPreview(next));
+  if (chosen.ambiguousAfterRestart || chosen.deliveryUncertain || chosen.inFlight) {
+    await send(chatId, '⚠️ Transaction incertaine ou déjà en cours. Aucun nouvel envoi; vérifie Gmail puis annule et reconstruis au besoin.');
+    return true;
+  }
+  try {
+    await requestFinalEmailConfirmation(chatId, chosenKind, chosen);
+  } catch (error) {
+    const code = String(error?.message || error);
+    if (code.startsWith('MATRIX_CLIENT_NOT_ELIGIBLE:')) {
+      const missing = code.split(':').slice(1).join(':').split('|').filter(Boolean);
+      await send(chatId, `🔒 Client non admissible: ${missing.join(', ')}. Utilise CORRIGER LE CLIENT ou CORRIGER LE COURRIEL; aucun email envoyé.`);
+    } else {
+      if (chosenKind === 'external' && chosen.name === 'telecharger_annexes_centris') clearMatrixTransaction(chatId, chosen.requestId);
+      await send(chatId, `🔒 Deuxième confirmation non créée: ${code.substring(0, 160)}. Aucun email envoyé.`);
+    }
+  }
   return true;
 }
 
@@ -10106,43 +10824,126 @@ function registerHandlers() {
     const msgId = cbq.message?.message_id;
 
     try {
-      if (action === 'send' && arg) {
-        const pending = pendingDocSends.get(arg);
-        if (!pending) {
-          await bot.answerCallbackQuery(cbq.id, { text: '⚠️ Pending introuvable (déjà traité?)' });
+      if (action === 'send' || action === 'cancel') {
+        await bot.answerCallbackQuery(cbq.id, { text: '⌛ Ancien bouton invalidé — utilise la nouvelle notification' });
+        await bot.sendMessage(chatId, '🔒 Cet ancien bouton était lié seulement à une adresse et n’est plus sécuritaire. Aucun email envoyé. Utilise la notification la plus récente ou recrée l’aperçu.');
+        return;
+      }
+      if (['mxconfirm', 'mxcancel', 'mxrefresh', 'mxclient', 'mxemail'].includes(action)) {
+        const pendingMatrix = pendingExternalEmailActions.get(chatId);
+        if (!pendingMatrix || pendingMatrix.name !== 'telecharger_annexes_centris' || pendingMatrix.requestId !== arg) {
+          await bot.answerCallbackQuery(cbq.id, { text: '🔒 Demande ancienne, remplacée ou absente' });
           return;
         }
-        await bot.answerCallbackQuery(cbq.id, { text: '📤 Envoi en cours...' });
-        // Édite le message original pour montrer le statut
-        if (chatId && msgId) {
-          await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '⏳ Envoi en cours...', callback_data: 'noop' }]] },
+        if (Number(msgId || 0) !== Number(pendingMatrix.telegramPreviewMessageId || 0)) {
+          await bot.answerCallbackQuery(cbq.id, { text: '🔒 Cet aperçu a été remplacé' });
+          return;
+        }
+        if (Date.now() > Number(pendingMatrix.matrixPreviewExpiresAt || 0)) {
+          clearMatrixTransaction(chatId, arg);
+          promoteNextPendingEmailDraft(chatId);
+          await bot.answerCallbackQuery(cbq.id, { text: '⌛ Aperçu expiré' });
+          await send(chatId, `⌛ Demande ${arg} expirée et nettoyée. Recrée l’aperçu; aucun email envoyé.`);
+          return;
+        }
+
+        if (action === 'mxcancel') {
+          clearMatrixTransaction(chatId, arg);
+          const next = promoteNextPendingEmailDraft(chatId);
+          await bot.answerCallbackQuery(cbq.id, { text: '🛑 Demande annulée' });
+          await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '🛑 ANNULÉE', callback_data: 'noop' }]] },
             { chat_id: chatId, message_id: msgId }).catch(() => {});
+          await send(chatId, `🛑 Demande ${arg} annulée. Aucun email envoyé.`);
+          if (next) await send(chatId, pendingEmailPreview(next));
+          return;
         }
-        // Le callback courant, provenant du seul compte Telegram autorisé,
-        // devient l'instruction exacte de cette tentative seulement.
-        const r = await envoyerDocsAuto({ ...pending, confirmationMessage: 'envoie' });
-        if (r.sent) {
-          pendingDocSends.delete(arg);
-          await bot.sendMessage(chatId, `✅ *Envoyé* à ${arg}\n${pending.match?.pdfs?.length || '?'} docs · ${Math.round((r.deliveryMs||0)/1000)}s`, { parse_mode: 'Markdown' });
-          auditLogEvent('inline-send', 'docs-sent', { email: arg, via: 'inline-button' });
-        } else {
-          if (chatId && msgId) {
-            await bot.editMessageReplyMarkup({ inline_keyboard: [[
-              { text: '✅ Envoyer les docs', callback_data: `send:${arg}` },
-              { text: '🗑 Annuler', callback_data: `cancel:${arg}` },
-            ]] }, { chat_id: chatId, message_id: msgId }).catch(() => {});
+
+        if (action === 'mxconfirm') {
+          const eligibility = matrixClientEligibility(pendingMatrix.client || {});
+          const artifact = pendingMatrixArtifacts.get(chatId);
+          if (!eligibility.eligible) {
+            await bot.answerCallbackQuery(cbq.id, { text: '🔒 Client incomplet — correction requise' });
+            await send(chatId, `🔒 Demande ${arg} bloquée: ${eligibility.missing.join(', ')}. Utilise CORRIGER LE CLIENT ou CORRIGER LE COURRIEL; aucun email envoyé.`);
+            return;
           }
-          await bot.sendMessage(chatId, `⚠️ Échec: ${r.error || r.reason || 'unknown'}`);
+          if (!artifact || artifact.expiresAt < Date.now() || artifact.num !== pendingMatrix.input?.centris_num) {
+            clearMatrixTransaction(chatId, arg);
+            await bot.answerCallbackQuery(cbq.id, { text: '⌛ PDF expirés ou absents' });
+            await send(chatId, `🔒 Les PDF figés de ${arg} sont absents ou expirés. Demande nettoyée; aucun email envoyé.`);
+            return;
+          }
+          await bot.answerCallbackQuery(cbq.id, { text: 'Étape 1/2 reçue — confirme maintenant l’adresse' });
+          try {
+            await requestFinalEmailConfirmation(chatId, 'external', pendingMatrix);
+          } catch (error) {
+            await send(chatId, `🔒 Deuxième confirmation impossible: ${String(error?.message || error).substring(0, 160)}. Aucun email envoyé.`);
+          }
+          return;
         }
-      } else if (action === 'cancel' && arg) {
-        if (pendingDocSends.has(arg)) {
-          pendingDocSends.delete(arg);
+
+        if (action === 'mxclient' || action === 'mxemail') {
+          const mode = action === 'mxclient' ? 'client' : 'email';
+          const promptText = mode === 'client'
+            ? `CORRECTION CLIENT — ${arg}\nRéponds À CE MESSAGE: Nom complet | téléphone | contexte immobilier précis`
+            : `CORRECTION COURRIEL — ${arg}\nRéponds À CE MESSAGE avec une seule adresse courriel exacte. La demande sera reconstruite.`;
+          const receipt = await bot.sendMessage(chatId, promptText, {
+            reply_markup: { force_reply: true, selective: true },
+          });
+          if (!receipt?.message_id) throw new Error('MATRIX_CORRECTION_PROMPT_MISSING');
+          pendingMatrix.correctionMode = mode;
+          pendingMatrix.correctionPromptMessageId = receipt.message_id;
+          savePendingEmailState();
+          await bot.answerCallbackQuery(cbq.id, { text: mode === 'client' ? '👤 Réponds au message de correction' : '✉️ Réponds avec le bon courriel' });
+          return;
+        }
+
+        if (action === 'mxrefresh') {
+          const snapshot = {
+            num: pendingMatrix.input.centris_num,
+            email: pendingMatrix.input.email_destination,
+            filtre: pendingMatrix.input.filtre || '',
+            messagePerso: pendingMatrix.input.message_perso || '',
+          };
+          clearMatrixTransaction(chatId, arg);
+          await bot.answerCallbackQuery(cbq.id, { text: '🔄 Rafraîchissement sécurisé lancé' });
+          await send(chatId, `🔄 Demande ${arg} invalidée. Nouvelle recherche Matrix exacte #${snapshot.num}; aucun email envoyé.`);
+          const stopTyping = startTypingIndicator(chatId, 6 * 60 * 1000);
+          try {
+            const result = await executeMatrixAnnexesTool({
+              num: snapshot.num, emailDestination: snapshot.email,
+              filtre: snapshot.filtre, messagePerso: snapshot.messagePerso,
+              chatId, userMessage: 'rafraîchir les documents',
+            });
+            await send(chatId, result);
+          } finally {
+            stopTyping();
+          }
+          return;
+        }
+      }
+      if (action === 'senddoc' && arg) {
+        const currentEntry = [...pendingDocSends.entries()].find(([, item]) => item?.actionId === arg);
+        const pendingKey = currentEntry?.[0] || null;
+        const pending = currentEntry?.[1] || null;
+        if (!pending) {
+          await bot.answerCallbackQuery(cbq.id, { text: '⚠️ Transaction expirée, remplacée ou déjà traitée' });
+          return;
+        }
+        await bot.answerCallbackQuery(cbq.id, { text: '1/2 reçu — vérifie maintenant l’adresse' });
+        // Le bouton est seulement la première confirmation. Aucun provider ne
+        // peut être appelé avant la réponse exacte à la deuxième étape.
+        await armPendingDocsFinalConfirmation(chatId, pending, pendingKey, msgId);
+      } else if (action === 'canceldoc' && arg) {
+        const currentEntry = [...pendingDocSends.entries()].find(([, item]) => item?.actionId === arg);
+        const pendingKey = currentEntry?.[0] || null;
+        if (pendingKey) {
+          pendingDocSends.delete(pendingKey);
           await bot.answerCallbackQuery(cbq.id, { text: '🗑 Annulé' });
           if (chatId && msgId) {
             await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '🗑 Annulé', callback_data: 'noop' }]] },
               { chat_id: chatId, message_id: msgId }).catch(() => {});
           }
-          auditLogEvent('inline-cancel', 'pending_cancelled', { email: arg, via: 'inline-button' });
+          auditLogEvent('inline-cancel', 'pending_cancelled', { email: pendingKey, actionId: arg, via: 'inline-button' });
         } else {
           await bot.answerCallbackQuery(cbq.id, { text: '⚠️ Déjà annulé/envoyé' });
         }
@@ -10383,19 +11184,7 @@ function registerHandlers() {
     if (!pending) {
       return bot.sendMessage(msg.chat.id, `❌ Aucun pending match pour "${target}". Utilise /pending pour voir la liste.`);
     }
-    await bot.sendMessage(msg.chat.id, `📤 Envoi docs à ${pending.email}...`);
-    try {
-      const r = await envoyerDocsAuto({ ...pending, confirmationMessage: 'envoie' });
-      if (r.sent) {
-        pendingDocSends.delete(pendingKey);
-        await bot.sendMessage(msg.chat.id, `✅ Envoyé · ${pending.match.pdfs.length} PDFs · ${Math.round(r.deliveryMs/1000)}s`);
-        auditLogEvent('manual-send', 'docs-sent', { email: pending.email, confirmed: true });
-      } else {
-        await bot.sendMessage(msg.chat.id, `⚠️ Échec: ${r.error || r.reason}`);
-      }
-    } catch (e) {
-      await bot.sendMessage(msg.chat.id, `❌ ${e.message}`);
-    }
+    await armPendingDocsFinalConfirmation(msg.chat.id, pending, pendingKey, msg.message_id);
   });
 
   // Annuler un pending docs
@@ -11172,11 +11961,16 @@ function registerHandlers() {
     const num = match[1];
     const email = match[2];
     const message_perso = match[3]?.trim() || null;
-    await bot.sendMessage(msg.chat.id, `📥 *Fiche Centris #${num}* → ${email}\n_Login Centris + download + envoi (10-30s)_`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(msg.chat.id, `📥 *Fiche Centris #${num}* → ${email}\n_Présentation de l’action seulement — aucun envoi avant deux confirmations._`, { parse_mode: 'Markdown' });
     bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
     const stopTyping = startTypingIndicator(msg.chat.id);
     try {
-      const result = await telechargerFicheCentris({ centris_num: num, email_destination: email, message_perso });
+      const result = await executeTool(
+        'telecharger_fiche_centris',
+        { centris_num: num, email_destination: email, message_perso },
+        msg.chat.id,
+        msg.text || '',
+      );
       stopTyping();
       await bot.sendMessage(msg.chat.id, String(result).substring(0, 4000), { parse_mode: 'Markdown' }).catch(() =>
         bot.sendMessage(msg.chat.id, String(result).substring(0, 4000).replace(/[*_`]/g, '')).catch(() => {})
@@ -11723,9 +12517,9 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     const chatId = msg.chat.id;
     const num = match[1];
-    const emailDestination = String(match[2] || '').trim();
+    const emailDestination = normalizeSingleRecipientEmail(match[2]);
     const messagePerso = String(match[3] || '').trim();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailDestination)) {
+    if (!emailDestination) {
       await bot.sendMessage(chatId, '❌ Adresse courriel invalide. Aucun document récupéré et aucun email envoyé.');
       return;
     }
@@ -12750,6 +13544,9 @@ function registerHandlers() {
     const text   = msg.text;
     if (!text || text.startsWith('/')) return;
     if (isDuplicate(msg.message_id)) return;
+    // Cette commande possède son contrôleur transactionnel dédié. Ne jamais
+    // la laisser aussi tomber dans Claude, ce qui créerait une deuxième action.
+    if (/^envoie\s+(?:les\s+)?docs?\s+(?:à|a)\s+\S+/i.test(text.trim())) return;
 
     log('IN', 'MSG', text.substring(0, 80));
 
@@ -12797,11 +13594,17 @@ function registerHandlers() {
       return; // Sort du handler après auto-install
     }
 
+    // Une correction Matrix doit répondre au prompt exact qui l'a demandée.
+    // Elle est traitée avant les confirmations génériques afin qu'une adresse
+    // ou un nom ne puisse jamais être interprété comme une autorisation.
+    if (await handleMatrixCorrectionReply(msg)) return;
+
     // Annulation exacte d'un brouillon/action email en attente.
     if (/^(?:annule|cancel)[!.]?$/i.test(text.trim()) &&
         (pendingEmails.has(chatId) || pendingExternalEmailActions.has(chatId) || pendingPipedriveActivityActions.has(chatId))) {
       pendingEmails.delete(chatId);
       pendingExternalEmailActions.delete(chatId);
+      pendingMatrixArtifacts.delete(chatId);
       pendingPipedriveActivityActions.delete(chatId);
       savePendingEmailState();
       savePendingPipedriveActions();
@@ -12815,7 +13618,7 @@ function registerHandlers() {
     if (await handlePipedriveActivityConfirmation(chatId, text)) return;
 
     // Vérifier si c'est une confirmation d'envoi d'email
-    if (await handleEmailConfirmation(chatId, text)) return;
+    if (await handleEmailConfirmation(msg)) return;
 
     const stopTyping = startTypingIndicator(chatId);
     bot.sendChatAction(chatId, 'typing').catch(() => {});
@@ -17651,7 +18454,10 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
     leadAudit.decision = 'blocked_suspect_name';
     leadAudit.suspectName = nom;
     if (email && dbxMatch?.identityVerified) {
-      pendingDocSends.set(email, { email, nom: '', telephone, centris, dealId, deal: dealFullObj, match: dbxMatch });
+      pendingDocSends.set(email, {
+        actionId: crypto.randomBytes(8).toString('hex'),
+        email, nom: '', telephone, centris, dealId, deal: dealFullObj, match: dbxMatch,
+      });
       firePreviewDocs({ email, nom: '', telephone, centris, deal: dealFullObj, match: dbxMatch });
     }
     autoEnvoiMsg = `\n⚠️ Nom suspect "${nom}" — pending manuel, pas d'envoi auto. Aucun email preview envoyé — validation dans Telegram requise.`;
@@ -17668,7 +18474,10 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   if (email && telephone && hasMatch && dbxMatch.identityVerified) {
     // Mode preview + pending (consent click obligatoire)
     leadAudit.decision = 'pending_no_email_sent';
-    pendingDocSends.set(email, { email, nom, telephone, centris, dealId, deal: dealFullObj, match: dbxMatch });
+    pendingDocSends.set(email, {
+      actionId: crypto.randomBytes(8).toString('hex'),
+      email, nom, telephone, centris, dealId, deal: dealFullObj, match: dbxMatch,
+    });
     firePreviewDocs({ email, nom, telephone, centris, deal: dealFullObj, match: dbxMatch });
     // Explique POURQUOI ce n'est pas auto-safe (transparence pour Shawn)
     const reasons = [];
@@ -17772,10 +18581,11 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   let replyMarkup;
   const hasPendingDocs = email && pendingDocSends?.has?.(email);
   if (hasPendingDocs) {
+    const pendingDocActionId = pendingDocSends.get(email)?.actionId;
     replyMarkup = {
       inline_keyboard: [[
-        { text: '✅ Envoie',  callback_data: `send:${email}` },
-        { text: '❌ Annule',  callback_data: `cancel:${email}` },
+        { text: '✅ Envoie',  callback_data: `senddoc:${pendingDocActionId}` },
+        { text: '❌ Annule',  callback_data: `canceldoc:${pendingDocActionId}` },
         { text: '📋 Audit',   callback_data: `audit:${msgId || email}` },
       ]],
     };
@@ -18420,6 +19230,10 @@ async function main() {
   refreshMailingPlan().catch(e => log('WARN', 'BOOT', `Mailing plan: ${e.message}`));
   // Refresh toutes les heures pour rester à jour
   safeCron('brevo-mailing-plan-refresh', refreshMailingPlan, 60 * 60 * 1000);
+  safeCron('matrix-preview-expiry-purge', async () => {
+    const purged = purgeExpiredMatrixTransactions();
+    if (purged) log('INFO', 'MATRIX-PREVIEW', `${purged} transaction(s) expirée(s) nettoyée(s)`);
+  }, 60 * 1000);
 
   // Step 2c — CATCH-UP veille J-1 (Shawn 2026-05-13):
   // Si redeploy/boot pendant la fenêtre 19-23h Eastern et veille pour aujourd'hui
