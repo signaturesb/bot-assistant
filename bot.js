@@ -116,6 +116,9 @@ const GITHUB_USER = 'signaturesb';
 const PD_KEY      = (process.env.PIPEDRIVE_API_KEY || '').trim();
 const BREVO_KEY   = process.env.BREVO_API_KEY || '';
 const SHAWN_EMAIL = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
+// Invariant métier explicite de ce déploiement: toute livraison Gmail à un
+// client externe contient cette adresse exacte dans le Cc visible.
+const REQUIRED_VISIBLE_CC_EMAIL = 'shawn@signaturesb.com';
 const JULIE_EMAIL = process.env.JULIE_EMAIL || 'julie@signaturesb.com';
 // Default Sonnet 4.6 — 5x moins cher qu'Opus pour 95% de la qualité sur ce use case.
 // Shawn peut switch à la volée via /opus (deep reasoning) ou /haiku (rapide, ultra-économique).
@@ -898,11 +901,26 @@ async function sendEmailLogged(opts) {
   const provider = String(emailPayload.via || opts.via || 'gmail').toLowerCase();
   const toAddresses = extractEmailAddresses(emailPayload.to);
   const ccAddresses = extractEmailAddresses(emailPayload.cc);
-  const shawnAddress = String(AGENT.email || 'shawn@signaturesb.com').trim().toLowerCase();
+  const shawnAddress = REQUIRED_VISIBLE_CC_EMAIL;
   const hasExternalGmailRecipient = provider === 'gmail' && toAddresses.some(address =>
     !isInternalEmailPayload({ to: address })
   );
   const hasVisibleShawnCc = ccAddresses.includes(shawnAddress);
+  const fingerprint = makeEmailFingerprint(emailPayload);
+  // Réservation atomique avant le premier await: deux confirmations identiques
+  // concurrentes ne peuvent pas toutes deux atteindre le fournisseur.
+  const priorIdentical = emailOutbox.slice().reverse().find((candidate) =>
+    candidate.fingerprint === fingerprint &&
+    Date.now() - Number(candidate.ts || 0) < 24 * 60 * 60 * 1000 &&
+    ['pending', 'sent', 'uncertain'].includes(candidate.outcome)
+  );
+  if (priorIdentical) {
+    return {
+      ok: false, blocked: true, code: 'EMAIL_DUPLICATE_FINGERPRINT_BLOCKED',
+      error: `Transaction identique déjà ${priorIdentical.outcome}`,
+      entryId: priorIdentical.id, durationMs: 0,
+    };
+  }
   const entry = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     ts: Date.now(),
@@ -913,7 +931,7 @@ async function sendEmailLogged(opts) {
     bcc: opts.bcc || [],
     subject: String(opts.subject || '').substring(0, 200),
     category: opts.category || 'unknown',
-    fingerprint: makeEmailFingerprint(emailPayload),
+    fingerprint,
     authorization: internalOnly ? 'internal-only' : 'required',
     outcome: 'pending',
   };
@@ -976,7 +994,14 @@ async function sendEmailLogged(opts) {
     if (entry.outcome === 'failed' && !entry.error && res?.clone) {
       try { entry.error = (await res.clone().text()).substring(0, 300); } catch {}
     }
-    saveEmailOutbox();
+    if (!saveEmailOutbox()) {
+      log('ERR', 'EMAIL', `Réponse fournisseur reçue mais résultat durable impossible à écrire → ${entry.to}`);
+      return {
+        ok: false, uncertain: true, code: 'EMAIL_OUTBOX_OUTCOME_PERSIST_FAILED',
+        error: 'Réponse fournisseur reçue; résultat durable non confirmé',
+        receipt: entry.receipt, status: entry.status, entryId: entry.id, durationMs: entry.durationMs,
+      };
+    }
 
     // 🔒 RÈGLE ABSOLUE Shawn ("100 fois je te le dit"): TOUJOURS Cc Shawn + Telegram notif
     // Si envoi réussi ET destinataire ≠ Shawn ET Cc ne contient pas shawn@signaturesb.com
@@ -7577,6 +7602,9 @@ function externalEmailActionSummary(name, input = {}) {
 }
 
 async function executeMatrixAnnexesTool({ num, emailDestination, filtre, messagePerso, chatId, userMessage, confirmationContext = {} }) {
+  if (!Number.isInteger(ALLOWED_ID) || ALLOWED_ID <= 0 || String(chatId) !== String(ALLOWED_ID)) {
+    return `🔒 Conversation Telegram non autorisée ou non configurée. Aucun accès Matrix, aucun PDF remis et aucun email envoyé.`;
+  }
   const cuaMod = getCUA();
   if (!cuaMod || !cuaMod.CUA_AVAILABLE() || !cuaMod.cuaGetCentrisAnnexes) {
     return `❌ Matrix/Playwright indisponible — aucune annexe récupérée et aucun envoi effectué.`;
@@ -7646,11 +7674,13 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   const returnedCentris = String(result?.listing?.centris_num || '').replace(/\D/g, '');
   const rawListingAddress = String(result?.listing?.address || '').replace(/[\r\n\0]+/g, ' ').replace(/\s+/g, ' ').trim();
   const listingAddress = /^\d{1,6}\s*,?\s+\S/.test(rawListingAddress) ? rawListingAddress.substring(0, 180) : '';
+  const listingAddressComplete = result?.listing?.address_complete === true;
+  const listingAddressSource = String(result?.listing?.address_source || '');
   if (returnedCentris !== String(num)) {
     return `🔒 Listing Matrix refusé: le résultat vérifié (${returnedCentris || 'numéro absent'}) ne correspond pas exactement au Centris #${num}. Aucun aperçu armé et aucun email envoyé.`;
   }
-  if (!listingAddress) {
-    return `🔒 Listing Matrix #${num} refusé: l’adresse exacte n’a pas pu être validée dans la fiche authentifiée. Aucun aperçu armé et aucun email envoyé.`;
+  if (!listingAddress || !listingAddressComplete || listingAddressSource !== 'matrix-listing-report-pdf') {
+    return `🔒 Listing Matrix #${num} refusé: l’adresse complète (rue et municipalité) n’a pas été confirmée dans la fiche PDF portant ce numéro Centris exact. Aucun aperçu armé, aucun PDF remis et aucun email envoyé.`;
   }
 
   // Telegram est le canal privé de Shawn: livraison interne des PDFs validés.
@@ -7705,7 +7735,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   const mimeHeader = (value) => String(value ?? '').replace(/[\r\n\0]+/g, ' ').trim();
   const listingLabel = listingAddress ? `${listingAddress} · Centris #${num}` : `Centris #${num}`;
   const subject = mimeHeader(`Documents ${listingLabel}${filtre ? ` — ${filtre}` : ''}`);
-  const cc = emailDestination.toLowerCase() === AGENT.email.toLowerCase() ? [] : [AGENT.email];
+  const cc = emailDestination.toLowerCase() === REQUIRED_VISIBLE_CC_EMAIL ? [] : [REQUIRED_VISIBLE_CC_EMAIL];
   const introText = clientInstruction || `Voici les ${documents.length} documents officiels disponibles dans Matrix pour ${listingLabel}.`;
   const totalPages = documents.reduce((total, doc) => total + Number(doc.page_count || 0), 0);
   const capturedReportCount = documents.filter((doc) => doc.generation_method === 'matrix-detail-page-capture' || doc.provenance === 'matrix_listing_report_capture_pdf').length;
@@ -10199,7 +10229,7 @@ function matrixRequestId() {
 
 function matrixTestAddresses() {
   return new Set([
-    AGENT.email,
+    REQUIRED_VISIBLE_CC_EMAIL,
     process.env.MATRIX_TEST_EMAIL,
     ...(String(process.env.MATRIX_TEST_EMAILS || '').split(/[;,]/)),
   ].map(normalizeSingleRecipientEmail).filter(Boolean));
@@ -10478,7 +10508,7 @@ function pendingEmailTransactionRecipient(kind, action) {
 
 function pendingEmailTransactionSummary(kind, action) {
   const to = pendingEmailTransactionRecipient(kind, action);
-  const cc = to && to !== String(AGENT.email || '').toLowerCase() ? [AGENT.email] : [];
+  const cc = to && to !== REQUIRED_VISIBLE_CC_EMAIL ? [REQUIRED_VISIBLE_CC_EMAIL] : [];
   const detail = kind === 'external'
     ? externalEmailActionSummary(action.name, action.input).label
     : String(action.sujet || 'Brouillon Gmail');
@@ -10605,6 +10635,10 @@ async function handleEmailConfirmation(msg) {
 
   if (finalMatch) {
     const confirmedRecipient = normalizeSingleRecipientEmail(finalMatch[1]);
+    if (external?.name === 'telecharger_annexes_centris' && external.correctionMode) {
+      await send(chatId, '🔒 Confirmation finale révoquée: une correction est en cours. Termine la correction et utilise le nouvel aperçu; aucun email envoyé.');
+      return true;
+    }
     const candidates = [
       pending && pending.confirmationStage === 'awaiting-final' &&
         pendingEmailTransactionRecipient('draft', pending) === confirmedRecipient
@@ -10886,6 +10920,21 @@ function registerHandlers() {
 
         if (action === 'mxclient' || action === 'mxemail') {
           const mode = action === 'mxclient' ? 'client' : 'email';
+          // Révoquer l'ancien prompt final AVANT de demander la correction.
+          // Une réponse tardive à ce prompt ne doit jamais atteindre Gmail.
+          pendingMatrix.confirmationStage = 'preview';
+          pendingMatrix.finalConfirmationRecipient = null;
+          pendingMatrix.finalConfirmationMessageId = null;
+          pendingMatrix.finalConfirmationExpiresAt = null;
+          pendingMatrix.confirmationPromptInFlight = false;
+          pendingMatrix.correctionMode = mode;
+          pendingMatrix.correctionPromptMessageId = null;
+          if (!savePendingEmailState()) {
+            await bot.answerCallbackQuery(cbq.id, { text: '🔒 Correction non sécurisée — état non persisté' });
+            await send(chatId, '🔒 Impossible de révoquer durablement l’ancienne confirmation. Demande annulée; aucun email envoyé.');
+            clearMatrixTransaction(chatId, arg);
+            return;
+          }
           const promptText = mode === 'client'
             ? `CORRECTION CLIENT — ${arg}\nRéponds À CE MESSAGE: Nom complet | téléphone | contexte immobilier précis`
             : `CORRECTION COURRIEL — ${arg}\nRéponds À CE MESSAGE avec une seule adresse courriel exacte. La demande sera reconstruite.`;
@@ -10893,9 +10942,11 @@ function registerHandlers() {
             reply_markup: { force_reply: true, selective: true },
           });
           if (!receipt?.message_id) throw new Error('MATRIX_CORRECTION_PROMPT_MISSING');
-          pendingMatrix.correctionMode = mode;
           pendingMatrix.correctionPromptMessageId = receipt.message_id;
-          savePendingEmailState();
+          if (!savePendingEmailState()) {
+            clearMatrixTransaction(chatId, arg);
+            throw new Error('MATRIX_CORRECTION_STATE_PERSIST_FAILED');
+          }
           await bot.answerCallbackQuery(cbq.id, { text: mode === 'client' ? '👤 Réponds au message de correction' : '✉️ Réponds avec le bon courriel' });
           return;
         }
