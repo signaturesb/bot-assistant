@@ -185,6 +185,12 @@ assert.strictEqual(_classifyCentrisLoginSnapshot({
   userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0, mfaVisible: 0,
   bodyText: "I've Read This",
 }), 'intermediate', 'la page intermédiaire Matrix doit être reconnue immédiatement sans nouvelle navigation login');
+assert.match(cuaSource, /const intermediateDeadline = Date\.now\(\) \+ 8000[\s\S]*?CENTRIS_INTERMEDIATE_NOT_ADVANCED/,
+  'une redirection Matrix lente doit être sondée avant de déclarer l’avis bloqué');
+assert.match(cuaSource, /accounts\\\.centris\\\.ca\\\/connect\\\/authorize[\s\S]*?\/Matrix\/Recherche[\s\S]*?CENTRIS_INTERMEDIATE_OAUTH_STALLED/,
+  'le retour OAuth après l’avis doit recevoir une seule sonde Matrix déterministe');
+assert.doesNotMatch(cuaSource, /['"]read['"]/,
+  'le libellé générique « read » ne doit jamais autoriser le bouton intermédiaire');
 assert.strictEqual(_classifyCentrisLoginSnapshot({
   url: 'https://matrix.centris.ca/Matrix/',
   userCodeVisible: 0, passwordVisible: 0, identifierVisible: 0, bodyText: '',
