@@ -236,6 +236,39 @@ assert.strictEqual(
 );
 assert.strictEqual(
   extractAddress(
+    [
+      'RE/MAX PRESTIGE, Agence immobilière',
+      'Shawn Barrette, Courtier immobilier résidentiel',
+      '16934036 (En vigueur)\tNo Centris',
+      '28 Rue Pierre-Rivière',
+      'Région',
+      'Quartier',
+      'Près de',
+      "Plan d'eau",
+      'Lanaudière',
+      '569 900 $',
+      'J6A 3N7',
+      'Repentigny (Repentigny)',
+      'Bonaventure',
+      'Voir toutes les photos',
+    ].join('\n'),
+    '28 Rue Pierre-Rivière',
+    '16934036',
+  ),
+  '28, Rue Pierre-Rivière, Repentigny (Repentigny)',
+  'la fiche réelle #16934036 doit utiliser le code postal comme ancre sans confondre région, quartier ou courtier',
+);
+assert.strictEqual(
+  extractAddress(
+    '16934036 (En vigueur) No Centris\n28 Rue Pierre-Rivière\nRégion\nLanaudière\n569 900 $\nJ6A 3N7\nMaison à étages',
+    '28 Rue Pierre-Rivière',
+    '16934036',
+  ),
+  '',
+  'le champ suivant le code postal doit être une municipalité valide',
+);
+assert.strictEqual(
+  extractAddress(
     'Fiche détaillée\n381, Rue Laval Repentigny (Repentigny)\nNo Centris 19465925',
     '381, Rue Laval, Documents joints',
     '19465925',

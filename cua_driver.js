@@ -975,12 +975,19 @@ async function inspectMatrixListingPage(page, centrisNum) {
     const looksLikeLocality = (value) => {
       const cleaned = clean(value || '');
       return cleaned.length >= 3 && cleaned.length <= 80 &&
-        /^[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+(?:[ -][A-Za-zÀ-ÿ'’.-]+){0,6}$/.test(cleaned) &&
+        /^[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+(?:[ -][A-Za-zÀ-ÿ'’.-]+){0,6}(?:\s*\([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’./ -]{1,68}\))?$/.test(cleaned) &&
         !/(?:centris|prix|en vigueur|vendu|courtier|chambre|pi[eè]ce|superficie|\$|r[ée]gion|secteur|maison|bungalow|plain-pied|[ée]tages?|duplex|triplex|condo|copropri[ée]t[ée]|r[ée]sidentiel|commercial|industriel|terrain|ferme|chalet|[àa]\s+vendre|[àa]\s+louer)/i.test(cleaned);
     };
     const addressNodes = [...document.querySelectorAll('h1,h2,h3,td,th,span,div,[class*="address" i],[class*="adresse" i]')];
     for (const element of addressNodes) {
-      const own = clean(element.textContent || '');
+      const rawOwn = String(element.innerText || element.textContent || '');
+      const ownLines = rawOwn.split(/\r?\n/).map(clean).filter(Boolean);
+      for (let index = 0; index < ownLines.length; index += 1) {
+        if (!addressStart.test(ownLines[index])) continue;
+        const locality = ownLines.slice(index + 1, index + 4).find(looksLikeLocality);
+        if (locality) addAddressCandidate(`${ownLines[index]}, ${locality}`, 'element-locality');
+      }
+      const own = clean(rawOwn);
       if (own.length >= 8 && own.length <= 180 && addressStart.test(own)) {
         addAddressCandidate(own, 'element');
         const sibling = clean(element.nextElementSibling?.textContent || '');
@@ -2657,7 +2664,14 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
   const addCandidate = (parsed, localityValue, lineIndex, source) => {
     if (!matchesVerifiedStreet(parsed)) return;
     const nearbyContext = lines.slice(Math.max(0, lineIndex - 5), lineIndex + 1).join(' ');
-    if (source !== 'flattened' && /(?:courtier|courtage|agence|bureau|re\/max|t[ée]l[ée]phone|courriel)/i.test(nearbyContext)) return;
+    // Le bandeau de la fiche peut afficher le courtier juste avant le numéro
+    // Centris, puis l'adresse du listing. La présence du numéro exact à au
+    // plus deux lignes de la rue distingue ce cas sûr d'une adresse de bureau.
+    const exactListingNearby = lines
+      .slice(Math.max(0, lineIndex - 2), lineIndex + 3)
+      .some((line) => matrixTextContainsExactNumber(line, exactNum));
+    if (source !== 'flattened' && !exactListingNearby &&
+        /(?:courtier|courtage|agence|bureau|re\/max|t[ée]l[ée]phone|courriel)/i.test(nearbyContext)) return;
     const municipality = validateLocality(localityValue);
     if (!municipality) return;
     const distance = distanceFromExact(lineIndex);
@@ -2679,7 +2693,10 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
     const parsed = parseAddress(lines[index]);
     if (!matchesVerifiedStreet(parsed)) continue;
     if (parsed.localityRaw) addCandidate(parsed, parsed.localityRaw, index, 'same-line');
-    for (let offset = 1; offset <= 3 && index + offset < lines.length; offset += 1) {
+    // Sans ancre de code postal, seule la ligne immédiatement sous la rue est
+    // assez sûre. Regarder plus loin peut confondre « Région », « Près de » ou
+    // le nom de la région administrative avec la municipalité.
+    for (let offset = 1; offset <= 1 && index + offset < lines.length; offset += 1) {
       let municipality = validateLocality(lines[index + offset]);
       if (!municipality) continue;
       const districtLine = lines[index + offset + 1]?.match(/^\(([^()]{2,70})\)$/)?.[1] || '';
@@ -2688,6 +2705,17 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
         if (withDistrict) municipality = withDistrict;
       }
       addCandidate(parsed, municipality, index, 'next-line');
+      break;
+    }
+
+    // Mise en page réelle de la fiche « détaillée client avec album »:
+    // rue, libellés Région/Quartier/Plan d'eau, région administrative, prix,
+    // code postal, puis municipalité. Le code postal québécois est une ancre
+    // beaucoup plus fiable qu'une recherche libre parmi ces champs voisins.
+    for (let offset = 1; offset <= 12 && index + offset + 1 < lines.length; offset += 1) {
+      if (!/^[A-Z]\d[A-Z]\s*\d[A-Z]\d$/i.test(lines[index + offset])) continue;
+      const municipality = validateLocality(lines[index + offset + 1]);
+      if (municipality) addCandidate(parsed, municipality, index, 'postal-locality');
       break;
     }
   }
