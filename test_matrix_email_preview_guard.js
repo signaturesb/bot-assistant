@@ -70,12 +70,16 @@ assert.ok(code.includes('Ne jamais conclure « courtier concurrent / accès rest
 assert.ok(code.includes('ne jamais créer/prétendre sauvegarder chatgpt_config.md'));
 assert.ok(code.includes('ne jamais déclarer les documents inaccessibles à cause du courtier sans preuve 401/403'));
 assert.ok(code.includes("name !== 'telecharger_annexes_centris'"), 'le preview Matrix doit passer avant le garde générique');
-assert.ok(code.includes("const directMatrixRequest = text.trim().match(/^#?(\\d{7,9})\\s+([^\\s@]+@[^\\s@]+)"),
-  'un message exact « numéro Centris + courriel » doit être reconnu sans choix du modèle');
+assert.ok(code.includes('const directMatrixRequest = parseDirectMatrixRequest(text)'),
+  'la commande Matrix naturelle doit être reconnue sans choix du modèle');
 assert.match(code, /if \(directMatrixRequest\)[\s\S]*?executeMatrixAnnexesTool/,
   'la demande directe doit ouvrir le preview Matrix déterministe');
 assert.match(code, /directMatrixRequest[\s\S]*?Aucun courriel ne sera envoyé par cette demande/,
   'la demande directe ne doit jamais être interprétée comme la confirmation Gmail');
+assert.match(code, /looksLikeMatrixSendWithoutEmail\(text\)[\s\S]*?Il me manque seulement le courriel du client/,
+  'un numéro sans destinataire doit être bloqué avant toute recherche ou inférence');
+assert.match(code, /looksLikeMatrixSendCommand\(text\)[\s\S]*?Commande Matrix ambiguë ou adresse courriel invalide/,
+  'une commande avec plusieurs numéros ou destinataires doit être bloquée avant Claude');
 assert.match(code, /action\.name === 'telecharger_annexes_centris'[\s\S]*?\^🔒 Confirmation refusée:[\s\S]*?pendingExternalEmailActions\.delete\(chatId\)/);
 
 // Le mot seul « envoie » ne reconstruit jamais le numéro ou le destinataire:

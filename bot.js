@@ -28,6 +28,11 @@ const {
   claimMatrixEmailConfirmation,
   releaseMatrixEmailConfirmation,
 } = require('./lib/matrix_email_confirmation_guard');
+const {
+  parseDirectMatrixRequest,
+  looksLikeMatrixSendWithoutEmail,
+  looksLikeMatrixSendCommand,
+} = require('./lib/matrix_request_parser');
 const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
 const { messageExplicitlyAuthorizesGitHubWrite, verifyProtectedStateWrite } = require('./lib/deployment_truth_guard');
@@ -13755,15 +13760,16 @@ function registerHandlers() {
     log('IN', 'MSG', text.substring(0, 80));
 
     // Parcours terrain déterministe en une seule demande:
-    //   19465925 client@example.com [message optionnel]
+    //   Envoie les documents du #19465925 à client@example.com [message optionnel]
+    // La forme courte « 19465925 client@example.com » reste acceptée.
     // Le modèle n'a aucun choix de tool à faire. Cette demande produit
     // uniquement les PDF + l'aperçu transactionnel; elle ne constitue jamais
     // une confirmation d'envoi Gmail.
-    const directMatrixRequest = text.trim().match(/^#?(\d{7,9})\s+([^\s@]+@[^\s@]+)(?:\s+([\s\S]+))?$/);
+    const directMatrixRequest = parseDirectMatrixRequest(text);
     if (directMatrixRequest) {
-      const num = directMatrixRequest[1];
-      const emailDestination = normalizeSingleRecipientEmail(directMatrixRequest[2]);
-      const messagePerso = String(directMatrixRequest[3] || '').trim();
+      const num = directMatrixRequest.centrisNum;
+      const emailDestination = normalizeSingleRecipientEmail(directMatrixRequest.email);
+      const messagePerso = directMatrixRequest.message;
       if (!emailDestination) {
         await send(chatId, '❌ Adresse courriel invalide. Aucun document récupéré et aucun email envoyé.');
         return;
@@ -13786,6 +13792,20 @@ function registerHandlers() {
       } finally {
         stopMatrixTyping();
       }
+      return;
+    }
+    if (looksLikeMatrixSendWithoutEmail(text)) {
+      await send(
+        chatId,
+        '🔒 Il me manque seulement le courriel du client. Écris: « Envoie les documents du #19465925 à client@example.com ».\nAucun document récupéré et aucun email envoyé.',
+      );
+      return;
+    }
+    if (looksLikeMatrixSendCommand(text)) {
+      await send(
+        chatId,
+        '❌ Commande Matrix ambiguë ou adresse courriel invalide. Utilise exactement un numéro et un destinataire: « Envoie les documents du #19465925 à client@example.com ».\nAucun document récupéré et aucun email envoyé.',
+      );
       return;
     }
 

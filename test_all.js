@@ -52,6 +52,7 @@ runScript('Workflow/backups audit', path.join(__dirname, 'scripts/audit-runtime-
 // 2. Firecrawl tests
 runScript('Firecrawl tests', path.join(__dirname, 'test_firecrawl.js'));
 runScript('Matrix exact search', path.join(__dirname, 'test_matrix_exact_search.js'));
+runScript('Matrix natural request parser', path.join(__dirname, 'test_matrix_request_parser.js'));
 runScript('Matrix authentication', path.join(__dirname, 'test_centris_playwright_auth.js'));
 runScript('Matrix document inventory', path.join(__dirname, 'test_centris_document_inventory.js'));
 runScript('Matrix authenticated browser download', path.join(__dirname, 'test_matrix_browser_download.js'));

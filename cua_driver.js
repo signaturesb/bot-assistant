@@ -3183,23 +3183,128 @@ async function waitForMatrixPdfResponse(context, trigger, timeoutMs = 30000) {
   return result;
 }
 
-async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 20000) {
+async function captureMatrixPrintPRequest(context, trigger, timeoutMs = 15000) {
+  if (typeof context?.route !== 'function' || typeof context?.unroute !== 'function') {
+    throw new Error('MATRIX_PRINT_INTERCEPTION_UNSUPPORTED');
+  }
+  const routePattern = '**/Matrix/PrintP*';
+  let timer = null;
+  let settled = false;
+  let requestCaptured = false;
+  let handler;
+  let finish;
+  const capturedRequest = new Promise((resolve, reject) => {
+    finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
+    };
+    timer = setTimeout(() => finish(new Error('MATRIX_PRINT_REQUEST_CAPTURE_TIMEOUT')), timeoutMs);
+  });
+  handler = async (route, routedRequest) => {
+    const request = routedRequest || route.request?.();
+    try {
+      const target = new URL(String(request?.url?.() || ''));
+      if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
+          !/^\/Matrix\/PrintP/i.test(target.pathname)) {
+        throw new Error('MATRIX_PRINT_STREAM_URL_REJECTED');
+      }
+      const method = String(request?.method?.() || 'GET').toUpperCase();
+      if (!['GET', 'POST'].includes(method)) throw new Error('MATRIX_PRINT_STREAM_METHOD_REJECTED');
+      let body = request?.postDataBuffer?.() || null;
+      if (!body) {
+        const postData = request?.postData?.();
+        if (typeof postData === 'string') body = Buffer.from(postData);
+      }
+      if (body && body.length > 2 * 1024 * 1024) throw new Error('MATRIX_PRINT_STREAM_BODY_TOO_LARGE');
+      const requestHeaders = typeof request?.allHeaders === 'function'
+        ? await request.allHeaders()
+        : (request?.headers?.() || {});
+      requestCaptured = true;
+      await route.abort('blockedbyclient').catch(() => {});
+      finish(null, {
+        url: target.href,
+        method,
+        body,
+        headers: requestHeaders,
+      });
+    } catch (error) {
+      requestCaptured = true;
+      await route.abort('blockedbyclient').catch(() => {});
+      finish(error);
+    }
+  };
+
+  await context.route(routePattern, handler);
+  // L'annulation volontaire de la navigation PrintP peut faire rejeter click().
+  // Une fois la requête capturée, cette erreur de navigation est attendue.
+  void Promise.resolve().then(trigger).catch((error) => {
+    if (!requestCaptured) finish(error);
+  });
+  try {
+    return await capturedRequest;
+  } finally {
+    clearTimeout(timer);
+    await context.unroute(routePattern, handler).catch(() => {});
+  }
+}
+
+function trustedMatrixRequestHeader(headers, name) {
+  const value = String(headers?.[name] || headers?.[name.toLowerCase()] || '').trim();
+  return value.replace(/[\r\n\0]+/g, ' ').substring(0, 1000);
+}
+
+function trustedMatrixNavigationHeader(value, fallback) {
+  try {
+    const target = new URL(String(value || ''));
+    if (target.protocol === 'https:' && /(^|\.)centris\.ca$/i.test(target.hostname)) return target.href;
+  } catch {}
+  return fallback;
+}
+
+async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 35000, requestInit = {}) {
   const target = new URL(String(rawUrl || ''));
   if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
       !/^\/Matrix\/PrintP/i.test(target.pathname)) {
     throw new Error('MATRIX_PRINT_STREAM_URL_REJECTED');
   }
+  const method = String(requestInit.method || 'GET').toUpperCase();
+  if (!['GET', 'POST'].includes(method)) throw new Error('MATRIX_PRINT_STREAM_METHOD_REJECTED');
+  const body = requestInit.body ? Buffer.from(requestInit.body) : null;
+  if (body && body.length > 2 * 1024 * 1024) throw new Error('MATRIX_PRINT_STREAM_BODY_TOO_LARGE');
+  if (method === 'GET' && body?.length) throw new Error('MATRIX_PRINT_STREAM_GET_BODY_REJECTED');
+  const capturedHeaders = requestInit.headers || {};
+  const referer = trustedMatrixNavigationHeader(
+    trustedMatrixRequestHeader(capturedHeaders, 'referer'),
+    `${MATRIX_BASE}/Matrix/Printing/PrintOptions.aspx`,
+  );
+  const origin = trustedMatrixNavigationHeader(
+    trustedMatrixRequestHeader(capturedHeaders, 'origin'),
+    '',
+  );
+  const headers = {
+    Cookie: cookieHeader,
+    Referer: referer,
+    Accept: trustedMatrixRequestHeader(capturedHeaders, 'accept') || 'application/pdf,*/*',
+  };
+  const contentType = trustedMatrixRequestHeader(capturedHeaders, 'content-type');
+  const userAgent = trustedMatrixRequestHeader(capturedHeaders, 'user-agent');
+  const acceptLanguage = trustedMatrixRequestHeader(capturedHeaders, 'accept-language');
+  const requestedWith = trustedMatrixRequestHeader(capturedHeaders, 'x-requested-with');
+  if (contentType) headers['Content-Type'] = contentType;
+  if (userAgent) headers['User-Agent'] = userAgent;
+  if (acceptLanguage) headers['Accept-Language'] = acceptLanguage;
+  if (requestedWith) headers['X-Requested-With'] = requestedWith;
+  if (origin) headers.Origin = origin.replace(/\/$/, '');
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let progress = null;
   try {
     const response = await fetch(target.href, {
-      method: 'GET',
-      headers: {
-        Cookie: cookieHeader,
-        Referer: `${MATRIX_BASE}/Matrix/Printing/PrintOptions.aspx`,
-        Accept: 'application/pdf,*/*',
-      },
+      method,
+      headers,
+      body: method === 'POST' ? body : undefined,
       redirect: 'manual',
       signal: controller.signal,
     });
@@ -3301,23 +3406,7 @@ async function findVisibleMatrixControl(page, matcher) {
 }
 
 async function downloadMatrixListingReport(context, page) {
-  let matrixDetailCapture = null;
   if (!/\/Matrix\/Printing\/PrintOptions\.aspx/i.test(page.url())) {
-    // Repli sans faux contenu: capturer la vraie fiche Matrix authentifiée
-    // avant de quitter la page. Il n'est utilisé que si le PrintP natif annonce
-    // PDF 200 sans jamais livrer d'octets sur le forfait Browserless gratuit.
-    if (typeof page.pdf === 'function') {
-      matrixDetailCapture = await page.pdf({
-        format: 'Letter',
-        printBackground: true,
-        displayHeaderFooter: false,
-        margin: { top: '8mm', bottom: '8mm', left: '8mm', right: '8mm' },
-      }).catch(() => null);
-    }
-    if (matrixDetailCapture &&
-        (matrixDetailCapture.length < 1000 || matrixDetailCapture.subarray(0, 4096).indexOf(Buffer.from('%PDF-')) < 0)) {
-      matrixDetailCapture = null;
-    }
     const printControl = await findVisibleMatrixControl(page, /^imprimer$/i);
     if (!printControl) throw new Error('MATRIX_PRINT_CONTROL_MISSING');
     await printControl.click({ timeout: 10000 });
@@ -3356,18 +3445,34 @@ async function downloadMatrixListingReport(context, page) {
 
   const pdfControl = await findVisibleMatrixControl(page, /^imprimer\s+en\s+pdf$/i);
   if (!pdfControl) throw new Error('MATRIX_PRINT_PDF_CONTROL_MISSING');
-  // Essayer d'abord le PrintP natif. S'il reste ouvert sans corps, utiliser la
-  // capture de la fiche Matrix déjà réalisée, jamais un PDF inventé.
+  // La fiche standard ne doit jamais remplacer silencieusement l'album client.
+  // Quand Playwright le permet, intercepter la requête PrintP avant son envoi
+  // puis l'exécuter une seule fois avec les mêmes cookies évite le verrou créé
+  // par deux requêtes Matrix concurrentes sur la même session.
   try {
-    const nativeReport = await waitForMatrixPdfOrDownload(
-      context, page, () => pdfControl.click({ timeout: 10000 }), 30000
+    if (typeof context?.route === 'function' && typeof context?.unroute === 'function') {
+      const authenticatedState = await context.storageState();
+      const cookieHeader = cookieHeaderFromPlaywrightCookies(authenticatedState.cookies, 'matrix.centris.ca');
+      if (!cookieHeader) throw new Error('MATRIX_PRINT_COOKIE_MISSING');
+      const printRequest = await captureMatrixPrintPRequest(
+        context,
+        () => pdfControl.click({ timeout: 10000 }),
+        15000,
+      );
+      const nativeReport = await streamMatrixPdfUntilEof(
+        printRequest.url,
+        cookieHeader,
+        35000,
+        printRequest,
+      );
+      console.log(`[MATRIX-PDF] Fiche détaillée avec album récupérée nativement (${nativeReport.length} octets)`);
+      return nativeReport;
+    }
+    return await waitForMatrixPdfOrDownload(
+      context, page, () => pdfControl.click({ timeout: 10000 }), 30000,
     );
-    return nativeReport;
   } catch (error) {
-    if (!matrixDetailCapture) throw error;
-    matrixDetailCapture._matrixGenerationMethod = 'matrix-detail-page-capture';
-    console.warn(`[MATRIX-PDF] PrintP natif indisponible (${safeErrorMessage(error).substring(0, 100)}); utilise la capture PDF de la fiche Matrix exacte`);
-    return matrixDetailCapture;
+    throw new Error(`MATRIX_DETAILED_ALBUM_PDF_UNAVAILABLE:${safeErrorMessage(error).substring(0, 140)}`);
   }
 }
 
@@ -4861,6 +4966,8 @@ module.exports = {
   _isMatrixDocumentRetryable: isMatrixDocumentRetryable,
   _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
   _waitForMatrixPdfOrDownload: waitForMatrixPdfOrDownload,
+  _captureMatrixPrintPRequest: captureMatrixPrintPRequest,
+  _streamMatrixPdfUntilEof: streamMatrixPdfUntilEof,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
