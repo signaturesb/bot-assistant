@@ -3187,7 +3187,10 @@ async function captureMatrixPrintPRequest(context, trigger, timeoutMs = 15000) {
   if (typeof context?.route !== 'function' || typeof context?.unroute !== 'function') {
     throw new Error('MATRIX_PRINT_INTERCEPTION_UNSUPPORTED');
   }
-  const routePattern = '**/Matrix/PrintP*';
+  // Le bouton PDF soumet souvent PrintOptions.aspx, puis Matrix redirige vers
+  // PrintP. Playwright ne route pas toujours le deuxième saut d'une chaîne de
+  // redirection; on capture donc la première navigation d'impression fiable.
+  const routePattern = '**/Matrix/**';
   let timer = null;
   let settled = false;
   let requestCaptured = false;
@@ -3206,11 +3209,16 @@ async function captureMatrixPrintPRequest(context, trigger, timeoutMs = 15000) {
     const request = routedRequest || route.request?.();
     try {
       const target = new URL(String(request?.url?.() || ''));
-      if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
-          !/^\/Matrix\/PrintP/i.test(target.pathname)) {
-        throw new Error('MATRIX_PRINT_STREAM_URL_REJECTED');
-      }
       const method = String(request?.method?.() || 'GET').toUpperCase();
+      const resourceType = String(request?.resourceType?.() || '').toLowerCase();
+      const navigationRequest = request?.isNavigationRequest?.() === true || resourceType === 'document';
+      const printP = /^\/Matrix\/PrintP/i.test(target.pathname);
+      const printOptions = /^\/Matrix\/Printing\/PrintOptions\.aspx$/i.test(target.pathname);
+      if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
+          (!printP && !(printOptions && navigationRequest))) {
+        await route.continue().catch(() => {});
+        return;
+      }
       if (!['GET', 'POST'].includes(method)) throw new Error('MATRIX_PRINT_STREAM_METHOD_REJECTED');
       let body = request?.postDataBuffer?.() || null;
       if (!body) {
@@ -3263,15 +3271,21 @@ function trustedMatrixNavigationHeader(value, fallback) {
   return fallback;
 }
 
+function isTrustedMatrixPrintUrl(target) {
+  return target.protocol === 'https:' && /(^|\.)centris\.ca$/i.test(target.hostname) && (
+    /^\/Matrix\/PrintP/i.test(target.pathname) ||
+    /^\/Matrix\/Printing\/PrintOptions\.aspx$/i.test(target.pathname)
+  );
+}
+
 async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 35000, requestInit = {}) {
-  const target = new URL(String(rawUrl || ''));
-  if (target.protocol !== 'https:' || !/(^|\.)centris\.ca$/i.test(target.hostname) ||
-      !/^\/Matrix\/PrintP/i.test(target.pathname)) {
+  let target = new URL(String(rawUrl || ''));
+  if (!isTrustedMatrixPrintUrl(target)) {
     throw new Error('MATRIX_PRINT_STREAM_URL_REJECTED');
   }
-  const method = String(requestInit.method || 'GET').toUpperCase();
+  let method = String(requestInit.method || 'GET').toUpperCase();
   if (!['GET', 'POST'].includes(method)) throw new Error('MATRIX_PRINT_STREAM_METHOD_REJECTED');
-  const body = requestInit.body ? Buffer.from(requestInit.body) : null;
+  let body = requestInit.body ? Buffer.from(requestInit.body) : null;
   if (body && body.length > 2 * 1024 * 1024) throw new Error('MATRIX_PRINT_STREAM_BODY_TOO_LARGE');
   if (method === 'GET' && body?.length) throw new Error('MATRIX_PRINT_STREAM_GET_BODY_REJECTED');
   const capturedHeaders = requestInit.headers || {};
@@ -3301,13 +3315,30 @@ async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 35000, 
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let progress = null;
   try {
-    const response = await fetch(target.href, {
-      method,
-      headers,
-      body: method === 'POST' ? body : undefined,
-      redirect: 'manual',
-      signal: controller.signal,
-    });
+    let response = null;
+    for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
+      const requestHeaders = { ...headers };
+      if (method === 'GET') delete requestHeaders['Content-Type'];
+      response = await fetch(target.href, {
+        method,
+        headers: requestHeaders,
+        body: method === 'POST' ? body : undefined,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+      if (![301, 302, 303, 307, 308].includes(response.status)) break;
+      if (redirectCount === 3) throw new Error('MATRIX_PRINT_STREAM_REDIRECT_LIMIT');
+      const location = response.headers.get('location');
+      if (!location) throw new Error('MATRIX_PRINT_STREAM_REDIRECT_MISSING');
+      const nextTarget = new URL(location, target);
+      if (!isTrustedMatrixPrintUrl(nextTarget)) throw new Error('MATRIX_PRINT_STREAM_REDIRECT_REJECTED');
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+        method = 'GET';
+        body = null;
+      }
+      target = nextTarget;
+    }
+    if (!response) throw new Error('MATRIX_PRINT_STREAM_RESPONSE_MISSING');
     if (!response.ok) throw new Error(`MATRIX_PRINT_STREAM_HTTP_${response.status}`);
     const contentType = String(response.headers.get('content-type') || '').toLowerCase();
     if (!contentType.includes('pdf')) throw new Error(`MATRIX_PRINT_STREAM_NOT_PDF:${contentType || 'unknown'}`);
