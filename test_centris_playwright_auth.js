@@ -46,6 +46,10 @@ assert(cuaSource.includes("session.send('Network.streamResourceContent', { reque
   'le flux PrintP original doit être lu directement sans seconde URL à usage unique');
 assert(cuaSource.includes("session.on('Network.dataReceived', state.dataHandler)"),
   'les octets du flux PrintP natif doivent être consommés pendant leur arrivée');
+assert(cuaSource.includes("'Fetch.takeResponseBodyAsStream'"),
+  'la réponse PrintP à usage unique doit pouvoir être suspendue au niveau navigateur');
+assert(cuaSource.includes("'IO.read'"),
+  'le flux PrintP suspendu doit être lu par blocs jusqu’à la fin PDF');
 assert(cuaSource.includes("await route.abort('blockedbyclient')"),
   'le PrintP navigateur doit être annulé avant la lecture HTTP unique');
 assert(cuaSource.includes('printRequest.url,') && cuaSource.includes('printRequest,'),

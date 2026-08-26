@@ -310,6 +310,72 @@ const context = {
     Buffer.alloc(1500, 2),
     Buffer.from('\n%%EOF'),
   ]);
+  const browserRootSession = new EventEmitter();
+  let browserRootDetached = false;
+  let browserFetchEnabled = false;
+  let browserStreamRead = false;
+  let browserAutoAttachDisabled = false;
+  browserRootSession.detach = async () => { browserRootDetached = true; };
+  browserRootSession.send = async (method, params) => {
+    if (method === 'Target.setDiscoverTargets') return {};
+    if (method === 'Target.setAutoAttach') {
+      if (params.autoAttach) {
+        browserRootSession.emit('Target.attachedToTarget', {
+          sessionId: 'page-session-1',
+          targetInfo: { type: 'page' },
+        });
+      } else {
+        browserAutoAttachDisabled = true;
+      }
+      return {};
+    }
+    if (method !== 'Target.sendMessageToTarget') throw new Error(`commande browser CDP inattendue: ${method}`);
+    const command = JSON.parse(params.message);
+    let result = {};
+    if (command.method === 'Fetch.enable') browserFetchEnabled = true;
+    else if (command.method === 'Fetch.takeResponseBodyAsStream') {
+      assert.strictEqual(command.params.requestId, 'paused-print-1');
+      result = { stream: 'print-stream-1' };
+    } else if (command.method === 'IO.read') {
+      assert.strictEqual(command.params.handle, 'print-stream-1');
+      browserStreamRead = true;
+      result = { data: nativeAlbumPdf.toString('base64'), base64Encoded: true, eof: false };
+    } else if (!['Runtime.runIfWaitingForDebugger', 'Page.stopLoading', 'IO.close'].includes(command.method)) {
+      throw new Error(`commande enfant CDP inattendue: ${command.method}`);
+    }
+    browserRootSession.emit('Target.receivedMessageFromTarget', {
+      sessionId: params.sessionId,
+      message: JSON.stringify({ id: command.id, result }),
+    });
+    return {};
+  };
+  const browserCdpContext = {
+    browser: () => ({ async newBrowserCDPSession() { return browserRootSession; } }),
+  };
+  assert.deepStrictEqual(
+    await cua._waitForMatrixPdfViaBrowserCdp(
+      browserCdpContext,
+      async () => browserRootSession.emit('Target.receivedMessageFromTarget', {
+        sessionId: 'page-session-1',
+        message: JSON.stringify({
+          method: 'Fetch.requestPaused',
+          params: {
+            requestId: 'paused-print-1',
+            request: { url: 'https://matrix.centris.ca/Matrix/PrintP?id=single-use' },
+            responseStatusCode: 200,
+          },
+        }),
+      }),
+      1000,
+    ),
+    nativeAlbumPdf,
+    'le CDP navigateur doit suspendre la réponse PrintP unique et lire son flux IO jusqu’à %%EOF',
+  );
+  assert.strictEqual(browserFetchEnabled, true);
+  assert.strictEqual(browserStreamRead, true);
+  assert.strictEqual(browserAutoAttachDisabled, true);
+  assert.strictEqual(browserRootDetached, true);
+
   const cdpSession = new EventEmitter();
   let cdpDetached = false;
   let cdpStopped = false;

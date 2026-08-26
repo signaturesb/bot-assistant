@@ -3502,6 +3502,163 @@ async function waitForMatrixPdfViaCdp(context, page, trigger, timeoutMs = 40000)
   }
 }
 
+async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000) {
+  const browser = context?.browser?.();
+  if (typeof browser?.newBrowserCDPSession !== 'function') throw new Error('MATRIX_PRINT_BROWSER_CDP_UNSUPPORTED');
+  const root = await browser.newBrowserCDPSession();
+  let timer = null;
+  let settled = false;
+  let protocolId = 0;
+  let total = 0;
+  const chunks = [];
+  let tail = Buffer.alloc(0);
+  const pending = new Map();
+  const childSessions = new Set();
+  const targetReady = [];
+  let attachedHandler = null;
+  let messageHandler = null;
+  let finish;
+  const result = new Promise((resolve, reject) => {
+    finish = (error, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(buffer);
+    };
+    timer = setTimeout(() => finish(new Error('MATRIX_PRINT_BROWSER_CDP_TIMEOUT')), timeoutMs);
+  });
+
+  const sendToTarget = async (sessionId, method, params = {}) => {
+    const id = ++protocolId;
+    const response = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+    try {
+      await root.send('Target.sendMessageToTarget', {
+        sessionId,
+        message: JSON.stringify({ id, method, params }),
+      });
+    } catch (error) {
+      pending.delete(id);
+      throw error;
+    }
+    return response;
+  };
+  const consumeChunk = (data, base64Encoded) => {
+    if (!data || settled) return null;
+    const chunk = Buffer.from(String(data), base64Encoded ? 'base64' : 'binary');
+    if (!chunk.length) return null;
+    total += chunk.length;
+    if (total > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    chunks.push(chunk);
+    const scan = Buffer.concat([tail, chunk]);
+    if (scan.indexOf(Buffer.from('%%EOF')) >= 0) {
+      const full = Buffer.concat(chunks, total);
+      const magic = full.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+      const eof = full.lastIndexOf(Buffer.from('%%EOF'));
+      if (magic < 0 || eof < magic || eof + 5 < 1000) throw new Error('MATRIX_PRINT_BROWSER_CDP_INVALID_PDF');
+      return full.subarray(magic, eof + 5);
+    }
+    tail = scan.subarray(Math.max(0, scan.length - 8));
+    return null;
+  };
+  const readPausedStream = async (sessionId, pausedRequestId) => {
+    let handle = null;
+    try {
+      const streamResult = await sendToTarget(sessionId, 'Fetch.takeResponseBodyAsStream', { requestId: pausedRequestId });
+      handle = streamResult?.stream;
+      if (!handle) throw new Error('MATRIX_PRINT_BROWSER_CDP_STREAM_MISSING');
+      while (!settled) {
+        const part = await sendToTarget(sessionId, 'IO.read', { handle, size: 64 * 1024 });
+        const pdfBuffer = consumeChunk(part?.data || '', Boolean(part?.base64Encoded));
+        if (pdfBuffer) {
+          void sendToTarget(sessionId, 'Page.stopLoading').catch(() => {});
+          finish(null, pdfBuffer);
+          return;
+        }
+        if (part?.eof) throw new Error('MATRIX_PRINT_BROWSER_CDP_EOF_MISSING');
+      }
+    } catch (error) {
+      finish(error);
+    } finally {
+      if (handle) void sendToTarget(sessionId, 'IO.close', { handle }).catch(() => {});
+    }
+  };
+
+  messageHandler = (event) => {
+    let message;
+    try { message = JSON.parse(String(event?.message || '')); }
+    catch { return; }
+    if (message.id) {
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      if (message.error) waiter.reject(new Error(`MATRIX_PRINT_BROWSER_CDP_PROTOCOL:${message.error.message || message.error.code}`));
+      else waiter.resolve(message.result || {});
+      return;
+    }
+    if (message.method !== 'Fetch.requestPaused' || settled) return;
+    const params = message.params || {};
+    try {
+      const target = new URL(String(params?.request?.url || ''));
+      if (!isTrustedMatrixPrintUrl(target) || !/^\/Matrix\/PrintP/i.test(target.pathname) || !params.responseStatusCode) {
+        void sendToTarget(event.sessionId, 'Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
+        return;
+      }
+      void readPausedStream(event.sessionId, params.requestId);
+    } catch (error) {
+      finish(error);
+    }
+  };
+  attachedHandler = (event) => {
+    const sessionId = String(event?.sessionId || '');
+    const targetType = String(event?.targetInfo?.type || '');
+    if (!sessionId || !['page', 'iframe', 'webview'].includes(targetType)) return;
+    childSessions.add(sessionId);
+    const ready = (async () => {
+      try {
+        await sendToTarget(sessionId, 'Fetch.enable', {
+          patterns: [{ urlPattern: '*://*.centris.ca/Matrix/PrintP*', requestStage: 'Response' }],
+        });
+      } finally {
+        await sendToTarget(sessionId, 'Runtime.runIfWaitingForDebugger').catch(() => {});
+      }
+    })();
+    targetReady.push(ready);
+    void ready.catch((error) => finish(error));
+  };
+
+  try {
+    root.on('Target.receivedMessageFromTarget', messageHandler);
+    root.on('Target.attachedToTarget', attachedHandler);
+    await root.send('Target.setDiscoverTargets', { discover: true });
+    await root.send('Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: true,
+      flatten: false,
+    });
+    // setAutoAttach signale aussi les pages déjà ouvertes. Leur Fetch.enable
+    // doit être confirmé avant le clic pour ne perdre aucune réponse unique.
+    await new Promise(resolve => setTimeout(resolve, 75));
+    await Promise.all(targetReady);
+    await trigger();
+    return await result;
+  } catch (error) {
+    finish(error);
+    return await result;
+  } finally {
+    clearTimeout(timer);
+    for (const waiter of pending.values()) waiter.reject(new Error('MATRIX_PRINT_BROWSER_CDP_CLOSED'));
+    pending.clear();
+    try { root.off?.('Target.receivedMessageFromTarget', messageHandler); } catch {}
+    try { root.off?.('Target.attachedToTarget', attachedHandler); } catch {}
+    await root.send('Target.setAutoAttach', {
+      autoAttach: false,
+      waitForDebuggerOnStart: false,
+      flatten: false,
+    }).catch(() => {});
+    await root.detach?.().catch(() => {});
+  }
+}
+
 async function matrixDownloadBuffer(download) {
   if (!download) throw new Error('MATRIX_PRINT_DOWNLOAD_MISSING');
   if (typeof download.createReadStream === 'function') {
@@ -3606,6 +3763,16 @@ async function downloadMatrixListingReport(context, page) {
   // puis l'exécuter une seule fois avec les mêmes cookies évite le verrou créé
   // par deux requêtes Matrix concurrentes sur la même session.
   try {
+    if (typeof context?.browser?.()?.newBrowserCDPSession === 'function') {
+      const nativeReport = await waitForMatrixPdfViaBrowserCdp(
+        context,
+        () => pdfControl.click({ timeout: 10000 }),
+        45000,
+      );
+      await page.close?.({ runBeforeUnload: false }).catch(() => {});
+      console.log(`[MATRIX-PDF] Fiche détaillée avec album lue sur la réponse PrintP unique jusqu'à %%EOF (${nativeReport.length} octets)`);
+      return nativeReport;
+    }
     if (typeof context?.newCDPSession === 'function') {
       const nativeReport = await waitForMatrixPdfViaCdp(
         context,
@@ -5141,6 +5308,7 @@ module.exports = {
   _captureMatrixPrintPRequest: captureMatrixPrintPRequest,
   _streamMatrixPdfUntilEof: streamMatrixPdfUntilEof,
   _waitForMatrixPdfViaCdp: waitForMatrixPdfViaCdp,
+  _waitForMatrixPdfViaBrowserCdp: waitForMatrixPdfViaBrowserCdp,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
