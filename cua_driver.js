@@ -3384,6 +3384,95 @@ async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 35000, 
   }
 }
 
+async function waitForMatrixPdfViaCdp(context, page, trigger, timeoutMs = 40000) {
+  if (typeof context?.newCDPSession !== 'function') throw new Error('MATRIX_PRINT_CDP_UNSUPPORTED');
+  const session = await context.newCDPSession(page);
+  let timer = null;
+  let settled = false;
+  let requestId = null;
+  let total = 0;
+  const chunks = [];
+  let tail = Buffer.alloc(0);
+  let responseHandler;
+  let dataHandler;
+  let finishedHandler;
+  let finish;
+  const result = new Promise((resolve, reject) => {
+    finish = (error, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(buffer);
+    };
+    timer = setTimeout(() => finish(new Error('MATRIX_PRINT_CDP_TIMEOUT')), timeoutMs);
+  });
+  const consumeBase64 = (encoded) => {
+    if (!encoded || settled) return;
+    const chunk = Buffer.from(String(encoded), 'base64');
+    if (!chunk.length) return;
+    total += chunk.length;
+    if (total > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+      finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+      return;
+    }
+    chunks.push(chunk);
+    const scan = Buffer.concat([tail, chunk]);
+    if (scan.indexOf(Buffer.from('%%EOF')) >= 0) {
+      const full = Buffer.concat(chunks, total);
+      const magic = full.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+      const eof = full.lastIndexOf(Buffer.from('%%EOF'));
+      if (magic < 0 || eof < magic || eof + 5 < 1000) {
+        finish(new Error('MATRIX_PRINT_CDP_INVALID_PDF'));
+        return;
+      }
+      void session.send('Page.stopLoading').catch(() => {});
+      finish(null, full.subarray(magic, eof + 5));
+      return;
+    }
+    tail = scan.subarray(Math.max(0, scan.length - 8));
+  };
+
+  responseHandler = async (event) => {
+    try {
+      const target = new URL(String(event?.response?.url || ''));
+      const mimeType = String(event?.response?.mimeType || '').toLowerCase();
+      if (!isTrustedMatrixPrintUrl(target) || !/^\/Matrix\/PrintP/i.test(target.pathname) ||
+          (!mimeType.includes('pdf') && mimeType !== 'application/octet-stream')) return;
+      requestId = event.requestId;
+      const streamed = await session.send('Network.streamResourceContent', { requestId });
+      consumeBase64(streamed?.bufferedData || '');
+    } catch (error) {
+      finish(error);
+    }
+  };
+  dataHandler = (event) => {
+    if (requestId && event?.requestId === requestId) consumeBase64(event.data || '');
+  };
+  finishedHandler = (event) => {
+    if (requestId && event?.requestId === requestId && !settled) {
+      finish(new Error('MATRIX_PRINT_CDP_EOF_MISSING'));
+    }
+  };
+
+  try {
+    await session.send('Network.enable');
+    session.on('Network.responseReceived', responseHandler);
+    session.on('Network.dataReceived', dataHandler);
+    session.on('Network.loadingFinished', finishedHandler);
+    await trigger();
+    return await result;
+  } catch (error) {
+    finish(error);
+    return await result;
+  } finally {
+    clearTimeout(timer);
+    try { session.off?.('Network.responseReceived', responseHandler); } catch {}
+    try { session.off?.('Network.dataReceived', dataHandler); } catch {}
+    try { session.off?.('Network.loadingFinished', finishedHandler); } catch {}
+    await session.detach?.().catch(() => {});
+  }
+}
+
 async function matrixDownloadBuffer(download) {
   if (!download) throw new Error('MATRIX_PRINT_DOWNLOAD_MISSING');
   if (typeof download.createReadStream === 'function') {
@@ -3488,6 +3577,17 @@ async function downloadMatrixListingReport(context, page) {
   // puis l'exécuter une seule fois avec les mêmes cookies évite le verrou créé
   // par deux requêtes Matrix concurrentes sur la même session.
   try {
+    if (typeof context?.newCDPSession === 'function') {
+      const nativeReport = await waitForMatrixPdfViaCdp(
+        context,
+        page,
+        () => pdfControl.click({ timeout: 10000 }),
+        40000,
+      );
+      await page.close?.({ runBeforeUnload: false }).catch(() => {});
+      console.log(`[MATRIX-PDF] Fiche détaillée avec album lue sur le flux natif jusqu'à %%EOF (${nativeReport.length} octets)`);
+      return nativeReport;
+    }
     if (typeof context?.route === 'function' && typeof context?.unroute === 'function') {
       const authenticatedState = await context.storageState();
       const cookieHeader = cookieHeaderFromPlaywrightCookies(authenticatedState.cookies, 'matrix.centris.ca');
@@ -5011,6 +5111,7 @@ module.exports = {
   _waitForMatrixPdfOrDownload: waitForMatrixPdfOrDownload,
   _captureMatrixPrintPRequest: captureMatrixPrintPRequest,
   _streamMatrixPdfUntilEof: streamMatrixPdfUntilEof,
+  _waitForMatrixPdfViaCdp: waitForMatrixPdfViaCdp,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,

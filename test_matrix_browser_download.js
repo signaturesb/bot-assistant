@@ -310,6 +310,39 @@ const context = {
     Buffer.alloc(1500, 2),
     Buffer.from('\n%%EOF'),
   ]);
+  const cdpSession = new EventEmitter();
+  let cdpDetached = false;
+  let cdpStopped = false;
+  cdpSession.send = async (method, params) => {
+    if (method === 'Network.enable') return {};
+    if (method === 'Network.streamResourceContent') {
+      assert.strictEqual(params.requestId, 'print-request-1');
+      return { bufferedData: nativeAlbumPdf.toString('base64') };
+    }
+    if (method === 'Page.stopLoading') { cdpStopped = true; return {}; }
+    throw new Error(`commande CDP inattendue: ${method}`);
+  };
+  cdpSession.detach = async () => { cdpDetached = true; };
+  assert.deepStrictEqual(
+    await cua._waitForMatrixPdfViaCdp(
+      { async newCDPSession() { return cdpSession; } },
+      {},
+      async () => cdpSession.emit('Network.responseReceived', {
+        requestId: 'print-request-1',
+        response: {
+          url: 'https://matrix.centris.ca/Matrix/PrintP?id=cdp-album',
+          mimeType: 'application/pdf',
+        },
+      }),
+      1000,
+    ),
+    nativeAlbumPdf,
+    'le flux original PrintP doit être lu par CDP jusqu’à %%EOF sans seconde requête',
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(cdpStopped, true);
+  assert.strictEqual(cdpDetached, true);
+
   const originalFetch = global.fetch;
   let replayedRequest = null;
   global.fetch = async (url, options) => {
