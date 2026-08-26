@@ -7674,7 +7674,14 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   }
   const normalizedFilter = String(filtre || '');
   const clientInstruction = String(messagePerso || '').replace(/[\r\0]+/g, ' ').trim().substring(0, 2000);
-  const cachedArtifact = hydrateMatrixArtifactForAction(chatId, pendingExternalEmailActions.get(chatId));
+  // La confirmation finale recharge toujours les octets depuis le cache
+  // durable afin de recalculer taille et SHA-256 juste avant de construire le
+  // MIME. Une copie RAM ne constitue jamais la preuve finale d'intégrité.
+  const cachedArtifact = hydrateMatrixArtifactForAction(
+    chatId,
+    pendingExternalEmailActions.get(chatId),
+    { forceDurableReload: isSendConfirmation },
+  );
   let result;
   if (isSendConfirmation) {
     if (!cachedArtifact || cachedArtifact.expiresAt < Date.now() ||
@@ -7694,17 +7701,33 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     return `❌ Annexes Matrix #${num} non récupérées: ${String(result?.message || 'aucun PDF validé').substring(0, 220)}\nAucun email envoyé. Aucun numéro substitut n'a été utilisé.`;
   }
 
-  const documents = result.annexes.map((doc, index) => ({
-    buffer: doc.buffer,
-    filename: String(doc.filename || `document_${index + 1}_${num}.pdf`),
-    label: String(doc.label || doc.filename || `Document ${index + 1}`),
-    size: Number(doc.size || doc.buffer?.length || 0),
-    page_count: Number.isFinite(doc.page_count) ? doc.page_count : null,
-    sha256: doc.sha256 || crypto.createHash('sha256').update(doc.buffer).digest('hex'),
-    source: 'matrix-global',
-    provenance: doc.provenance || null,
-    generation_method: doc.generation_method || null,
-  }));
+  const documentIntegrityFailures = [];
+  const documents = result.annexes.map((doc, index) => {
+    const buffer = Buffer.isBuffer(doc?.buffer) ? doc.buffer : Buffer.from(doc?.buffer || []);
+    const computedSize = buffer.length;
+    const computedSha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+    const reportedSize = Number(doc?.size || 0);
+    const reportedSha256 = String(doc?.sha256 || '').toLowerCase();
+    if (computedSize < 1000 || buffer.subarray(0, 5).toString('ascii') !== '%PDF-' ||
+        (reportedSize > 0 && reportedSize !== computedSize) ||
+        (reportedSha256 && reportedSha256 !== computedSha256)) {
+      documentIntegrityFailures.push(String(doc?.filename || doc?.label || `document ${index + 1}`));
+    }
+    return {
+      buffer,
+      filename: String(doc.filename || `document_${index + 1}_${num}.pdf`),
+      label: String(doc.label || doc.filename || `Document ${index + 1}`),
+      size: computedSize,
+      page_count: Number.isFinite(doc.page_count) ? doc.page_count : null,
+      sha256: computedSha256,
+      source: 'matrix-global',
+      provenance: doc.provenance || null,
+      generation_method: doc.generation_method || null,
+    };
+  });
+  if (documentIntegrityFailures.length) {
+    return `🔒 Intégrité PDF refusée pour Matrix #${num}: ${documentIntegrityFailures.length} pièce(s) ne correspondent pas aux octets validés. Aucun aperçu armé, aucun PDF remis et aucun email envoyé.`;
+  }
   const failures = Array.isArray(result.failures) ? result.failures : [];
   const returnedCentris = String(result?.listing?.centris_num || '').replace(/\D/g, '');
   const rawListingAddress = String(result?.listing?.address || '').replace(/[\r\n\0]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -8046,7 +8069,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     gmail_message_id: gmailProviderReceipt.id,
     gmail_thread_id: gmailProviderReceipt.threadId || null,
   });
-  return `✅ ${documents.length} documents Matrix #${num} envoyés à *${emailDestination}*${cc.length ? ` (Cc ${AGENT.email})` : ''}.\nPreuve Gmail: \`${gmailProviderReceipt.id}\`\nAucun document omis; aucune relance automatique.`;
+  return `✅ ${documents.length} documents Matrix #${num} envoyés à *${emailDestination}*${cc.length ? ` (Cc ${REQUIRED_VISIBLE_CC_EMAIL})` : ''}.\nPreuve Gmail: \`${gmailProviderReceipt.id}\`\nAucun document omis; aucune relance automatique.`;
 }
 
 async function executeTool(name, input, chatId, userMessage = '', actionContext = {}) {
@@ -10446,7 +10469,7 @@ function matrixPreviewSummary(action = {}) {
   ].join('\n');
 }
 
-function hydrateMatrixArtifactForAction(chatId, action) {
+function hydrateMatrixArtifactForAction(chatId, action, { forceDurableReload = false } = {}) {
   if (!action || action.name !== 'telecharger_annexes_centris' || !action.requestId) return null;
   const recipient = normalizeSingleRecipientEmail(action.input?.email_destination);
   const current = pendingMatrixArtifacts.get(chatId);
@@ -10458,7 +10481,7 @@ function hydrateMatrixArtifactForAction(chatId, action) {
     current.expiresAt === action.matrixPreviewExpiresAt &&
     current.expiresAt >= Date.now() &&
     Array.isArray(current.documents) && current.documents.length > 0;
-  if (exact) return current;
+  if (exact && !forceDurableReload) return current;
   pendingMatrixArtifacts.delete(chatId);
   const loaded = loadMatrixArtifactCache({
     dataDir: DATA_DIR,

@@ -92,8 +92,12 @@ try {
 
   const purgeId = 'mx7777777777777777';
   const purge = write(purgeId, Date.now() + 1000);
-  assert.strictEqual(purgeExpiredMatrixArtifactCaches(testRoot, Date.now() + 2000), 1);
+  const stalePartial = path.join(cacheRoot(testRoot), '.partial-mx8888888888888888-deadbeef');
+  fs.mkdirSync(stalePartial, { mode: 0o700 });
+  fs.writeFileSync(path.join(stalePartial, 'orphan.pdf'), '%PDF-1.4\npartial\n%%EOF');
+  assert.strictEqual(purgeExpiredMatrixArtifactCaches(testRoot, Date.now() + 2000), 2);
   assert.strictEqual(fs.existsSync(purge.directory), false);
+  assert.strictEqual(fs.existsSync(stalePartial), false, 'un cache partiel abandonné doit être purgé au redémarrage');
 
   assert.strictEqual(safeRemoveRequest(testRoot, restartId), true);
   assert.strictEqual(fs.existsSync(written.directory), false);

@@ -21,6 +21,8 @@ assert.match(handler, /24 \* 1024 \* 1024/,
   'la taille du MIME complet doit être contrôlée avant Gmail');
 assert.match(handler, /const cc = emailDestination\.toLowerCase\(\) === REQUIRED_VISIBLE_CC_EMAIL \? \[\] : \[REQUIRED_VISIBLE_CC_EMAIL\]/,
   'Shawn doit être en Cc visible pour un client externe');
+assert.match(handler, /Cc \$\{REQUIRED_VISIBLE_CC_EMAIL\}/,
+  'le reçu de succès doit annoncer le même Cc obligatoire que le MIME réel');
 assert.match(handler, /attachments: documents\.map/,
   'le manifeste d’autorisation doit contenir toutes les pièces jointes');
 assert.match(handler, /const clientInstruction = String\(messagePerso/,

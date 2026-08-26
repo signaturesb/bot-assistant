@@ -227,6 +227,44 @@ assert.strictEqual(
 );
 assert.strictEqual(
   extractAddress(
+    'No Centris 19465925 (En vigueur)\n381 Rue Laval\nRepentigny (Repentigny)\nNo Centris est 19465925',
+    '381 Rue Laval, Région Lanaudière',
+    '19465925',
+  ),
+  '381, Rue Laval, Repentigny (Repentigny)',
+  'la vraie mise en page #19465925 doit ignorer la région administrative DOM et confirmer la ville depuis le PDF exact',
+);
+assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n381, Rue Laval Repentigny (Repentigny)\nNo Centris 19465925',
+    '381, Rue Laval, Documents joints',
+    '19465925',
+  ),
+  '381, Rue Laval, Repentigny (Repentigny)',
+  'pdf-parse peut supprimer la virgule entre la rue exacte et la municipalité sans rendre la preuve ambiguë',
+);
+assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n381, Rue Laval\nRepentigny\n(Repentigny)\nNo Centris 19465925',
+    '381, Rue Laval, Documents joints',
+    '19465925',
+  ),
+  '381, Rue Laval, Repentigny (Repentigny)',
+  'un quartier placé sur une ligne PDF séparée doit être rattaché à la municipalité validée',
+);
+for (const falseLocality of ['Maison à étages', 'À vendre', 'Résidentiel', 'Région Lanaudière', 'Ouest']) {
+  assert.strictEqual(
+    extractAddress(
+      `Fiche détaillée\n381, Rue Laval\n${falseLocality}\nNo Centris 19465925`,
+      '381, Rue Laval, Région Lanaudière',
+      '19465925',
+    ),
+    '',
+    `${falseLocality} ne doit jamais devenir une municipalité`,
+  );
+}
+assert.strictEqual(
+  extractAddress(
     'No Centris 19465925\n381, Rue Notre-Dame\nRepentigny\nCourtier immobilier\n381, Rue Laval\nMontréal',
     '381, Rue Laval, Repentigny (Repentigny)',
     '19465925',

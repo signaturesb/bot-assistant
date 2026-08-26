@@ -34,6 +34,10 @@ assert.match(handler, /writeMatrixArtifactCache\(/,
 assert.match(code, /function hydrateMatrixArtifactForAction/);
 assert.match(code, /loadMatrixArtifactCache\(/,
   'un redémarrage doit recharger puis revalider le cache exact au lieu de produire un faux PDF expiré');
+assert.match(handler, /forceDurableReload: isSendConfirmation/,
+  'la confirmation finale doit relire les PDF du cache durable et recalculer leur intégrité');
+assert.match(code, /exact && !forceDurableReload/,
+  'une copie RAM ne doit jamais court-circuiter la revalidation finale du cache');
 assert.match(code, /removeMatrixArtifactCache\(DATA_DIR/,
   'annulation, expiration, correction et succès doivent nettoyer le cache privé');
 assert.match(handler, /listing: result\.listing \|\| null/,
@@ -51,6 +55,10 @@ assert.match(handler, /returnedCentris !== String\(num\)/);
 assert.match(handler, /l’adresse complète \(rue et municipalité\)/);
 assert.match(handler, /result\?\.listing\?\.address_complete === true/);
 assert.match(handler, /listingAddressSource !== 'matrix-listing-report-pdf'/);
+assert.match(handler, /const computedSha256 = crypto\.createHash\('sha256'\)\.update\(buffer\)\.digest\('hex'\)/,
+  'le bot doit recalculer lui-même le SHA-256 des octets avant tout aperçu');
+assert.match(handler, /reportedSha256 && reportedSha256 !== computedSha256/,
+  'une empreinte amont incohérente doit bloquer le workflow');
 assert.match(handler, /matrixClientEligibility\(approvedPreview\.client \|\| \{\}\)/);
 assert.match(handler, /État Gmail incertain/);
 assert.match(handler, /Gmail bloqué avant livraison/);

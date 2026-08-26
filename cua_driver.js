@@ -976,7 +976,7 @@ async function inspectMatrixListingPage(page, centrisNum) {
       const cleaned = clean(value || '');
       return cleaned.length >= 3 && cleaned.length <= 80 &&
         /^[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+(?:[ -][A-Za-zÀ-ÿ'’.-]+){0,6}$/.test(cleaned) &&
-        !/(?:centris|prix|en vigueur|vendu|courtier|chambre|pi[eè]ce|superficie|\$)/i.test(cleaned);
+        !/(?:centris|prix|en vigueur|vendu|courtier|chambre|pi[eè]ce|superficie|\$|r[ée]gion|secteur|maison|bungalow|plain-pied|[ée]tages?|duplex|triplex|condo|copropri[ée]t[ée]|r[ée]sidentiel|commercial|industriel|terrain|ferme|chalet|[àa]\s+vendre|[àa]\s+louer)/i.test(cleaned);
     };
     const addressNodes = [...document.querySelectorAll('h1,h2,h3,td,th,span,div,[class*="address" i],[class*="adresse" i]')];
     for (const element of addressNodes) {
@@ -2599,11 +2599,12 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
     const candidate = cleanLine(value).replace(/,+\s*$/, '');
     const match = candidate.match(addressLine);
     if (!match) return null;
-    const civicHadComma = new RegExp(`^${match[1]}\\s*,`).test(candidate);
     return {
       civic: match[1],
       streetName: cleanLine(match[2]),
-      street: `${match[1]}${civicHadComma ? ',' : ''} ${cleanLine(match[2])}`,
+      // Normaliser l'affichage client même si Matrix omet la virgule après
+      // le numéro civique dans certains formats de fiche.
+      street: `${match[1]}, ${cleanLine(match[2])}`,
       localityRaw: cleanLine(match[3] || ''),
     };
   };
@@ -2620,7 +2621,8 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
       .replace(/,?\s+[A-Z]\d[A-Z]\s*\d[A-Z]\d\s*$/i, '')
       .trim();
     if (candidate.length < 3 || candidate.length > 100) return '';
-    if (/(?:centris|prix|en vigueur|vendu|courtier|courtage|agence|bureau|chambre|pi[eè]ce|superficie|terrain|propri[ée]t[ée]|adresse|municipalit[ée]|province|code postal|fiche|document|caract[ée]ristique|taxe|t[ée]l[ée]phone|courriel|re\/max)/i.test(candidate)) return '';
+    if (/(?:centris|prix|en vigueur|vendu|courtier|courtage|agence|bureau|chambre|pi[eè]ce|superficie|terrain|propri[ée]t[ée]|adresse|municipalit[ée]|province|code postal|fiche|document|caract[ée]ristique|taxe|t[ée]l[ée]phone|courriel|re\/max|r[ée]gion|secteur|quartier|maison|bungalow|unifamiliale|[àa]\s+[ée]tages|d[ée]tach[ée]|jumel[ée]|plain-pied|duplex|triplex|quadruplex|condo|copropri[ée]t[ée]|r[ée]sidentiel|commercial|industriel|ferme|chalet|[àa]\s+vendre|[àa]\s+louer)/i.test(candidate)) return '';
+    if (/^(?:est|ouest|nord|sud)$/i.test(candidate)) return '';
     const parts = candidate.match(/^([^()]+?)(?:\s*\(([^()]+)\))?$/);
     if (!parts || !validateLocalityName(parts[1])) return '';
     if (parts[2] && !validateLocalityName(parts[2], true)) return '';
@@ -2638,7 +2640,6 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
   const base = parseAddress(fallbackStreet);
   const baseStreetTokens = streetTokens(base?.streetName || '');
   if (!base || !baseStreetTokens.length) return '';
-  const baseLocality = validateLocality(base.localityRaw);
   const matchesVerifiedStreet = (parsed) => {
     if (!parsed || parsed.civic !== base.civic) return false;
     const candidateTokens = streetTokens(parsed.streetName);
@@ -2655,23 +2656,37 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
   const candidates = [];
   const addCandidate = (parsed, localityValue, lineIndex, source) => {
     if (!matchesVerifiedStreet(parsed)) return;
+    const nearbyContext = lines.slice(Math.max(0, lineIndex - 5), lineIndex + 1).join(' ');
+    if (source !== 'flattened' && /(?:courtier|courtage|agence|bureau|re\/max|t[ée]l[ée]phone|courriel)/i.test(nearbyContext)) return;
     const municipality = validateLocality(localityValue);
     if (!municipality) return;
-    // Si Matrix avait déjà fourni une localité structurelle, le PDF peut y
-    // ajouter un quartier, mais il ne peut pas la remplacer par une autre ville.
-    if (baseLocality && localityCore(baseLocality) !== localityCore(municipality)) return;
     const distance = distanceFromExact(lineIndex);
     if (distance > 12) return;
     candidates.push({ municipality, distance, source });
   };
 
+  const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const streetPattern = base.streetName.split(/\s+/).map(escapeRegex).join('\\s+');
+  const verifiedAddressPrefix = new RegExp(
+    `^${escapeRegex(base.civic)}\\s*,?\\s+${streetPattern}(?:\\s*,\\s*|\\s+)(.{3,100})$`,
+    'i',
+  );
   for (let index = 0; index < lines.length; index += 1) {
+    // pdf-parse peut supprimer uniquement le séparateur entre la rue et la
+    // municipalité. Le préfixe civique+rue déjà vérifié borne alors le reste.
+    const verifiedTail = lines[index].match(verifiedAddressPrefix)?.[1] || '';
+    if (verifiedTail) addCandidate(base, verifiedTail, index, 'verified-prefix');
     const parsed = parseAddress(lines[index]);
     if (!matchesVerifiedStreet(parsed)) continue;
     if (parsed.localityRaw) addCandidate(parsed, parsed.localityRaw, index, 'same-line');
     for (let offset = 1; offset <= 3 && index + offset < lines.length; offset += 1) {
-      const municipality = validateLocality(lines[index + offset]);
+      let municipality = validateLocality(lines[index + offset]);
       if (!municipality) continue;
+      const districtLine = lines[index + offset + 1]?.match(/^\(([^()]{2,70})\)$/)?.[1] || '';
+      if (districtLine) {
+        const withDistrict = validateLocality(`${municipality} (${districtLine})`);
+        if (withDistrict) municipality = withDistrict;
+      }
       addCandidate(parsed, municipality, index, 'next-line');
       break;
     }
@@ -2679,10 +2694,8 @@ function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCe
 
   // Repli pour pdf-parse lorsque tous les retours de ligne ont été aplatis.
   // Il reste borné par « No Centris + numéro exact », et par la rue DOM séparée.
-  const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const streetPattern = base.streetName.split(/\s+/).map(escapeRegex).join('\\s+');
   const flatPattern = new RegExp(
-    `\\b${escapeRegex(base.civic)}\\s*,?\\s+${streetPattern}\\s*,\\s*(.{3,100}?)\\s+(?:No\\s+)?Centris\\D{0,12}${escapeRegex(exactNum)}(?:\\D|$)`,
+    `\\b${escapeRegex(base.civic)}\\s*,?\\s+${streetPattern}(?:\\s*,\\s*|\\s+)(.{3,100}?)\\s+(?:No\\s+)?Centris\\D{0,12}${escapeRegex(exactNum)}(?:\\D|$)`,
     'i',
   );
   const flatMunicipality = validateLocality(cleanLine(text).match(flatPattern)?.[1] || '');
