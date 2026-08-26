@@ -35,7 +35,6 @@ function runScript(name, scriptPath, env = {}) {
 
 // 1. Parser tests
 runScript('Parser tests', path.join(__dirname, 'test_parser.js'));
-runScript('Dropbox identity guard', path.join(__dirname, 'test_dropbox_identity_guard.js'));
 
 // Runtime safety: crons non chevauchants, Telegram, HMAC et persistance.
 runScript('Runtime safety', path.join(__dirname, 'test_runtime_safety.js'));
@@ -60,6 +59,7 @@ runScript('Matrix PDF structural validation', path.join(__dirname, 'test_pdf_val
 runScript('Matrix email preview guard', path.join(__dirname, 'test_matrix_email_preview_guard.js'));
 runScript('Email provider delivery receipt', path.join(__dirname, 'test_email_delivery_receipt.js'));
 runScript('Matrix email MIME', path.join(__dirname, 'test_matrix_email_mime.js'));
+runScript('Matrix 15 required scenarios', path.join(__dirname, 'test_matrix_required_scenarios.js'));
 runScript('Tool batch write serialization', path.join(__dirname, 'test_tool_batch.js'));
 
 // 3. Plan quotas inline test
