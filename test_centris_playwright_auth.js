@@ -42,9 +42,9 @@ assert(cuaSource.includes('MATRIX_RESUME_INVENTORY_CHANGED'), 'Un inventaire mod
 assert(cuaSource.includes('reopenVerifiedMatrixListing(page, exactNum, state.url)'), 'La phase fiche doit rouvrir directement le listing vérifié sans répéter la recherche globale');
 assert(cuaSource.includes('doc.action_id === MATRIX_LISTING_REPORT_ACTION ? 1'), 'La fiche doit être générée avec une seule tentative longue sous la limite Browserless');
 assert(cuaSource.includes('captureMatrixPrintPRequest('), 'La requête PrintP doit être capturée avant son envoi navigateur');
-assert(cuaSource.includes("session.send('Network.streamResourceContent', { requestId })"),
+assert(cuaSource.includes("session.send('Network.streamResourceContent', { requestId: state.requestId })"),
   'le flux PrintP original doit être lu directement sans seconde URL à usage unique');
-assert(cuaSource.includes("session.on('Network.dataReceived', dataHandler)"),
+assert(cuaSource.includes("session.on('Network.dataReceived', state.dataHandler)"),
   'les octets du flux PrintP natif doivent être consommés pendant leur arrivée');
 assert(cuaSource.includes("await route.abort('blockedbyclient')"),
   'le PrintP navigateur doit être annulé avant la lecture HTTP unique');

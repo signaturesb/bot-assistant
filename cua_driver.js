@@ -3386,16 +3386,15 @@ async function streamMatrixPdfUntilEof(rawUrl, cookieHeader, timeoutMs = 35000, 
 
 async function waitForMatrixPdfViaCdp(context, page, trigger, timeoutMs = 40000) {
   if (typeof context?.newCDPSession !== 'function') throw new Error('MATRIX_PRINT_CDP_UNSUPPORTED');
-  const session = await context.newCDPSession(page);
   let timer = null;
   let settled = false;
-  let requestId = null;
   let total = 0;
   const chunks = [];
   let tail = Buffer.alloc(0);
-  let responseHandler;
-  let dataHandler;
-  let finishedHandler;
+  const attachedPages = new Map();
+  const sessions = [];
+  const printRoutePattern = '**/Matrix/PrintP*';
+  let printRouteHandler = null;
   let finish;
   const result = new Promise((resolve, reject) => {
     finish = (error, buffer) => {
@@ -3425,40 +3424,67 @@ async function waitForMatrixPdfViaCdp(context, page, trigger, timeoutMs = 40000)
         finish(new Error('MATRIX_PRINT_CDP_INVALID_PDF'));
         return;
       }
-      void session.send('Page.stopLoading').catch(() => {});
+      for (const state of sessions) {
+        if (state.requestId) void state.session.send('Page.stopLoading').catch(() => {});
+      }
       finish(null, full.subarray(magic, eof + 5));
       return;
     }
     tail = scan.subarray(Math.max(0, scan.length - 8));
   };
 
-  responseHandler = async (event) => {
-    try {
-      const target = new URL(String(event?.response?.url || ''));
-      const mimeType = String(event?.response?.mimeType || '').toLowerCase();
-      if (!isTrustedMatrixPrintUrl(target) || !/^\/Matrix\/PrintP/i.test(target.pathname) ||
-          (!mimeType.includes('pdf') && mimeType !== 'application/octet-stream')) return;
-      requestId = event.requestId;
-      const streamed = await session.send('Network.streamResourceContent', { requestId });
-      consumeBase64(streamed?.bufferedData || '');
-    } catch (error) {
-      finish(error);
-    }
-  };
-  dataHandler = (event) => {
-    if (requestId && event?.requestId === requestId) consumeBase64(event.data || '');
-  };
-  finishedHandler = (event) => {
-    if (requestId && event?.requestId === requestId && !settled) {
-      finish(new Error('MATRIX_PRINT_CDP_EOF_MISSING'));
-    }
+  const attachPage = async (targetPage) => {
+    const selectedPage = targetPage || page;
+    if (attachedPages.has(selectedPage)) return attachedPages.get(selectedPage);
+    const attaching = (async () => {
+      const session = await context.newCDPSession(selectedPage);
+      const state = { session, requestId: null, responseHandler: null, dataHandler: null, finishedHandler: null };
+      state.responseHandler = async (event) => {
+        try {
+          const target = new URL(String(event?.response?.url || ''));
+          if (!isTrustedMatrixPrintUrl(target) || !/^\/Matrix\/PrintP/i.test(target.pathname)) return;
+          state.requestId = event.requestId;
+          const streamed = await session.send('Network.streamResourceContent', { requestId: state.requestId });
+          consumeBase64(streamed?.bufferedData || '');
+        } catch (error) {
+          finish(error);
+        }
+      };
+      state.dataHandler = (event) => {
+        if (state.requestId && event?.requestId === state.requestId) consumeBase64(event.data || '');
+      };
+      state.finishedHandler = (event) => {
+        if (state.requestId && event?.requestId === state.requestId && !settled) {
+          finish(new Error('MATRIX_PRINT_CDP_EOF_MISSING'));
+        }
+      };
+      await session.send('Network.enable');
+      session.on('Network.responseReceived', state.responseHandler);
+      session.on('Network.dataReceived', state.dataHandler);
+      session.on('Network.loadingFinished', state.finishedHandler);
+      sessions.push(state);
+      return state;
+    })();
+    attachedPages.set(selectedPage, attaching);
+    return attaching;
   };
 
   try {
-    await session.send('Network.enable');
-    session.on('Network.responseReceived', responseHandler);
-    session.on('Network.dataReceived', dataHandler);
-    session.on('Network.loadingFinished', finishedHandler);
+    await attachPage(page);
+    if (typeof context?.route === 'function' && typeof context?.unroute === 'function') {
+      printRouteHandler = async (route, request) => {
+        try {
+          let requestPage = page;
+          try { requestPage = request?.frame?.()?.page?.() || page; } catch {}
+          await attachPage(requestPage);
+          await route.continue();
+        } catch (error) {
+          try { await route.abort('failed'); } catch {}
+          finish(error);
+        }
+      };
+      await context.route(printRoutePattern, printRouteHandler);
+    }
     await trigger();
     return await result;
   } catch (error) {
@@ -3466,10 +3492,13 @@ async function waitForMatrixPdfViaCdp(context, page, trigger, timeoutMs = 40000)
     return await result;
   } finally {
     clearTimeout(timer);
-    try { session.off?.('Network.responseReceived', responseHandler); } catch {}
-    try { session.off?.('Network.dataReceived', dataHandler); } catch {}
-    try { session.off?.('Network.loadingFinished', finishedHandler); } catch {}
-    await session.detach?.().catch(() => {});
+    if (printRouteHandler) await context.unroute(printRoutePattern, printRouteHandler).catch(() => {});
+    for (const state of sessions) {
+      try { state.session.off?.('Network.responseReceived', state.responseHandler); } catch {}
+      try { state.session.off?.('Network.dataReceived', state.dataHandler); } catch {}
+      try { state.session.off?.('Network.loadingFinished', state.finishedHandler); } catch {}
+      await state.session.detach?.().catch(() => {});
+    }
   }
 }
 

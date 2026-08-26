@@ -343,6 +343,70 @@ const context = {
   assert.strictEqual(cdpStopped, true);
   assert.strictEqual(cdpDetached, true);
 
+  const cdpOpenerPage = { name: 'print-options' };
+  const cdpPopupPage = { name: 'print-popup' };
+  const cdpOpenerSession = new EventEmitter();
+  const cdpPopupSession = new EventEmitter();
+  let popupPrintRoute = null;
+  let popupPrintRouteRemoved = false;
+  let popupCdpUsed = false;
+  for (const session of [cdpOpenerSession, cdpPopupSession]) {
+    session.detach = async () => {};
+  }
+  cdpOpenerSession.send = async (method) => {
+    if (method === 'Network.enable') return {};
+    throw new Error(`commande CDP opener inattendue: ${method}`);
+  };
+  cdpPopupSession.send = async (method, params) => {
+    if (method === 'Network.enable') return {};
+    if (method === 'Network.streamResourceContent') {
+      popupCdpUsed = true;
+      assert.strictEqual(params.requestId, 'popup-print-request');
+      return { bufferedData: nativeAlbumPdf.toString('base64') };
+    }
+    if (method === 'Page.stopLoading') return {};
+    throw new Error(`commande CDP popup inattendue: ${method}`);
+  };
+  const cdpPopupContext = {
+    async newCDPSession(targetPage) {
+      return targetPage === cdpPopupPage ? cdpPopupSession : cdpOpenerSession;
+    },
+    async route(pattern, handler) {
+      assert.strictEqual(pattern, '**/Matrix/PrintP*');
+      popupPrintRoute = handler;
+    },
+    async unroute(pattern, handler) {
+      assert.strictEqual(pattern, '**/Matrix/PrintP*');
+      assert.strictEqual(handler, popupPrintRoute);
+      popupPrintRouteRemoved = true;
+    },
+  };
+  assert.deepStrictEqual(
+    await cua._waitForMatrixPdfViaCdp(
+      cdpPopupContext,
+      cdpOpenerPage,
+      async () => popupPrintRoute({
+        async continue() {
+          cdpPopupSession.emit('Network.responseReceived', {
+            requestId: 'popup-print-request',
+            response: {
+              url: 'https://matrix.centris.ca/Matrix/PrintP?id=popup-album',
+              mimeType: 'text/html',
+            },
+          });
+        },
+        async abort() { throw new Error('la requête PrintP ne doit pas être annulée'); },
+      }, {
+        frame: () => ({ page: () => cdpPopupPage }),
+      }),
+      1000,
+    ),
+    nativeAlbumPdf,
+    'le PrintP ouvert dans un popup doit être suspendu, branché au CDP du popup puis continué une seule fois',
+  );
+  assert.strictEqual(popupCdpUsed, true);
+  assert.strictEqual(popupPrintRouteRemoved, true);
+
   const originalFetch = global.fetch;
   let replayedRequest = null;
   global.fetch = async (url, options) => {
