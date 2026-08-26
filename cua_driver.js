@@ -963,7 +963,14 @@ async function inspectMatrixListingPage(page, centrisNum) {
       `\\b\\d{1,6}\\s*,?\\s+${streetPrefix}\\b.{3,140}?(?=\\s+(?:No\\s+Centris|Centris|Prix|[0-9][0-9\\s]*\\s*\\$|En vigueur|Vendu|$))`,
       'i'
     ))?.[0] || null;
-    const address = addressElement || addressFallback;
+    // Le premier élément court contient parfois seulement la rue, alors que
+    // le texte de la fiche contient aussi la municipalité avant « No Centris ».
+    // Préférer ce libellé complet lorsqu'il reste borné et commence par la même
+    // adresse; conserver l'élément court comme repli sûr.
+    const completeFallback = addressFallback && addressStart.test(clean(addressFallback)) && clean(addressFallback).length <= 180
+      ? clean(addressFallback)
+      : null;
+    const address = completeFallback || addressElement;
     const detailEvidence = Boolean(
       additionalHeading || principalMatch ||
       /[ée]valuation\s*\(municipale\)|taxes\s*\(annuelles\)|vente avec garantie l[ée]gale|superficie du terrain|certificat de localisation/i.test(bodyText)
