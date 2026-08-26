@@ -6,6 +6,7 @@ const {
   isExplicitEmailConfirmation,
   createOneShotAuthorization,
   consumeOneShotAuthorization,
+  selectFirstEmailConfirmation,
 } = require('./lib/email_send_guard');
 
 assert.strictEqual(isExplicitEmailConfirmation('envoie'), true);
@@ -52,6 +53,33 @@ assert.throws(
   () => createOneShotAuthorization({ message: 'ok', ...base }),
   e => e && e.code === 'EMAIL_SEND_CONFIRM_REQUIRED'
 );
+
+const oldDraft = { to: 'info@bestmontrealmortgage.ca' };
+const matrixPreview = {
+  name: 'telecharger_annexes_centris',
+  input: { email_destination: 'shawn@signaturesb.com' },
+  telegramPreviewMessageId: 9001,
+};
+assert.deepStrictEqual(
+  selectFirstEmailConfirmation({ pending: oldDraft, external: matrixPreview, repliedMessageId: 0 }),
+  { ok: false, reason: 'ambiguous' },
+  'un ancien brouillon et Matrix ne doivent jamais choisir le premier Map implicitement',
+);
+assert.strictEqual(
+  selectFirstEmailConfirmation({ pending: oldDraft, external: matrixPreview, repliedMessageId: 9001 }).action,
+  matrixPreview,
+  'une réponse liée au message Matrix exact doit sélectionner uniquement Matrix',
+);
+assert.deepStrictEqual(
+  selectFirstEmailConfirmation({ external: matrixPreview, repliedMessageId: 1234 }),
+  { ok: false, reason: 'matrix-reply-required' },
+  'répondre au mauvais aperçu Matrix doit faire zéro sélection',
+);
+assert.deepStrictEqual(
+  selectFirstEmailConfirmation({}),
+  { ok: false, reason: 'none' },
+  'un mot envoie sans transaction ne doit jamais ressusciter l’historique',
+);
 assert.throws(
   () => createOneShotAuthorization({ message: 'envoie', ...base, ttlMs: 60 * 60 * 1000 }),
   e => e && e.code === 'EMAIL_SEND_TTL_INVALID'
@@ -78,7 +106,9 @@ assert.match(
   'document send path must create and pass a content-bound authorization'
 );
 assert.ok(botCode.includes('pendingExternalEmailActions'), 'external provider actions need a two-step pending confirmation');
-assert.ok(botCode.includes('if (external.inFlight)'), 'external email confirmation must suppress concurrent duplicate attempts');
+assert.ok(botCode.includes('if (action.inFlight)'), 'email confirmation must suppress concurrent duplicate attempts');
+assert.ok(botCode.includes("action.confirmationStage = 'awaiting-final'"), 'email send must require a second confirmation stage');
+assert.ok(botCode.includes('finalConfirmationMessageId'), 'second confirmation must bind to the exact Telegram prompt');
 assert.ok(botCode.includes('PENDING_EMAILS_FILE'), 'pending drafts must survive a Render restart');
 assert.ok(botCode.includes('queuePendingEmailDraft'), 'automatic drafts must use a non-overwriting queue');
 assert.ok(botCode.includes('deliveryUncertain'), 'provider uncertainty must block duplicate retries');
