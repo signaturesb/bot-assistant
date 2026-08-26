@@ -49,7 +49,9 @@ scenario('Correspondance Dropbox approximative ne remplace pas Matrix exact', ()
 scenario('Mauvais document ou mauvaise propriété détecté', () => {
   assert.match(bot, /returnedCentris !== String\(num\)/);
   assert.match(cua, /MATRIX_PRINT_LISTING_MISMATCH/);
-  assert.match(cua, /const address = completeFallback \|\| addressElement/);
+  assert.match(cua, /extractCompleteMatrixAddressFromText/);
+  assert.match(bot, /listingAddressComplete/);
+  assert.match(bot, /listingAddressSource !== 'matrix-listing-report-pdf'/);
 });
 scenario('Document manquant, corrompu ou incomplet bloqué', () => {
   assert.match(cua, /MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH/);
@@ -59,6 +61,7 @@ scenario('Document manquant, corrompu ou incomplet bloqué', () => {
 scenario('Double clic et commandes concurrentes bloqués', () => {
   assert.match(bot, /if \(action\.inFlight\)/);
   assert.match(bot, /pendingExternalEmailActions\.has\(chatId\)/);
+  assert.match(bot, /EMAIL_DUPLICATE_FINGERPRINT_BLOCKED/);
 });
 scenario('Confirmation Telegram one-shot non réutilisable', () => {
   const payload = { via: 'gmail', to: 'client@example.com', cc: ['shawn@signaturesb.com'], subject: 'X', body: 'Y', attachments: [] };
