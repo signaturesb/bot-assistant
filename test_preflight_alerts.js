@@ -2,7 +2,14 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
 const { evaluateSmsHmacSelfTest, evaluateActiveTemplate } = require('./lib/preflight_checks');
+
+const botSource = fs.readFileSync('./bot.js', 'utf8');
+assert.match(botSource, /pendingLeads\.filter\(l => l\.needsName && Number\(l\.ts \|\| 0\) >= bootStartTs\)/,
+  'le détecteur ne doit pas confondre le backlog restauré avec une panne apparue au démarrage');
+assert.doesNotMatch(botSource, /leads sans nom valide — parser AI peut-être cassé/,
+  'le bot ne doit pas diagnostiquer un parseur cassé à partir du seul nombre historique de leads en attente');
 
 const hmac = evaluateSmsHmacSelfTest('test-secret');
 assert.strictEqual(hmac.ok, true);

@@ -7799,12 +7799,17 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   // Ne pas renvoyer les mêmes pièces lors de la confirmation finale.
   if (!isSendConfirmation && ALLOWED_ID && chatId) {
     const telegramDeliveryFailures = [];
-    for (const doc of documents) {
+    await send(
+      chatId,
+      `✅ ${documents.length} PDF(s) Matrix #${num} validés. Remise des pièces et préparation de l’aperçu en cours — aucun courriel envoyé.`,
+    );
+    for (const [index, doc] of documents.entries()) {
       try {
         const telegramReceipt = await bot.sendDocument(chatId, doc.buffer, {
           caption: `📎 ${doc.label}\nCentris #${num} · ${Math.round(doc.size / 1024)} KB${doc.page_count ? ` · ${doc.page_count} page(s)` : ''}`,
         }, { filename: doc.filename, contentType: 'application/pdf' });
         if (!telegramReceipt?.message_id) throw new Error('accusé Telegram sans message_id');
+        log('OK', 'CENTRIS-MATRIX-PREVIEW', `PDF Telegram ${index + 1}/${documents.length} confirmé pour #${num}`);
       } catch (error) {
         telegramDeliveryFailures.push({ filename: doc.filename, error: String(error?.message || error) });
         log('WARN', 'CENTRIS-MATRIX-ANNEXES', `Telegram: ${error.message}`);
@@ -8075,6 +8080,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       pendingMatrixPreview.telegramPreviewMessageId = summaryReceipt.message_id;
       pendingMatrixPreview.telegramHtmlPreviewMessageId = htmlPreviewMessageId;
       if (!savePendingEmailState()) throw new Error('transaction impossible à repersister après reçu Telegram');
+      log('OK', 'CENTRIS-MATRIX-PREVIEW', `Aperçu ${requestId} armé pour #${num} avec ${documents.length} PDF(s)`);
     } catch (error) {
       captureMatrixWorkflowError(error, {
         stage: 'telegram-preview', errorCode: 'MATRIX_SUMMARY_DELIVERY_FAILED',
@@ -9523,11 +9529,22 @@ async function detectAnomalies() {
     });
   }
 
-  // 2c. Pendings qui s'accumulent (>5 pendingDocSends OU >3 pendingLeads needsName)
+  // 2c. Pendings qui s'accumulent (>5 pendingDocSends OU >3 NOUVEAUX
+  // pendingLeads needsName). Les entrées restaurées du disque au redémarrage
+  // sont un backlog visible dans /pending, pas une preuve que le parseur vient
+  // de casser. Ne jamais transformer ce backlog historique en fausse anomalie
+  // au milieu d'une opération Matrix.
   const pendingDocsCount = typeof pendingDocSends !== 'undefined' ? pendingDocSends.size : 0;
-  const pendingNamesCount = typeof pendingLeads !== 'undefined' ? pendingLeads.filter(l => l.needsName).length : 0;
+  const pendingNamesSinceBoot = typeof pendingLeads !== 'undefined'
+    ? pendingLeads.filter(l => l.needsName && Number(l.ts || 0) >= bootStartTs)
+    : [];
+  const pendingNamesCount = pendingNamesSinceBoot.length;
   if (pendingDocsCount > 5) anomalies.push({ key: 'pending_docs_pileup', msg: `${pendingDocsCount} pending doc-sends accumulés — auto-send bloqué?`, severity: 'medium' });
-  if (pendingNamesCount > 3) anomalies.push({ key: 'pending_names_pileup', msg: `${pendingNamesCount} leads sans nom valide — parser AI peut-être cassé`, severity: 'medium' });
+  if (pendingNamesCount > 3) anomalies.push({
+    key: 'pending_names_pileup',
+    msg: `${pendingNamesCount} nouveaux leads reçus depuis ce démarrage attendent un nom — vérifier /pending`,
+    severity: 'medium',
+  });
 
   // 2d. Retry counter dangereusement haut (lead coincé en boucle)
   const highRetries = Object.entries(leadRetryState || {}).filter(([,v]) => v.count >= 3).length;
@@ -12821,7 +12838,7 @@ function registerHandlers() {
     const stopTyping = startTypingIndicator(chatId, 6 * 60 * 1000);
     await bot.sendMessage(
       chatId,
-      `🔎 Matrix #${num}: récupération et validation des PDF pour l’aperçu ${emailDestination}.\n🔒 Aucun courriel ne sera envoyé par cette commande.`,
+      `🔎 Matrix #${num}: récupération et validation des PDF pour l’aperçu ${emailDestination}.\n⏳ Prévoir généralement 1 à 3 minutes selon le nombre de pièces.\n🔒 Aucun courriel ne sera envoyé par cette commande.`,
     );
     try {
       const result = await executeMatrixAnnexesTool({
@@ -13860,7 +13877,7 @@ function registerHandlers() {
         return;
       }
       const stopMatrixTyping = startTypingIndicator(chatId, 6 * 60 * 1000);
-      await send(chatId, `🔎 Matrix #${num}: récupération et validation des PDF pour l’aperçu ${emailDestination}.\n🔒 Aucun courriel ne sera envoyé par cette demande.`);
+      await send(chatId, `🔎 Matrix #${num}: récupération et validation des PDF pour l’aperçu ${emailDestination}.\n⏳ Prévoir généralement 1 à 3 minutes selon le nombre de pièces.\n🔒 Aucun courriel ne sera envoyé par cette demande.`);
       try {
         const result = await executeMatrixAnnexesTool({
           num,
@@ -14861,14 +14878,15 @@ function startDailyTasks() {
   // CENTRIS SESSION MAINTENANCE — vérification réelle dans Matrix toutes les
   // 6 h. Réutilise CENTRIS_USER/PASS de Render et le MFA Gmail/TOTP/bridge.
   // Le délai au boot évite la pointe de redéploiement; un verrou et un cooldown
-  // empêchent les connexions concurrentes et les boucles de MFA.
+  // empêchent les connexions concurrentes et les boucles de MFA. Le smoke test
+  // PDF complet n'est JAMAIS lancé automatiquement au boot: il monopolisait
+  // Matrix au moment exact où Shawn lançait son premier test après un deploy.
+  // Le boot ne fait qu'une vérification légère de session. Le test PDF complet
+  // reste une vérification de release déclenchée volontairement, hors demande
+  // client, afin qu'une action Telegram humaine garde toujours la priorité.
   if (centrisAutomationConfigured()) {
     setTimeout(async () => {
-      // Le smoke vérifie et renouvelle lui-même la session. Ne jamais lancer
-      // d'abord maintainCentrisSession(): Matrix interprète les deux
-      // navigateurs successifs comme des connexions concurrentes.
-      if (process.env.CENTRIS_SMOKE_TEST_LISTING) await runCentrisReadOnlySmokeTest('boot-delayed');
-      else await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
+      await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
     }, 60 * 1000);
     safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 6 * 60 * 60 * 1000, { timeoutMs: 120000 });
     log('OK', 'CENTRIS', 'Maintenance de session automatique activée (boot + 6 h)');

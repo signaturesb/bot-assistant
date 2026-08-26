@@ -34,7 +34,8 @@ assert(!botSource.includes('bot.onText(/\\/centris/'), 'Un handler /centris trop
 assert(botSource.includes('bot.onText(/^\\/centris(?:@\\w+)?\\s*$/i'), 'La commande /centris doit être strictement délimitée');
 assert(botSource.includes("safeCron('centris-session-maintenance'"), 'La session Centris doit être entretenue automatiquement');
 assert(botSource.includes("maintainCentrisSession('boot-delayed')"), 'Le boot doit programmer un renouvellement différé');
-assert(botSource.includes("if (process.env.CENTRIS_SMOKE_TEST_LISTING) await runCentrisReadOnlySmokeTest('boot-delayed')"), 'Le smoke boot doit remplacer le renouvellement préalable pour éviter MultipleLoginBreach');
+assert(!botSource.includes("runCentrisReadOnlySmokeTest('boot-delayed')"), 'Le smoke PDF complet ne doit jamais monopoliser Matrix automatiquement au boot');
+assert(botSource.includes("await maintainCentrisSession('boot-delayed')"), 'Le boot doit seulement vérifier la session Matrix');
 assert(botSource.includes('deux connexions Browserless strictement séquentielles'), 'Le smoke peut fractionner Browserless sans ouvrir deux navigateurs Matrix à la fois');
 assert(cuaSource.includes('await context.close();\n      context = null;\n      await browser.close();\n      browser = null;\n\n      browser = await launchBrowser();'), 'La phase A doit être fermée avant le lancement Browserless B');
 assert(cuaSource.includes('resumeVerifiedCentrisSession(context)'), 'La phase B doit reprendre strictement la session, sans nouveau login/MFA');

@@ -66,6 +66,12 @@ assert.match(handler, /matrixClientEligibility\(approvedPreview\.client \|\| \{\
 assert.match(handler, /État Gmail incertain/);
 assert.match(handler, /Gmail bloqué avant livraison/);
 assert.match(handler, /if \(!isSendConfirmation && ALLOWED_ID && chatId\)/);
+assert.match(handler, /PDF\(s\) Matrix #\$\{num\} validés\. Remise des pièces et préparation de l’aperçu en cours/,
+  'une opération Matrix longue doit rendre sa progression visible sans annoncer un faux succès courriel');
+assert.match(handler, /PDF Telegram \$\{index \+ 1\}\/\$\{documents\.length\} confirmé/,
+  'chaque remise Telegram doit produire une preuve de progression exploitable');
+assert.match(handler, /Aperçu \$\{requestId\} armé pour #\$\{num\}/,
+  'le journal doit distinguer clairement la création de l’aperçu de l’envoi Gmail');
 assert.match(handler, /String\(chatId\) !== String\(ALLOWED_ID\)/,
   'Matrix doit être inaccessible depuis tout autre chat Telegram');
 assert.match(handler, /Confirmation refusée:.*PDF ont changé/s);
