@@ -21,6 +21,7 @@ const {
   verifyEmailProviderReceipt,
   verifyGmailSentMetadata,
 } = require('./lib/email_delivery_receipt');
+const { evaluateConnectionResults } = require('./lib/connection_monitor');
 const {
   safeRemoveRequest: removeMatrixArtifactCache,
   writeMatrixArtifactCache,
@@ -14897,6 +14898,7 @@ const centrisMaintenanceState = {
   lastSuccessAt: 0,
   consecutiveFailures: 0,
   lastAlertAt: 0,
+  retryTimer: null,
 };
 
 function centrisAutomationConfigured() {
@@ -14904,6 +14906,15 @@ function centrisAutomationConfigured() {
   return process.env.CENTRIS_AUTO_LOGIN !== 'false' &&
     sessionKey.length >= 32 &&
     Boolean(process.env.CENTRIS_USER && process.env.CENTRIS_PASS && process.env.BROWSERLESS_WS);
+}
+
+function scheduleCentrisMaintenanceRetry() {
+  if (centrisMaintenanceState.retryTimer) return;
+  centrisMaintenanceState.retryTimer = setTimeout(async () => {
+    centrisMaintenanceState.retryTimer = null;
+    await maintainCentrisSession('retry-30min').catch(() => ({ ok: false }));
+  }, 30 * 60 * 1000);
+  centrisMaintenanceState.retryTimer.unref?.();
 }
 
 async function maintainCentrisSession(reason = 'periodic') {
@@ -14924,6 +14935,10 @@ async function maintainCentrisSession(reason = 'periodic') {
     if (!result.ok) throw new Error(result.error || 'renouvellement Centris refusé');
     centrisMaintenanceState.lastSuccessAt = Date.now();
     centrisMaintenanceState.consecutiveFailures = 0;
+    if (centrisMaintenanceState.retryTimer) {
+      clearTimeout(centrisMaintenanceState.retryTimer);
+      centrisMaintenanceState.retryTimer = null;
+    }
     log('OK', 'CENTRIS', `Session vérifiée/renouvelée automatiquement (${reason})`);
     return { ok: true, expiresAt: result.expiresAt };
   } catch (e) {
@@ -14941,6 +14956,7 @@ async function maintainCentrisSession(reason = 'periodic') {
         { category: 'centris-auto-renewal', failures: centrisMaintenanceState.consecutiveFailures }
       ).catch(() => {});
     }
+    scheduleCentrisMaintenanceRetry();
     return { ok: false, error };
   } finally {
     centrisMaintenanceState.running = false;
@@ -15000,6 +15016,160 @@ async function runCentrisReadOnlySmokeTest(reason = 'manual') {
   }
 }
 
+// ─── SURVEILLANCE 24/7 DES CONNEXIONS STRUCTURELLES ────────────────────────
+// Sondes strictement en lecture seule; aucun courriel client et aucun scrape
+// PDF. Trois échecs consécutifs sont requis avant une alerte afin d'absorber
+// les micro-coupures. L'état vit sur le disque persistant Render.
+const STRUCTURE_CONNECTION_FILE = path.join(DATA_DIR, 'structure_connections.json');
+let structureConnectionState = loadJSON(STRUCTURE_CONNECTION_FILE, {
+  lastRunAt: null,
+  allCriticalOk: false,
+  checks: {},
+});
+
+function recentDeepHealth(name, maxAgeMs = 90 * 60 * 1000) {
+  const checkedAt = Date.parse(healthState.lastRun || '');
+  const check = healthState.checks?.[name];
+  if (!Number.isFinite(checkedAt) || Date.now() - checkedAt > maxAgeMs || !check) return null;
+  return check.ok === true;
+}
+
+async function runStructureConnectionCheck(reason = 'periodic') {
+  const results = {};
+
+  try {
+    const probePath = path.join(DATA_DIR, '.structure_connection_probe');
+    fs.writeFileSync(probePath, 'ok', { mode: 0o600 });
+    const readBack = fs.readFileSync(probePath, 'utf8');
+    fs.unlinkSync(probePath);
+    const stat = typeof fs.statfsSync === 'function' ? fs.statfsSync(DATA_DIR) : null;
+    const freeBytes = stat ? Number(stat.bavail) * Number(stat.bsize) : null;
+    const enoughSpace = freeBytes === null || freeBytes >= 64 * 1024 * 1024;
+    results.storage = {
+      ok: readBack === 'ok' && enoughSpace,
+      critical: true,
+      detail: enoughSpace ? `disque persistant OK${freeBytes === null ? '' : ` · ${Math.round(freeBytes / 1048576)} MB libres`}` : 'moins de 64 MB libres',
+    };
+  } catch (error) {
+    results.storage = { ok: false, critical: true, detail: `disque non inscriptible: ${error.message}` };
+  }
+
+  // Identité Telegram et webhook exact, sans envoyer de message test.
+  try {
+    const [meResponse, webhookResponse] = await Promise.all([
+      fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`, { signal: AbortSignal.timeout(8000) }),
+      fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo`, { signal: AbortSignal.timeout(8000) }),
+    ]);
+    const [me, webhook] = await Promise.all([meResponse.json(), webhookResponse.json()]);
+    const expectedWebhook = 'https://signaturesb-bot-s272.onrender.com/webhook/telegram';
+    const actualWebhook = String(webhook?.result?.url || '');
+    const pending = Number(webhook?.result?.pending_update_count || 0);
+    const ok = meResponse.ok && me?.ok === true && webhookResponse.ok && webhook?.ok === true &&
+      actualWebhook === expectedWebhook && pending <= 20;
+    results.telegram = {
+      ok,
+      critical: true,
+      detail: ok ? `getMe + webhook OK · ${pending} en attente` : `webhook=${actualWebhook ? 'inattendu' : 'absent'} · pending=${pending}`,
+    };
+  } catch (error) {
+    results.telegram = { ok: false, critical: true, detail: `API indisponible: ${error.message}` };
+  }
+
+  // Profil Gmail en lecture seule: valide le refresh token et l'API sans envoi.
+  try {
+    const profile = await gmailAPI('/profile');
+    results.gmail = {
+      ok: Boolean(profile?.emailAddress),
+      critical: true,
+      detail: profile?.emailAddress ? 'token + profil Gmail OK' : 'profil Gmail absent',
+    };
+  } catch (error) {
+    results.gmail = { ok: false, critical: true, detail: `Gmail: ${error.message}` };
+  }
+
+  // La preuve Matrix réelle vient de la maintenance Browserless aux 6 h, avec
+  // retries aux 30 min en cas de panne. Cette sonde n'ouvre pas un navigateur.
+  const centrisConfigured = centrisAutomationConfigured();
+  const sessionUsable = Boolean(centrisSession.authenticated && centrisSession.cookies && Date.now() < centrisSession.expiry);
+  const proofAge = centrisMaintenanceState.lastSuccessAt ? Date.now() - centrisMaintenanceState.lastSuccessAt : null;
+  const inWarmup = Date.now() - bootStartTs < 20 * 60 * 1000;
+  const proofFresh = proofAge !== null && proofAge <= 8 * 60 * 60 * 1000;
+  const centrisOk = centrisConfigured && sessionUsable &&
+    centrisMaintenanceState.consecutiveFailures < 3 && (proofFresh || (inWarmup && proofAge === null));
+  results.matrix = {
+    ok: centrisOk,
+    critical: true,
+    detail: !centrisConfigured ? 'configuration Centris/Browserless incomplète'
+      : !sessionUsable ? 'session Centris absente ou expirée'
+        : centrisMaintenanceState.consecutiveFailures >= 3 ? `${centrisMaintenanceState.consecutiveFailures} validations réseau échouées`
+          : proofFresh ? `session Matrix vérifiée il y a ${Math.round(proofAge / 60000)} min`
+            : inWarmup ? 'validation Matrix de démarrage en cours'
+              : 'preuve Matrix plus vieille que 8 h',
+  };
+
+  try {
+    const template = await loadMasterTemplate();
+    const validation = template ? (_masterTplCache.validation || validateMasterEmailTemplate(template)) : null;
+    results.template = {
+      ok: Boolean(validation?.ok),
+      critical: true,
+      detail: validation?.ok ? `modèle officiel OK · ${Math.round(validation.bytes / 1024)} KB` : 'modèle officiel indisponible ou invalide',
+    };
+  } catch (error) {
+    results.template = { ok: false, critical: true, detail: `modèle: ${error.message}` };
+  }
+
+  // Réutilise les tests profonds horaires pour ne pas multiplier les appels.
+  const modelHealth = recentDeepHealth('anthropic');
+  results.model = {
+    ok: Boolean(process.env.ANTHROPIC_API_KEY) && modelHealth !== false && (modelHealth !== null || inWarmup),
+    critical: true,
+    detail: modelHealth === true ? 'test profond récent OK' : modelHealth === false ? 'dernier test profond échoué' : 'test profond de démarrage en cours',
+  };
+  const pipedriveHealth = recentDeepHealth('pipedrive');
+  results.pipedrive = {
+    ok: pipedriveHealth !== false && (pipedriveHealth !== null || inWarmup),
+    critical: false,
+    detail: pipedriveHealth === true ? 'test profond récent OK' : pipedriveHealth === false ? 'dernier test profond échoué' : 'test profond en attente',
+  };
+  results.observability = {
+    ok: MATRIX_OBSERVABILITY.enabled === true,
+    critical: false,
+    detail: MATRIX_OBSERVABILITY.enabled ? 'Sentry actif' : `Sentry inactif: ${MATRIX_OBSERVABILITY.reason || 'inconnu'}`,
+  };
+
+  const evaluated = evaluateConnectionResults(structureConnectionState, results, {
+    threshold: 3,
+    cooldownMs: 6 * 60 * 60 * 1000,
+  });
+  structureConnectionState = {
+    ...evaluated.state,
+    lastRunISO: new Date(evaluated.state.lastRunAt).toISOString(),
+    reason,
+  };
+  safeWriteJSON(STRUCTURE_CONNECTION_FILE, structureConnectionState);
+
+  if (evaluated.alerts.length) {
+    const details = evaluated.alerts.map(item => `🔴 ${item.name}: ${item.detail} (${item.consecutiveFailures} échecs)`).join('\n');
+    await sendTelegramWithFallback(
+      `🚨 *Connexions de la structure dégradées*\n\n${details}\n\nLe bot continue de surveiller toutes les 10 minutes. Aucun courriel client ni aucune relance automatique.`,
+      { category: 'structure-health-critical', failures: evaluated.alerts.map(item => item.name) },
+    );
+    auditLogEvent('health', 'structure-connections-alert', { failures: evaluated.alerts.map(item => item.name) });
+  }
+  if (evaluated.recoveries.length) {
+    const recovered = evaluated.recoveries.map(item => `✅ ${item.name}`).join('\n');
+    await sendTelegramWithFallback(
+      `✅ *Connexions rétablies*\n\n${recovered}\n\nLa surveillance 24/7 demeure active.`,
+      { category: 'structure-health-recovered', recovered: evaluated.recoveries.map(item => item.name) },
+    );
+    auditLogEvent('health', 'structure-connections-recovered', { recovered: evaluated.recoveries.map(item => item.name) });
+  }
+  log(structureConnectionState.allCriticalOk ? 'OK' : 'WARN', 'CONNECTIONS',
+    `${structureConnectionState.allCriticalOk ? 'structure OK' : 'structure dégradée'} · ${Object.entries(structureConnectionState.checks).map(([name, check]) => `${name}=${check.ok ? '✅' : '❌'}`).join(' ')}`);
+  return structureConnectionState;
+}
+
 function startDailyTasks() {
   // KEEP-ALIVE — self-ping /health toutes les 10 min pour empêcher Render de
   // mettre le service en veille (spin-down après inactivité sur certains plans).
@@ -15028,6 +15198,11 @@ function startDailyTasks() {
   } else if (process.env.CENTRIS_USER && process.env.CENTRIS_PASS) {
     log('WARN', 'CENTRIS', 'Auto-session inactive: BROWSERLESS_WS/CENTRIS_SESSION_KEY absent ou CENTRIS_AUTO_LOGIN=false');
   }
+
+  // Surveillance permanente, légère et non chevauchante. Le premier passage
+  // attend la validation Matrix de démarrage pour éviter une fausse alerte.
+  setTimeout(() => runStructureConnectionCheck('boot-delayed').catch(error => log('WARN', 'CONNECTIONS', error.message)), 2 * 60 * 1000);
+  safeCron('structure-connections', () => runStructureConnectionCheck('periodic'), 10 * 60 * 1000, { timeoutMs: 90000 });
 
   // LEAD AGING ESCALATION — ping si pending >4h (max 1×/jour par lead)
   // Évite qu'un pending reste silencieusement oublié si Shawn n'a pas vu la notif.
@@ -15683,8 +15858,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === 'GET' && url === '/readyz') {
-    // Ready si Anthropic + Brevo + Pipedrive keys présents
-    const ready = !!(process.env.ANTHROPIC_API_KEY && process.env.BREVO_API_KEY && process.env.PIPEDRIVE_API_KEY);
+    // Ready si la configuration existe et si le dernier contrôle structurel
+    // récent n'a pas confirmé une panne critique.
+    const configured = !!(process.env.ANTHROPIC_API_KEY && process.env.GMAIL_CLIENT_ID &&
+      process.env.CENTRIS_USER && process.env.BROWSERLESS_WS && BOT_TOKEN);
+    const monitorFresh = Number(structureConnectionState.lastRunAt || 0) > 0 &&
+      Date.now() - Number(structureConnectionState.lastRunAt) < 20 * 60 * 1000;
+    const ready = configured && (!monitorFresh || structureConnectionState.allCriticalOk === true);
     res.writeHead(ready ? 200 : 503, { 'Content-Type': 'text/plain' });
     res.end(ready ? 'READY' : 'NOT_READY');
     return;
@@ -15695,8 +15875,10 @@ const server = http.createServer(async (req, res) => {
     const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
     const commit = (process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown').substring(0, 7);
     const branch = process.env.RENDER_GIT_BRANCH || 'unknown';
+    const connectionFresh = Number(structureConnectionState.lastRunAt || 0) > 0 &&
+      Date.now() - Number(structureConnectionState.lastRunAt) < 20 * 60 * 1000;
     const health = {
-      status: 'ok',
+      status: connectionFresh && !structureConnectionState.allCriticalOk ? 'degraded' : 'ok',
       timestamp: new Date().toISOString(),
       uptime_sec: uptimeS,
       uptime_human: `${Math.floor(uptimeS/3600)}h ${Math.floor((uptimeS%3600)/60)}m`,
@@ -15738,6 +15920,7 @@ const server = http.createServer(async (req, res) => {
         by_model:        Object.fromEntries(Object.entries(costTracker.byModel).map(([k,v])=>[k, Number(v.toFixed(2))])),
       },
       webhook_health: global.__webhookHealth || { status: 'not_initialized' },
+      connection_health: structureConnectionState,
       health_score: computeHealthScore(),
     };
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -19212,7 +19395,7 @@ async function sendTelegramWithFallback(msg, ctx = {}) {
   }
   // 4. SMS Brevo — dernière chance (niveau "le téléphone vibre c'est urgent")
   // N'activé que pour catégories critiques pour éviter spam SMS (coût + nuisance)
-  const smsCategories = /lead-notif|lead-abandoned|P1-pending|P2-docs-failed|preflight|cost-monthly/i;
+  const smsCategories = /lead-notif|lead-abandoned|P1-pending|P2-docs-failed|preflight|cost-monthly|structure-health-critical/i;
   if (process.env.ENABLE_BREVO_SYSTEM_SMS === 'true' && BREVO_KEY && AGENT?.telephone && smsCategories.test(ctx.category || '')) {
     try {
           const phone = AGENT.telephone.replace(/\D/g, '');

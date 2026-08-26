@@ -38,6 +38,7 @@ runScript('Parser tests', path.join(__dirname, 'test_parser.js'));
 
 // Runtime safety: crons non chevauchants, Telegram, HMAC et persistance.
 runScript('Runtime safety', path.join(__dirname, 'test_runtime_safety.js'));
+runScript('Connection monitoring', path.join(__dirname, 'test_connection_monitor.js'));
 
 // Preflight: ne pas confondre route campagne 410/HMAC SMS ni backup/template actif.
 runScript('Preflight alerts', path.join(__dirname, 'test_preflight_alerts.js'));

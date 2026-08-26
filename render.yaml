@@ -6,7 +6,7 @@ services:
     region: oregon
     buildCommand: npm install --production
     startCommand: node bot.js
-    healthCheckPath: /
+    healthCheckPath: /healthz
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
