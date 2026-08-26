@@ -167,6 +167,46 @@ assert.strictEqual(mergedFrames.docs.length, 2);
 assert.ok(mergedFrames.docs.some((doc) => doc.action_id === 'DV_Link'));
 assert.ok(mergedFrames.docs.some((doc) => /id=plan/.test(doc.url)));
 
+const mergedAddressFrames = cua._mergeMatrixDocumentSnapshots([
+  {
+    url: 'https://matrix.centris.ca/Matrix/Results.aspx', exactListingMentioned: true,
+    detailEvidence: true, docs: fixture28936167,
+    listing: { centris_num: '28936167', address: '440, Rue du Bord-de-l’Eau', address_complete: false },
+  },
+  {
+    url: 'https://matrix.centris.ca/Matrix/Details.aspx', exactListingMentioned: true,
+    detailEvidence: true, docs: [],
+    listing: { centris_num: '28936167', address: '440, Rue du Bord-de-l’Eau, Saint-Alphonse-Rodriguez', address_complete: true },
+  },
+]);
+assert.strictEqual(mergedAddressFrames.listing.address_complete, true, 'l’adresse complète d’un frame exact ne doit pas être perdue');
+
+const extractAddress = cua._extractCompleteMatrixAddressFromText;
+assert.strictEqual(typeof extractAddress, 'function');
+assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\nNo Centris 28936167',
+    '440, Rue du Bord-de-l’Eau',
+  ),
+  '440, Rue du Bord-de-l’Eau, Saint-Alphonse-Rodriguez',
+  'la municipalité doit être réunie à la rue vérifiée',
+);
+assert.strictEqual(
+  extractAddress('440, Rue du Bord-de-l’Eau\nDocuments additionnels\nNo Centris 28936167', '440, Rue du Bord-de-l’Eau'),
+  '',
+  'un titre Matrix ne doit jamais devenir une municipalité',
+);
+assert.strictEqual(
+  extractAddress('123, Rue du Courtier\nMontréal\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez', '440, Rue du Bord-de-l’Eau'),
+  '440, Rue du Bord-de-l’Eau, Saint-Alphonse-Rodriguez',
+  'une adresse de courtier ne doit jamais remplacer celle du listing',
+);
+assert.strictEqual(
+  extractAddress('440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez', '441, Rue du Bord-de-l’Eau'),
+  '',
+  'le numéro civique doit correspondre à la rue déjà vérifiée',
+);
+
 const referenceOnly = cua._mergeMatrixDocumentSnapshots([{
   url: 'https://matrix.centris.ca/Matrix/Results.aspx', exactListingMentioned: true,
   docs: fixture28936167,
@@ -317,8 +357,9 @@ assert.ok(cuaCode.includes('for (const frame of page.frames())'), 'la recherche 
 assert.ok(cuaCode.includes('a,button,[role="link"],[data-href]'), 'le résultat exact ne doit pas dépendre d’un lien texte unique');
 assert.ok(cuaCode.includes('media\\.ashx|annex|document|download'), 'les documents doivent tolérer les variantes d’URL Matrix');
 assert.ok(cuaCode.includes('lien de téléchargement Matrix non résolu'), 'un document visible sans URL doit devenir un échec explicite, jamais disparaître');
-assert.ok(cuaCode.includes("const addressElement = [...document.querySelectorAll"), 'l’adresse doit être extraite d’un élément court de la fiche Matrix');
-assert.ok(cuaCode.includes("listing: state.listing || null"), 'le téléchargement doit retourner l’adresse vérifiée au générateur de courriel');
+assert.ok(cuaCode.includes('const addressCandidates = []'), 'l’adresse doit être extraite de plusieurs structures sûres de la fiche Matrix');
+assert.ok(cuaCode.includes('matrix-listing-report-pdf'), 'la municipalité doit être prouvée par la fiche PDF exacte');
+assert.ok(cuaCode.includes('listing: finalListing'), 'le téléchargement doit retourner l’adresse complète vérifiée au générateur de courriel');
 assert.ok(cuaCode.includes('discovered_count: matchedDocs.length'), 'le résultat doit comparer documents découverts et PDF validés');
 assert.ok(!cuaCode.includes('cb.checked = true; cb.click()'), 'sélectionner un format ne doit pas cocher puis décocher la case');
 assert.ok(!cuaCode.includes('const navigatedOK = true'), 'le téléchargement de fiche ne doit pas cliquer deux fois le même résultat');
