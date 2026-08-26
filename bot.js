@@ -15797,15 +15797,17 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
   // Sans ce header, n'importe qui peut injecter des commandes dans le bot.
   // Le secret est configuré côté Telegram via setWebhook(secret_token).
   if (req.method === 'POST' && url === '/webhook/telegram') {
+    const telegramRemoteIp = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '')
+      .split(',')[0].trim();
     // Rate limit: Telegram peut envoyer plusieurs updates/min en burst
-    if (!webhookRateOK(req.socket.remoteAddress, url, 120)) {
-      log('WARN', 'SECURITY', `Webhook Telegram rate-limited from ${req.socket.remoteAddress}`);
+    if (!webhookRateOK(telegramRemoteIp, url, 120)) {
+      log('WARN', 'SECURITY', `Webhook Telegram rate-limited from ${telegramRemoteIp}`);
       res.writeHead(429); res.end('too many requests'); return;
     }
     const tgSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
     const provided = req.headers['x-telegram-bot-api-secret-token'];
     if (tgSecret && provided !== tgSecret) {
-      log('WARN', 'SECURITY', `Webhook Telegram — bad/missing secret-token from ${ip}`);
+      log('WARN', 'SECURITY', `Webhook Telegram — bad/missing secret-token from ${telegramRemoteIp}`);
       res.writeHead(401); res.end('unauthorized'); return;
     }
     let body = '';
@@ -17637,6 +17639,37 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
   // ─── GET /admin/matrix-test?num=N — test Matrix global en lecture seule.
   // L'ancien alias /admin/zone-test pointe volontairement vers le même test
   // pour qu'aucun diagnostic ne retombe dans la Zone personnelle de Shawn.
+  // POST séparé et protégé pour un aperçu Telegram interne. Cette route fixe
+  // la destination à Shawn et transmet un message qui ne correspond jamais à
+  // la confirmation d'envoi; elle ne peut donc pas appeler Gmail.
+  if (req.method === 'POST' && url.startsWith('/admin/matrix-preview-test')) {
+    if (!webhookRateOK(req.socket.remoteAddress, url, 3)) { res.writeHead(429); res.end('rate limit'); return; }
+    const u = new URL(req.url, 'http://x');
+    const num = String(u.searchParams.get('num') || '').replace(/\D/g, '');
+    const email = normalizeSingleRecipientEmail(u.searchParams.get('email') || '');
+    if (!/^\d{7,9}$/.test(num) || email !== REQUIRED_VISIBLE_CC_EMAIL) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'MATRIX_INTERNAL_PREVIEW_INPUT_REJECTED' }));
+      return;
+    }
+    try {
+      const result = await executeMatrixAnnexesTool({
+        num,
+        emailDestination: email,
+        filtre: '',
+        messagePerso: '',
+        chatId: ALLOWED_ID,
+        userMessage: 'aperçu interne seulement',
+      });
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: /^📂/u.test(String(result || '')), result }));
+    } catch (error) {
+      res.writeHead(500, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ ok: false, error: String(error?.message || error).substring(0, 180) }));
+    }
+    return;
+  }
+
   if (req.method === 'GET' && (url.startsWith('/admin/matrix-test') || url.startsWith('/admin/zone-test'))) {
     if (!webhookRateOK(req.socket.remoteAddress, url, 5)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
