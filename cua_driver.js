@@ -400,8 +400,18 @@ function mergeMatrixDocumentSnapshots(snapshots = []) {
   });
   const primary = ranked[0] || null;
   if (!primary) return null;
+  const listingSnapshot = ranked
+    .filter((snapshot) => snapshot.exactListingMentioned && snapshot.listing?.address)
+    .sort((left, right) => {
+      const score = (snapshot) =>
+        (snapshot.detailEvidence === true ? 100 : 0) +
+        (snapshot.listing?.address_complete === true ? 1000 : 0) +
+        String(snapshot.listing?.address || '').length;
+      return score(right) - score(left);
+    })[0] || primary;
   return {
     ...primary,
+    listing: listingSnapshot.listing || primary.listing || null,
     docs: dedupeCentrisDiscoveredDocs(ranked.flatMap((snapshot) => snapshot.docs || [])),
     documentReferences: [...new Set(ranked.flatMap((snapshot) => snapshot.documentReferences || []))],
     mediaLinkCount: ranked.reduce((total, snapshot) => total + Number(snapshot.mediaLinkCount || 0), 0),
@@ -956,9 +966,36 @@ async function inspectMatrixListingPage(page, centrisNum) {
     // ligne. Tolère « 440, Rue... », les abréviations et les voies québécoises.
     const streetPrefix = '(?:rue|avenue|av\\.?|boulevard|boul\\.?|chemin|ch\\.?|rang|route|mont[ée]e?|place|all[ée]e?|impasse|croissant|terrasse|c[ôo]te|promenade|carr[ée]|autoroute)';
     const addressStart = new RegExp(`^\\d{1,6}\\s*,?\\s+${streetPrefix}\\b`, 'i');
-    const addressElement = [...document.querySelectorAll('h1,h2,h3,td,th,span,[class*="address" i],[class*="adresse" i]')]
-      .map((element) => clean(element.textContent || ''))
-      .find((value) => value.length >= 8 && value.length <= 180 && addressStart.test(value));
+    const addressCandidates = [];
+    const addAddressCandidate = (value, source = 'element') => {
+      const cleaned = clean(value || '');
+      if (cleaned.length < 8 || cleaned.length > 180 || !addressStart.test(cleaned)) return;
+      addressCandidates.push({ value: cleaned, source });
+    };
+    const looksLikeLocality = (value) => {
+      const cleaned = clean(value || '');
+      return cleaned.length >= 3 && cleaned.length <= 80 &&
+        /^[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+(?:[ -][A-Za-zÀ-ÿ'’.-]+){0,6}$/.test(cleaned) &&
+        !/(?:centris|prix|en vigueur|vendu|courtier|chambre|pi[eè]ce|superficie|\$)/i.test(cleaned);
+    };
+    const addressNodes = [...document.querySelectorAll('h1,h2,h3,td,th,span,div,[class*="address" i],[class*="adresse" i]')];
+    for (const element of addressNodes) {
+      const own = clean(element.textContent || '');
+      if (own.length >= 8 && own.length <= 180 && addressStart.test(own)) {
+        addAddressCandidate(own, 'element');
+        const sibling = clean(element.nextElementSibling?.textContent || '');
+        if (looksLikeLocality(sibling)) addAddressCandidate(`${own}, ${sibling}`, 'sibling');
+      }
+      for (const container of [element.parentElement, element.parentElement?.parentElement]) {
+        const lines = String(container?.innerText || '').split(/\r?\n/).map(clean).filter(Boolean);
+        for (let index = 0; index < lines.length; index += 1) {
+          if (!addressStart.test(lines[index])) continue;
+          addAddressCandidate(lines[index], 'container-line');
+          const locality = lines.slice(index + 1, index + 4).find(looksLikeLocality);
+          if (locality) addAddressCandidate(`${lines[index]}, ${locality}`, 'container-locality');
+        }
+      }
+    }
     const addressFallback = bodyText.match(new RegExp(
       `\\b\\d{1,6}\\s*,?\\s+${streetPrefix}\\b.{3,140}?(?=\\s+(?:No\\s+Centris|Centris|Prix|[0-9][0-9\\s]*\\s*\\$|En vigueur|Vendu|$))`,
       'i'
@@ -967,10 +1004,18 @@ async function inspectMatrixListingPage(page, centrisNum) {
     // le texte de la fiche contient aussi la municipalité avant « No Centris ».
     // Préférer ce libellé complet lorsqu'il reste borné et commence par la même
     // adresse; conserver l'élément court comme repli sûr.
-    const completeFallback = addressFallback && addressStart.test(clean(addressFallback)) && clean(addressFallback).length <= 180
-      ? clean(addressFallback)
-      : null;
-    const address = completeFallback || addressElement;
+    if (addressFallback) addAddressCandidate(addressFallback, 'body');
+    const municipalityCommaCount = (value) => {
+      const commas = (String(value || '').match(/,/g) || []).length;
+      return /^\d{1,6}\s*,/.test(String(value || '')) ? commas >= 2 : commas >= 1;
+    };
+    addressCandidates.sort((left, right) =>
+      Number(municipalityCommaCount(right.value)) - Number(municipalityCommaCount(left.value)) ||
+      right.value.length - left.value.length
+    );
+    const selectedAddress = addressCandidates[0] || null;
+    const address = selectedAddress?.value || null;
+    const addressComplete = Boolean(address && municipalityCommaCount(address));
     const detailEvidence = Boolean(
       additionalHeading || principalMatch ||
       /[ée]valuation\s*\(municipale\)|taxes\s*\(annuelles\)|vente avec garantie l[ée]gale|superficie du terrain|certificat de localisation/i.test(bodyText)
@@ -984,7 +1029,13 @@ async function inspectMatrixListingPage(page, centrisNum) {
       detailEvidence,
       passwordInputs: document.querySelectorAll('input[type=password]').length,
       mediaLinkCount: mediaAnchors.length, printControlCount, docs, documentReferences,
-      listing: { centris_num: expectedNum, price: clean(price), address: clean(address) },
+      listing: {
+        centris_num: expectedNum,
+        price: clean(price),
+        address: clean(address),
+        address_complete: addressComplete,
+        address_source: selectedAddress?.source || null,
+      },
     };
   }, String(centrisNum));
   const snapshots = [];
@@ -2524,6 +2575,91 @@ async function reopenVerifiedMatrixListing(page, exactNum, rawListingUrl) {
   return state;
 }
 
+// Matrix affiche souvent la rue et la municipalité sur deux lignes distinctes.
+// La fiche détaillée PDF sert de seconde preuve, après validation du numéro
+// Centris exact. Cette extraction reste volontairement stricte: au moindre
+// doute, elle retourne une chaîne vide et le workflow refuse l'aperçu.
+function extractCompleteMatrixAddressFromText(text, fallbackStreet = '') {
+  const cleanLine = (value) => String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map(cleanLine)
+    .filter(Boolean);
+  const streetPrefix = '(?:rue|avenue|av\\.?|boulevard|boul\\.?|chemin|ch\\.?|rang|route|mont[ée]e?|place|all[ée]e?|impasse|croissant|terrasse|c[ôo]te|promenade|carr[ée]|autoroute)';
+  const addressStart = new RegExp(`^\\d{1,6}\\s*,?\\s+${streetPrefix}\\b`, 'i');
+  const isComplete = (value) => {
+    const candidate = cleanLine(value);
+    const commas = (candidate.match(/,/g) || []).length;
+    return addressStart.test(candidate) &&
+      (/^\d{1,6}\s*,/.test(candidate) ? commas >= 2 : commas >= 1);
+  };
+  const locality = (value) => {
+    let candidate = cleanLine(value)
+      .replace(/\s*\([^)]{2,80}\)\s*$/, '')
+      .replace(/,?\s+(?:Qu[ée]bec|QC)(?:\s+[A-Z]\d[A-Z]\s*\d[A-Z]\d)?\s*$/i, '')
+      .trim();
+    if (candidate.length < 3 || candidate.length > 80 || /\d|\$/.test(candidate)) return '';
+    if (/(?:centris|prix|en vigueur|vendu|courtier|chambre|pi[eè]ce|superficie|terrain|propri[ée]t[ée]|adresse|municipalit[ée]|province|code postal|fiche)/i.test(candidate)) return '';
+    if (!/^[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+(?:\s+(?:(?:de|du|des|la|le|sur|sous|en|aux|les|l[eè]s)|[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+)){0,6}$/.test(candidate)) return '';
+    return candidate;
+  };
+  const base = cleanLine(fallbackStreet).replace(/,+\s*$/, '');
+  const baseCivic = base.match(/^(\d{1,6})\s*,?\s+/)?.[1] || '';
+  const baseStreetTokens = normalizeCentrisMatchKey(base)
+    .replace(/^\d{1,6}\s+/, '')
+    .split(/\s+/)
+    .filter((token) => token.length >= 3 && !/^(?:rue|avenue|boulevard|chemin|rang|route|place|montee|allee|impasse|croissant|terrasse|cote|promenade|carre|autoroute|des|les|une)$/.test(token));
+  // Sans la rue déjà vérifiée dans la fiche authentifiée, une autre adresse
+  // imprimée plus loin (par exemple celle du courtier) pourrait être choisie.
+  if (!baseCivic || !baseStreetTokens.length || !addressStart.test(base)) return '';
+  const matchesVerifiedStreet = (value) => {
+    const candidate = cleanLine(value);
+    if (candidate.match(/^(\d{1,6})\s*,?\s+/)?.[1] !== baseCivic) return false;
+    const key = normalizeCentrisMatchKey(candidate);
+    return baseStreetTokens.every((token) => key.includes(token));
+  };
+  const candidates = [];
+  const add = (value) => {
+    const candidate = cleanLine(value);
+    if (!isComplete(candidate) || candidate.length > 180 || !matchesVerifiedStreet(candidate)) return;
+    if (!candidates.includes(candidate)) candidates.push(candidate);
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!addressStart.test(line)) continue;
+    add(line);
+    if (isComplete(line)) continue;
+    for (let offset = 1; offset <= 3 && index + offset < lines.length; offset += 1) {
+      const municipality = locality(lines[index + offset]);
+      if (!municipality) continue;
+      add(`${line}, ${municipality}`);
+      break;
+    }
+  }
+
+  // Certains parseurs PDF aplatissent les retours de ligne. Dans ce cas, la
+  // rue déjà lue dans le DOM permet de borner exactement le début de l'adresse;
+  // seul le premier libellé municipal valide qui la suit est accepté.
+  if (!isComplete(base)) {
+    const normalizedText = cleanLine(text);
+    const escapedTokens = base
+      .replace(/^(\d{1,6})\s*,?\s+/, '$1 ')
+      .split(/\s+/)
+      .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const basePattern = escapedTokens.join('\\s*,?\\s+');
+    const match = normalizedText.match(new RegExp(`${basePattern}\\s*,?\\s+([^,]{3,80}?)(?=\\s+(?:No\\s+Centris|Centris|Prix|En vigueur|Vendu|\\d[\\d ]*\\s*\\$)|,)`, 'i'));
+    const municipality = locality(match?.[1] || '');
+    if (municipality) add(`${base}, ${municipality}`);
+  }
+
+  candidates.sort((left, right) => right.length - left.length);
+  return candidates[0] || '';
+}
+
 /**
  * Télécharge toutes les annexes (DV, certificat, plans) d'un listing via CUA.
  * @param {string} centrisNum
@@ -2626,6 +2762,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
       label: doc.name,
       error: 'lien de téléchargement Matrix non résolu',
     }));
+    let validatedListingAddressFromPdf = '';
     // mediaserver.centris.ca refuse parfois les requêtes API directes même si
     // elles partagent les cookies. Ouvrir le lien comme un vrai onglet Matrix
     // conserve la navigation authentifiée utilisée par un clic manuel.
@@ -2685,6 +2822,10 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
         if (doc.action_id === MATRIX_LISTING_REPORT_ACTION &&
             (!parsed || !matrixTextContainsExactNumber(parsed.text, exactNum))) {
           throw new Error(`MATRIX_PRINT_LISTING_MISMATCH:${exactNum}`);
+        }
+        if (doc.action_id === MATRIX_LISTING_REPORT_ACTION && parsed) {
+          const completeAddress = extractCompleteMatrixAddressFromText(parsed.text, activeState?.listing?.address || '');
+          if (completeAddress) validatedListingAddressFromPdf = completeAddress;
         }
         const enriched = addCentrisContentMetadata(doc, buffer, validatedPdf.pageCount);
         runningDownloadedBytes += buffer.length;
@@ -2815,6 +2956,19 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
     const complete = failures.length === 0 && annexes.length === matchedDocs.length &&
       uniqueHashes.size === annexes.length && contentManifest.complete &&
       annexes.every((doc) => Number(doc.page_count) > 0 && /^[a-f0-9]{64}$/.test(String(doc.sha256 || '')));
+    const finalListingAddress = validatedListingAddressFromPdf || state?.listing?.address || '';
+    const finalListing = {
+      ...(state?.listing || {}),
+      address: finalListingAddress,
+      // Seule la fiche PDF qui contient également le numéro Centris exact
+      // constitue la preuve finale de la municipalité. Le DOM reste une aide
+      // de navigation, jamais une autorisation d'armer le courriel.
+      address_complete: Boolean(validatedListingAddressFromPdf),
+      address_source: validatedListingAddressFromPdf
+        ? 'matrix-listing-report-pdf'
+        : (state?.listing?.address_source || null),
+    };
+    console.log(`[MATRIX-ADDRESS] source=${finalListing.address_source || 'none'} complete=${finalListing.address_complete} length=${finalListingAddress.length}`);
     return {
       success: complete,
       complete,
@@ -2825,7 +2979,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
       docs_count: downloadableDocs.length,
       docs_list: publicInventory.docs,
       document_references: state.documentReferences || [],
-      listing: state.listing || null,
+      listing: finalListing,
       document_inventory: publicInventory,
       manifest_id: fullInventory.manifest_id,
       inventory_manifest_id: fullInventory.manifest_id,
@@ -4646,6 +4800,7 @@ module.exports = {
   _downloadMatrixListingReport: downloadMatrixListingReport,
   _matrixDownloadableDocs: matrixDownloadableDocs,
   _matrixDownloadPlanFingerprint: matrixDownloadPlanFingerprint,
+  _extractCompleteMatrixAddressFromText: extractCompleteMatrixAddressFromText,
   _isMatrixOperationInProgress: isMatrixOperationInProgress,
   _isMatrixDocumentRetryable: isMatrixDocumentRetryable,
   _waitForMatrixPdfResponse: waitForMatrixPdfResponse,
