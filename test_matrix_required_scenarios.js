@@ -30,6 +30,7 @@ scenario('Numéro Centris invalide refusé', () => {
 });
 scenario('Client complet et admissible', () => {
   assert.match(bot, /function matrixClientEligibility/);
+  assert.match(bot, /const nameValid = client\.testMode/);
   assert.match(bot, /nom complet fiable[\s\S]*?adresse courriel unique[\s\S]*?numéro de téléphone valide[\s\S]*?contexte immobilier clair/);
 });
 scenario('Courriel général sans client identifié bloqué', () => {
@@ -48,6 +49,7 @@ scenario('Correspondance Dropbox approximative ne remplace pas Matrix exact', ()
 scenario('Mauvais document ou mauvaise propriété détecté', () => {
   assert.match(bot, /returnedCentris !== String\(num\)/);
   assert.match(cua, /MATRIX_PRINT_LISTING_MISMATCH/);
+  assert.match(cua, /const address = completeFallback \|\| addressElement/);
 });
 scenario('Document manquant, corrompu ou incomplet bloqué', () => {
   assert.match(cua, /MATRIX_EXPECTED_DOCUMENT_COUNT_MISMATCH/);
