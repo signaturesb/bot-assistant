@@ -183,6 +183,31 @@ assert.strictEqual(mergedAddressFrames.listing.address_complete, true, 'l’adre
 
 const extractAddress = cua._extractCompleteMatrixAddressFromText;
 assert.strictEqual(typeof extractAddress, 'function');
+const extractPrice = cua._extractMatrixListingPriceFromText;
+assert.strictEqual(typeof extractPrice, 'function');
+assert.strictEqual(
+  extractPrice(
+    '16934036 (En vigueur)\tNo Centris\n28 Rue Pierre-Rivière\nRégion\nLanaudière\n569 900 $\nJ6A 3N7\nRepentigny (Repentigny)\nTaxes municipales\n4 281 $',
+    '16934036',
+  ),
+  '569 900 $',
+  'le prix ne doit jamais absorber les deux derniers chiffres du numéro Centris',
+);
+assert.strictEqual(
+  extractPrice('19465925 (En vigueur) No Centris\n381 Rue Laval\n620 000 $\nTaxes\n4 615 $', '19465925'),
+  '620 000 $',
+  'le montant le plus proche de la fiche exacte doit gagner sur les taxes',
+);
+assert.strictEqual(
+  extractPrice('16934036 (En vigueur) No Centris\n28 Rue Pierre-Rivière\n34 569 900 $', '16934036'),
+  '34 569 900 $',
+  'un vrai prix élevé correctement isolé sur sa ligne doit rester accepté',
+);
+assert.strictEqual(
+  extractPrice('No Centris 99999999\n569 900 $', '16934036'),
+  null,
+  'un prix provenant d’un autre numéro Centris doit être refusé',
+);
 assert.strictEqual(
   extractAddress(
     'Fiche détaillée\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\nNo Centris 28936167',

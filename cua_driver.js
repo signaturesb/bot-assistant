@@ -900,10 +900,53 @@ async function openExactMatrixListing(page, centrisNum) {
   return state;
 }
 
+// Extrait le prix depuis les vraies lignes Matrix, jamais depuis une version
+// aplatie qui pourrait coller la fin du numéro Centris devant le montant.
+// Le prix doit être proche du numéro exact de la fiche; les taxes et autres
+// montants plus loin dans la page perdent donc naturellement le classement.
+function extractMatrixListingPriceFromText(text, exactCentrisNum = '') {
+  const exactNum = String(exactCentrisNum || '').replace(/\D/g, '');
+  if (!/^\d{7,9}$/.test(exactNum)) return null;
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => String(line || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim())
+    .filter(Boolean);
+  const exactIndexes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (matrixTextContainsExactNumber(lines[index], exactNum)) exactIndexes.push(index);
+  }
+  if (!exactIndexes.length) return null;
+
+  const candidates = [];
+  const moneyPattern = /(?<!\d)(\d{1,3}(?:[ ]\d{3})+|\d{4,9})\s*\$(?!\d)/g;
+  for (let index = 0; index < lines.length; index += 1) {
+    for (const match of lines[index].matchAll(moneyPattern)) {
+      const amount = Number(String(match[1] || '').replace(/\D/g, ''));
+      if (!Number.isSafeInteger(amount) || amount < 1000 || amount > 250000000) continue;
+      const distance = Math.min(...exactIndexes.map((exactIndex) => Math.abs(exactIndex - index)));
+      if (distance > 25) continue;
+      const occursAfterExact = exactIndexes.some((exactIndex) => index >= exactIndex && index - exactIndex <= 25);
+      candidates.push({
+        amount,
+        distance,
+        occursAfterExact,
+        value: `${amount.toLocaleString('fr-CA').replace(/\u00a0/g, ' ')} $`,
+      });
+    }
+  }
+  if (!candidates.length) return null;
+  candidates.sort((left, right) =>
+    Number(right.occursAfterExact) - Number(left.occursAfterExact) ||
+    left.distance - right.distance ||
+    right.amount - left.amount);
+  return candidates[0].value;
+}
+
 async function inspectMatrixListingPage(page, centrisNum) {
   const inspectFrame = async (frame) => frame.evaluate((expectedNum) => {
     const clean = (value) => String(value || '').replace(/[\u00A0\u2000-\u200B\s]+/g, ' ').trim();
-    const bodyText = clean(document.body?.innerText || '');
+    const rawBodyText = String(document.body?.innerText || '');
+    const bodyText = clean(rawBodyText);
     const allElements = [...document.querySelectorAll('h1,h2,h3,h4,h5,div,span,strong')];
     const additionalHeading = allElements.find((el) => /^document\(s\) additionnel\(s\)$/i.test(clean(el.textContent)));
     const afterHeading = (element) => !!additionalHeading &&
@@ -960,7 +1003,6 @@ async function inspectMatrixListingPage(page, centrisNum) {
     const documentReferences = principalMatch && !docs.some((doc) => doc.source_section === 'principal_dv' && !/modification/i.test(doc.name))
       ? [principalMatch[1].replace(/\s+/g, '')]
       : [];
-    const price = bodyText.match(/(?:^|\s)([0-9][0-9\s]*\$)(?:\s|$)/)?.[1] || null;
     // L'adresse est d'abord lue dans un élément court de la fiche afin de ne
     // pas avaler les champs voisins lorsque Matrix aplatit les retours de
     // ligne. Tolère « 440, Rue... », les abréviations et les voies québécoises.
@@ -1032,13 +1074,14 @@ async function inspectMatrixListingPage(page, centrisNum) {
     ).length;
     return {
       url: location.href, title: document.title, text: bodyText.substring(0, 4000),
+      fieldText: rawBodyText.substring(0, 16000),
       exactListingMentioned: new RegExp(`(^|\\D)${String(expectedNum).replace(/\\D/g, '')}(\\D|$)`).test(bodyText),
       detailEvidence,
       passwordInputs: document.querySelectorAll('input[type=password]').length,
       mediaLinkCount: mediaAnchors.length, printControlCount, docs, documentReferences,
       listing: {
         centris_num: expectedNum,
-        price: clean(price),
+        price: null,
         address: clean(address),
         address_complete: addressComplete,
         address_source: selectedAddress?.source || null,
@@ -1048,7 +1091,13 @@ async function inspectMatrixListingPage(page, centrisNum) {
   const snapshots = [];
   for (const frame of page.frames()) {
     const snapshot = await inspectFrame(frame).catch(() => null);
-    if (snapshot) snapshots.push(snapshot);
+    if (snapshot) {
+      if (snapshot.listing) {
+        snapshot.listing.price = extractMatrixListingPriceFromText(snapshot.fieldText, centrisNum);
+      }
+      delete snapshot.fieldText;
+      snapshots.push(snapshot);
+    }
   }
   const snapshot = mergeMatrixDocumentSnapshots(snapshots) ||
     { url: page.url(), text: '', docs: [], mediaLinkCount: 0, passwordInputs: 0 };
@@ -5530,6 +5579,7 @@ module.exports = {
   _isExactMatrixListingLabel: isExactMatrixListingLabel,
   _scoreMatrixSearchCandidate: scoreMatrixSearchCandidate,
   _scoreMatrixSubmitControl: scoreMatrixSubmitControl,
+  _extractMatrixListingPriceFromText: extractMatrixListingPriceFromText,
   _extractTaxCandidatesFromText: extractTaxCandidatesFromText,
   _downloadMatrixPdfInBrowser: downloadMatrixPdfInBrowser,
   _downloadMatrixPdfAuthenticated: downloadMatrixPdfAuthenticated,
