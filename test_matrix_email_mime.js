@@ -40,5 +40,17 @@ assert.match(handler, /01\\s\*·\\s\*Données du marché[\s\S]*?01 · Dossier do
   'les intitulés génériques vides doivent devenir des sections documentaires utiles');
 assert.match(code, /UN SEUL courriel avec le modèle officiel SignatureSB/,
   'le routage doit demander un seul courriel contenant tous les PDF');
+assert.match(code, /EMAIL_SHAWN_VISIBLE_CC_REQUIRED/,
+  'le garde central Gmail doit bloquer tout tiers sans Cc Shawn visible');
+assert.match(code, /const hasExternalGmailRecipient[\s\S]*?const hasVisibleShawnCc/,
+  'le contrôle Cc doit être calculé sur le payload exact remis au provider');
+const genericGmail = code.match(/async function envoyerEmailGmail[\s\S]*?\n}\n\n\/\/ ─── Réponse rapide mobile/)?.[0] || '';
+assert.ok(genericGmail, 'envoyerEmailGmail absent');
+assert.match(genericGmail, /const toHeader\s*=\s*safeTo/,
+  'le To MIME générique doit utiliser seulement l’adresse normalisée');
+assert.match(genericGmail, /\.\.\.\(cc\.length \? \[`Cc:/,
+  'le brouillon Gmail externe doit inclure Shawn en Cc visible');
+assert.doesNotMatch(genericGmail, /Bcc: \$\{AGENT\.email\}/,
+  'une copie Bcc ne doit jamais remplacer le Cc visible demandé');
 
 console.log('✅ Courriel Matrix: template obligatoire, MIME texte+HTML, UTF-8, Cc et limite Gmail');
