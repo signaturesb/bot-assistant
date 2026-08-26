@@ -112,6 +112,15 @@ assert.ok(botCode.includes('finalConfirmationMessageId'), 'second confirmation m
 assert.ok(botCode.includes('PENDING_EMAILS_FILE'), 'pending drafts must survive a Render restart');
 assert.ok(botCode.includes('queuePendingEmailDraft'), 'automatic drafts must use a non-overwriting queue');
 assert.ok(botCode.includes('deliveryUncertain'), 'provider uncertainty must block duplicate retries');
+const loggedWrapper = botCode.match(/async function sendEmailLogged[\s\S]*?\n}\n\n\/\/ 🔒 RÈGLE ABSOLUE/)?.[0] || '';
+assert.ok(loggedWrapper, 'sendEmailLogged doit rester auditable');
+assert.ok(
+  loggedWrapper.indexOf('const priorIdentical = emailOutbox') < loggedWrapper.indexOf('emailOutbox.push(entry)'),
+  'la réservation par empreinte doit précéder atomiquement toute tentative fournisseur',
+);
+assert.ok(loggedWrapper.includes('EMAIL_DUPLICATE_FINGERPRINT_BLOCKED'));
+assert.ok(loggedWrapper.includes('EMAIL_OUTBOX_OUTCOME_PERSIST_FAILED'));
+assert.ok(botCode.includes("const REQUIRED_VISIBLE_CC_EMAIL = 'shawn@signaturesb.com'"), 'le Cc visible obligatoire ne doit pas dépendre d’une env dérivée');
 assert.ok(!/pendingEmails\.set\(ALLOWED_ID/.test(botCode), 'automatic lead drafts must never overwrite the active draft');
 assert.ok(botCode.includes("name === 'telecharger_docs_centris_complet'"), 'multi-email action must be blocked under one-shot policy');
 assert.match(
