@@ -10217,7 +10217,10 @@ function formatClientPhone(value) {
 
 function matrixClientEligibility(client = {}) {
   const missing = [];
-  if (!isValidProspectName(String(client.name || ''))) missing.push('nom complet fiable');
+  const nameValid = client.testMode
+    ? String(client.name || '').trim().split(/\s+/).filter(Boolean).length >= 2
+    : isValidProspectName(String(client.name || ''));
+  if (!nameValid) missing.push('nom complet fiable');
   if (!normalizeSingleRecipientEmail(client.email)) missing.push('adresse courriel unique');
   if (!normalizeClientPhone(client.phone)) missing.push('numéro de téléphone valide');
   if (!String(client.context || '').trim()) missing.push('contexte immobilier clair');
