@@ -383,6 +383,86 @@ const context = {
   assert.strictEqual(browserHandlerPresentOnDisable, true, 'autoAttach doit être désactivé avant le retrait des handlers');
   assert.strictEqual(browserRootDetached, true);
 
+  const pageFetchContext = new EventEmitter();
+  const pageFetchOpener = { name: 'print-options-page' };
+  const pageFetchPopup = { name: 'print-pdf-page' };
+  const pageFetchOpenerSession = new EventEmitter();
+  const pageFetchPopupSession = new EventEmitter();
+  let pageFetchRoute = null;
+  let pageFetchReads = 0;
+  let pageFetchFailedExactRequest = false;
+  let pageFetchDetached = 0;
+  const splitAt = nativeAlbumPdf.length - 3;
+  for (const session of [pageFetchOpenerSession, pageFetchPopupSession]) {
+    session.detach = async () => { pageFetchDetached += 1; };
+  }
+  pageFetchOpenerSession.send = async (method) => {
+    if (method === 'Fetch.enable') return {};
+    throw new Error(`commande page opener inattendue: ${method}`);
+  };
+  pageFetchPopupSession.send = async (method, params) => {
+    if (method === 'Fetch.enable') return {};
+    if (method === 'Fetch.takeResponseBodyAsStream') {
+      assert.strictEqual(params.requestId, 'page-paused-print');
+      return { stream: 'page-print-stream' };
+    }
+    if (method === 'IO.read') {
+      pageFetchReads += 1;
+      const part = pageFetchReads === 1
+        ? nativeAlbumPdf.subarray(0, splitAt)
+        : nativeAlbumPdf.subarray(splitAt);
+      return { data: part.toString('base64'), base64Encoded: true, eof: false };
+    }
+    if (method === 'IO.close') return {};
+    if (method === 'Fetch.failRequest') {
+      assert.strictEqual(params.requestId, 'page-paused-print');
+      assert.strictEqual(params.errorReason, 'Aborted');
+      pageFetchFailedExactRequest = true;
+      return {};
+    }
+    throw new Error(`commande page popup inattendue: ${method}`);
+  };
+  pageFetchContext.pages = () => [pageFetchOpener];
+  pageFetchContext.newCDPSession = async (targetPage) =>
+    targetPage === pageFetchPopup ? pageFetchPopupSession : pageFetchOpenerSession;
+  pageFetchContext.route = async (pattern, handler) => {
+    assert.strictEqual(pattern, '**/Matrix/PrintP*');
+    pageFetchRoute = handler;
+  };
+  pageFetchContext.unroute = async (pattern, handler) => {
+    assert.strictEqual(pattern, '**/Matrix/PrintP*');
+    assert.strictEqual(handler, pageFetchRoute);
+  };
+  assert.deepStrictEqual(
+    await cua._waitForMatrixPdfViaPageFetchCdp(
+      pageFetchContext,
+      pageFetchOpener,
+      async () => {
+        pageFetchContext.emit('page', pageFetchPopup);
+        await pageFetchRoute({
+          async continue() {
+            pageFetchPopupSession.emit('Fetch.requestPaused', {
+              requestId: 'page-paused-print',
+              request: { url: 'https://matrix.centris.ca/Matrix/PrintP?id=page-stream' },
+              responseStatusCode: 200,
+              responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+            });
+          },
+          async abort() { throw new Error('la réponse PrintP ne doit pas être annulée avant lecture'); },
+        }, {
+          frame: () => ({ page: () => pageFetchPopup }),
+        });
+        throw new Error('le clic popup peut rejeter après la capture Fetch');
+      },
+      1000,
+    ),
+    nativeAlbumPdf,
+    'la popup Playwright doit être armée avec Fetch avant la réponse et lire un %%EOF scindé sans rejouer l’URL',
+  );
+  assert.strictEqual(pageFetchReads, 2);
+  assert.strictEqual(pageFetchFailedExactRequest, true);
+  assert.strictEqual(pageFetchDetached, 2);
+
   const cdpSession = new EventEmitter();
   let cdpDetached = false;
   let cdpStopped = false;

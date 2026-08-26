@@ -50,6 +50,10 @@ assert(cuaSource.includes("'Fetch.takeResponseBodyAsStream'"),
   'la réponse PrintP à usage unique doit pouvoir être suspendue au niveau navigateur');
 assert(cuaSource.includes("'IO.read'"),
   'le flux PrintP suspendu doit être lu par blocs jusqu’à la fin PDF');
+assert(cuaSource.includes('waitForMatrixPdfViaPageFetchCdp('),
+  'la fiche détaillée doit utiliser le CDP Fetch de la page/popup gérée par Playwright');
+assert(cuaSource.includes("context.on?.('page', pageHandler)"),
+  'chaque popup Matrix doit être armée dès sa création');
 assert(cuaSource.includes("await route.abort('blockedbyclient')"),
   'le PrintP navigateur doit être annulé avant la lecture HTTP unique');
 assert(cuaSource.includes('printRequest.url,') && cuaSource.includes('printRequest,'),

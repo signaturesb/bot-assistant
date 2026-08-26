@@ -3709,6 +3709,175 @@ async function waitForMatrixPdfViaBrowserCdp(context, trigger, timeoutMs = 45000
   }
 }
 
+async function waitForMatrixPdfViaPageFetchCdp(context, page, trigger, timeoutMs = 45000) {
+  if (typeof context?.newCDPSession !== 'function') throw new Error('MATRIX_PRINT_PAGE_FETCH_CDP_UNSUPPORTED');
+  let timer = null;
+  let settled = false;
+  let total = 0;
+  let tail = Buffer.alloc(0);
+  let activeStream = null;
+  const chunks = [];
+  const armedPages = new Map();
+  const sessions = [];
+  const routePattern = '**/Matrix/PrintP*';
+  let routeHandler = null;
+  let pageHandler = null;
+  let finish;
+  const result = new Promise((resolve, reject) => {
+    finish = (error, buffer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(buffer);
+    };
+    timer = setTimeout(() => finish(new Error('MATRIX_PRINT_PAGE_FETCH_CDP_TIMEOUT')), timeoutMs);
+  });
+  const consume = (data, base64Encoded) => {
+    if (!data || settled) return null;
+    const chunk = Buffer.from(String(data), base64Encoded ? 'base64' : 'binary');
+    if (!chunk.length) return null;
+    total += chunk.length;
+    if (total > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    chunks.push(chunk);
+    const scan = Buffer.concat([tail, chunk]);
+    if (total >= 4096) {
+      const prefix = Buffer.concat(chunks, total).subarray(0, 4096);
+      if (prefix.indexOf(Buffer.from('%PDF-')) < 0) throw new Error('MATRIX_PRINT_PAGE_FETCH_CDP_NOT_PDF');
+    }
+    if (scan.indexOf(Buffer.from('%%EOF')) >= 0) {
+      const full = Buffer.concat(chunks, total);
+      const magic = full.subarray(0, 4096).indexOf(Buffer.from('%PDF-'));
+      const eof = full.lastIndexOf(Buffer.from('%%EOF'));
+      if (magic < 0 || eof < magic || eof + 5 < 1000) throw new Error('MATRIX_PRINT_PAGE_FETCH_CDP_INVALID_PDF');
+      return full.subarray(magic, eof + 5);
+    }
+    tail = scan.subarray(Math.max(0, scan.length - 8));
+    return null;
+  };
+  const readPaused = async (state, requestId) => {
+    let handle = null;
+    try {
+      const stream = await state.session.send('Fetch.takeResponseBodyAsStream', { requestId });
+      handle = stream?.stream;
+      if (!handle) throw new Error('MATRIX_PRINT_PAGE_FETCH_CDP_STREAM_MISSING');
+      while (!settled) {
+        const part = await state.session.send('IO.read', { handle, size: 64 * 1024 });
+        const pdfBuffer = consume(part?.data || '', Boolean(part?.base64Encoded));
+        if (pdfBuffer) {
+          await state.session.send('IO.close', { handle }).catch(() => {});
+          handle = null;
+          await state.session.send('Fetch.failRequest', {
+            requestId,
+            errorReason: 'Aborted',
+          }).catch(() => {});
+          finish(null, pdfBuffer);
+          return;
+        }
+        if (part?.eof) throw new Error('MATRIX_PRINT_PAGE_FETCH_CDP_EOF_MISSING');
+      }
+    } catch (error) {
+      finish(error);
+    } finally {
+      if (handle) await state.session.send('IO.close', { handle }).catch(() => {});
+    }
+  };
+  const armPage = async (targetPage) => {
+    const selectedPage = targetPage || page;
+    if (armedPages.has(selectedPage)) return armedPages.get(selectedPage);
+    const arming = (async () => {
+      const session = await context.newCDPSession(selectedPage);
+      const state = { session, pausedHandler: null };
+      state.pausedHandler = (params) => {
+        if (settled) return;
+        try {
+          const target = new URL(String(params?.request?.url || ''));
+          if (!isTrustedMatrixPrintUrl(target) || !/^\/Matrix\/PrintP/i.test(target.pathname) || !params.responseStatusCode) {
+            void session.send('Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
+            return;
+          }
+          const status = Number(params.responseStatusCode || 0);
+          if ([301, 302, 303, 307, 308].includes(status)) {
+            void session.send('Fetch.continueRequest', { requestId: params.requestId }).catch(finish);
+            return;
+          }
+          const headers = Object.fromEntries((params.responseHeaders || []).map((header) => [
+            String(header?.name || '').toLowerCase(),
+            String(header?.value || ''),
+          ]));
+          const contentType = String(headers['content-type'] || '').toLowerCase();
+          const contentLength = Number(headers['content-length'] || 0);
+          if (![200, 206].includes(status)) {
+            void session.send('Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
+            finish(new Error(`MATRIX_PRINT_PAGE_FETCH_CDP_HTTP_${status || 'UNKNOWN'}`));
+            return;
+          }
+          if (contentLength > MATRIX_DOCUMENT_FILE_MAX_BYTES) {
+            void session.send('Fetch.failRequest', { requestId: params.requestId, errorReason: 'Aborted' }).catch(() => {});
+            finish(new Error('MATRIX_DOCUMENT_TOO_LARGE'));
+            return;
+          }
+          if (activeStream && (activeStream.state !== state || activeStream.requestId !== params.requestId)) {
+            void session.send('Fetch.continueRequest', { requestId: params.requestId }).catch(() => {});
+            return;
+          }
+          activeStream = { state, requestId: params.requestId };
+          console.log(`[MATRIX-PDF] Réponse PrintP suspendue sur sa page (HTTP ${status}, ${contentType || 'type inconnu'})`);
+          void readPaused(state, params.requestId);
+        } catch (error) {
+          finish(error);
+        }
+      };
+      await session.send('Fetch.enable', {
+        patterns: [{ urlPattern: '*://*.centris.ca/Matrix/PrintP*', requestStage: 'Response' }],
+      });
+      session.on('Fetch.requestPaused', state.pausedHandler);
+      sessions.push(state);
+      return state;
+    })();
+    armedPages.set(selectedPage, arming);
+    return arming;
+  };
+
+  try {
+    pageHandler = (newPage) => { void armPage(newPage).catch(finish); };
+    context.on?.('page', pageHandler);
+    const existingPages = typeof context.pages === 'function' ? context.pages() : [page];
+    await Promise.all([...new Set([page, ...existingPages])].map(armPage));
+    if (typeof context.route === 'function' && typeof context.unroute === 'function') {
+      routeHandler = async (route, request) => {
+        try {
+          let requestPage = page;
+          try { requestPage = request?.frame?.()?.page?.() || page; } catch {}
+          await armPage(requestPage);
+          await route.continue();
+        } catch (error) {
+          try { await route.abort('failed'); } catch {}
+          finish(error);
+        }
+      };
+      await context.route(routePattern, routeHandler);
+    }
+    try {
+      await trigger();
+    } catch (error) {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      if (!activeStream) finish(error);
+    }
+    return await result;
+  } catch (error) {
+    finish(error);
+    return await result;
+  } finally {
+    clearTimeout(timer);
+    if (routeHandler) await context.unroute(routePattern, routeHandler).catch(() => {});
+    try { context.off?.('page', pageHandler); } catch {}
+    for (const state of sessions) {
+      try { state.session.off?.('Fetch.requestPaused', state.pausedHandler); } catch {}
+      await state.session.detach?.().catch(() => {});
+    }
+  }
+}
+
 async function matrixDownloadBuffer(download) {
   if (!download) throw new Error('MATRIX_PRINT_DOWNLOAD_MISSING');
   if (typeof download.createReadStream === 'function') {
@@ -3813,25 +3982,15 @@ async function downloadMatrixListingReport(context, page) {
   // puis l'exécuter une seule fois avec les mêmes cookies évite le verrou créé
   // par deux requêtes Matrix concurrentes sur la même session.
   try {
-    if (typeof context?.browser?.()?.newBrowserCDPSession === 'function') {
-      const nativeReport = await waitForMatrixPdfViaBrowserCdp(
+    if (typeof context?.newCDPSession === 'function') {
+      const nativeReport = await waitForMatrixPdfViaPageFetchCdp(
         context,
+        page,
         () => pdfControl.click({ timeout: 10000 }),
         45000,
       );
       await page.close?.({ runBeforeUnload: false }).catch(() => {});
-      console.log(`[MATRIX-PDF] Fiche détaillée avec album lue sur la réponse PrintP unique jusqu'à %%EOF (${nativeReport.length} octets)`);
-      return nativeReport;
-    }
-    if (typeof context?.newCDPSession === 'function') {
-      const nativeReport = await waitForMatrixPdfViaCdp(
-        context,
-        page,
-        () => pdfControl.click({ timeout: 10000 }),
-        40000,
-      );
-      await page.close?.({ runBeforeUnload: false }).catch(() => {});
-      console.log(`[MATRIX-PDF] Fiche détaillée avec album lue sur le flux natif jusqu'à %%EOF (${nativeReport.length} octets)`);
+      console.log(`[MATRIX-PDF] Fiche détaillée avec album lue sur le flux de sa page jusqu'à %%EOF (${nativeReport.length} octets)`);
       return nativeReport;
     }
     if (typeof context?.route === 'function' && typeof context?.unroute === 'function') {
@@ -5359,6 +5518,7 @@ module.exports = {
   _streamMatrixPdfUntilEof: streamMatrixPdfUntilEof,
   _waitForMatrixPdfViaCdp: waitForMatrixPdfViaCdp,
   _waitForMatrixPdfViaBrowserCdp: waitForMatrixPdfViaBrowserCdp,
+  _waitForMatrixPdfViaPageFetchCdp: waitForMatrixPdfViaPageFetchCdp,
   _mapWithConcurrency: mapWithConcurrency,
   _parsePdfBufferWithModule: parsePdfBufferWithModule,
   cuaLoginCentris,
