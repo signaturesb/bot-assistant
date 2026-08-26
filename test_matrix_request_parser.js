@@ -5,7 +5,10 @@ const {
   parseDirectMatrixRequest,
   looksLikeMatrixSendWithoutEmail,
   looksLikeMatrixSendCommand,
+  assertMatrixRequestParserReady,
 } = require('./lib/matrix_request_parser');
+
+assert.strictEqual(assertMatrixRequestParserReady(), true, 'l’auto-test permanent du démarrage doit réussir');
 
 const expected = { centrisNum: '19465925', email: 'client@example.com', message: '' };
 

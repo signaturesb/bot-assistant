@@ -32,7 +32,9 @@ const {
   parseDirectMatrixRequest,
   looksLikeMatrixSendWithoutEmail,
   looksLikeMatrixSendCommand,
+  assertMatrixRequestParserReady,
 } = require('./lib/matrix_request_parser');
+assertMatrixRequestParserReady();
 const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
 const { messageExplicitlyAuthorizesGitHubWrite, verifyProtectedStateWrite } = require('./lib/deployment_truth_guard');

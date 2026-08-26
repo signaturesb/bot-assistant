@@ -27,6 +27,9 @@ jobs:
       - name: Parser tests
         run: npm run test-parser
         continue-on-error: false
+      - name: Complete Matrix workflow regression suite
+        run: npm test
+        continue-on-error: false
       - name: Validate
         run: npm run validate
         continue-on-error: false
