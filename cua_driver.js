@@ -951,7 +951,19 @@ async function inspectMatrixListingPage(page, centrisNum) {
       ? [principalMatch[1].replace(/\s+/g, '')]
       : [];
     const price = bodyText.match(/(?:^|\s)([0-9][0-9\s]*\$)(?:\s|$)/)?.[1] || null;
-    const address = bodyText.match(/\b\d{1,6}\s+(?:rue|avenue|boulevard|chemin|rang|route)\s+[^\n]{3,100}/i)?.[0] || null;
+    // L'adresse est d'abord lue dans un élément court de la fiche afin de ne
+    // pas avaler les champs voisins lorsque Matrix aplatit les retours de
+    // ligne. Tolère « 440, Rue... », les abréviations et les voies québécoises.
+    const streetPrefix = '(?:rue|avenue|av\\.?|boulevard|boul\\.?|chemin|ch\\.?|rang|route|mont[ée]e?|place|all[ée]e?|impasse|croissant|terrasse|c[ôo]te|promenade|carr[ée]|autoroute)';
+    const addressStart = new RegExp(`^\\d{1,6}\\s*,?\\s+${streetPrefix}\\b`, 'i');
+    const addressElement = [...document.querySelectorAll('h1,h2,h3,td,th,span,[class*="address" i],[class*="adresse" i]')]
+      .map((element) => clean(element.textContent || ''))
+      .find((value) => value.length >= 8 && value.length <= 180 && addressStart.test(value));
+    const addressFallback = bodyText.match(new RegExp(
+      `\\b\\d{1,6}\\s*,?\\s+${streetPrefix}\\b.{3,140}?(?=\\s+(?:No\\s+Centris|Centris|Prix|[0-9][0-9\\s]*\\s*\\$|En vigueur|Vendu|$))`,
+      'i'
+    ))?.[0] || null;
+    const address = addressElement || addressFallback;
     const detailEvidence = Boolean(
       additionalHeading || principalMatch ||
       /[ée]valuation\s*\(municipale\)|taxes\s*\(annuelles\)|vente avec garantie l[ée]gale|superficie du terrain|certificat de localisation/i.test(bodyText)
@@ -1133,7 +1145,12 @@ function expectedCentrisDocumentCount(centrisNum, filtre = null) {
   }
   const smokeNum = String(process.env.CENTRIS_SMOKE_TEST_LISTING || '').replace(/\D/g, '');
   const smokeExpected = Number(process.env.CENTRIS_SMOKE_EXPECTED_DOCUMENTS || 0);
-  return exactNum === smokeNum && Number.isInteger(smokeExpected) && smokeExpected > 0 ? smokeExpected : 0;
+  if (exactNum === smokeNum && Number.isInteger(smokeExpected) && smokeExpected > 0) return smokeExpected;
+  // Référence réelle déjà vérifiée indépendamment: 1 fiche détaillée Matrix +
+  // 8 documents additionnels. Ce garde intégré empêche un faux succès 8/8 si
+  // une variable Render est supprimée accidentellement.
+  const verifiedReferenceCounts = Object.freeze({ '28936167': 9 });
+  return verifiedReferenceCounts[exactNum] || 0;
 }
 
 function safeErrorMessage(error) {
@@ -1824,10 +1841,10 @@ async function loginCentris(context) {
     console.log('[CUA] Avis Matrix reconnu, validation unique...');
     const controls = page.locator('button, a, input[type="submit"]');
     const allowedLabels = new Set([
-      "i've read this", 'j\'ai lu ceci', 'read', 'continue', 'continuer', 'accept', 'accepter',
+      "i've read this", 'j\'ai lu ceci', 'continue', 'continuer', 'accept', 'accepter',
     ]);
     const matches = [];
-    const count = Math.min(await controls.count().catch(() => 0), 30);
+    const count = await controls.count().catch(() => 0);
     for (let index = 0; index < count; index += 1) {
       const control = controls.nth(index);
       const visible = await control.isVisible().catch(() => false);
@@ -1843,9 +1860,27 @@ async function loginCentris(context) {
       throw new Error(`CENTRIS_INTERMEDIATE_CONTINUE_${code}:${safeCentrisPageLocation(page.url())}`);
     }
     await matches[0].click({ timeout: 10000 });
-    await page.waitForTimeout(3000);
+    const intermediateDeadline = Date.now() + 8000;
+    while (isCentrisIntermediateUrl(page.url()) && Date.now() < intermediateDeadline) {
+      await page.waitForTimeout(500);
+    }
     if (isCentrisIntermediateUrl(page.url())) {
       throw new Error(`CENTRIS_INTERMEDIATE_NOT_ADVANCED:${safeCentrisPageLocation(page.url())}`);
+    }
+    // Le bouton peut revenir brièvement dans l'échange OAuth. Une seule sonde
+    // Matrix est permise; succès uniquement avec preuve applicative réelle.
+    if (/^accounts\.centris\.ca\/connect\/authorize$/i.test(safeCentrisPageLocation(page.url()))) {
+      await page.goto(`${MATRIX_BASE}/Matrix/Recherche`, {
+        waitUntil: 'commit', timeout: 12000,
+      }).catch(() => null);
+      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
+      const oauthUrl = page.url();
+      const oauthPasswordVisible = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+      const oauthText = await page.locator('body').innerText({ timeout: 2500 }).catch(() => '');
+      if (isMatrixMultipleLoginPage(oauthUrl, oauthText)) throw new Error('MATRIX_MULTIPLE_LOGIN_BREACH');
+      if (!isAuthenticatedMatrixPage(oauthUrl, oauthPasswordVisible, oauthText)) {
+        throw new Error(`CENTRIS_INTERMEDIATE_OAUTH_STALLED:${safeCentrisPageLocation(oauthUrl)}`);
+      }
     }
   }
 
@@ -2783,6 +2818,7 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
       docs_count: downloadableDocs.length,
       docs_list: publicInventory.docs,
       document_references: state.documentReferences || [],
+      listing: state.listing || null,
       document_inventory: publicInventory,
       manifest_id: fullInventory.manifest_id,
       inventory_manifest_id: fullInventory.manifest_id,
