@@ -29,6 +29,13 @@ assert.match(handler, /renderedHtmlSha256/);
 assert.match(code, /const pendingMatrixArtifacts = new Map\(\)/);
 assert.match(handler, /les PDF figés de l’aperçu Matrix/);
 assert.match(handler, /pendingMatrixArtifacts\.set\(chatId/);
+assert.match(handler, /writeMatrixArtifactCache\(/,
+  'les PDF du preview doivent être figés dans un cache privé avant d’armer la confirmation');
+assert.match(code, /function hydrateMatrixArtifactForAction/);
+assert.match(code, /loadMatrixArtifactCache\(/,
+  'un redémarrage doit recharger puis revalider le cache exact au lieu de produire un faux PDF expiré');
+assert.match(code, /removeMatrixArtifactCache\(DATA_DIR/,
+  'annulation, expiration, correction et succès doivent nettoyer le cache privé');
 assert.match(handler, /listing: result\.listing \|\| null/,
   'l’adresse Matrix doit être figée avec les PDF du preview');
 assert.match(handler, /listing: cachedArtifact\.listing \|\| null/,
@@ -38,7 +45,8 @@ assert.match(handler, /gmailProviderReceipt\?\.id/);
 assert.match(handler, /Preuve Gmail:/);
 assert.match(handler, /APERÇU HTML — aucun envoi/);
 assert.match(handler, /const requestId = matrixRequestId\(\)/);
-assert.match(handler, /const client = await resolveMatrixClientContext\(emailDestination, num\)/);
+assert.match(handler, /clientOverride[\s\S]*?resolveMatrixClientContext\(emailDestination, num\)/,
+  'le client vient de Pipedrive ou d’une correction Telegram explicite revalidée');
 assert.match(handler, /returnedCentris !== String\(num\)/);
 assert.match(handler, /l’adresse complète \(rue et municipalité\)/);
 assert.match(handler, /result\?\.listing\?\.address_complete === true/);
@@ -54,6 +62,12 @@ assert.ok(code.includes('Ne jamais conclure « courtier concurrent / accès rest
 assert.ok(code.includes('ne jamais créer/prétendre sauvegarder chatgpt_config.md'));
 assert.ok(code.includes('ne jamais déclarer les documents inaccessibles à cause du courtier sans preuve 401/403'));
 assert.ok(code.includes("name !== 'telecharger_annexes_centris'"), 'le preview Matrix doit passer avant le garde générique');
+assert.ok(code.includes("const directMatrixRequest = text.trim().match(/^#?(\\d{7,9})\\s+([^\\s@]+@[^\\s@]+)"),
+  'un message exact « numéro Centris + courriel » doit être reconnu sans choix du modèle');
+assert.match(code, /if \(directMatrixRequest\)[\s\S]*?executeMatrixAnnexesTool/,
+  'la demande directe doit ouvrir le preview Matrix déterministe');
+assert.match(code, /directMatrixRequest[\s\S]*?Aucun courriel ne sera envoyé par cette demande/,
+  'la demande directe ne doit jamais être interprétée comme la confirmation Gmail');
 assert.match(code, /action\.name === 'telecharger_annexes_centris'[\s\S]*?\^🔒 Confirmation refusée:[\s\S]*?pendingExternalEmailActions\.delete\(chatId\)/);
 
 // Le mot seul « envoie » ne reconstruit jamais le numéro ou le destinataire:

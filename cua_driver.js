@@ -2579,85 +2579,124 @@ async function reopenVerifiedMatrixListing(page, exactNum, rawListingUrl) {
 // La fiche détaillée PDF sert de seconde preuve, après validation du numéro
 // Centris exact. Cette extraction reste volontairement stricte: au moindre
 // doute, elle retourne une chaîne vide et le workflow refuse l'aperçu.
-function extractCompleteMatrixAddressFromText(text, fallbackStreet = '') {
+function extractCompleteMatrixAddressFromText(text, fallbackStreet = '', exactCentrisNum = '') {
   const cleanLine = (value) => String(value || '')
     .replace(/\u00a0/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+  const exactNum = String(exactCentrisNum || '').replace(/\D/g, '');
+  // La fonction n'est jamais autorisée à compléter une adresse à partir d'une
+  // fiche qui ne contient pas aussi le numéro Centris exact déjà recherché.
+  if (!/^\d{7,9}$/.test(exactNum) || !matrixTextContainsExactNumber(text, exactNum)) return '';
+
   const lines = String(text || '')
     .split(/\r?\n/)
     .map(cleanLine)
     .filter(Boolean);
   const streetPrefix = '(?:rue|avenue|av\\.?|boulevard|boul\\.?|chemin|ch\\.?|rang|route|mont[ée]e?|place|all[ée]e?|impasse|croissant|terrasse|c[ôo]te|promenade|carr[ée]|autoroute)';
-  const addressStart = new RegExp(`^\\d{1,6}\\s*,?\\s+${streetPrefix}\\b`, 'i');
-  const isComplete = (value) => {
-    const candidate = cleanLine(value);
-    const commas = (candidate.match(/,/g) || []).length;
-    return addressStart.test(candidate) &&
-      (/^\d{1,6}\s*,/.test(candidate) ? commas >= 2 : commas >= 1);
+  const addressLine = new RegExp(`^(\\d{1,6})\\s*,?\\s+(${streetPrefix}\\s+[^,]{1,100}?)(?:\\s*,\\s*(.{3,100}))?$`, 'i');
+  const parseAddress = (value) => {
+    const candidate = cleanLine(value).replace(/,+\s*$/, '');
+    const match = candidate.match(addressLine);
+    if (!match) return null;
+    const civicHadComma = new RegExp(`^${match[1]}\\s*,`).test(candidate);
+    return {
+      civic: match[1],
+      streetName: cleanLine(match[2]),
+      street: `${match[1]}${civicHadComma ? ',' : ''} ${cleanLine(match[2])}`,
+      localityRaw: cleanLine(match[3] || ''),
+    };
   };
-  const locality = (value) => {
+  const validateLocalityName = (value, allowSlash = false) => {
+    const candidate = cleanLine(value);
+    if (candidate.length < 2 || candidate.length > 70 || /\d|\$|@/.test(candidate)) return false;
+    const separator = allowSlash ? "[ \/-]" : '[ -]';
+    const word = "[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ'’.]*";
+    return new RegExp(`^${word}(?:${separator}${word}){0,9}$`).test(candidate);
+  };
+  const validateLocality = (value) => {
     let candidate = cleanLine(value)
-      .replace(/\s*\([^)]{2,80}\)\s*$/, '')
       .replace(/,?\s+(?:Qu[ée]bec|QC)(?:\s+[A-Z]\d[A-Z]\s*\d[A-Z]\d)?\s*$/i, '')
+      .replace(/,?\s+[A-Z]\d[A-Z]\s*\d[A-Z]\d\s*$/i, '')
       .trim();
-    if (candidate.length < 3 || candidate.length > 80 || /\d|\$/.test(candidate)) return '';
-    if (/(?:centris|prix|en vigueur|vendu|courtier|chambre|pi[eè]ce|superficie|terrain|propri[ée]t[ée]|adresse|municipalit[ée]|province|code postal|fiche)/i.test(candidate)) return '';
-    if (!/^[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+(?:\s+(?:(?:de|du|des|la|le|sur|sous|en|aux|les|l[eè]s)|[A-ZÀ-Ý][A-Za-zÀ-ÿ'’.-]+)){0,6}$/.test(candidate)) return '';
-    return candidate;
+    if (candidate.length < 3 || candidate.length > 100) return '';
+    if (/(?:centris|prix|en vigueur|vendu|courtier|courtage|agence|bureau|chambre|pi[eè]ce|superficie|terrain|propri[ée]t[ée]|adresse|municipalit[ée]|province|code postal|fiche|document|caract[ée]ristique|taxe|t[ée]l[ée]phone|courriel|re\/max)/i.test(candidate)) return '';
+    const parts = candidate.match(/^([^()]+?)(?:\s*\(([^()]+)\))?$/);
+    if (!parts || !validateLocalityName(parts[1])) return '';
+    if (parts[2] && !validateLocalityName(parts[2], true)) return '';
+    return parts[2] ? `${cleanLine(parts[1])} (${cleanLine(parts[2])})` : cleanLine(parts[1]);
   };
-  const base = cleanLine(fallbackStreet).replace(/,+\s*$/, '');
-  const baseCivic = base.match(/^(\d{1,6})\s*,?\s+/)?.[1] || '';
-  const baseStreetTokens = normalizeCentrisMatchKey(base)
-    .replace(/^\d{1,6}\s+/, '')
+  const localityCore = (value) => normalizeCentrisMatchKey(String(value || '').replace(/\s*\([^)]*\)\s*$/, ''));
+  const streetTokens = (value) => normalizeCentrisMatchKey(value)
     .split(/\s+/)
-    .filter((token) => token.length >= 3 && !/^(?:rue|avenue|boulevard|chemin|rang|route|place|montee|allee|impasse|croissant|terrasse|cote|promenade|carre|autoroute|des|les|une)$/.test(token));
-  // Sans la rue déjà vérifiée dans la fiche authentifiée, une autre adresse
-  // imprimée plus loin (par exemple celle du courtier) pourrait être choisie.
-  if (!baseCivic || !baseStreetTokens.length || !addressStart.test(base)) return '';
-  const matchesVerifiedStreet = (value) => {
-    const candidate = cleanLine(value);
-    if (candidate.match(/^(\d{1,6})\s*,?\s+/)?.[1] !== baseCivic) return false;
-    const key = normalizeCentrisMatchKey(candidate);
-    return baseStreetTokens.every((token) => key.includes(token));
+    .filter((token) => token.length >= 2 &&
+      !/^(?:rue|avenue|av|boulevard|boul|chemin|ch|rang|route|montee|place|allee|impasse|croissant|terrasse|cote|promenade|carre|autoroute|de|du|des|la|le|les|l|d|en|sur|sous|aux)$/.test(token));
+
+  // La valeur DOM peut déjà inclure « municipalité (quartier) ». Elle doit
+  // être séparée avant de calculer les jetons distinctifs de la RUE; autrement
+  // Repentigny deviendrait à tort un jeton obligatoire du nom « Rue Laval ».
+  const base = parseAddress(fallbackStreet);
+  const baseStreetTokens = streetTokens(base?.streetName || '');
+  if (!base || !baseStreetTokens.length) return '';
+  const baseLocality = validateLocality(base.localityRaw);
+  const matchesVerifiedStreet = (parsed) => {
+    if (!parsed || parsed.civic !== base.civic) return false;
+    const candidateTokens = streetTokens(parsed.streetName);
+    return baseStreetTokens.every((token) => candidateTokens.includes(token));
   };
+
+  const exactLineIndexes = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (matrixTextContainsExactNumber(lines[index], exactNum)) exactLineIndexes.push(index);
+  }
+  const distanceFromExact = (index) => exactLineIndexes.length
+    ? Math.min(...exactLineIndexes.map((exactIndex) => Math.abs(exactIndex - index)))
+    : Number.POSITIVE_INFINITY;
   const candidates = [];
-  const add = (value) => {
-    const candidate = cleanLine(value);
-    if (!isComplete(candidate) || candidate.length > 180 || !matchesVerifiedStreet(candidate)) return;
-    if (!candidates.includes(candidate)) candidates.push(candidate);
+  const addCandidate = (parsed, localityValue, lineIndex, source) => {
+    if (!matchesVerifiedStreet(parsed)) return;
+    const municipality = validateLocality(localityValue);
+    if (!municipality) return;
+    // Si Matrix avait déjà fourni une localité structurelle, le PDF peut y
+    // ajouter un quartier, mais il ne peut pas la remplacer par une autre ville.
+    if (baseLocality && localityCore(baseLocality) !== localityCore(municipality)) return;
+    const distance = distanceFromExact(lineIndex);
+    if (distance > 12) return;
+    candidates.push({ municipality, distance, source });
   };
 
   for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (!addressStart.test(line)) continue;
-    add(line);
-    if (isComplete(line)) continue;
+    const parsed = parseAddress(lines[index]);
+    if (!matchesVerifiedStreet(parsed)) continue;
+    if (parsed.localityRaw) addCandidate(parsed, parsed.localityRaw, index, 'same-line');
     for (let offset = 1; offset <= 3 && index + offset < lines.length; offset += 1) {
-      const municipality = locality(lines[index + offset]);
+      const municipality = validateLocality(lines[index + offset]);
       if (!municipality) continue;
-      add(`${line}, ${municipality}`);
+      addCandidate(parsed, municipality, index, 'next-line');
       break;
     }
   }
 
-  // Certains parseurs PDF aplatissent les retours de ligne. Dans ce cas, la
-  // rue déjà lue dans le DOM permet de borner exactement le début de l'adresse;
-  // seul le premier libellé municipal valide qui la suit est accepté.
-  if (!isComplete(base)) {
-    const normalizedText = cleanLine(text);
-    const escapedTokens = base
-      .replace(/^(\d{1,6})\s*,?\s+/, '$1 ')
-      .split(/\s+/)
-      .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    const basePattern = escapedTokens.join('\\s*,?\\s+');
-    const match = normalizedText.match(new RegExp(`${basePattern}\\s*,?\\s+([^,]{3,80}?)(?=\\s+(?:No\\s+Centris|Centris|Prix|En vigueur|Vendu|\\d[\\d ]*\\s*\\$)|,)`, 'i'));
-    const municipality = locality(match?.[1] || '');
-    if (municipality) add(`${base}, ${municipality}`);
-  }
+  // Repli pour pdf-parse lorsque tous les retours de ligne ont été aplatis.
+  // Il reste borné par « No Centris + numéro exact », et par la rue DOM séparée.
+  const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const streetPattern = base.streetName.split(/\s+/).map(escapeRegex).join('\\s+');
+  const flatPattern = new RegExp(
+    `\\b${escapeRegex(base.civic)}\\s*,?\\s+${streetPattern}\\s*,\\s*(.{3,100}?)\\s+(?:No\\s+)?Centris\\D{0,12}${escapeRegex(exactNum)}(?:\\D|$)`,
+    'i',
+  );
+  const flatMunicipality = validateLocality(cleanLine(text).match(flatPattern)?.[1] || '');
+  if (flatMunicipality) addCandidate(base, flatMunicipality, exactLineIndexes[0] || 0, 'flattened');
 
-  candidates.sort((left, right) => right.length - left.length);
-  return candidates[0] || '';
+  if (!candidates.length) return '';
+  // Deux municipalités différentes pour la même rue dans la même fiche sont
+  // une ambiguïté (souvent l'adresse du courtier): ne jamais choisir au hasard.
+  const municipalityCores = new Set(candidates.map((candidate) => localityCore(candidate.municipality)));
+  if (municipalityCores.size !== 1) return '';
+  candidates.sort((left, right) => left.distance - right.distance ||
+    Number(right.source === 'same-line') - Number(left.source === 'same-line') ||
+    right.municipality.length - left.municipality.length);
+  return `${base.street}, ${candidates[0].municipality}`;
 }
 
 /**
@@ -2824,7 +2863,11 @@ async function cuaGetCentrisAnnexes(centrisNum, filtre = null, options = {}) {
           throw new Error(`MATRIX_PRINT_LISTING_MISMATCH:${exactNum}`);
         }
         if (doc.action_id === MATRIX_LISTING_REPORT_ACTION && parsed) {
-          const completeAddress = extractCompleteMatrixAddressFromText(parsed.text, activeState?.listing?.address || '');
+          const completeAddress = extractCompleteMatrixAddressFromText(
+            parsed.text,
+            activeState?.listing?.address || '',
+            exactNum,
+          );
           if (completeAddress) validatedListingAddressFromPdf = completeAddress;
         }
         const enriched = addCentrisContentMetadata(doc, buffer, validatedPdf.pageCount);

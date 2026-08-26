@@ -187,24 +187,61 @@ assert.strictEqual(
   extractAddress(
     'Fiche détaillée\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\nNo Centris 28936167',
     '440, Rue du Bord-de-l’Eau',
+    '28936167',
   ),
   '440, Rue du Bord-de-l’Eau, Saint-Alphonse-Rodriguez',
   'la municipalité doit être réunie à la rue vérifiée',
 );
 assert.strictEqual(
-  extractAddress('440, Rue du Bord-de-l’Eau\nDocuments additionnels\nNo Centris 28936167', '440, Rue du Bord-de-l’Eau'),
+  extractAddress('440, Rue du Bord-de-l’Eau\nDocuments additionnels\nNo Centris 28936167', '440, Rue du Bord-de-l’Eau', '28936167'),
   '',
   'un titre Matrix ne doit jamais devenir une municipalité',
 );
 assert.strictEqual(
-  extractAddress('123, Rue du Courtier\nMontréal\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez', '440, Rue du Bord-de-l’Eau'),
+  extractAddress('123, Rue du Courtier\nMontréal\n440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\nNo Centris 28936167', '440, Rue du Bord-de-l’Eau', '28936167'),
   '440, Rue du Bord-de-l’Eau, Saint-Alphonse-Rodriguez',
   'une adresse de courtier ne doit jamais remplacer celle du listing',
 );
 assert.strictEqual(
-  extractAddress('440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez', '441, Rue du Bord-de-l’Eau'),
+  extractAddress('440, Rue du Bord-de-l’Eau\nSaint-Alphonse-Rodriguez\nNo Centris 28936167', '441, Rue du Bord-de-l’Eau', '28936167'),
   '',
   'le numéro civique doit correspondre à la rue déjà vérifiée',
+);
+assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n381, Rue Laval\nRepentigny (Repentigny)\nNo Centris 19465925',
+    '381, Rue Laval, Repentigny (Repentigny)',
+    '19465925',
+  ),
+  '381, Rue Laval, Repentigny (Repentigny)',
+  'la municipalité et le district du fallback DOM ne doivent pas devenir des jetons de rue',
+);
+assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n381, Rue Laval, Repentigny (Repentigny)\nNo Centris : 19465925',
+    '381, Rue Laval, Repentigny',
+    '19465925',
+  ),
+  '381, Rue Laval, Repentigny (Repentigny)',
+  'un district valide entre parenthèses doit être conservé depuis le PDF exact',
+);
+assert.strictEqual(
+  extractAddress(
+    'No Centris 19465925\n381, Rue Notre-Dame\nRepentigny\nCourtier immobilier\n381, Rue Laval\nMontréal',
+    '381, Rue Laval, Repentigny (Repentigny)',
+    '19465925',
+  ),
+  '',
+  'une adresse de courtier au même numéro civique mais sur une autre rue doit être rejetée',
+);
+assert.strictEqual(
+  extractAddress(
+    'Fiche détaillée\n381, Rue Laval\nRepentigny (Repentigny)\nNo Centris 99999999',
+    '381, Rue Laval, Repentigny (Repentigny)',
+    '19465925',
+  ),
+  '',
+  'la fiche PDF doit contenir le numéro Centris exact demandé',
 );
 
 const referenceOnly = cua._mergeMatrixDocumentSnapshots([{
