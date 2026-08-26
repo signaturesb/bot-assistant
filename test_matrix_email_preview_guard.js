@@ -40,11 +40,15 @@ assert.match(handler, /APERÇU HTML — aucun envoi/);
 assert.match(handler, /const requestId = matrixRequestId\(\)/);
 assert.match(handler, /const client = await resolveMatrixClientContext\(emailDestination, num\)/);
 assert.match(handler, /returnedCentris !== String\(num\)/);
-assert.match(handler, /l’adresse exacte n’a pas pu être validée/);
+assert.match(handler, /l’adresse complète \(rue et municipalité\)/);
+assert.match(handler, /result\?\.listing\?\.address_complete === true/);
+assert.match(handler, /listingAddressSource !== 'matrix-listing-report-pdf'/);
 assert.match(handler, /matrixClientEligibility\(approvedPreview\.client \|\| \{\}\)/);
 assert.match(handler, /État Gmail incertain/);
 assert.match(handler, /Gmail bloqué avant livraison/);
 assert.match(handler, /if \(!isSendConfirmation && ALLOWED_ID && chatId\)/);
+assert.match(handler, /String\(chatId\) !== String\(ALLOWED_ID\)/,
+  'Matrix doit être inaccessible depuis tout autre chat Telegram');
 assert.match(handler, /Confirmation refusée:.*PDF ont changé/s);
 assert.ok(code.includes('Ne jamais conclure « courtier concurrent / accès restreint » sans un code HTTP 401/403 observé'));
 assert.ok(code.includes('ne jamais créer/prétendre sauvegarder chatgpt_config.md'));
@@ -83,5 +87,9 @@ assert.match(code, /function purgeExpiredMatrixTransactions/);
 assert.match(code, /safeCron\('matrix-preview-expiry-purge'/);
 assert.match(confirmationHandler, /requestId: action\.requestId \|\| null/,
   'la deuxième confirmation doit transmettre le même identifiant unique au garde final');
+assert.match(confirmationHandler, /external\?\.name === 'telecharger_annexes_centris' && external\.correctionMode/,
+  'une correction en cours doit révoquer tout ancien prompt final');
+assert.match(code, /Révoquer l'ancien prompt final[\s\S]*?confirmationStage = 'preview'[\s\S]*?finalConfirmationMessageId = null/,
+  'le clic de correction doit révoquer et persister l’ancien prompt avant de demander les nouvelles données');
 
 console.log('✅ Aperçu Matrix lié au destinataire, modèle et PDF avant confirmation');
