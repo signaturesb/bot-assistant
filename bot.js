@@ -4794,30 +4794,9 @@ async function envoyerDocsProspect(terme, emailDest, fichier, opts = {}) {
   }
   log('INFO', 'DOCS', `[STEP 2/9] email destination: ${toEmail || '(VIDE — listing-mode)'} | centris=${centris || '(none)'}`);
 
-  // Confidentialité: même une commande explicite exige un vrai contact client
-  // avec courriel + téléphone. Si seulement l'email est fourni, compléter en
-  // lecture seule depuis Pipedrive; ne jamais inventer ni contourner ce contrôle.
-  let clientPhone = '';
-  if (deal?.person_id && PD_KEY) {
-    try {
-      const p = await pdGet(`/persons/${deal.person_id}`);
-      clientPhone = p?.data?.phone?.find(x => x.primary)?.value || p?.data?.phone?.[0]?.value || '';
-    } catch {}
-  }
-  if (!clientPhone && toEmail && PD_KEY) {
-    try {
-      const ps = await pdGet(`/persons/search?term=${encodeURIComponent(toEmail)}&fields=email&exact_match=true&limit=2`);
-      const person = ps?.data?.items?.[0]?.item;
-      if (person?.id) {
-        const p = await pdGet(`/persons/${person.id}`);
-        clientPhone = p?.data?.phone?.find(x => x.primary)?.value || p?.data?.phone?.[0]?.value || '';
-      }
-    } catch {}
-  }
-  const clientPhoneDigits = String(clientPhone).replace(/\D/g, '').replace(/^1/, '');
-  if (toEmail && !/^\d{10}$/.test(clientPhoneDigits)) {
-    return `🔒 Aucun document préparé ni envoyé à ${toEmail}: un numéro de téléphone client valide est obligatoire. Ajoute/confirme le téléphone dans Pipedrive, puis relance la commande.`;
-  }
+  // Une commande Telegram explicite avec une adresse courriel valide suffit.
+  // Le téléphone est un enrichissement CRM facultatif et ne doit jamais
+  // empêcher Shawn d'envoyer des documents au destinataire qu'il vient de nommer.
 
   // 3. Dossier Dropbox — folder hint (auto) ou fastDropboxMatch via index complet
   let folder = opts.folderHint || null;
@@ -5232,7 +5211,7 @@ Au plaisir,<br>
         });
         savePendingEmailState();
       }
-      return `🔒 *Documents prêts pour ${realToEmail}*, mais aucun email n'est parti.\n1️⃣ Réponds exactement *"envoie"*.\n2️⃣ Confirme ensuite l’adresse exacte demandée par le bot.`;
+      return `🔒 *Documents prêts pour ${realToEmail}*, mais aucun email n'est parti.\nRéponds exactement *« envoie »* pour les envoyer maintenant.`;
     }
   }
 
@@ -8402,7 +8381,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         });
         savePendingEmailState();
         auditLogEvent('email', 'external-action-pending', { tool: name, to: summary.to, chatId });
-        return `📧 *ACTION PRÊTE — AUCUN ENVOI EFFECTUÉ*\n\nÀ: ${summary.to}\nCc visible: ${summary.to === String(AGENT.email).toLowerCase() ? 'aucun (vous êtes le destinataire)' : AGENT.email}\nContenu: ${summary.label}\n\n1️⃣ Réponds *« envoie »*.\n2️⃣ Confirme ensuite l’adresse exacte demandée par le bot.`;
+        return `📧 *ACTION PRÊTE — AUCUN ENVOI EFFECTUÉ*\n\nÀ: ${summary.to}\nCc visible: ${summary.to === String(AGENT.email).toLowerCase() ? 'aucun (vous êtes le destinataire)' : AGENT.email}\nContenu: ${summary.label}\n\nRéponds exactement *« envoie »* pour envoyer maintenant.`;
       }
       if (!CONFIRM_REGEX.test(String(userMessage || '').trim())) {
         return '🔒 Envoi externe bloqué: confirmation exacte « envoie » requise.';
@@ -10993,15 +10972,14 @@ async function armPendingDocsFinalConfirmation(chatId, pending, pendingKey, prev
   };
   pendingExternalEmailActions.set(chatId, action);
   savePendingEmailState();
-  try {
-    await requestFinalEmailConfirmation(chatId, 'external', action);
-    return true;
-  } catch (error) {
-    pendingExternalEmailActions.delete(chatId);
-    savePendingEmailState();
-    await send(chatId, `❌ Deuxième confirmation non créée: ${String(error?.message || error).substring(0, 140)}. Aucun email envoyé.`);
-    return false;
-  }
+  // La commande « envoie les docs à ... » ou le bouton Telegram constitue
+  // déjà la confirmation exacte de Shawn. Exécuter immédiatement la
+  // transaction nouvellement armée, sans demander une seconde confirmation.
+  return handleEmailConfirmation({
+    chat: { id: chatId },
+    message_id: previewMessageId || Date.now(),
+    text: 'envoie',
+  });
 }
 
 async function handleEmailConfirmation(msg) {
@@ -11137,7 +11115,7 @@ async function handleEmailConfirmation(msg) {
         } else {
           // Échec déterministe: le fournisseur n'a pas livré. La confirmation
           // consommée ne peut pas être rejouée; on revient à l'aperçu et une
-          // nouvelle double confirmation sera nécessaire.
+          // une nouvelle confirmation exacte sera nécessaire.
           action.inFlight = false;
           action.attemptStartedAt = null;
           action.deliveryUncertain = false;
@@ -11146,7 +11124,7 @@ async function handleEmailConfirmation(msg) {
           action.finalConfirmationMessageId = null;
           action.finalConfirmationExpiresAt = null;
           savePendingEmailState();
-          await send(chatId, `${resultText}\n\n🔁 Échec confirmé sans livraison. La demande reste en aperçu; utilise CONFIRMER pour recommencer une nouvelle double confirmation.`);
+          await send(chatId, `${resultText}\n\n🔁 Échec confirmé sans livraison. La demande reste en aperçu; réponds de nouveau « envoie » pour réessayer.`);
         }
       } catch (error) {
         action.inFlight = false;
@@ -11166,7 +11144,7 @@ async function handleEmailConfirmation(msg) {
       });
       await envoyerEmailGmail({ ...action, authorization });
     } catch (error) {
-      log('ERR', 'EMAIL', `Gmail fail après double confirmation: ${error.message}`);
+      log('ERR', 'EMAIL', `Gmail fail après confirmation transactionnelle: ${error.message}`);
       action.inFlight = false;
       action.deliveryUncertain = true;
       savePendingEmailState();
@@ -12408,7 +12386,7 @@ function registerHandlers() {
     const num = match[1];
     const email = match[2];
     const message_perso = match[3]?.trim() || null;
-    await bot.sendMessage(msg.chat.id, `📥 *Fiche Centris #${num}* → ${email}\n_Présentation de l’action seulement — aucun envoi avant deux confirmations._`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(msg.chat.id, `📥 *Fiche Centris #${num}* → ${email}\n_Présentation de l’action seulement — réponds « envoie » pour expédier._`, { parse_mode: 'Markdown' });
     bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
     const stopTyping = startTypingIndicator(msg.chat.id);
     try {
@@ -19184,7 +19162,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
   const sourceTrusted = /^(centris|remax|realtor|duproprio)$/i.test(source?.source || '');
   const exactMatch = dbxMatch?.score === 100;
   const completeContact = !!(email && (telephone || centris));
-  if (email && telephone && hasMatch && dbxMatch.identityVerified) {
+  if (email && hasMatch && dbxMatch.identityVerified) {
     // Mode preview + pending (consent click obligatoire)
     leadAudit.decision = 'pending_no_email_sent';
     pendingDocSends.set(email, {
@@ -19209,8 +19187,7 @@ async function traiterNouveauLead(lead, msgId, from, subject, source, opts = {})
                    `   ✅ Click le bouton ci-dessous OU dis \`envoie les docs à ${email}\``;
   } else if (email && (dbxMatch?.folder || dbxMatch?.candidates?.length)) {
     leadAudit.decision = 'unverified_dropbox_candidate';
-    const missingContact = !telephone ? ' Le numéro de téléphone du client est absent.' : '';
-    autoEnvoiMsg = `\n🔒 *Documents bloqués* — courriel + téléphone client + numéro Centris exact sont obligatoires.${missingContact} Aucun fichier listé, aucun bouton d'envoi, aucune préparation.`;
+    autoEnvoiMsg = `\n🔒 *Documents bloqués* — une correspondance exacte avec le dossier Dropbox et le numéro Centris est obligatoire. Le téléphone client est facultatif. Aucun fichier listé, aucun bouton d'envoi, aucune préparation.`;
   } else if (dealId && email) {
     // Aucun match Dropbox du tout mais deal créé — alerte pour visibilité
     leadAudit.decision = 'no_dropbox_match';

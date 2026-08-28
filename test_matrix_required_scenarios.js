@@ -45,6 +45,8 @@ scenario('Courriel invalide ou correspondance réellement ambiguë bloqués', ()
 scenario('Téléphone et nom facultatifs restent visibles sans être inventés', () => {
   assert.match(bot, /Téléphone:.*non fourni \(facultatif — jamais inventé\)/);
   assert.match(bot, /Enrichissement CRM facultatif absent/);
+  assert.doesNotMatch(bot, /un numéro de téléphone client valide est obligatoire/);
+  assert.match(bot, /Le téléphone client est facultatif/);
 });
 scenario('Correspondance Dropbox approximative ne remplace pas Matrix exact', () => {
   const matrixHandler = bot.match(/async function executeMatrixAnnexesTool[\s\S]*?\n}\n\nasync function executeTool/)?.[0] || '';
