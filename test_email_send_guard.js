@@ -119,6 +119,19 @@ assert.ok(
   'la réservation par empreinte doit précéder atomiquement toute tentative fournisseur',
 );
 assert.ok(loggedWrapper.includes('EMAIL_DUPLICATE_FINGERPRINT_BLOCKED'));
+assert.ok(
+  loggedWrapper.includes("opts.confirmedResend === true && priorIdentical?.outcome === 'sent'"),
+  'un renvoi confirmé doit contourner uniquement un résultat antérieur sent, jamais pending/uncertain',
+);
+assert.match(
+  botCode,
+  /const\s+CONFIRM_REGEX\s*=.*renvoie.*annule\\s\+et\\s\+renvoie/i,
+  'Telegram doit accepter renvoie et annule et renvoie comme confirmations explicites',
+);
+assert.ok(
+  botCode.includes('confirmedResend: explicitResend || Boolean(action.resendOfEntryId)'),
+  'un nouvel aperçu reconstruit après annulation doit autoriser le renvoi explicite',
+);
 assert.ok(loggedWrapper.includes('EMAIL_OUTBOX_OUTCOME_PERSIST_FAILED'));
 assert.ok(botCode.includes("const REQUIRED_VISIBLE_CC_EMAIL = 'shawn@signaturesb.com'"), 'le Cc visible obligatoire ne doit pas dépendre d’une env dérivée');
 assert.ok(!/pendingEmails\.set\(ALLOWED_ID/.test(botCode), 'automatic lead drafts must never overwrite the active draft');

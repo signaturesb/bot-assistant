@@ -972,7 +972,8 @@ async function sendEmailLogged(opts) {
     Date.now() - Number(candidate.ts || 0) < 24 * 60 * 60 * 1000 &&
     ['pending', 'sent', 'uncertain'].includes(candidate.outcome)
   );
-  if (priorIdentical) {
+  const confirmedResend = opts.confirmedResend === true && priorIdentical?.outcome === 'sent';
+  if (priorIdentical && !confirmedResend) {
     return {
       ok: false, blocked: true, code: 'EMAIL_DUPLICATE_FINGERPRINT_BLOCKED',
       error: `Transaction identique déjà ${priorIdentical.outcome}`,
@@ -992,6 +993,7 @@ async function sendEmailLogged(opts) {
     fingerprint,
     authorization: internalOnly ? 'internal-only' : 'required',
     outcome: 'pending',
+    resendOfEntryId: confirmedResend ? priorIdentical.id : null,
   };
   emailOutbox.push(entry);
   if (!saveEmailOutbox()) {
@@ -7748,7 +7750,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   if (!Number.isInteger(ALLOWED_ID) || ALLOWED_ID <= 0 || String(chatId) !== String(ALLOWED_ID)) {
     return `🔒 Conversation Telegram non autorisée ou non configurée. Aucun accès Matrix, aucun PDF remis et aucun email envoyé.`;
   }
-  const isSendConfirmation = /^(?:envoie|send)[!.]?$/i.test(String(userMessage || '').trim());
+  const isSendConfirmation = /^(?:envoie|renvoie|send)[!.]?$/i.test(String(userMessage || '').trim());
   const activeMatrixTransaction = pendingExternalEmailActions.get(chatId);
   const workflowRequestId = String(
     confirmationContext.requestId || activeMatrixTransaction?.requestId || matrixRequestId(),
@@ -8070,7 +8072,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       Date.now() - Number(entry.ts || 0) < 24 * 60 * 60 * 1000 &&
       ['pending', 'sent', 'uncertain'].includes(entry.outcome)
     );
-    if (priorAttempt) {
+    if (priorAttempt && priorAttempt.outcome !== 'sent') {
       return `🔒 Un envoi Gmail identique est déjà ${priorAttempt.outcome === 'sent' ? 'confirmé envoyé' : 'en cours ou incertain'} dans le registre durable (transaction ${priorAttempt.id}). Aucun nouvel aperçu n’est armé et aucune répétition fournisseur n’est permise.`;
     }
     const client = clientOverride && normalizeSingleRecipientEmail(clientOverride.email) === emailDestination
@@ -8096,6 +8098,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       emailSubject: subject,
       emailBody: bodyText,
       emailCc: cc,
+      resendOfEntryId: priorAttempt?.outcome === 'sent' ? priorAttempt.id : null,
     };
     let htmlPreviewMessageId = null;
     try {
@@ -8221,6 +8224,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   const sent = await sendEmailLogged({
     via: 'gmail', to: emailDestination, cc, subject,
     category: 'centris-matrix-annexes', authorization, emailPayload,
+    confirmedResend: confirmationContext.confirmedResend === true,
     sendFn: async () => {
       const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
         method: 'POST',
@@ -8247,6 +8251,9 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
       observeFailure('gmail-send', 'MATRIX_GMAIL_SEND_BLOCKED', {
         result: 'blocked', document_count: documents.length,
       });
+      if (sent.code === 'EMAIL_DUPLICATE_FINGERPRINT_BLOCKED' && /déjà sent/i.test(String(sent.error || ''))) {
+        return `🔁 Gmail confirme qu’un courriel identique a déjà été envoyé. Si la cliente ne l’a pas reçu, réponds exactement « renvoie » pour autoriser un seul nouvel envoi.`;
+      }
       return `🔒 Gmail bloqué avant livraison pour la demande ${approvedPreview.requestId || '?'}: ${sent.error || sent.code}. Aucun email envoyé.`;
     }
     observeFailure('gmail-send', 'MATRIX_GMAIL_SEND_REJECTED', {
@@ -10466,7 +10473,7 @@ function isAllowed(msg) {
 }
 
 // ─── Confirmation envoi email ─────────────────────────────────────────────────
-const CONFIRM_REGEX = /^(envoie[!.]?|envoie[- ]le[!.]?|send[!.]?)$/i;
+const CONFIRM_REGEX = /^(envoie[!.]?|envoie[- ]le[!.]?|renvoie[!.]?|annule\s+et\s+renvoie[!.]?|send[!.]?)$/i;
 const PIPEDRIVE_ACTIVITY_CONFIRM_REGEX = /^(?:confirme|confirm)[!.]?$/i;
 
 async function handlePipedriveActivityConfirmation(chatId, text) {
@@ -10986,6 +10993,7 @@ async function handleEmailConfirmation(msg) {
   const chatId = msg?.chat?.id;
   const text = String(msg?.text || '').trim();
   const firstConfirmation = CONFIRM_REGEX.test(text);
+  const explicitResend = /^(?:renvoie|annule\s+et\s+renvoie)[!.]?$/i.test(text);
   const finalMatch = text.match(/^confirme\s+([^\s]+@[^\s]+)$/i);
   if (!firstConfirmation && !finalMatch) return false;
 
@@ -11089,6 +11097,10 @@ async function handleEmailConfirmation(msg) {
             finalPromptMessageId: action.finalConfirmationMessageId,
             confirmedRecipient,
             requestId: action.requestId || null,
+            // Un nouvel aperçu reconstruit après annulation constitue une
+            // nouvelle autorisation explicite. « renvoie » permet aussi le
+            // renvoi direct si Gmail avait confirmé le premier exemplaire.
+            confirmedResend: explicitResend || Boolean(action.resendOfEntryId),
           },
         );
         const resultText = String(result || '');
