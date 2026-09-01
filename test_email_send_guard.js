@@ -132,6 +132,13 @@ assert.ok(
   botCode.includes('confirmedResend: explicitResend || Boolean(action.resendOfEntryId)'),
   'un nouvel aperçu reconstruit après annulation doit autoriser le renvoi explicite',
 );
+assert.ok(botCode.includes('function cancelPendingEmailTransactions'), 'une annulation ciblée doit libérer tous les états email associés');
+assert.match(botCode, /clearMatrixTransaction\(chatId, external\.requestId \|\| null\)/, 'annule destinataire doit supprimer la transaction Matrix et son cache');
+assert.match(botCode, /\^\(\?:\\\/annule-tout\|ann\?u\+l\+e\\s\+tout\)/, 'annule tout doit fournir une fermeture explicite de toutes les sessions');
+assert.match(botCode, /\^\(\?:ann\?u\+l\+e\|cancel\)/, 'la faute courante annulle doit être acceptée');
+const pendingListHandler = botCode.match(/\/\/ Voir liste pending docs[\s\S]*?\/\/ "nom Prénom Nom"/)?.[0] || '';
+assert.ok(pendingListHandler, '/pending doit rester auditable');
+assert.ok(!pendingListHandler.includes('.delete('), '/pending doit uniquement afficher la liste et ne jamais annuler');
 assert.ok(loggedWrapper.includes('EMAIL_OUTBOX_OUTCOME_PERSIST_FAILED'));
 assert.ok(botCode.includes("const REQUIRED_VISIBLE_CC_EMAIL = 'shawn@signaturesb.com'"), 'le Cc visible obligatoire ne doit pas dépendre d’une env dérivée');
 assert.ok(!/pendingEmails\.set\(ALLOWED_ID/.test(botCode), 'automatic lead drafts must never overwrite the active draft');

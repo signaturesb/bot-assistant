@@ -11624,19 +11624,85 @@ function registerHandlers() {
     await armPendingDocsFinalConfirmation(msg.chat.id, pending, pendingKey, msg.message_id);
   });
 
-  // Annuler un pending docs
-  bot.onText(/^(?:annule|cancel)\s+(\S+)/i, (msg, match) => {
-    if (!isAllowed(msg)) return;
-    const target = match[1].toLowerCase().trim();
-    let cancelled = null;
-    for (const [email, p] of pendingDocSends) {
-      if (email.toLowerCase() === target || p.nom?.toLowerCase().includes(target.toLowerCase())) {
-        cancelled = email;
+  function cancellationTargetMatches(targetRaw, ...candidateValues) {
+    const clean = value => String(value || '').trim().toLowerCase().replace(/^mailto:/, '');
+    const target = clean(targetRaw);
+    if (!target) return false;
+    const targetLocal = target.split('@')[0].replace(/[^a-z0-9]/g, '');
+    return candidateValues.some(value => {
+      const candidate = clean(value);
+      if (!candidate) return false;
+      const local = candidate.split('@')[0].replace(/[^a-z0-9]/g, '');
+      if (candidate === target || local === targetLocal) return true;
+      if (candidate.includes(target) || local.includes(targetLocal)) return true;
+      // Une annulation ne livre rien: accepter un début assez précis évite
+      // qu'une petite faute (« frederick ») laisse une transaction verrouillée.
+      return targetLocal.length >= 6 && local.length >= 6 &&
+        targetLocal.slice(0, 6) === local.slice(0, 6);
+    });
+  }
+
+  function cancelPendingEmailTransactions(chatId, targetRaw, { all = false } = {}) {
+    const cancelled = new Set();
+    for (const [email, pendingDoc] of pendingDocSends.entries()) {
+      if (all || cancellationTargetMatches(targetRaw, email, pendingDoc?.email, pendingDoc?.nom)) {
         pendingDocSends.delete(email);
-        break;
+        cancelled.add(email);
       }
     }
-    bot.sendMessage(msg.chat.id, cancelled ? `🗑 Annulé: ${cancelled}` : `❌ Aucun pending pour "${target}"`);
+
+    const external = pendingExternalEmailActions.get(chatId);
+    const externalRecipient = pendingEmailTransactionRecipient('external', external);
+    if (external && (all || cancellationTargetMatches(targetRaw, externalRecipient, external?.client?.name))) {
+      if (external.name === 'telecharger_annexes_centris') {
+        clearMatrixTransaction(chatId, external.requestId || null);
+      } else {
+        pendingExternalEmailActions.delete(chatId);
+      }
+      cancelled.add(externalRecipient || 'transaction Matrix');
+    }
+
+    const draft = pendingEmails.get(chatId);
+    const draftRecipient = pendingEmailTransactionRecipient('draft', draft);
+    if (draft && (all || cancellationTargetMatches(targetRaw, draftRecipient, draft?.toName))) {
+      pendingEmails.delete(chatId);
+      cancelled.add(draftRecipient || 'brouillon');
+    }
+
+    if (all) {
+      pendingPipedriveActivityActions.delete(chatId);
+      pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => Number(item.chatId) !== Number(chatId));
+      savePendingPipedriveActions();
+    } else {
+      pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => {
+        if (Number(item.chatId) !== Number(chatId)) return true;
+        const recipient = pendingEmailTransactionRecipient('draft', item.draft);
+        if (!cancellationTargetMatches(targetRaw, recipient, item.draft?.toName)) return true;
+        cancelled.add(recipient || 'brouillon en file');
+        return false;
+      });
+    }
+    savePendingEmailState();
+    return [...cancelled];
+  }
+
+  // Annuler toutes les transactions actives sans transformer /pending en commande destructive.
+  bot.onText(/^(?:\/annule-tout|ann?u+l+e\s+tout)[!.]?$/i, (msg) => {
+    if (!isAllowed(msg)) return;
+    const cancelled = cancelPendingEmailTransactions(msg.chat.id, '', { all: true });
+    bot.sendMessage(msg.chat.id, cancelled.length
+      ? `🗑 ${cancelled.length} transaction(s) annulée(s). Tu peux reconstruire et renvoyer immédiatement.`
+      : '✅ Aucune transaction active à annuler.');
+  });
+
+  // Annuler un pending docs ET la transaction email/Matrix correspondante.
+  bot.onText(/^(?:ann?u+l+e|cancel)\s+(?!tout(?:\s|$))(\S+)/i, (msg, match) => {
+    if (!isAllowed(msg)) return;
+    const target = match[1].toLowerCase().trim();
+    const cancelled = cancelPendingEmailTransactions(msg.chat.id, target);
+    bot.sendMessage(msg.chat.id, cancelled.length
+      ? `🗑 Annulé: ${cancelled.join(', ')}. Toutes les sessions liées sont libérées; tu peux reconstruire et renvoyer.`
+      : `❌ Aucune transaction pour "${target}". /pending affiche seulement la liste; /annule-tout libère toutes les sessions.`);
   });
 
   // Voir liste pending docs
