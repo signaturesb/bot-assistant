@@ -175,6 +175,7 @@ const AGENT = {
   partenaire:   process.env.AGENT_PARTNER   || '',
   couleur:      process.env.AGENT_COULEUR   || '#aa0721',
   dbx_terrains: process.env.DBX_TERRAINS   || '/Terrain en ligne',
+  dbx_liste_terrains: process.env.DBX_LISTE_TERRAINS || '/Liste terrain a jour Signature SB/liste_terrains_disponibles_signaturesb.pdf',
   dbx_templates:process.env.DBX_TEMPLATES  || '/Liste de contact/email_templates',
   dbx_contacts: process.env.DBX_CONTACTS   || '/Contacts',
   // Plan SaaS du tenant (solo, pro, enterprise) — détermine quotas + features
@@ -2551,6 +2552,104 @@ async function downloadDropboxFile(filePath) {
   const buffer = Buffer.from(await res.arrayBuffer());
   const filename = p.split('/').pop();
   return { buffer, filename };
+}
+
+// Liste client officielle SignatureSB. Le fichier est téléchargé de Dropbox
+// au moment de CHAQUE envoi: une mise à jour faite par Julie au même chemin est
+// donc utilisée immédiatement, sans copie locale ni cache périssable.
+async function envoyerListeTerrains({ email, nom, message, cc }, confirmationMessage = '') {
+  const dest = normalizeSingleRecipientEmail(email);
+  if (!dest) return '❌ Adresse courriel invalide ou manquante.';
+
+  const sourcePath = AGENT.dbx_liste_terrains;
+  const file = await downloadDropboxFile(sourcePath);
+  if (!file?.buffer) return `❌ Liste de terrains introuvable dans Dropbox: ${sourcePath}`;
+  if (file.buffer.length < 5000 || file.buffer.subarray(0, 4).toString() !== '%PDF') {
+    log('ERR', 'TERRAIN_LIST', `Fichier Dropbox invalide: ${sourcePath} (${file.buffer.length} octets)`);
+    return '❌ Envoi bloqué: le fichier officiel de terrains n’est pas un PDF valide.';
+  }
+
+  const token = await getGmailToken();
+  if (!token) return '❌ Liste récupérée, mais Gmail n’est pas disponible.';
+
+  const filename = 'liste_terrains_disponibles_signaturesb.pdf';
+  const subject = 'Terrains disponibles — SignatureSB';
+  const intro = String(message || '').trim() ||
+    `Bonjour${nom ? ` ${String(nom).trim()}` : ''},\n\nVoici notre liste de terrains actuellement disponibles. N’hésitez pas à me dire quels secteurs ou projets vous intéressent afin que je puisse mieux vous guider.\n\nAu plaisir,\n${AGENT.nom}`;
+  const introHtml = escapeHtml(intro).replace(/\n/g, '<br>');
+  const contentHTML = `
+<p style="margin:0 0 18px;color:#cccccc;font-size:14px;line-height:1.7;">${introHtml}</p>
+<div style="background:#111111;border:1px solid #1e1e1e;border-radius:8px;padding:18px;margin:20px 0;">
+<div style="color:${AGENT.couleur};font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;">Liste à jour</div>
+<div style="color:#f5f5f7;font-size:14px;">📎 ${escapeHtml(filename)} <span style="color:#888;">(${Math.round(file.buffer.length / 1024)} KB)</span></div>
+</div>`;
+  let html = await buildEmailFromMasterTpl({
+    TITRE_EMAIL: 'Terrains disponibles',
+    LABEL_SECTION: 'Sélection SignatureSB',
+    TERRITOIRES: 'Lanaudière · Laurentides · environs',
+    HERO_TITRE: 'Terrains<br>disponibles.',
+    INTRO_TEXTE: contentHTML,
+    CITATION: 'Je vous accompagne de la sélection du terrain jusqu’à la réalisation de votre projet.',
+  });
+  if (!html) {
+    html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#0a0a0a;color:#f5f5f7;padding:24px;"><div style="max-width:620px;margin:auto;border-top:4px solid ${AGENT.couleur};padding-top:24px;">${contentHTML}<p>${escapeHtml(AGENT.nom)} · ${escapeHtml(AGENT.compagnie)}<br>${escapeHtml(AGENT.telephone)}</p></div></body></html>`;
+  }
+
+  const ccUser = !cc ? [] : (Array.isArray(cc) ? cc : String(cc).split(','))
+    .map(value => normalizeSingleRecipientEmail(value)).filter(Boolean);
+  const ccFinal = [...new Set([AGENT.email, ...ccUser].filter(value => value.toLowerCase() !== dest))];
+  const enc = value => `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`;
+  const boundary = `sbTerrains${Date.now()}`;
+  const lines = [
+    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `To: ${dest}`,
+    ...(ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : []),
+    `Reply-To: ${AGENT.email}`,
+    `Subject: ${enc(subject)}`,
+    'MIME-Version: 1.0',
+    'X-SignatureSB-Automation: kira-bot',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '', `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '', Buffer.from(html, 'utf8').toString('base64'),
+    `--${boundary}`,
+    'Content-Type: application/pdf',
+    `Content-Disposition: attachment; filename="${enc(filename)}"`,
+    'Content-Transfer-Encoding: base64',
+    '', file.buffer.toString('base64'),
+    `--${boundary}--`,
+  ];
+  const raw = Buffer.from(lines.join('\r\n')).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const emailPayload = {
+    via: 'gmail', to: dest, cc: ccFinal, bcc: [], subject, body: intro,
+    attachments: [{
+      name: filename,
+      size: file.buffer.length,
+      sha256: crypto.createHash('sha256').update(file.buffer).digest('hex'),
+    }],
+  };
+  let authorization = null;
+  if (!isInternalEmailPayload(emailPayload)) {
+    try {
+      authorization = createOneShotAuthorization({ message: confirmationMessage, ...emailPayload });
+    } catch {
+      return `🔒 Liste de terrains prête pour ${dest}, mais aucun email n’est parti. Réponds exactement « envoie ».`;
+    }
+  }
+  const sent = await sendEmailLogged({
+    via: 'gmail', to: dest, cc: ccFinal, subject,
+    category: 'liste-terrains-signaturesb', authorization, emailPayload,
+    sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw }),
+    }),
+  });
+  if (!sent.ok) return `❌ Liste non envoyée: ${sent.error || sent.status || 'Gmail indisponible'}`;
+  auditLogEvent('terrain-list', 'sent', { to: dest, path: sourcePath, bytes: file.buffer.length });
+  return `✅ Liste de terrains SignatureSB envoyée à *${dest}*\n📎 ${filename} · ${Math.round(file.buffer.length / 1024)} KB\nCc: ${ccFinal.join(', ') || 'aucun'}`;
 }
 // ═══════════════════════════════════════════════════════════════════════════
 // DROPBOX INDEX COMPLET — scan récursif paginé de tous les terrains + fichiers
@@ -7646,6 +7745,7 @@ const TOOLS = [
   { name: 'list_dropbox_folder', description: 'Liste les fichiers dans un dossier Dropbox (documents propriétés, terrains)', input_schema: { type: 'object', properties: { path: { type: 'string', description: 'Chemin ("Terrain en ligne" ou "" pour racine)' } }, required: ['path'] } },
   { name: 'read_dropbox_file',   description: 'Lit un fichier texte depuis Dropbox', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
   { name: 'send_dropbox_file',   description: 'Télécharge un PDF/image depuis Dropbox et l\'envoie à Shawn par Telegram', input_schema: { type: 'object', properties: { path: { type: 'string' }, caption: { type: 'string' } }, required: ['path'] } },
+  { name: 'envoyer_liste_terrains', description: 'Prépare l’envoi par Gmail de la liste officielle et toujours à jour des terrains SignatureSB. Télécharge à chaque demande le PDF maître Dropbox /Liste terrain a jour Signature SB/liste_terrains_disponibles_signaturesb.pdf, utilise le template officiel avec logos, met Shawn en Cc visible et exige ensuite la confirmation exacte « envoie ». Utiliser pour « envoie ma liste de terrains à [courriel] », « partage les terrains disponibles » ou équivalent.', input_schema: { type: 'object', properties: { email: { type: 'string', description: 'Courriel du destinataire' }, nom: { type: 'string', description: 'Prénom ou nom du destinataire, si connu' }, message: { type: 'string', description: 'Message personnalisé optionnel' }, cc: { type: 'string', description: 'Cc additionnels optionnels, séparés par des virgules' } }, required: ['email'] } },
   // ── Contacts ──
   { name: 'chercher_contact',  description: 'Chercher dans les contacts iPhone de Shawn (Dropbox /Contacts/contacts.vcf). Trouver tel cell et email perso avant tout suivi. Complète Pipedrive.', input_schema: { type: 'object', properties: { terme: { type: 'string', description: 'Nom, prénom ou numéro de téléphone' } }, required: ['terme'] } },
   // ── Brevo ──
@@ -7719,6 +7819,7 @@ const PIPEDRIVE_WRITE_TOOL_ACTIONS = Object.freeze({
 function getExternalEmailToolRecipient(name, input = {}) {
   const recipients = {
     envoyer_docs_prospect: input.email || (String(input.terme || '').includes('@') ? input.terme : ''),
+    envoyer_liste_terrains: input.email,
     envoyer_rapport_comparables: input.email,
     telecharger_fiche_centris: input.email_destination,
     envoyer_fiche_centris_native: input.email,
@@ -7735,6 +7836,7 @@ function externalEmailActionSummary(name, input = {}) {
   const centris = String(input.centris_num || input.centris || '').replace(/\D/g, '');
   const labels = {
     envoyer_docs_prospect: `documents Dropbox${input.terme ? ` pour ${input.terme}` : ''}`,
+    envoyer_liste_terrains: 'liste officielle des terrains SignatureSB (PDF Dropbox à jour)',
     envoyer_rapport_comparables: `rapport comparables ${input.ville || ''}`.trim(),
     telecharger_fiche_centris: `fiche Centris #${centris}`,
     envoyer_fiche_centris_native: `fiche Centris native #${centris}`,
@@ -8482,6 +8584,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         userMessage,
         chatId,
       });
+      case 'envoyer_liste_terrains': return await envoyerListeTerrains(input, userMessage);
       case 'voir_emails_recents':  return await voirEmailsRecents(input.depuis || '1d');
       case 'voir_conversation':    return await voirConversation(input.terme);
       case 'envoyer_email': {
