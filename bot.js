@@ -35,6 +35,7 @@ const {
 } = require('./lib/matrix_email_confirmation_guard');
 const {
   parseDirectMatrixRequest,
+  parseDirectMatrixBatchRequest,
   looksLikeMatrixSendWithoutEmail,
   looksLikeMatrixSendCommand,
   assertMatrixRequestParserReady,
@@ -424,6 +425,8 @@ const pendingExternalEmailActions = new Map(); // chatId → transaction email u
 const pendingMatrixArtifacts = new Map();
 const pendingPipedriveActivityActions = new Map(); // chatId → aperçu figé + confirmation one-shot
 let pendingEmailDraftQueue = []; // brouillons additionnels, jamais écrasés
+let pendingMatrixRequestQueue = []; // demandes Matrix séquentielles, une confirmation par inscription
+const matrixQueueProcessing = new Set();
 let pendingDocSends = new Map(); // email → { email, nom, centris, dealId, deal, match, _firstSeen }
 let quarantinedLegacyEmailActions = 0;
 
@@ -486,9 +489,15 @@ try {
     pendingEmailDraftQueue = Array.isArray(saved.queue)
       ? saved.queue.filter(item => Number(item?.draft?.confirmationVersion || 0) === EMAIL_CONFIRMATION_VERSION).slice(-100)
       : [];
+    pendingMatrixRequestQueue = Array.isArray(saved.matrixQueue)
+      ? saved.matrixQueue.filter(item => item && Number(item.chatId) === ALLOWED_ID &&
+          /^\d{7,9}$/.test(String(item.centrisNum || '')) &&
+          /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(item.email || ''))).slice(0, 30)
+      : [];
   }
 } catch {
   pendingEmailDraftQueue = [];
+  pendingMatrixRequestQueue = [];
 }
 
 function savePendingEmailState() {
@@ -496,6 +505,7 @@ function savePendingEmailState() {
     active: [...pendingEmails.entries()],
     external: [...pendingExternalEmailActions.entries()].map(([chatId, action]) => [chatId, { ...action, inFlight: false }]),
     queue: pendingEmailDraftQueue.slice(-100),
+    matrixQueue: pendingMatrixRequestQueue.slice(0, 30),
   });
 }
 
@@ -8484,6 +8494,68 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   return `${providerState}\n${documents.length} documents Matrix #${num} remis à *${emailDestination}*${cc.length ? ` (Cc ${REQUIRED_VISIBLE_CC_EMAIL})` : ''}.\nPreuve Gmail: \`${gmailProviderReceipt.id}\`\n📥 Vérification de la copie dans votre boîte en arrière-plan. Aucun document omis; aucune relance automatique.`;
 }
 
+function enqueueMatrixRequests(chatId, requests = []) {
+  const active = pendingExternalEmailActions.get(chatId);
+  const activeKey = active?.name === 'telecharger_annexes_centris'
+    ? `${active.input?.centris_num}:${String(active.input?.email_destination || '').toLowerCase()}`
+    : '';
+  const known = new Set(pendingMatrixRequestQueue
+    .filter(item => Number(item.chatId) === Number(chatId))
+    .map(item => `${item.centrisNum}:${item.email}`));
+  if (activeKey) known.add(activeKey);
+  const added = [];
+  for (const request of requests) {
+    const centrisNum = String(request.centrisNum || '').replace(/\D/g, '');
+    const email = normalizeSingleRecipientEmail(request.email);
+    const key = `${centrisNum}:${email}`;
+    if (!/^\d{7,9}$/.test(centrisNum) || !email || known.has(key)) continue;
+    const item = {
+      id: matrixRequestId(), chatId, centrisNum, email,
+      message: String(request.message || '').trim().substring(0, 2000),
+      createdAt: Date.now(),
+    };
+    pendingMatrixRequestQueue.push(item);
+    known.add(key);
+    added.push(item);
+  }
+  if (pendingMatrixRequestQueue.length > 30) pendingMatrixRequestQueue = pendingMatrixRequestQueue.slice(0, 30);
+  savePendingEmailState();
+  return added;
+}
+
+async function startNextQueuedMatrixRequest(chatId) {
+  if (matrixQueueProcessing.has(chatId) || pendingExternalEmailActions.has(chatId)) return false;
+  const index = pendingMatrixRequestQueue.findIndex(item => Number(item.chatId) === Number(chatId));
+  if (index < 0) return false;
+  const item = pendingMatrixRequestQueue[index];
+  matrixQueueProcessing.add(chatId);
+  try {
+    await send(chatId, `🔎 Prochain dossier #${item.centrisNum} pour ${item.email}: récupération et aperçu en cours.\n🔒 Aucun courriel envoyé.`);
+    const result = await executeMatrixAnnexesTool({
+      num: item.centrisNum, emailDestination: item.email, filtre: '',
+      messagePerso: item.message, chatId,
+      userMessage: `aperçu Matrix en file ${item.centrisNum} ${item.email}`,
+    });
+    pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(candidate => candidate.id !== item.id);
+    savePendingEmailState();
+    await send(chatId, result);
+    if (!pendingExternalEmailActions.has(chatId) &&
+        pendingMatrixRequestQueue.some(candidate => Number(candidate.chatId) === Number(chatId))) {
+      setTimeout(() => startNextQueuedMatrixRequest(chatId).catch(error =>
+        log('ERR', 'MATRIX-QUEUE', String(error?.message || error).substring(0, 180))), 500);
+    }
+    return pendingExternalEmailActions.has(chatId);
+  } catch (error) {
+    pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(candidate => candidate.id !== item.id);
+    savePendingEmailState();
+    await send(chatId, `❌ Aperçu Matrix #${item.centrisNum} non complété: ${String(error?.message || error).substring(0, 180)}\nLes autres inscriptions restent en file; aucun email envoyé.`);
+    setTimeout(() => startNextQueuedMatrixRequest(chatId).catch(() => {}), 500);
+    return false;
+  } finally {
+    matrixQueueProcessing.delete(chatId);
+  }
+}
+
 async function executeTool(name, input, chatId, userMessage = '', actionContext = {}) {
   try {
     const pdAction = PIPEDRIVE_WRITE_TOOL_ACTIONS[name];
@@ -11295,9 +11367,12 @@ async function handleEmailConfirmation(msg) {
           pendingExternalEmailActions.delete(chatId);
           if (action.pendingDocKey) pendingDocSends.delete(action.pendingDocKey);
           savePendingEmailState();
-          const next = promoteNextPendingEmailDraft(chatId);
           await send(chatId, resultText);
-          if (next) await send(chatId, pendingEmailPreview(next));
+          const matrixStarted = await startNextQueuedMatrixRequest(chatId);
+          if (!matrixStarted && !pendingExternalEmailActions.has(chatId)) {
+            const next = promoteNextPendingEmailDraft(chatId);
+            if (next) await send(chatId, pendingEmailPreview(next));
+          }
         } else if (action.name === 'telecharger_annexes_centris' &&
                    /^🔒 Confirmation refusée:/u.test(resultText)) {
           pendingExternalEmailActions.delete(chatId);
@@ -11463,20 +11538,24 @@ function registerHandlers() {
         }
         if (Date.now() > Number(pendingMatrix.matrixPreviewExpiresAt || 0)) {
           clearMatrixTransaction(chatId, arg);
-          promoteNextPendingEmailDraft(chatId);
           await bot.answerCallbackQuery(cbq.id, { text: '⌛ Aperçu expiré' });
           await send(chatId, `⌛ Demande ${arg} expirée et nettoyée. Recrée l’aperçu; aucun email envoyé.`);
+          const matrixStarted = await startNextQueuedMatrixRequest(chatId);
+          if (!matrixStarted) promoteNextPendingEmailDraft(chatId);
           return;
         }
 
         if (action === 'mxcancel') {
           clearMatrixTransaction(chatId, arg);
-          const next = promoteNextPendingEmailDraft(chatId);
           await bot.answerCallbackQuery(cbq.id, { text: '🛑 Demande annulée' });
           await bot.editMessageReplyMarkup({ inline_keyboard: [[{ text: '🛑 ANNULÉE', callback_data: 'noop' }]] },
             { chat_id: chatId, message_id: msgId }).catch(() => {});
           await send(chatId, `🛑 Demande ${arg} annulée. Aucun email envoyé.`);
-          if (next) await send(chatId, pendingEmailPreview(next));
+          const matrixStarted = await startNextQueuedMatrixRequest(chatId);
+          if (!matrixStarted) {
+            const next = promoteNextPendingEmailDraft(chatId);
+            if (next) await send(chatId, pendingEmailPreview(next));
+          }
           return;
         }
 
@@ -11492,6 +11571,7 @@ function registerHandlers() {
             clearMatrixTransaction(chatId, arg);
             await bot.answerCallbackQuery(cbq.id, { text: '⌛ PDF expirés ou absents' });
             await send(chatId, `🔒 Les PDF figés de ${arg} sont absents ou expirés. Demande nettoyée; aucun email envoyé.`);
+            await startNextQueuedMatrixRequest(chatId);
             return;
           }
           await bot.answerCallbackQuery(cbq.id, { text: 'Envoi confirmé' });
@@ -11879,6 +11959,7 @@ function registerHandlers() {
     if (all) {
       pendingPipedriveActivityActions.delete(chatId);
       pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => Number(item.chatId) !== Number(chatId));
+      pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(item => Number(item.chatId) !== Number(chatId));
       savePendingPipedriveActions();
     } else {
       pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => {
@@ -11886,6 +11967,11 @@ function registerHandlers() {
         const recipient = pendingEmailTransactionRecipient('draft', item.draft);
         if (!cancellationTargetMatches(targetRaw, recipient, item.draft?.toName)) return true;
         cancelled.add(recipient || 'brouillon en file');
+        return false;
+      });
+      pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(item => {
+        if (Number(item.chatId) !== Number(chatId) || !cancellationTargetMatches(targetRaw, item.email)) return true;
+        cancelled.add(`#${item.centrisNum} en file`);
         return false;
       });
     }
@@ -11916,7 +12002,9 @@ function registerHandlers() {
   bot.onText(/\/pending/, msg => {
     if (!isAllowed(msg)) return;
     const pendingNames = pendingLeads.filter(l => l.needsName);
-    if (pendingDocSends.size === 0 && pendingNames.length === 0) {
+    const queuedMatrix = pendingMatrixRequestQueue.filter(item => Number(item.chatId) === Number(msg.chat.id));
+    if (pendingDocSends.size === 0 && pendingNames.length === 0 && queuedMatrix.length === 0 &&
+        !pendingExternalEmailActions.has(msg.chat.id)) {
       return bot.sendMessage(msg.chat.id, '✅ Aucun lead ni doc en attente');
     }
     const parts = [];
@@ -11933,6 +12021,13 @@ function registerHandlers() {
         `• ${p.nom || p.email} · score ${p.match?.score} · ${p.match?.pdfs.length} PDFs → \`envoie les docs à ${p.email}\``
       ).join('\n');
       parts.push(`📦 *Docs en attente (${pendingDocSends.size})*\n${lines}`);
+    }
+    const activeMatrix = pendingExternalEmailActions.get(msg.chat.id);
+    if (activeMatrix?.name === 'telecharger_annexes_centris') {
+      parts.push(`🔎 *Aperçu Matrix actif*\n• #${activeMatrix.input?.centris_num} → ${activeMatrix.input?.email_destination}`);
+    }
+    if (queuedMatrix.length) {
+      parts.push(`📚 *Matrix en file (${queuedMatrix.length})*\n${queuedMatrix.map(item => `• #${item.centrisNum} → ${item.email}`).join('\n')}`);
     }
     bot.sendMessage(msg.chat.id, parts.join('\n\n'), { parse_mode: 'Markdown' });
   });
@@ -14266,33 +14361,33 @@ function registerHandlers() {
     // Le modèle n'a aucun choix de tool à faire. Cette demande produit
     // uniquement les PDF + l'aperçu transactionnel; elle ne constitue jamais
     // une confirmation d'envoi Gmail.
-    const directMatrixRequest = parseDirectMatrixRequest(text);
-    if (directMatrixRequest) {
-      const num = directMatrixRequest.centrisNum;
-      const emailDestination = normalizeSingleRecipientEmail(directMatrixRequest.email);
-      const messagePerso = directMatrixRequest.message;
+    const directMatrixBatchRequest = parseDirectMatrixBatchRequest(text);
+    const directMatrixRequest = directMatrixBatchRequest ? null : parseDirectMatrixRequest(text);
+    if (directMatrixBatchRequest || directMatrixRequest) {
+      const emailDestination = normalizeSingleRecipientEmail(
+        directMatrixBatchRequest?.email || directMatrixRequest?.email,
+      );
       if (!emailDestination) {
         await send(chatId, '❌ Adresse courriel invalide. Aucun document récupéré et aucun email envoyé.');
         return;
       }
-      const stopMatrixTyping = startTypingIndicator(chatId, 6 * 60 * 1000);
-      await send(chatId, `🔎 Matrix #${num}: récupération et validation des PDF pour l’aperçu ${emailDestination}.\n⏳ Prévoir généralement 1 à 3 minutes selon le nombre de pièces.\n🔒 Aucun courriel ne sera envoyé par cette demande.`);
-      try {
-        const result = await executeMatrixAnnexesTool({
-          num,
-          emailDestination,
-          filtre: '',
-          messagePerso,
-          chatId,
-          userMessage: text,
-        });
-        await send(chatId, result);
-      } catch (error) {
-        log('ERR', 'MATRIX-DIRECT-REQUEST', String(error?.message || error).substring(0, 220));
-        await send(chatId, `❌ Aperçu Matrix #${num} non complété: ${String(error?.message || error).substring(0, 180)}\nAucun email envoyé.`);
-      } finally {
-        stopMatrixTyping();
+      const active = pendingExternalEmailActions.get(chatId);
+      const activeRecipient = pendingEmailTransactionRecipient('external', active);
+      if (active && activeRecipient && activeRecipient !== emailDestination) {
+        await send(chatId, `🔒 Un aperçu actif vise ${activeRecipient}. Annule-le avant de créer un lot pour ${emailDestination}; aucun email envoyé.`);
+        return;
       }
+      const centrisNums = directMatrixBatchRequest?.centrisNums || [directMatrixRequest.centrisNum];
+      const messagePerso = directMatrixBatchRequest?.message || directMatrixRequest?.message || '';
+      const added = enqueueMatrixRequests(chatId, centrisNums.map(centrisNum => ({
+        centrisNum, email: emailDestination, message: messagePerso,
+      })));
+      const queuedForRecipient = pendingMatrixRequestQueue.filter(item =>
+        Number(item.chatId) === Number(chatId) && item.email === emailDestination);
+      await send(chatId, added.length
+        ? `📚 ${added.length} inscription(s) ajoutée(s) pour ${emailDestination}: ${added.map(item => `#${item.centrisNum}`).join(', ')}.\nChaque inscription aura son propre aperçu et son propre courriel; elles seront traitées automatiquement l’une après l’autre.\nEn attente: ${queuedForRecipient.length}. Aucun email envoyé.`
+        : `ℹ️ Ces inscriptions sont déjà actives ou en file pour ${emailDestination}. Aucun doublon ajouté; aucun email envoyé.`);
+      await startNextQueuedMatrixRequest(chatId);
       return;
     }
     if (looksLikeMatrixSendWithoutEmail(text)) {
@@ -14365,6 +14460,7 @@ function registerHandlers() {
       pendingEmails.delete(chatId);
       pendingExternalEmailActions.delete(chatId);
       pendingMatrixArtifacts.delete(chatId);
+      pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(item => Number(item.chatId) !== Number(chatId));
       pendingPipedriveActivityActions.delete(chatId);
       savePendingEmailState();
       savePendingPipedriveActions();

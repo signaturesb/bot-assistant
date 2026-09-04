@@ -40,7 +40,9 @@ scenario('Commande explicite numéro + courriel admissible sans dépendre du CRM
 });
 scenario('Courriel invalide ou correspondance réellement ambiguë bloqués', () => {
   assert.strictEqual(matrixClientEligibility({ email: 'invalide', propertyIdentified: true }).eligible, false);
-  assert.strictEqual(matrixClientEligibility({ email: 'client@example.com', propertyIdentified: true, ambiguous: true }).eligible, false);
+  const duplicateCrm = matrixClientEligibility({ email: 'client@example.com', propertyIdentified: true, ambiguous: true });
+  assert.strictEqual(duplicateCrm.eligible, true, 'un doublon CRM ne change pas le destinataire exact donné par Shawn');
+  assert.ok(duplicateCrm.enrichmentMissing.includes('correspondance CRM multiple'));
 });
 scenario('Téléphone et nom facultatifs restent visibles sans être inventés', () => {
   assert.match(bot, /Téléphone:.*non fourni \(facultatif — jamais inventé\)/);

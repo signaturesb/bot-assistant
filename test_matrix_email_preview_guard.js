@@ -33,6 +33,16 @@ assert.ok(
 );
 assert.match(handler, /renderedHtmlSha256/);
 assert.match(code, /const pendingMatrixArtifacts = new Map\(\)/);
+assert.match(code, /let pendingMatrixRequestQueue = \[\]/,
+  'plusieurs inscriptions pour le même destinataire doivent utiliser une file dédiée');
+assert.match(code, /matrixQueue: pendingMatrixRequestQueue\.slice/,
+  'la file Matrix doit survivre aux redéploiements');
+assert.match(code, /function enqueueMatrixRequests/);
+assert.match(code, /async function startNextQueuedMatrixRequest/);
+assert.match(code, /const directMatrixBatchRequest = parseDirectMatrixBatchRequest\(text\)/,
+  'une commande Telegram peut contenir plusieurs numéros et un destinataire exact');
+assert.match(code, /const matrixStarted = await startNextQueuedMatrixRequest\(chatId\)/,
+  'après un succès, la prochaine inscription doit préparer son aperçu sans écraser la précédente');
 assert.match(handler, /les PDF figés de l’aperçu Matrix/);
 assert.match(handler, /pendingMatrixArtifacts\.set\(chatId/);
 assert.match(handler, /writeMatrixArtifactCache\(/,
@@ -93,11 +103,11 @@ assert.ok(code.includes('Ne jamais conclure « courtier concurrent / accès rest
 assert.ok(code.includes('ne jamais créer/prétendre sauvegarder chatgpt_config.md'));
 assert.ok(code.includes('ne jamais déclarer les documents inaccessibles à cause du courtier sans preuve 401/403'));
 assert.ok(code.includes("name !== 'telecharger_annexes_centris'"), 'le preview Matrix doit passer avant le garde générique');
-assert.ok(code.includes('const directMatrixRequest = parseDirectMatrixRequest(text)'),
+assert.ok(code.includes('parseDirectMatrixRequest(text)'),
   'la commande Matrix naturelle doit être reconnue sans choix du modèle');
-assert.match(code, /if \(directMatrixRequest\)[\s\S]*?executeMatrixAnnexesTool/,
-  'la demande directe doit ouvrir le preview Matrix déterministe');
-assert.match(code, /directMatrixRequest[\s\S]*?Aucun courriel ne sera envoyé par cette demande/,
+assert.match(code, /if \(directMatrixBatchRequest \|\| directMatrixRequest\)[\s\S]*?enqueueMatrixRequests[\s\S]*?startNextQueuedMatrixRequest/,
+  'la demande directe doit entrer dans la file déterministe puis ouvrir son aperçu');
+assert.match(code, /directMatrixRequest[\s\S]*?Aucun email envoyé/,
   'la demande directe ne doit jamais être interprétée comme la confirmation Gmail');
 assert.match(code, /looksLikeMatrixSendWithoutEmail\(text\)[\s\S]*?Il me manque seulement le courriel du client/,
   'un numéro sans destinataire doit être bloqué avant toute recherche ou inférence');

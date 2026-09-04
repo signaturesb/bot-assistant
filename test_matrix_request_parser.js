@@ -3,6 +3,7 @@
 const assert = require('assert');
 const {
   parseDirectMatrixRequest,
+  parseDirectMatrixBatchRequest,
   looksLikeMatrixSendWithoutEmail,
   looksLikeMatrixSendCommand,
   assertMatrixRequestParserReady,
@@ -45,6 +46,16 @@ assert.deepStrictEqual(
   parseDirectMatrixRequest('envoie 19465925 client@example.com Bonjour, voici le dossier.'),
   { ...expected, message: 'Bonjour, voici le dossier.' },
 );
+assert.deepStrictEqual(
+  parseDirectMatrixBatchRequest('Envoie 19465925, 10709767 et 28936167 à client@example.com'),
+  { centrisNums: ['19465925', '10709767', '28936167'], email: 'client@example.com', message: '' },
+);
+assert.deepStrictEqual(
+  parseDirectMatrixBatchRequest('19465925 10709767 28936167 client@example.com Voici les dossiers.'),
+  { centrisNums: ['19465925', '10709767', '28936167'], email: 'client@example.com', message: 'Voici les dossiers.' },
+);
+assert.strictEqual(parseDirectMatrixBatchRequest('envoie 19465925 et 10709767'), null);
+assert.strictEqual(parseDirectMatrixBatchRequest('envoie 19465925 à a@example.com et 10709767 à b@example.com'), null);
 
 assert.strictEqual(parseDirectMatrixRequest('envoie les documents du #19465925'), null);
 assert.strictEqual(looksLikeMatrixSendWithoutEmail('envoie les documents du #19465925'), true);
