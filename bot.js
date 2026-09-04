@@ -1290,6 +1290,7 @@ RÈGLES INVIOLABLES:
 • Max 3 paragraphes courts — 1 info concrète de valeur
 • Fermer: "Au plaisir," ou "Merci, au plaisir"
 • CTA: "Laissez-moi savoir" — jamais de pression
+• Toute réponse, relance, demande de feedback et tout brouillon Telegram passe par envoyer_email. À la confirmation, la couche Gmail applique obligatoirement le master officiel Dropbox avec logos et couleurs; ne jamais contourner ce rendu ni ajouter une deuxième signature dans le texte.
 
 TEMPLATES ÉPROUVÉS:
 • Envoi docs: "Bonjour, voici l'information concernant le terrain. N'hésitez pas si vous avez des questions. Au plaisir,"
@@ -5673,22 +5674,89 @@ async function voirConversation(terme) {
   }
 }
 
-async function envoyerEmailGmail({ to, toName, sujet, texte, authorization }) {
+function transactionalEmailParts(texte) {
+  const lines = String(texte || '').replace(/\r\n/g, '\n').trim().split('\n');
+  let greeting = 'Bonjour,';
+  if (lines.length && /^Bonjour(?:\s+[^,\n]+)?\s*[,!]\s*$/i.test(lines[0].trim())) {
+    greeting = lines.shift().trim();
+  }
+  while (lines.length && !lines[0].trim()) lines.shift();
+
+  // Le footer du modèle maître contient déjà l'identité complète. Conserver
+  // « Au plaisir, » dans le message, mais retirer seulement la signature
+  // standard qui suit afin d'éviter le doublon observé dans Apple Mail.
+  const closingIndex = lines.findIndex((line) => /^Au plaisir\s*[,]?\s*$/i.test(line.trim()));
+  if (closingIndex >= 0) {
+    const trailing = lines.slice(closingIndex + 1).join('\n');
+    if (/Shawn Barrette|Courtier immobilier|RE\/MAX PRESTIGE|514[-\s.]?927[-\s.]?1340|shawn@signaturesb\.com/i.test(trailing)) {
+      lines.splice(closingIndex + 1);
+    }
+  }
+  return { greeting, body: lines.join('\n').trim() };
+}
+
+async function buildTransactionalEmailFromMaster({ sujet, texte }) {
+  const { greeting, body } = transactionalEmailParts(texte);
+  const paragraphs = body.split(/\n\s*\n/).filter(Boolean).map((paragraph) =>
+    `<p style="margin:0 0 18px;color:#cccccc;font-size:15px;line-height:1.7;">${escapeHtml(paragraph).replace(/\n/g, '<br>')}</p>`
+  ).join('');
+  let html = await buildEmailFromMasterTpl({
+    TITRE_EMAIL: escapeHtml(sujet || 'Message SignatureSB'),
+    LABEL_SECTION: 'Réponse personnalisée',
+    TERRITOIRES: escapeHtml(AGENT.region),
+    SOUS_TITRE_ANALYSE: 'Service immobilier SignatureSB',
+    HERO_TITRE: 'Un suivi<br>personnalisé.',
+    INTRO_TEXTE: paragraphs,
+    TITRE_SECTION_1: '', MARCHE_LABEL: '', PRIX_MEDIAN: '', VARIATION_PRIX: '', SOURCE_STAT: '',
+    LABEL_TABLEAU: '', TABLEAU_STATS_HTML: '', TITRE_SECTION_2: '', CITATION: '', CONTENU_STRATEGIE: '',
+    CTA_TITRE: 'Vous souhaitez en discuter?',
+    CTA_SOUS_TITRE: 'Je suis disponible pour répondre à vos questions.',
+    CTA_URL: `tel:${AGENT.telephone.replace(/\D/g, '')}`,
+    CTA_BOUTON: `Appeler ${AGENT.prenom} — ${AGENT.telephone}`,
+    CTA_NOTE: `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie}`,
+    REFERENCE_URL: `tel:${AGENT.telephone.replace(/\D/g, '')}`,
+    SOURCES: `${AGENT.nom} · ${AGENT.titre} · ${AGENT.compagnie}`,
+    DESINSCRIPTION_URL: '',
+  });
+  if (!html) return null;
+
+  // Les réponses courtes gardent header, logos, message, CTA, programme de
+  // référence et footer. Les blocs d'analyse de marché restent réservés aux
+  // rapports et comparables.
+  html = html.replace(
+    /<!-- ══ SÉPARATEUR ══ -->[\s\S]*?<!-- ══ CTA PRINCIPAL ══ -->/,
+    '<!-- ══ CTA PRINCIPAL ══ -->'
+  );
+  html = html
+    .replace(/Données Centris Matrix/g, 'Groupe Immobilier SignatureSB · RE/MAX PRESTIGE')
+    .replace(/Bonjour\s*,/i, escapeHtml(greeting))
+    .replace(/\{\{\s*contact\.[A-Z_]+\s*\}\}/gi, '')
+    .replace(/\{\{\s*params\.[A-Z_]+\s*\}\}/gi, '');
+
+  // Échec fermé: aucun courriel client ne part si le master Dropbox ne peut
+  // pas produire le rendu transactionnel attendu avec l'identité officielle.
+  if (Buffer.byteLength(html, 'utf8') < 50000 ||
+      /01\s*·\s*Données du marché|02\s*·\s*Stratégie/i.test(html) ||
+      !/RE\/MAX/i.test(html)) {
+    log('ERR', 'TEMPLATE', 'Rendu transactionnel maître rejeté — envoi Gmail bloqué');
+    return null;
+  }
+  return html;
+}
+
+async function envoyerEmailGmail({ to, toName, sujet, texte, authorization, renderedHtml }) {
   const token = await getGmailToken();
   if (!token) throw new Error('Gmail non configuré — vérifier GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN dans Render');
   const safeTo = normalizeSingleRecipientEmail(to);
   if (!safeTo) throw new Error('Adresse Gmail invalide ou ambiguë — un seul destinataire exact est requis');
 
-  // HTML branded dynamique (utilise AGENT_CONFIG)
-  const html = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;margin:0 auto;padding:20px;">
-<div style="border-top:3px solid ${AGENT.couleur};padding-top:16px;">
-${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` : '<br>').join('')}
-</div>
-<div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;color:#666;font-size:12px;">
-<strong>${AGENT.nom}</strong> · ${AGENT.compagnie}<br>
-📞 ${AGENT.telephone} · <a href="https://${AGENT.site}" style="color:${AGENT.couleur};">${AGENT.site}</a>
-</div>
-</body></html>`;
+  const html = renderedHtml || await buildTransactionalEmailFromMaster({ sujet, texte });
+  if (!html) {
+    const error = new Error('Modèle maître SignatureSB Dropbox indisponible ou invalide — aucun email envoyé');
+    error.code = 'EMAIL_BRAND_TEMPLATE_UNAVAILABLE';
+    throw error;
+  }
+  const renderedHtmlSha256 = crypto.createHash('sha256').update(html, 'utf8').digest('hex');
 
   const boundary  = `sb_${Date.now()}`;
   // Le MIME utilise uniquement l'adresse normalisée. Le nom d'affichage peut
@@ -5731,7 +5799,8 @@ ${texte.split('\n').map(l => l.trim() ? `<p style="margin:0 0 12px;">${l}</p>` :
     .toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
   const emailPayload = {
-    via: 'gmail', to: safeTo, cc, bcc: [], subject: sujet, body: texte, attachments: []
+    via: 'gmail', to: safeTo, cc, bcc: [], subject: sujet, body: texte,
+    renderedHtmlSha256, attachments: []
   };
   const logged = await sendEmailLogged({
     via: 'gmail', to: safeTo, cc, bcc: [], subject: sujet, body: texte,
@@ -8594,7 +8663,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
           { to: input.to, toName: input.toName, sujet: input.sujet, texte: input.texte },
           { replace: true, source: 'manual-tool' },
         );
-        return `📧 *BROUILLON EMAIL — EN ATTENTE D'APPROBATION*\n\n*À:* ${input.toName ? input.toName + ' <' + input.to + '>' : input.to}\n*Objet:* ${input.sujet}\n\n---\n${input.texte}\n---\n\n💬 Dis *"envoie"* pour confirmer, ou modifie ce que tu veux.`;
+        return `📧 *BROUILLON EMAIL — EN ATTENTE D'APPROBATION*\n\n*À:* ${input.toName ? input.toName + ' <' + input.to + '>' : input.to}\n*Objet:* ${input.sujet}\n🎨 *Modèle:* SignatureSB officiel Dropbox · logos + couleurs\n\n---\n${input.texte}\n---\n\n💬 Dis *"envoie"* pour confirmer, ou modifie ce que tu veux.`;
       }
       case 'rechercher_web':       return await rechercherWeb(input.requete);
       case 'list_github_repos':    return await listGitHubRepos();
@@ -11252,14 +11321,34 @@ async function handleEmailConfirmation(msg) {
 
     const cc = confirmedRecipient === String(AGENT.email || '').toLowerCase() ? [] : [AGENT.email];
     let authorization;
+    let renderedHtml;
     try {
+      renderedHtml = await buildTransactionalEmailFromMaster({ sujet: action.sujet, texte: action.texte });
+      if (!renderedHtml) {
+        const templateError = new Error('Modèle maître SignatureSB Dropbox indisponible ou invalide');
+        templateError.code = 'EMAIL_BRAND_TEMPLATE_UNAVAILABLE';
+        throw templateError;
+      }
+      const renderedHtmlSha256 = crypto.createHash('sha256').update(renderedHtml, 'utf8').digest('hex');
       authorization = createOneShotAuthorization({
         message: 'envoie', via: 'gmail', to: action.to, cc, bcc: [],
-        subject: action.sujet, body: action.texte, attachments: [],
+        subject: action.sujet, body: action.texte, renderedHtmlSha256, attachments: [],
       });
-      await envoyerEmailGmail({ ...action, authorization });
+      await envoyerEmailGmail({ ...action, authorization, renderedHtml });
     } catch (error) {
       log('ERR', 'EMAIL', `Gmail fail après confirmation transactionnelle: ${error.message}`);
+      if (error.code === 'EMAIL_BRAND_TEMPLATE_UNAVAILABLE') {
+        action.inFlight = false;
+        action.attemptStartedAt = null;
+        action.deliveryUncertain = false;
+        action.confirmationStage = 'preview';
+        action.finalConfirmationRecipient = null;
+        action.finalConfirmationMessageId = null;
+        action.finalConfirmationExpiresAt = null;
+        savePendingEmailState();
+        await send(chatId, '🔒 Envoi bloqué: le modèle officiel SignatureSB dans Dropbox est indisponible ou invalide. Aucun appel Gmail effectué; le brouillon reste en attente.');
+        return true;
+      }
       action.inFlight = false;
       action.deliveryUncertain = true;
       savePendingEmailState();

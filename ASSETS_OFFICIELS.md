@@ -3,6 +3,13 @@
 > **RÈGLE ABSOLUE:** Tous les emails clients utilisent OBLIGATOIREMENT le master template Dropbox.
 > Jamais de recréation manuelle des logos ou du design.
 
+Cette règle couvre aussi les réponses rapides, suivis, feedbacks, brouillons
+manuels approuvés dans Telegram et messages sans pièce jointe. Le texte brut
+reste identique au brouillon approuvé; le HTML est rendu au moment de la
+confirmation depuis le master Dropbox. Si le master est absent ou invalide,
+l'envoi client échoue fermé avant Gmail. Aucun mini-template local ne doit le
+remplacer.
+
 ---
 
 ## 🎨 Master template email (UNIQUE source)
@@ -110,7 +117,7 @@ Quand bot construit un email, il DOIT:
 - [x] Téléphone cliquable `tel:${AGENT.telephone.replace(/\D/g,'')}`
 - [x] Email cliquable `mailto:${AGENT.email}`
 - [x] Site cliquable `https://${AGENT.site}`
-- [x] Fallback inline HTML si Dropbox indispo (mais logos textes seulement en fallback)
+- [x] Bloquer l'envoi avant Gmail si le master Dropbox est indisponible ou invalide (aucun fallback local)
 
 ---
 
@@ -139,4 +146,4 @@ Code: `/Users/signaturesb/Documents/github/mailing-masse/campaigns_library.js`
 
 ---
 
-*Dernière mise à jour: 2026-04-22 — Compagnie = "RE/MAX PRESTIGE" (Rawdon retiré)*
+*Dernière mise à jour: 2026-09-04 — master Dropbox obligatoire pour toutes les réponses et relances*
