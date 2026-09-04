@@ -8223,13 +8223,17 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   // Inclut le modèle HTML, les en-têtes et les séparateurs dans le calcul;
   // aucune pièce jointe ne sera retirée silencieusement pour passer la limite.
   const mimeBytes = Buffer.byteLength(mimeMessage, 'utf8');
-  if (mimeBytes > 25 * 1024 * 1024) {
+  // L'API Gmail publie 36 700 160 octets (35 MiB) pour messages.send.
+  // Ce contrôle porte sur le MIME décodé complet, pas sur les seuls fichiers
+  // ni sur la représentation base64url du champ JSON `raw`.
+  const gmailApiMaxMessageBytes = 35 * 1024 * 1024;
+  if (mimeBytes > gmailApiMaxMessageBytes) {
     observeFailure('mime-build', 'MATRIX_GMAIL_SIZE_LIMIT_EXCEEDED', {
       document_count: documents.length,
       attachment_encoded_bytes: encodedBytes,
       mime_bytes: mimeBytes,
     });
-    return `⚠️ Le courriel complet (${(mimeBytes / 1024 / 1024).toFixed(1)} MB) dépasse la limite Gmail de 25 MB après encodage MIME. Aucun email envoyé; aucun document omis silencieusement. L'ancien brouillon reste rangé dans la file et « envoie » ne peut pas l'expédier par erreur.`;
+    return `⚠️ Le courriel complet (${(mimeBytes / 1024 / 1024).toFixed(1)} MB) dépasse la limite officielle de l’API Gmail de 35 MB. Aucun email envoyé; aucun document omis silencieusement. L'ancien brouillon reste rangé dans la file et « envoie » ne peut pas l'expédier par erreur.`;
   }
   const raw = Buffer.from(mimeMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const renderedHtmlSha256 = crypto.createHash('sha256').update(html, 'utf8').digest('hex');

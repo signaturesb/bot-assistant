@@ -11,8 +11,8 @@ assert.match(handler, /deferActivePendingEmail\(chatId\)/,
   'une nouvelle demande Matrix doit désarmer tout ancien brouillon avant même un échec de taille');
 assert.doesNotMatch(handler, /encodedBytes > 22 \* 1024 \* 1024/,
   'une estimation partielle à 22 MB ne doit pas rejeter un MIME complet encore admissible');
-assert.match(handler, /mimeBytes > 25 \* 1024 \* 1024/,
-  'la limite doit être évaluée sur le MIME complet avec toutes les pièces');
+assert.match(handler, /mimeBytes > gmailApiMaxMessageBytes/,
+  'la limite officielle doit être évaluée sur le MIME complet avec toutes les pièces');
 assert.match(handler, /matrixPreviewExpiresAt: Date\.now\(\) \+ MATRIX_PREVIEW_TTL_MS/);
 assert.match(handler, /approvedPreview\.matrixFingerprint !== payloadFingerprint/);
 assert.match(handler, /telegramReceipt\?\.message_id/);
