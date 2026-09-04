@@ -17,7 +17,7 @@ assert.match(handler, /filename\*=UTF-8''/,
   'les noms de fichiers UTF-8 doivent utiliser RFC 5987');
 assert.match(handler, /replace\(\/\[\\r\\n\\0\]\+\/g/,
   'les valeurs externes ne doivent pas injecter des en-têtes MIME');
-assert.match(handler, /24 \* 1024 \* 1024/,
+assert.match(handler, /25 \* 1024 \* 1024/,
   'la taille du MIME complet doit être contrôlée avant Gmail');
 assert.match(handler, /const cc = emailDestination\.toLowerCase\(\) === REQUIRED_VISIBLE_CC_EMAIL \? \[\] : \[REQUIRED_VISIBLE_CC_EMAIL\]/,
   'Shawn doit être en Cc visible pour un client externe');

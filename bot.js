@@ -7968,6 +7968,16 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     const currentSummary = externalEmailActionSummary(current.name, current.input);
     return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Réponds « envoie » pour la terminer ou « annule » avant de créer un nouvel aperçu. Aucun email envoyé.`;
   }
+  if (!isSendConfirmation && emailDestination && pendingEmails.has(chatId)) {
+    // Dès qu'une nouvelle demande Matrix explicite commence, l'ancien
+    // brouillon général perd sa capacité d'être confirmé par un « envoie »
+    // isolé. On le conserve dans la file, mais il ne redevient actif qu'après
+    // la fin ou l'annulation explicite du parcours Matrix.
+    deferActivePendingEmail(chatId);
+    auditLogEvent('email', 'draft-deferred-for-matrix-request', {
+      chatId, centrisNum: num, to: emailDestination,
+    });
+  }
   const normalizedFilter = String(filtre || '');
   const clientInstruction = String(messagePerso || '').replace(/[\r\0]+/g, ' ').trim().substring(0, 2000);
   // La confirmation finale recharge toujours les octets depuis le cache
@@ -8110,15 +8120,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     return `⚠️ Preview incomplet pour #${num}: ${documents.length} PDF(s) validé(s), ${failures.length} échec(s).\nAucun email envoyé pour éviter un dossier partiel.\n\n${list}${failureText}`;
   }
 
-  // Gmail limite le message encodé à environ 25 MB. On échoue avant l'envoi
-  // plutôt que de retirer silencieusement une pièce jointe.
+  // Estimation diagnostique seulement. La décision se prend plus bas sur le
+  // MIME complet (HTML, en-têtes, séparateurs et toutes les pièces), car le
+  // vieux seuil de 22 MB rejetait des lots qui tenaient encore sous la limite.
   const encodedBytes = documents.reduce((total, doc) => total + Math.ceil(doc.size * 4 / 3), 0);
-  if (encodedBytes > 22 * 1024 * 1024) {
-    observeFailure('mime-build', 'MATRIX_GMAIL_SIZE_LIMIT_EXCEEDED', {
-      document_count: documents.length,
-    });
-    return `⚠️ Les ${documents.length} pièces jointes dépassent la limite sécuritaire Gmail (22 MB encodés). Aucun email envoyé; aucun document omis silencieusement.`;
-  }
 
   // Les valeurs utilisées dans les en-têtes MIME doivent être sur une seule
   // ligne. Le filtre vient de Telegram et ne doit jamais pouvoir injecter un
@@ -8217,8 +8222,14 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   const mimeMessage = lines.join('\r\n');
   // Inclut le modèle HTML, les en-têtes et les séparateurs dans le calcul;
   // aucune pièce jointe ne sera retirée silencieusement pour passer la limite.
-  if (Buffer.byteLength(mimeMessage, 'utf8') > 24 * 1024 * 1024) {
-    return `⚠️ Le courriel complet dépasse la limite sécuritaire Gmail de 24 MB après encodage MIME. Aucun email envoyé; aucun document omis silencieusement.`;
+  const mimeBytes = Buffer.byteLength(mimeMessage, 'utf8');
+  if (mimeBytes > 25 * 1024 * 1024) {
+    observeFailure('mime-build', 'MATRIX_GMAIL_SIZE_LIMIT_EXCEEDED', {
+      document_count: documents.length,
+      attachment_encoded_bytes: encodedBytes,
+      mime_bytes: mimeBytes,
+    });
+    return `⚠️ Le courriel complet (${(mimeBytes / 1024 / 1024).toFixed(1)} MB) dépasse la limite Gmail de 25 MB après encodage MIME. Aucun email envoyé; aucun document omis silencieusement. L'ancien brouillon reste rangé dans la file et « envoie » ne peut pas l'expédier par erreur.`;
   }
   const raw = Buffer.from(mimeMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const renderedHtmlSha256 = crypto.createHash('sha256').update(html, 'utf8').digest('hex');
@@ -15335,13 +15346,13 @@ async function runStructureConnectionCheck(reason = 'periodic') {
     results.gmail = { ok: false, critical: true, detail: `Gmail: ${error.message}` };
   }
 
-  // La preuve Matrix réelle vient de la maintenance Browserless aux 6 h, avec
+  // La preuve Matrix réelle vient de la maintenance Browserless aux 90 min, avec
   // retries aux 30 min en cas de panne. Cette sonde n'ouvre pas un navigateur.
   const centrisConfigured = centrisAutomationConfigured();
   const sessionUsable = Boolean(centrisSession.authenticated && centrisSession.cookies && Date.now() < centrisSession.expiry);
   const proofAge = centrisMaintenanceState.lastSuccessAt ? Date.now() - centrisMaintenanceState.lastSuccessAt : null;
   const inWarmup = Date.now() - bootStartTs < 20 * 60 * 1000;
-  const proofFresh = proofAge !== null && proofAge <= 8 * 60 * 60 * 1000;
+  const proofFresh = proofAge !== null && proofAge <= 3 * 60 * 60 * 1000;
   const centrisOk = centrisConfigured && sessionUsable &&
     centrisMaintenanceState.consecutiveFailures < 3 && (proofFresh || (inWarmup && proofAge === null));
   results.matrix = {
@@ -15429,7 +15440,9 @@ function startDailyTasks() {
   }, 10 * 60 * 1000, { timeoutMs: 10000 });
 
   // CENTRIS SESSION MAINTENANCE — vérification réelle dans Matrix toutes les
-  // 6 h. Réutilise CENTRIS_USER/PASS de Render et le MFA Gmail/TOTP/bridge.
+  // 90 min. Les sessions observées expirent parfois avant 3 h; cette cadence
+  // les renouvelle avant une demande client et évite un MFA sur le chemin chaud.
+  // Réutilise CENTRIS_USER/PASS de Render et le MFA Gmail/TOTP/bridge.
   // Le délai au boot évite la pointe de redéploiement; un verrou et un cooldown
   // empêchent les connexions concurrentes et les boucles de MFA. Le smoke test
   // PDF complet n'est JAMAIS lancé automatiquement au boot: il monopolisait
@@ -15441,8 +15454,8 @@ function startDailyTasks() {
     setTimeout(async () => {
       await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
     }, 60 * 1000);
-    safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 6 * 60 * 60 * 1000, { timeoutMs: 120000 });
-    log('OK', 'CENTRIS', 'Maintenance de session automatique activée (boot + 6 h)');
+    safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 90 * 60 * 1000, { timeoutMs: 120000 });
+    log('OK', 'CENTRIS', 'Maintenance de session automatique activée (boot + 90 min)');
   } else if (process.env.CENTRIS_USER && process.env.CENTRIS_PASS) {
     log('WARN', 'CENTRIS', 'Auto-session inactive: BROWSERLESS_WS/CENTRIS_SESSION_KEY absent ou CENTRIS_AUTO_LOGIN=false');
   }

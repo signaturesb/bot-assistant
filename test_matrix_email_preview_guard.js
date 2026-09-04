@@ -7,6 +7,12 @@ const code = fs.readFileSync('./bot.js', 'utf8');
 const handler = code.match(/async function executeMatrixAnnexesTool[\s\S]*?\n}\n\nasync function executeTool/)?.[0] || '';
 assert.ok(handler, 'executeMatrixAnnexesTool absent');
 assert.match(handler, /pendingExternalEmailActions\.set/);
+assert.match(handler, /deferActivePendingEmail\(chatId\)/,
+  'une nouvelle demande Matrix doit désarmer tout ancien brouillon avant même un échec de taille');
+assert.doesNotMatch(handler, /encodedBytes > 22 \* 1024 \* 1024/,
+  'une estimation partielle à 22 MB ne doit pas rejeter un MIME complet encore admissible');
+assert.match(handler, /mimeBytes > 25 \* 1024 \* 1024/,
+  'la limite doit être évaluée sur le MIME complet avec toutes les pièces');
 assert.match(handler, /matrixPreviewExpiresAt: Date\.now\(\) \+ MATRIX_PREVIEW_TTL_MS/);
 assert.match(handler, /approvedPreview\.matrixFingerprint !== payloadFingerprint/);
 assert.match(handler, /telegramReceipt\?\.message_id/);
@@ -120,6 +126,8 @@ assert.match(confirmationHandler, /if \(finalMatch \|\| directSelection\?\.ok\)/
   'une confirmation exacte doit entrer immédiatement dans la transaction d’envoi');
 assert.match(code, /telecharger_annexes_centris:\s*360000/,
   'le délai du tool doit couvrir l’attente du verrou et les sessions Matrix séquentielles');
+assert.match(code, /centris-session-maintenance'[\s\S]*?90 \* 60 \* 1000/,
+  'la session Centris doit être vérifiée avant son expiration observée de moins de 3 h');
 assert.match(code, /function matrixPreviewButtons[\s\S]*?mxconfirm:[\s\S]*?mxcancel:[\s\S]*?mxrefresh:[\s\S]*?mxclient:[\s\S]*?mxemail:/,
   'les cinq actions Telegram doivent être liées à la demande Matrix unique');
 assert.match(code, /function matrixPreviewSummary[\s\S]*?Client:[\s\S]*?Téléphone:[\s\S]*?CONTENU COMPLET DU COURRIEL/,
