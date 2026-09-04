@@ -149,6 +149,7 @@ const SHAWN_EMAIL = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
 // Invariant métier explicite de ce déploiement: toute livraison Gmail à un
 // client externe contient cette adresse exacte dans le Cc visible.
 const REQUIRED_VISIBLE_CC_EMAIL = 'shawn@signaturesb.com';
+const EMAIL_FROM_NAME = 'SignatureSB Groupe immobilier';
 const JULIE_EMAIL = process.env.JULIE_EMAIL || 'julie@signaturesb.com';
 // Default Sonnet 4.6 — 5x moins cher qu'Opus pour 95% de la qualité sur ce use case.
 // Shawn peut switch à la volée via /opus (deep reasoning) ou /haiku (rapide, ultra-économique).
@@ -2612,10 +2613,10 @@ async function envoyerListeTerrains({ email, nom, message, cc }, confirmationMes
   const enc = value => `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`;
   const boundary = `sbTerrains${Date.now()}`;
   const lines = [
-    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `To: ${dest}`,
     ...(ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : []),
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `Subject: ${enc(subject)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -5234,10 +5235,10 @@ Au plaisir,<br>
   const ccLine = ccFinal.length ? [`Cc: ${ccFinal.join(', ')}`] : [];
 
   const lines = [
-    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `To: ${realToEmail}`,
     ...ccLine,
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -5782,10 +5783,10 @@ async function envoyerEmailGmail({ to, toName, sujet, texte, authorization, rend
   };
 
   const msgLines = [
-    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `To: ${toHeader}`,
     ...(cc.length ? [`Cc: ${cc.join(', ')}`] : []),
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `Subject: ${encSubj(sujet)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -7153,10 +7154,10 @@ async function _envoyerListingPubliqueLink({ num, email_destination, cc, message
     log('WARN', 'CENTRIS', `Master template Dropbox indispo, fallback HTML inline (sans logos)`);
   }
   const lines = [
-    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `To: ${email_destination}`,
     ccFinal.length ? `Cc: ${ccFinal.join(', ')}` : '',
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `Subject: ${enc(subject)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -7377,10 +7378,10 @@ async function telechargerFicheCentris({ centris_num, email_destination, cc, mes
     log('WARN', 'CENTRIS', `Master template indispo pour fiche #${num}, fallback HTML inline`);
   }
   const lines = [
-    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `To: ${email_destination}`,
     ...ccLine,
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `Subject: ${enc(subject)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -7724,10 +7725,10 @@ async function envoyerRapportComparables({ type = 'terrain', ville, jours = 14, 
   const reportCc = dest.toLowerCase() === String(AGENT.email).toLowerCase() ? [] : [AGENT.email];
 
   const msgLines = [
-    `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+    `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `To: ${dest}`,
     ...(reportCc.length ? [`Cc: ${reportCc.join(', ')}`] : []),
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
     `Subject: ${enc(sujet)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -8192,10 +8193,10 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   const boundary = `sbMatrix${Date.now()}`;
   const alternativeBoundary = `sbMatrixAlt${Date.now()}`;
   const lines = [
-    `From: ${mimeHeader(AGENT.nom)} <${mimeHeader(AGENT.email)}>`,
+    `From: ${mimeHeader(EMAIL_FROM_NAME)} <${mimeHeader(AGENT.email)}>`,
     `To: ${emailDestination}`,
     ...(cc.length ? [`Cc: ${cc.join(', ')}`] : []),
-    `Reply-To: ${AGENT.email}`,
+    `Reply-To: ${mimeHeader(EMAIL_FROM_NAME)} <${mimeHeader(AGENT.email)}>`,
     `Subject: ${enc(subject)}`,
     'MIME-Version: 1.0',
     'X-SignatureSB-Automation: kira-bot',
@@ -9370,10 +9371,10 @@ ${pjList}
               log('WARN', 'CENTRIS', `Master template indispo pour annexes #${num}, fallback inline`);
             }
             const parts = [
-              `From: ${AGENT.nom} <${AGENT.email}>`,
+              `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
               `To: ${email_destination}`,
               `Cc: ${AGENT.email}`,
-              `Reply-To: ${AGENT.email}`,
+              `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
               `Subject: ${enc(subject)}`,
               'MIME-Version: 1.0',
               'X-SignatureSB-Automation: kira-bot',
@@ -9567,10 +9568,10 @@ ${pjList}
               }
               const ccLine = `Cc: ${AGENT.email}`;
               const lines = [
-                `From: ${AGENT.nom} <${AGENT.email}>`,
+                `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
                 `To: ${forward_email}`,
                 ccLine,
-                `Reply-To: ${AGENT.email}`,
+                `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
                 `Subject: ${enc(subject)}`,
                 'MIME-Version: 1.0',
                 'X-SignatureSB-Automation: kira-bot',
@@ -14952,9 +14953,9 @@ async function checkVeilleCampagnesBackup() {
       if (html && gmailTok) {
         const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
         const lines = [
-          `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+          `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
           `To: ${SHAWN_EMAIL}`,
-          `Reply-To: ${AGENT.email}`,
+          `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
           `Subject: ${enc(`[VEILLE J-1] ${subj}`)}`,
           'MIME-Version: 1.0',
           'X-SignatureSB-Automation: kira-bot',
@@ -18049,9 +18050,9 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       if (!token) { res.writeHead(500); res.end(JSON.stringify({error:'gmail token absent'})); return; }
       const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
       const lines = [
-        `From: ${AGENT.nom} · ${AGENT.compagnie} <${AGENT.email}>`,
+        `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
         `To: ${to}`,
-        `Reply-To: ${AGENT.email}`,
+        `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
         `Subject: ${enc(subject)}`,
         'MIME-Version: 1.0',
         'X-SignatureSB-Automation: kira-bot',
@@ -18801,9 +18802,9 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
 
       const textBody = `Voici la propriété!\n\n${listingData.adresse}\n${listingData.prix}\nN° Centris ${listingData.centrisNum} · ${listingData.type} · ${listingData.statut}\n\nAppelez-moi: 514-927-1340\n${AGENT.email}\nhttps://www.signaturesb.com`;
       const lines = [
-        `From: ${AGENT.nom} · Signature SB <${AGENT.email}>`,
+        `From: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
         `To: ${toEmail}`,
-        `Reply-To: ${AGENT.email}`,
+        `Reply-To: ${EMAIL_FROM_NAME} <${AGENT.email}>`,
         `Subject: ${enc(subject)}`,
         'MIME-Version: 1.0',
         'X-SignatureSB-Automation: kira-bot',

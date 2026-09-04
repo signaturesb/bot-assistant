@@ -23,6 +23,12 @@ assert.match(handler, /mimeBytes > gmailApiMaxMessageBytes/,
   'la taille exacte du MIME complet doit être contrôlée avant Gmail');
 assert.match(handler, /const cc = emailDestination\.toLowerCase\(\) === REQUIRED_VISIBLE_CC_EMAIL \? \[\] : \[REQUIRED_VISIBLE_CC_EMAIL\]/,
   'Shawn doit être en Cc visible pour un client externe');
+assert.match(handler, /From: \$\{mimeHeader\(EMAIL_FROM_NAME\)\}/,
+  'le nom d’expéditeur Matrix doit utiliser la marque officielle');
+assert.match(handler, /Reply-To: \$\{mimeHeader\(EMAIL_FROM_NAME\)\}/,
+  'le nom de réponse Matrix doit utiliser la même marque officielle');
+assert.match(code, /const EMAIL_FROM_NAME = 'SignatureSB Groupe immobilier'/,
+  'le nom visible doit être centralisé et exact');
 assert.match(handler, /Cc \$\{REQUIRED_VISIBLE_CC_EMAIL\}/,
   'le reçu de succès doit annoncer le même Cc obligatoire que le MIME réel');
 assert.match(handler, /attachments: documents\.map/,
