@@ -984,13 +984,29 @@ async function sendEmailLogged(opts) {
     Date.now() - Number(candidate.ts || 0) < 24 * 60 * 60 * 1000 &&
     ['pending', 'sent', 'uncertain'].includes(candidate.outcome)
   );
-  const confirmedResend = opts.confirmedResend === true && priorIdentical?.outcome === 'sent';
+  const confirmedResend = opts.confirmedResend === true && ['sent', 'uncertain'].includes(priorIdentical?.outcome);
   if (priorIdentical && !confirmedResend) {
     return {
       ok: false, blocked: true, code: 'EMAIL_DUPLICATE_FINGERPRINT_BLOCKED',
       error: `Transaction identique déjà ${priorIdentical.outcome}`,
       entryId: priorIdentical.id, durationMs: 0,
     };
+  }
+  // Shawn vient de confirmer « envoie » après un résultat fournisseur
+  // incertain. L'ancien verrou ne doit pas le remettre dans une boucle infinie:
+  // on le conserve dans l'audit, mais on l'annule/supersède avant UNE nouvelle
+  // tentative. Les entrées pending restent non contournables (double clic réel).
+  if (confirmedResend && priorIdentical.outcome === 'uncertain') {
+    priorIdentical.outcome = 'cancelled-for-retry';
+    priorIdentical.cancelledAt = Date.now();
+    priorIdentical.cancelReason = 'explicit-envoie-after-uncertain';
+    if (!saveEmailOutbox()) {
+      return {
+        ok: false, blocked: true, code: 'EMAIL_UNCERTAIN_CANCEL_PERSIST_FAILED',
+        error: 'Impossible d’annuler durablement le premier envoi incertain',
+        entryId: priorIdentical.id, durationMs: 0,
+      };
+    }
   }
   const entry = {
     id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -11360,7 +11376,7 @@ async function handleEmailConfirmation(msg) {
             // Un nouvel aperçu reconstruit après annulation constitue une
             // nouvelle autorisation explicite. « renvoie » permet aussi le
             // renvoi direct si Gmail avait confirmé le premier exemplaire.
-            confirmedResend: explicitResend || Boolean(action.resendOfEntryId),
+            confirmedResend: explicitResend || Boolean(action.resendOfEntryId) || Boolean(action.retryUncertainAuthorized),
           },
         );
         const resultText = String(result || '');
@@ -11398,8 +11414,12 @@ async function handleEmailConfirmation(msg) {
           action.finalConfirmationRecipient = null;
           action.finalConfirmationMessageId = null;
           action.finalConfirmationExpiresAt = null;
+          action.retryUncertainAuthorized = /Transaction identique déjà uncertain/i.test(resultText);
           savePendingEmailState();
-          await send(chatId, `${resultText}\n\n🔁 Échec confirmé sans livraison. La demande reste en aperçu; réponds de nouveau « envoie » pour réessayer.`);
+          const retryText = action.retryUncertainAuthorized
+            ? '🔁 Ancien verrou incertain identifié. Réponds « envoie »: il sera annulé, le doublon sera nettoyé et une seule nouvelle tentative partira.'
+            : '🔁 Échec confirmé sans livraison. La demande reste en aperçu; réponds de nouveau « envoie » pour réessayer.';
+          await send(chatId, `${resultText}\n\n${retryText}`);
         }
       } catch (error) {
         action.inFlight = false;

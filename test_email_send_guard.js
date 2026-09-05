@@ -120,17 +120,19 @@ assert.ok(
 );
 assert.ok(loggedWrapper.includes('EMAIL_DUPLICATE_FINGERPRINT_BLOCKED'));
 assert.ok(
-  loggedWrapper.includes("opts.confirmedResend === true && priorIdentical?.outcome === 'sent'"),
-  'un renvoi confirmé doit contourner uniquement un résultat antérieur sent, jamais pending/uncertain',
+  loggedWrapper.includes("opts.confirmedResend === true && ['sent', 'uncertain'].includes(priorIdentical?.outcome)"),
+  'un renvoi confirmé doit pouvoir superséder un résultat sent ou uncertain, jamais pending',
 );
+assert.ok(loggedWrapper.includes("priorIdentical.outcome = 'cancelled-for-retry'"), 'un uncertain confirmé doit être annulé durablement avant le nouvel envoi');
+assert.ok(loggedWrapper.includes('EMAIL_UNCERTAIN_CANCEL_PERSIST_FAILED'), 'le renvoi doit échouer fermé si l’annulation durable échoue');
 assert.match(
   botCode,
   /const\s+CONFIRM_REGEX\s*=.*renvoie.*annule\\s\+et\\s\+renvoie/i,
   'Telegram doit accepter renvoie et annule et renvoie comme confirmations explicites',
 );
 assert.ok(
-  botCode.includes('confirmedResend: explicitResend || Boolean(action.resendOfEntryId)'),
-  'un nouvel aperçu reconstruit après annulation doit autoriser le renvoi explicite',
+  botCode.includes('confirmedResend: explicitResend || Boolean(action.resendOfEntryId) || Boolean(action.retryUncertainAuthorized)'),
+  'un nouvel aperçu ou un retry uncertain confirmé doit autoriser le renvoi explicite',
 );
 assert.ok(botCode.includes('function cancelPendingEmailTransactions'), 'une annulation ciblée doit libérer tous les états email associés');
 assert.match(botCode, /clearMatrixTransaction\(chatId, external\.requestId \|\| null\)/, 'annule destinataire doit supprimer la transaction Matrix et son cache');
