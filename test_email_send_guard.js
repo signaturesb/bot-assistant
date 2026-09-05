@@ -72,8 +72,13 @@ assert.strictEqual(
 );
 assert.deepStrictEqual(
   selectFirstEmailConfirmation({ external: matrixPreview, repliedMessageId: 1234 }),
-  { ok: true, kind: 'external', action: matrixPreview },
-  'une seule transaction Matrix active doit être sélectionnée par « envoie » sans Reply Telegram',
+  { ok: false, reason: 'target-required', kind: 'external', action: matrixPreview },
+  'un « envoie » non lié ne doit jamais sélectionner implicitement un dossier',
+);
+assert.strictEqual(
+  selectFirstEmailConfirmation({ external: matrixPreview, repliedMessageId: 9001 }).action,
+  matrixPreview,
+  'une réponse au bon aperçu doit sélectionner exactement ce dossier',
 );
 assert.deepStrictEqual(
   selectFirstEmailConfirmation({}),

@@ -984,7 +984,11 @@ async function sendEmailLogged(opts) {
     Date.now() - Number(candidate.ts || 0) < 24 * 60 * 60 * 1000 &&
     ['pending', 'sent', 'uncertain'].includes(candidate.outcome)
   );
-  const confirmedResend = opts.confirmedResend === true && ['sent', 'uncertain'].includes(priorIdentical?.outcome);
+  const confirmedResend = (
+    opts.confirmedResend === true && ['sent', 'uncertain'].includes(priorIdentical?.outcome)
+  ) || (
+    opts.replaceFailedTransaction === true && priorIdentical?.outcome === 'uncertain'
+  );
   if (priorIdentical && !confirmedResend) {
     return {
       ok: false, blocked: true, code: 'EMAIL_DUPLICATE_FINGERPRINT_BLOCKED',
@@ -8438,6 +8442,7 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
     via: 'gmail', to: emailDestination, cc, subject,
     category: 'centris-matrix-annexes', authorization, emailPayload,
     confirmedResend: confirmationContext.confirmedResend === true,
+    replaceFailedTransaction: confirmationContext.replaceFailedTransaction === true,
     sendFn: async () => {
       const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
         method: 'POST',
@@ -8868,7 +8873,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
           return `❌ PERPLEXITY_API_KEY absent dans Render env vars.\nSign up: perplexity.ai/api → Generate key → ajouter dans dashboard Render.`;
         }
         const { question } = input || {};
-        if (!question) return `❌ Question requise`;
+        if (!question) return `�� Question requise`;
         try {
           const r = await fetch('https://api.perplexity.ai/chat/completions', {
             method: 'POST',
@@ -11156,7 +11161,10 @@ function pendingEmailTransactionSummary(kind, action) {
   const detail = kind === 'external'
     ? externalEmailActionSummary(action.name, action.input).label
     : String(action.sujet || 'Brouillon Gmail');
-  return { to, cc, detail };
+  const centris = kind === 'external'
+    ? String(action?.input?.centris_num || action?.input?.centris || '')
+    : String(action?.centris || '');
+  return { to, cc, detail, centris };
 }
 
 async function requestFinalEmailConfirmation(chatId, kind, action) {
@@ -11189,6 +11197,7 @@ async function requestFinalEmailConfirmation(chatId, kind, action) {
       `À: ${summary.to}`,
       `Cc visible: ${summary.cc.join(', ') || 'aucun (vous êtes le destinataire)'}`,
       `Contenu: ${summary.detail}`,
+      summary.centris ? `Dossier Centris: #${summary.centris}` : '',
       action.requestId ? `Demande unique: ${action.requestId}` : '',
       '',
       `Répondez À CE MESSAGE exactement: confirme ${summary.to}`,
@@ -11377,6 +11386,10 @@ async function handleEmailConfirmation(msg) {
             // nouvelle autorisation explicite. « renvoie » permet aussi le
             // renvoi direct si Gmail avait confirmé le premier exemplaire.
             confirmedResend: explicitResend || Boolean(action.resendOfEntryId) || Boolean(action.retryUncertainAuthorized),
+            // Une NOUVELLE demande ciblée et reconfirmée peut remplacer un
+            // ancien essai incertain. Elle ne peut jamais remplacer un envoi
+            // confirmé « sent » ni un appel fournisseur encore « pending ».
+            replaceFailedTransaction: true,
           },
         );
         const resultText = String(result || '');
@@ -11399,33 +11412,24 @@ async function handleEmailConfirmation(msg) {
           await send(chatId, resultText);
           if (next) await send(chatId, pendingEmailPreview(next));
         } else if (/^⚠️ État Gmail incertain/u.test(resultText)) {
-          action.inFlight = false;
-          action.deliveryUncertain = true;
+          pendingExternalEmailActions.delete(chatId);
+          if (action.name === 'telecharger_annexes_centris') pendingMatrixArtifacts.delete(chatId);
           savePendingEmailState();
-          await send(chatId, `${resultText}\n\n⚠️ Je bloque toute répétition automatique. Vérifie Gmail/Centris, puis annule et reconstruis seulement si l’envoi est absent.`);
+          await send(chatId, `${resultText}\n\n🧹 Cette demande a été annulée automatiquement. Recrée immédiatement le dossier voulu; aucun autre brouillon ne sera envoyé automatiquement.`);
         } else {
           // Échec déterministe: le fournisseur n'a pas livré. La confirmation
           // consommée ne peut pas être rejouée; on revient à l'aperçu et une
           // une nouvelle confirmation exacte sera nécessaire.
-          action.inFlight = false;
-          action.attemptStartedAt = null;
-          action.deliveryUncertain = false;
-          action.confirmationStage = 'preview';
-          action.finalConfirmationRecipient = null;
-          action.finalConfirmationMessageId = null;
-          action.finalConfirmationExpiresAt = null;
-          action.retryUncertainAuthorized = /Transaction identique déjà uncertain/i.test(resultText);
+          pendingExternalEmailActions.delete(chatId);
+          if (action.name === 'telecharger_annexes_centris') pendingMatrixArtifacts.delete(chatId);
           savePendingEmailState();
-          const retryText = action.retryUncertainAuthorized
-            ? '🔁 Ancien verrou incertain identifié. Réponds « envoie »: il sera annulé, le doublon sera nettoyé et une seule nouvelle tentative partira.'
-            : '🔁 Échec confirmé sans livraison. La demande reste en aperçu; réponds de nouveau « envoie » pour réessayer.';
-          await send(chatId, `${resultText}\n\n${retryText}`);
+          await send(chatId, `${resultText}\n\n🧹 Échec annulé automatiquement. Tu peux recréer tout de suite une nouvelle demande ciblée; aucun brouillon suivant ne part automatiquement.`);
         }
       } catch (error) {
-        action.inFlight = false;
-        action.deliveryUncertain = true;
+        pendingExternalEmailActions.delete(chatId);
+        if (action.name === 'telecharger_annexes_centris') pendingMatrixArtifacts.delete(chatId);
         savePendingEmailState();
-        await send(chatId, `❌ Tentative non complétée: ${String(error?.message || error).substring(0, 180)}\n⚠️ État incertain: aucune relance automatique.`);
+        await send(chatId, `❌ Tentative non complétée: ${String(error?.message || error).substring(0, 180)}\n🧹 Demande annulée automatiquement. Tu peux en créer une nouvelle immédiatement; aucune relance ni aucun autre brouillon automatique.`);
       }
       return true;
     }
@@ -11485,8 +11489,16 @@ async function handleEmailConfirmation(msg) {
 
   const selection = directSelection || selectFirstEmailConfirmation({ pending, external, repliedMessageId });
   if (!selection.ok) {
+    if (selection.reason === 'target-required' && selection.action) {
+      await requestFinalEmailConfirmation(chatId, selection.kind, selection.action);
+      return true;
+    }
     if (selection.reason === 'ambiguous') {
-      await send(chatId, '🔒 Plusieurs actions courriel sont en attente. Aucune priorité automatique: réponds directement au bon aperçu Matrix ou annule. Aucun email envoyé.');
+      const choices = [
+        external ? pendingEmailTransactionSummary('external', external) : null,
+        pending ? pendingEmailTransactionSummary('draft', pending) : null,
+      ].filter(Boolean).map(item => `${item.centris ? `#${item.centris} → ` : ''}${item.to}`).join('\n');
+      await send(chatId, `🔒 Plusieurs dossiers sont en attente; je refuse de choisir automatiquement.\n${choices}\n\nRéponds directement au bon aperçu ou annule le mauvais dossier. Aucun email envoyé.`);
     } else {
       await send(chatId, '🔒 Aucune transaction courriel sélectionnable. Aucun email envoyé.');
     }
