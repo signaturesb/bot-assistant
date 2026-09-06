@@ -130,7 +130,7 @@ assert.match(confirmationHandler, /const directSelection = firstConfirmation/,
   '« envoie » doit sélectionner directement la transaction unique active');
 assert.match(confirmationHandler, /finalConfirmationMessageId/);
 assert.match(confirmationHandler, /confirmationStage === 'awaiting-final'/);
-assert.match(confirmationHandler, /Plusieurs actions courriel sont en attente[\s\S]*?Aucune priorité automatique/,
+assert.match(confirmationHandler, /Plusieurs dossiers sont en attente[\s\S]*?refuse de choisir automatiquement/,
   'deux actions simultanées ne doivent jamais choisir un destinataire par ordre de Map');
 assert.match(confirmationHandler, /if \(finalMatch \|\| directSelection\?\.ok\)/,
   'une confirmation exacte doit entrer immédiatement dans la transaction d’envoi');

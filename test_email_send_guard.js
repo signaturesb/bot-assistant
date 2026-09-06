@@ -149,6 +149,14 @@ assert.ok(!pendingListHandler.includes('.delete('), '/pending doit uniquement af
 assert.ok(loggedWrapper.includes('EMAIL_OUTBOX_OUTCOME_PERSIST_FAILED'));
 assert.ok(botCode.includes("const REQUIRED_VISIBLE_CC_EMAIL = 'shawn@signaturesb.com'"), 'le Cc visible obligatoire ne doit pas dépendre d’une env dérivée');
 assert.ok(!/pendingEmails\.set\(ALLOWED_ID/.test(botCode), 'automatic lead drafts must never overwrite the active draft');
+assert.ok(
+  (botCode.match(/stale-preview-auto-replaced/g) || []).length >= 2,
+  'une nouvelle demande ciblée doit remplacer automatiquement un ancien aperçu non envoyé',
+);
+assert.ok(
+  botCode.includes('if (current.inFlight)'),
+  'une transaction fournisseur réellement en cours doit rester protégée contre le remplacement',
+);
 assert.ok(botCode.includes("name === 'telecharger_docs_centris_complet'"), 'multi-email action must be blocked under one-shot policy');
 assert.match(
   cuaCode,

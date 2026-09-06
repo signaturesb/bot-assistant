@@ -7997,7 +7997,19 @@ async function executeMatrixAnnexesTool({ num, emailDestination, filtre, message
   if (!isSendConfirmation && emailDestination && pendingExternalEmailActions.has(chatId)) {
     const current = pendingExternalEmailActions.get(chatId);
     const currentSummary = externalEmailActionSummary(current.name, current.input);
-    return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Réponds « envoie » pour la terminer ou « annule » avant de créer un nouvel aperçu. Aucun email envoyé.`;
+    if (current.inFlight) {
+      return `⏳ Un envoi est présentement en cours pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Attends son résultat; aucun deuxième appel fournisseur lancé.`;
+    }
+    const oldRequestId = current.requestId || null;
+    if (current.name === 'telecharger_annexes_centris') clearMatrixTransaction(chatId, oldRequestId);
+    else {
+      pendingExternalEmailActions.delete(chatId);
+      savePendingEmailState();
+    }
+    auditLogEvent('email', 'stale-preview-auto-replaced', {
+      chatId, oldTo: currentSummary.to, oldLabel: currentSummary.label,
+      newTo: emailDestination, newCentris: num,
+    });
   }
   if (!isSendConfirmation && emailDestination && pendingEmails.has(chatId)) {
     // Dès qu'une nouvelle demande Matrix explicite commence, l'ancien
@@ -8655,7 +8667,18 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
         if (pendingExternalEmailActions.has(chatId)) {
           const current = pendingExternalEmailActions.get(chatId);
           const currentSummary = externalEmailActionSummary(current.name, current.input);
-          return `🔒 Une autre action courriel est déjà active pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Elle n’a pas été écrasée; termine-la ou annule-la d’abord.`;
+          if (current.inFlight) {
+            return `⏳ Un envoi est présentement en cours pour ${currentSummary.to || 'un destinataire'} (${currentSummary.label}). Aucun deuxième appel fournisseur lancé.`;
+          }
+          if (current.name === 'telecharger_annexes_centris') clearMatrixTransaction(chatId, current.requestId || null);
+          else {
+            pendingExternalEmailActions.delete(chatId);
+            savePendingEmailState();
+          }
+          auditLogEvent('email', 'stale-preview-auto-replaced', {
+            chatId, oldTo: currentSummary.to, oldLabel: currentSummary.label,
+            newTo: summary.to, newLabel: summary.label,
+          });
         }
         deferActivePendingEmail(chatId);
         pendingExternalEmailActions.set(chatId, {
@@ -8873,7 +8896,7 @@ async function executeTool(name, input, chatId, userMessage = '', actionContext 
           return `❌ PERPLEXITY_API_KEY absent dans Render env vars.\nSign up: perplexity.ai/api → Generate key → ajouter dans dashboard Render.`;
         }
         const { question } = input || {};
-        if (!question) return `�� Question requise`;
+        if (!question) return `❌ Question requise`;
         try {
           const r = await fetch('https://api.perplexity.ai/chat/completions', {
             method: 'POST',
