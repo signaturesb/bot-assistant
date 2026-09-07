@@ -72,8 +72,8 @@ assert.strictEqual(
 );
 assert.deepStrictEqual(
   selectFirstEmailConfirmation({ external: matrixPreview, repliedMessageId: 1234 }),
-  { ok: false, reason: 'target-required', kind: 'external', action: matrixPreview },
-  'un « envoie » non lié ne doit jamais sélectionner implicitement un dossier',
+  { ok: true, kind: 'external', action: matrixPreview },
+  'une seule transaction ciblée active doit partir avec le simple mot « envoie »',
 );
 assert.strictEqual(
   selectFirstEmailConfirmation({ external: matrixPreview, repliedMessageId: 9001 }).action,
