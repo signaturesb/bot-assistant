@@ -28,7 +28,7 @@
     "compression": "^1.8.1",
     "dotenv": "^16.0.0",
     "fuse.js": "^7.5.0",
-    "got": "^15.1.0",
+    "got": "^16.0.0",
     "helmet": "^8.3.0",
     "lru-cache": "^11.5.2",
     "node-telegram-bot-api": "^0.67.0",
