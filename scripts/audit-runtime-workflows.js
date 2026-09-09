@@ -84,11 +84,15 @@ if (/nettoyerDoublonsActivites\s*\(|method:\s*['"](?:POST|PUT|PATCH|DELETE)['"]/
   errors.push('Mutation Pipedrive détectée dans l’audit hebdo.');
 }
 
-// Le safety check Brevo alerte, mais ne suspend et n’envoie jamais.
-const brevoSafety = block('async function safetyCheckCampagnes()', '// ─── Veille J-1 backup');
+// Le safety check Brevo est fail-closed: il peut uniquement suspendre une
+// campagne non approuvée. Il ne doit jamais envoyer ni modifier son contenu.
+const brevoSafety = block('async function safetyCheckCampagnes()', '// ─── Aperçu exact environ 1 h');
 if (!brevoSafety) errors.push('Bloc safetyCheckCampagnes introuvable.');
-if (/method:\s*['"](?:POST|PUT|PATCH|DELETE)['"]|\/sendTest\b/.test(brevoSafety)) {
-  errors.push('Mutation Brevo détectée dans safetyCheckCampagnes.');
+if (!/body:\s*JSON\.stringify\(\{ status: 'suspended' \}\)/.test(brevoSafety)) {
+  errors.push('Suspension fail-closed absente de safetyCheckCampagnes.');
+}
+if (/\/sendNow\b|\/sendTest\b|htmlContent\s*:|subject\s*:/.test(brevoSafety)) {
+  errors.push('Mutation Brevo autre que suspension détectée dans safetyCheckCampagnes.');
 }
 
 // Les anciennes portes admin mutatives doivent rester explicitement bloquées.
@@ -138,4 +142,4 @@ requireText("if (GIST_WRITES_ENABLED) safeCron('gist-optional-backup'", 'Backup 
 console.log('=== KIRA RUNTIME WORKFLOW AUDIT ===');
 for (const error of errors) console.error(`ERROR: ${error}`);
 if (errors.length) process.exit(1);
-console.log('OK: boucles non chevauchantes, CRM/campagnes lecture seule, backups vérifiés');
+console.log('OK: boucles non chevauchantes, CRM lecture seule, campagnes fail-closed, backups vérifiés');

@@ -28,6 +28,7 @@
     "test-firecrawl": "node test_firecrawl.js",
     "test-cua": "node test_cua.js",
     "test-email-guard": "node test_email_send_guard.js",
+    "test-campaign-approval": "node test_campaign_approval_guard.js",
     "test-pipedrive-guard": "node test_pipedrive_write_guard.js",
     "test-admin-auth": "node test_admin_auth.js",
     "test-outbound-url-guard": "node test_outbound_url_guard.js",

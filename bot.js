@@ -11794,7 +11794,7 @@ function registerHandlers() {
           if (action === 'cmp_send') {
             await bot.answerCallbackQuery(cbq.id, { text: '⏳ Confirmation...' });
             try {
-              // 1. Fetch scheduledAt actuel
+              // Une confirmation n'est valide que pour l'aperçu exact envoyé par courriel.
               const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
                 headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
               }).then(r => r.json());
@@ -11803,28 +11803,44 @@ function registerHandlers() {
                 auditLogEvent('campaign', 'duplicate-confirm-blocked', { campaignId, status: det.status, sentDate: det.sentDate });
                 return;
               }
+              const preview = campaignPreviews.pending[String(campaignId)];
+              if (!preview) {
+                await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : aucun aperçu exact valide n'a été envoyé. Attends la nouvelle notification avec le visuel.`);
+                auditLogEvent('campaign', 'confirm-blocked-no-preview', { campaignId });
+                return;
+              }
+              if (Date.now() >= new Date(preview.expiresAt).getTime()) {
+                consumeCampaignPreview(campaignId);
+                await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : la confirmation est expirée. Il faut reprogrammer et recevoir un nouvel aperçu.`);
+                auditLogEvent('campaign', 'confirm-blocked-expired', { campaignId });
+                return;
+              }
+              const currentHash = campaignApprovalHash(det);
+              if (currentHash !== preview.hash) {
+                consumeCampaignPreview(campaignId);
+                await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : le contenu, les destinataires ou l'heure ont changé depuis l'aperçu. Un nouveau visuel est obligatoire.`);
+                auditLogEvent('campaign', 'confirm-blocked-hash-mismatch', { campaignId });
+                return;
+              }
+              if (det.status !== 'suspended') {
+                await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : statut inattendu ${det.status}. Aucune action effectuée.`);
+                return;
+              }
               const sched = det.scheduledAt;
               const schedMs = sched ? new Date(sched).getTime() : 0;
-              const isFuture = schedMs > Date.now() + 60000; // >1 min dans le futur
-
-              // 2a. Si scheduledAt dans le futur → PUT scheduledAt (Brevo respecte la date)
-              // 2b. Si pas de scheduledAt ou passé → POST sendNow (envoi immédiat)
-              let r, label;
-              if (isFuture) {
-                r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
-                  method: 'PUT',
-                  headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ scheduledAt: sched }),
-                  signal: AbortSignal.timeout(15000),
-                });
-                label = `✅ Confirmé — envoi ${new Date(sched).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' })}`;
-              } else {
-                r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/sendNow`, {
-                  method: 'POST',
-                  headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
-                });
-                label = `✅ Envoyée maintenant`;
+              if (schedMs <= Date.now() + 60000) {
+                consumeCampaignPreview(campaignId);
+                await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : l'heure prévue est passée ou trop proche. Aucun envoi immédiat automatique; il faut la reprogrammer.`);
+                auditLogEvent('campaign', 'confirm-blocked-schedule-past', { campaignId, scheduledAt: sched });
+                return;
               }
+              const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+                method: 'PUT',
+                headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scheduledAt: sched }),
+                signal: AbortSignal.timeout(15000),
+              });
+              const label = `✅ Confirmé — envoi ${new Date(sched).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' })}`;
               if (r.ok || r.status === 204) {
                 if (chatId && msgId) {
                   const newMarkup = { inline_keyboard: [[{ text: label, callback_data: 'noop' }]] };
@@ -11832,8 +11848,9 @@ function registerHandlers() {
                 }
                 await bot.sendMessage(chatId, label);
                 // Approval registry — évite une nouvelle alerte du safety check.
-                approveCampaign(campaignId);
-                auditLogEvent('campaign', 'confirmed', { campaignId, scheduledAt: sched, mode: isFuture ? 'scheduled' : 'sendNow' });
+                approveCampaign(campaignId, currentHash);
+                consumeCampaignPreview(campaignId);
+                auditLogEvent('campaign', 'confirmed', { campaignId, scheduledAt: sched, mode: 'scheduled', previewHash: currentHash });
               } else {
                 const err = await r.text().catch(() => '');
                 await bot.sendMessage(chatId, `❌ Brevo ${r.status}: ${err.substring(0, 200)}`);
@@ -14904,17 +14921,60 @@ async function runDedupHebdo() {
 // Toute campagne scheduledAt sans approval entry → alerte lecture seule.
 const CAMPAIGN_APPROVALS_FILE = path.join(DATA_DIR, 'campaigns_approved.json');
 let campaignApprovals = loadJSON(CAMPAIGN_APPROVALS_FILE, { approved: {} });
-function approveCampaign(id) {
-  campaignApprovals.approved[String(id)] = { approvedAt: new Date().toISOString() };
+const CAMPAIGN_PREVIEWS_FILE = path.join(DATA_DIR, 'campaign_previews.json');
+let campaignPreviews = loadJSON(CAMPAIGN_PREVIEWS_FILE, { pending: {} });
+function campaignApprovalPayload(c) {
+  const recipients = c.recipients || {};
+  return {
+    version: 1,
+    id: String(c.id),
+    name: c.name || '',
+    subject: c.subject || '',
+    htmlContent: c.htmlContent || '',
+    sender: c.sender || {},
+    recipients: {
+      lists: [...(recipients.lists || recipients.listIds || [])].map(Number).sort((a, b) => a - b),
+      exclusionLists: [...(recipients.exclusionLists || recipients.exclusionListIds || [])].map(Number).sort((a, b) => a - b),
+      segments: [...(recipients.segments || [])].map(Number).sort((a, b) => a - b),
+      excludedSegments: [...(recipients.excludedSegments || [])].map(Number).sort((a, b) => a - b),
+    },
+    scheduledAt: c.scheduledAt || '',
+  };
+}
+function campaignApprovalHash(c) {
+  return crypto.createHash('sha256').update(JSON.stringify(campaignApprovalPayload(c))).digest('hex');
+}
+function rememberCampaignPreview(c) {
+  campaignPreviews.pending[String(c.id)] = {
+    hash: campaignApprovalHash(c),
+    previewedAt: new Date().toISOString(),
+    expiresAt: c.scheduledAt || new Date(Date.now() + 2 * 3600 * 1000).toISOString(),
+  };
+  saveJSON(CAMPAIGN_PREVIEWS_FILE, campaignPreviews);
+}
+function consumeCampaignPreview(id) {
+  delete campaignPreviews.pending[String(id)];
+  saveJSON(CAMPAIGN_PREVIEWS_FILE, campaignPreviews);
+}
+function approveCampaign(id, hash) {
+  campaignApprovals.approved[String(id)] = { approvedAt: new Date().toISOString(), hash: hash || null };
   saveJSON(CAMPAIGN_APPROVALS_FILE, campaignApprovals);
 }
-function isCampaignApproved(id) {
-  return !!campaignApprovals.approved[String(id)];
+async function isCampaignApproved(c) {
+  const approval = campaignApprovals.approved[String(c.id)];
+  if (!approval?.hash) return false;
+  try {
+    const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${c.id}`, {
+      headers: { 'api-key': BREVO_KEY, accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) return false;
+    return campaignApprovalHash(await r.json()) === approval.hash;
+  } catch { return false; }
 }
 
-// ─── SAFETY CHECK CAMPAGNES — lecture seule ───────────────────────────────
-// Scanne les campagnes des 48h prochaines et alerte. Un cron ne doit jamais
-// suspendre, envoyer un test ou modifier une campagne Brevo sans action courante.
+// ─── SAFETY CHECK CAMPAGNES — verrou fail-closed ──────────────────────────
+// Toute campagne en file sans approbation exacte est suspendue avant son envoi.
 async function safetyCheckCampagnes() {
   if (!BREVO_KEY) return;
   try {
@@ -14939,29 +14999,37 @@ async function safetyCheckCampagnes() {
       return t > now && t <= limit48h;
     });
     const alerts = [];
+    let suspended = 0;
     for (const c of upcoming) {
-      if (isCampaignApproved(c.id)) continue;
+      if (await isCampaignApproved(c)) continue;
       const sched = new Date(c.scheduledAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' });
-      alerts.push(`🚨 *${c.name}* (#${c.id})\n   Schedulée ${sched} sans approbation enregistrée\n   Statut inchangé: ${c._scanStatus}\n   Sujet: ${(c.subject||'').substring(0,80)}`);
+      const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${c.id}/status`, {
+        method: 'PUT',
+        headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'suspended' }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (sr.ok || sr.status === 204) {
+        suspended++;
+        alerts.push(`🛑 *${c.name}* (#${c.id})\n   Schedulée ${sched} sans approbation\n   Statut: SUSPENDUE automatiquement\n   Sujet: ${(c.subject||'').substring(0,80)}`);
+      } else {
+        alerts.push(`🚨 *${c.name}* (#${c.id})\n   ÉCHEC DU BLOCAGE (Brevo ${sr.status}) — intervention requise immédiatement`);
+      }
     }
     if (alerts.length) {
-      const tgMsg = `🛡️ *SAFETY CHECK CAMPAGNES — LECTURE SEULE*\n_${alerts.length} campagne(s) sans approbation; aucune modification effectuée_\n\n` + alerts.join('\n\n') + `\n\n→ Tape \`/campaigns\` pour réviser et choisir une action`;
+      const tgMsg = `🛡️ *VERROU CAMPAGNES*\n_${alerts.length} campagne(s) sans approbation détectée(s)_\n\n` + alerts.join('\n\n') + `\n\n→ Le visuel exact sera envoyé avant toute nouvelle confirmation.`;
       await sendTelegramWithFallback(tgMsg, { category: 'safety-campaigns' }).catch(() => {});
     }
-    if (alerts.length > 0) log('WARN', 'SAFETY', `${alerts.length} campagne(s) sans approbation — alerte seulement`);
-    return { scanned: campaigns.length, upcoming: upcoming.length, unapproved: alerts.length, mutated: 0 };
+    if (alerts.length > 0) log('WARN', 'SAFETY', `${alerts.length} campagne(s) sans approbation; ${suspended} suspendue(s)`);
+    return { scanned: campaigns.length, upcoming: upcoming.length, unapproved: alerts.length, suspended };
   } catch (e) { log('WARN', 'SAFETY', `safetyCheck: ${e.message}`); }
 }
 
-// ─── Veille J-1 backup côté Render (au cas où Mac dort) ─────────────────
+// ─── Aperçu exact environ 1 h avant l'heure prévue ───────────────────────
 async function checkVeilleCampagnesBackup() {
   if (!BREVO_KEY) return;
-  log('INFO', 'VEILLE', 'Backup check campagnes suspended pour demain...');
-
-  // Demain en Eastern
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  const tomorrowKey = tomorrow.toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
+  log('INFO', 'VEILLE', 'Recherche campagnes suspendues à confirmer dans environ 1 h...');
+  const nowMs = Date.now();
 
   // Liste suspended
   const r = await fetch('https://api.brevo.com/v3/emailCampaigns?status=suspended&limit=50', {
@@ -14975,12 +15043,12 @@ async function checkVeilleCampagnesBackup() {
   // était ignorée et partait sans preview/confirmation.
   const camps = (data.campaigns || []);
   const targets = camps.filter(c => {
-    const d = (c.scheduledAt || '').split('T')[0];
-    return d === tomorrowKey;
+    const t = new Date(c.scheduledAt || 0).getTime();
+    return t > nowMs && t <= nowMs + 65 * 60 * 1000;
   });
 
   if (!targets.length) {
-    log('INFO', 'VEILLE', `Aucune campagne pour demain (${tomorrowKey})`);
+    log('INFO', 'VEILLE', 'Aucune campagne suspendue prévue dans les 65 prochaines minutes');
     return;
   }
 
@@ -14990,18 +15058,19 @@ async function checkVeilleCampagnesBackup() {
   try { state = JSON.parse(require('fs').readFileSync(STATE_FILE, 'utf8')); } catch {}
 
   for (const camp of targets) {
-    const dedupKey = `veille_${camp.id}_${tomorrowKey}`;
+    const dedupKey = `approval_preview_${camp.id}_${camp.scheduledAt}`;
     if (state[dedupKey]) { log('INFO', 'VEILLE', `${dedupKey} déjà fait (Mac scheduler probablement)`); continue; }
 
     // 1. Envoie preview via GMAIL API (Brevo sendTest hold → unreliable)
     // On fetch le HTML campagne + send via Gmail OAuth (delivery garantie).
     let testOK = false;
     let previewError = null;
+    let campFull = null;
     try {
       const detRes = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}`, {
         headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000)
       });
-      const campFull = detRes.ok ? await detRes.json() : null;
+      campFull = detRes.ok ? await detRes.json() : null;
       const html = campFull?.htmlContent;
       const subj = campFull?.subject || camp.name;
       const gmailTok = await getGmailToken();
@@ -15019,10 +15088,10 @@ async function checkVeilleCampagnesBackup() {
           Buffer.from(html, 'utf-8').toString('base64'),
         ];
         const raw = Buffer.from(lines.join('\r\n')).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-        const previewSubject = `[VEILLE J-1] ${subj}`;
+        const previewSubject = `[À CONFIRMER · ENVOI DANS 1 H] ${subj}`;
         const logged = await sendEmailLogged({
           via: 'gmail', to: SHAWN_EMAIL, subject: previewSubject, body: `Preview campagne Brevo #${camp.id}`,
-          category: 'veille-j1-internal-preview',
+          category: 'campaign-approval-preview',
           sendFn: () => fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
             method: 'POST',
             headers: { 'Authorization': `Bearer ${gmailTok}`, 'Content-Type': 'application/json' },
@@ -15046,20 +15115,23 @@ async function checkVeilleCampagnesBackup() {
     const segMatch = (camp.name || '').match(/\[(?:AUTO|REENG|TERRAINS)\]\s*([^·\d][^·]*?)(?:\s*[·\d]|$)/);
     const segment = segMatch ? segMatch[1].trim() : 'Campagne';
     const lists = det.recipients?.lists || det.recipients?.listIds || [];
-    const dateStr = new Date(camp.scheduledAt).toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'America/Toronto' });
+    const dateStr = new Date(camp.scheduledAt).toLocaleString('fr-CA', { dateStyle: 'long', timeStyle: 'short', timeZone: 'America/Toronto' });
 
-    const tgText = `📧 *Campagne demain à 10h*\n\n` +
+    // Le bouton n'est valide que pour le contenu exact réellement prévisualisé.
+    if (testOK && campFull) rememberCampaignPreview(campFull);
+
+    const tgText = `📧 *Campagne à confirmer — environ 1 h avant*\n\n` +
       `*${segment}* · #${camp.id}\n` +
       `📅 ${dateStr}\n` +
       `👥 listes [${lists.join(',')}]\n` +
       `📝 ${(det.subject || camp.subject || '').substring(0, 80)}\n\n` +
-      (testOK ? `📬 *Preview envoyé via Gmail* à shawn@signaturesb.com — sujet \\[VEILLE J-1\\]\n\n` : `⚠️ Preview échoué (${previewError || '?'}) — utilise \`/admin/preview-via-gmail?id=${camp.id}\`\n\n`) +
+      (testOK ? `📬 *Visuel exact envoyé par courriel* à ${SHAWN_EMAIL}\n🔐 Le bouton est lié à cette version exacte.\n\n` : `⚠️ Aperçu échoué (${previewError || '?'}) — confirmation BLOQUÉE\n\n`) +
       `_Rien ne s'envoie sans ton ✅ Confirmer ci-dessous._`;
 
     // Boutons inline direct (1 click, pas besoin de taper /campaigns)
     const replyMarkup = {
       inline_keyboard: [[
-        { text: '✅ Confirmer', callback_data: `cmp_send:${camp.id}` },
+        ...(testOK ? [{ text: '✅ Confirmer', callback_data: `cmp_send:${camp.id}` }] : []),
         { text: '🚫 Annuler', callback_data: `cmp_cancel:${camp.id}` },
         { text: '👁 Preview', callback_data: `cmp_preview:${camp.id}` },
       ]],
@@ -15972,23 +16044,17 @@ function startDailyTasks() {
       runDedupHebdo().catch(e => log('WARN', 'DEDUP', `Hebdo: ${e.message}`));
     }
 
-    // ── VEILLE J-1 SUR RENDER (Shawn 2026-05-13) — source de vérité primaire ─
-    // Bug réel (perdu #39 24-avril + #40 8-mai): Mac scheduler.js LaunchAgent
-    // dort si Mac fermé pendant la fenêtre 18-23h Eastern. Render tourne 24/7,
-    // donc on déplace la veille J-1 ici. La fonction interne fait dédup par
-    // campagne (clé veille_<id>_<date>) dans fichier persistent — donc safe
-    // même si réessayé plusieurs fois OU si Mac scheduler fait pareil.
-    //
-    // FENÊTRE ÉLARGIE 19h-23h Eastern (vs h===19 strict avant) — tolère redeploy
-    // Render. Toute heure dans la fenêtre = exécution; dédup interne empêche spam.
-    if (h >= 19 && h <= 23 && lastCron.veilleCampaign !== todayStr) {
-      lastCron.veilleCampaign = todayStr;
+    // Aperçu et demande de confirmation environ 1 h avant l'heure prévue.
+    // Vérification toutes les 5 minutes; dédup par campagne + horaire.
+    const approvalSlot = `${todayStr}-${h}-${Math.floor(m / 5)}`;
+    if (m % 5 === 0 && lastCron.veilleCampaign !== approvalSlot) {
+      lastCron.veilleCampaign = approvalSlot;
       checkVeilleCampagnesBackup().catch(e => log('WARN', 'VEILLE', `${e.message}`));
     }
 
     // ── SAFETY CHECK CAMPAGNES — TOUTES les heures (Shawn 2026-05-05) ────────
     // Bug réel: campagne #34 [AUTO] Vendeurs scheduled sans approval.
-    // Filet de sécurité lecture seule: scan et alerte, sans suspendre ni envoyer.
+    // Filet de sécurité fail-closed: suspend toute campagne non approuvée.
     if (m < 5 && lastCron.safetyHourly !== `${todayStr}-${h}`) {
       lastCron.safetyHourly = `${todayStr}-${h}`;
       safetyCheckCampagnes().catch(e => log('WARN', 'SAFETY', `${e.message}`));
@@ -16608,6 +16674,11 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       const action = url.startsWith('/confirm') ? 'confirm' : 'cancel';
       const pageHTML = (emoji, titre, sousTitre, couleur = '#aa0721') => `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${titre}</title></head><body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,sans-serif;"><div style="text-align:center;padding:40px 24px;max-width:340px;"><div style="font-size:64px;margin-bottom:20px;">${emoji}</div><div style="color:#f5f5f7;font-size:22px;font-weight:700;margin-bottom:12px;">${titre}</div><div style="color:#666;font-size:14px;line-height:1.6;">${sousTitre}</div><div style="margin-top:28px;color:${couleur};font-size:10px;font-weight:700;letter-spacing:2px;">SIGNATURE SB · RE/MAX PRESTIGE</div></div></body></html>`;
       if (!campaignId) { res.writeHead(400); res.end('ID manquant'); return; }
+      if (action === 'confirm') {
+        res.writeHead(410, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(pageHTML('🛑', 'Confirmation déplacée dans le bot', 'Pour votre sécurité, ouvrez la notification Telegram contenant le visuel exact et appuyez sur Confirmer. Aucun envoi n’a été déclenché.'));
+        return;
+      }
       // Validation HMAC token
       const secret = process.env.CONFIRM_SECRET || '';
       if (!secret) { res.writeHead(503); res.end('CONFIRM_SECRET non configuré'); return; }
@@ -17677,6 +17748,13 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
   // 3. Pré-écrit registre AVANT envoi (anti-double-call)
   // 4. Vérifie status post-envoi
   if ((req.method === 'POST' || req.method === 'GET') && url.startsWith('/admin/brevo-send-now')) {
+    res.writeHead(403, { 'content-type':'application/json' });
+    res.end(JSON.stringify({
+      sent: false,
+      error: 'Envoi direct désactivé. Un aperçu exact et une confirmation one-shot dans le bot sont obligatoires.'
+    }, null, 2));
+    return;
+    /* istanbul ignore next -- ancien chemin conservé temporairement pour audit */
     if (!webhookRateOK(req.socket.remoteAddress, url, 3)) { res.writeHead(429); res.end('rate limit'); return; }
     const u = new URL(req.url, 'http://x');
     const id = u.searchParams.get('id');
