@@ -11826,6 +11826,13 @@ function registerHandlers() {
                 await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : statut inattendu ${det.status}. Aucune action effectuée.`);
                 return;
               }
+              const cadence = await campaignMonthlyCapCheck(det);
+              if (!cadence.ok) {
+                consumeCampaignPreview(campaignId);
+                await bot.sendMessage(chatId, `🛑 Campagne #${campaignId} bloquée : ${cadence.error}. ${cadence.atCap || 0} contact(s) atteindraient plus de ${cadence.maximum || 2} courriels ce mois-ci, ou l’audience ne respecte pas sa préférence.`);
+                auditLogEvent('campaign', 'confirm-blocked-cadence', { campaignId, cadence });
+                return;
+              }
               const sched = det.scheduledAt;
               const schedMs = sched ? new Date(sched).getTime() : 0;
               if (schedMs <= Date.now() + 60000) {
@@ -14944,6 +14951,85 @@ function campaignApprovalPayload(c) {
 function campaignApprovalHash(c) {
   return crypto.createHash('sha256').update(JSON.stringify(campaignApprovalPayload(c))).digest('hex');
 }
+const CAMPAIGN_AUDIENCE_RULES = [
+  { key: 'terrains', match: /terrains?/i, lists: [8], exclusions: [10] },
+  { key: 'acheteurs', match: /acheteurs?/i, lists: [5], exclusions: [7, 8, 10] },
+  { key: 'vendeurs', match: /vendeurs?/i, lists: [7], exclusions: [4, 5, 8, 10] },
+  { key: 'prospects', match: /prospects?/i, lists: [4], exclusions: [5, 7, 8, 10] },
+  { key: 'anciens-clients-reference', match: /r[eé]f[eé]rencement|anciens? clients?/i, lists: [3, 6, 7], exclusions: [4, 5, 8, 10], allowSubset: true },
+];
+function campaignAudienceRule(c) {
+  const label = `${c.name || ''} ${c.subject || ''}`;
+  return CAMPAIGN_AUDIENCE_RULES.find(rule => rule.match.test(label)) || null;
+}
+function campaignRecipientLists(c) {
+  const r = c.recipients || {};
+  return {
+    lists: [...(r.lists || r.listIds || [])].map(Number).sort((a, b) => a - b),
+    exclusions: [...(r.exclusionLists || r.exclusionListIds || [])].map(Number).sort((a, b) => a - b),
+  };
+}
+function validateCampaignAudience(c) {
+  const rule = campaignAudienceRule(c);
+  if (!rule) return { ok: false, error: 'AUDIENCE_INCONNUE' };
+  const actual = campaignRecipientLists(c);
+  const allowed = new Set(rule.lists);
+  const listsOK = actual.lists.length > 0 && actual.lists.every(id => allowed.has(id)) &&
+    (rule.allowSubset || (actual.lists.length === rule.lists.length && rule.lists.every(id => actual.lists.includes(id))));
+  const exclusionsOK = rule.exclusions.every(id => actual.exclusions.includes(id));
+  if (!listsOK || !exclusionsOK) {
+    return { ok: false, error: 'AUDIENCE_NON_CONFORME', segment: rule.key, expected: rule, actual };
+  }
+  return { ok: true, segment: rule.key, actual };
+}
+async function fetchAllBrevoContacts() {
+  const contacts = [];
+  for (let offset = 0; offset < 100000; offset += 500) {
+    const r = await fetch(`https://api.brevo.com/v3/contacts?limit=500&offset=${offset}`, {
+      headers: { 'api-key': BREVO_KEY, accept: 'application/json' }, signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) throw new Error(`Brevo contacts HTTP ${r.status}`);
+    const data = await r.json();
+    contacts.push(...(data.contacts || []));
+    if (contacts.length >= (data.count || 0) || (data.contacts || []).length < 500) break;
+  }
+  return contacts;
+}
+async function campaignMonthlyCapCheck(c, maximum = 2) {
+  const audience = validateCampaignAudience(c);
+  if (!audience.ok) return audience;
+  const [contacts, sentRes] = await Promise.all([
+    fetchAllBrevoContacts(),
+    fetch('https://api.brevo.com/v3/emailCampaigns?status=sent&limit=100&sort=desc', {
+      headers: { 'api-key': BREVO_KEY, accept: 'application/json' }, signal: AbortSignal.timeout(15000),
+    }),
+  ]);
+  if (!sentRes.ok) throw new Error(`Brevo campagnes HTTP ${sentRes.status}`);
+  const sentData = await sentRes.json();
+  const now = new Date();
+  const monthKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year: 'numeric', month: '2-digit' }).format(now);
+  const sentThisMonth = (sentData.campaigns || []).filter(item => {
+    if (!item.sentDate) return false;
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto', year: 'numeric', month: '2-digit' }).format(new Date(item.sentDate)) === monthKey;
+  });
+  const target = campaignRecipientLists(c);
+  let eligible = 0;
+  let atCap = 0;
+  for (const contact of contacts) {
+    if (!contact.email || contact.emailBlacklisted) continue;
+    const memberships = new Set((contact.listIds || []).map(Number));
+    const targeted = target.lists.some(id => memberships.has(id)) && !target.exclusions.some(id => memberships.has(id));
+    if (!targeted) continue;
+    eligible++;
+    let received = 0;
+    for (const sent of sentThisMonth) {
+      const past = campaignRecipientLists(sent);
+      if (past.lists.some(id => memberships.has(id)) && !past.exclusions.some(id => memberships.has(id))) received++;
+    }
+    if (received >= maximum) atCap++;
+  }
+  return { ok: atCap === 0, error: atCap ? 'LIMITE_MENSUELLE' : null, maximum, eligible, atCap, monthKey, segment: audience.segment };
+}
 function rememberCampaignPreview(c) {
   campaignPreviews.pending[String(c.id)] = {
     hash: campaignApprovalHash(c),
@@ -15073,6 +15159,11 @@ async function checkVeilleCampagnesBackup() {
       campFull = detRes.ok ? await detRes.json() : null;
       const html = campFull?.htmlContent;
       const subj = campFull?.subject || camp.name;
+      const cadence = campFull ? await campaignMonthlyCapCheck(campFull) : { ok: false, error: 'CAMPAGNE_INTROUVABLE' };
+      if (!cadence.ok) {
+        previewError = `${cadence.error}${cadence.atCap ? ` — ${cadence.atCap} contact(s) à la limite` : ''}`;
+        throw new Error(previewError);
+      }
       const gmailTok = await getGmailToken();
       if (html && gmailTok) {
         const enc = s => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;

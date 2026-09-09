@@ -16,5 +16,10 @@ assert.match(source, /Envoi direct désactivé/, 'direct send endpoint must be d
 assert.match(source, /Confirmation déplacée dans le bot/, 'legacy email confirm link must be disabled');
 assert.match(source, /m % 5 === 0/, 'approval preview scanner must run every five minutes');
 assert.match(source, /65 \* 60 \* 1000/, 'preview must be generated about one hour before send');
+assert.match(source, /campaignMonthlyCapCheck\(det\)/, 'confirmation must recheck the monthly contact cap');
+assert.match(source, /received >= maximum/, 'each contact must be capped individually');
+assert.match(source, /emailBlacklisted/, 'blacklisted contacts must never be counted as eligible');
+assert.match(source, /AUDIENCE_NON_CONFORME/, 'campaign audience must match its declared intent');
+assert.match(source, /key: 'terrains'[\s\S]{0,100}lists: \[8\]/, 'terrain campaigns must target only entrepreneurs list 8');
 
 console.log('✅ Campaign approval guard: fail-closed, exact-preview, one-shot OK');
