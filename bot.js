@@ -1520,21 +1520,11 @@ EXEMPLES SHAWN → ACTIONS:
   → chercher_comparables(type=Unifamiliale, sous_type=Plain-pied, muni=Chertsey, statut=Vendu)
 
 ═══ ENVOI FICHE D'UN LISTING À UN CLIENT (PRIORITÉ ABSOLUE) ═══
-TOUJOURS utiliser \`envoyer_fiche_centris_native\` en PREMIER quand demande:
-• "envoie la fiche du #X à client@email.com"
-• "envoie le PDF du listing #X à Y"
-• "envoie le détaillé client de #X"
-
-Ce flow utilise l'UI Matrix natif (Imprimer → Detaillé client avec album photos
-→ Envoyer par courriel) qui produit le VRAI PDF officiel Centris avec photos HD
-et signature Shawn intégrée. Sender authentifié shawn@signaturesb.com via Centris.
-
-Fallback SEULEMENT si native échoue:
-1. \`telecharger_fiche_centris\` (HTTP + CUA)
-2. Envoi lien public Centris.ca
-
-JAMAIS utiliser \`telecharger_fiche_centris\` en premier choix pour un envoi
-client — le PDF natif Matrix est toujours supérieur (qualité, signature, photos).
+TOUJOURS utiliser \`telecharger_annexes_centris\` pour récupérer les PDF officiels
+par recherche globale Matrix, même pour une inscription d'un autre courtier.
+Afficher les pièces jointes réelles dans Telegram AVANT de demander « envoie ».
+Sans PDF récupéré, validé et figé: aucune fiche annoncée prête, aucun envoi armé.
+Un blocage de compte Centris ne se résout pas par un autre canal d'envoi.
 
 ═══ DEUX TYPES DE RAPPORTS COMPARABLES ═══
 
@@ -8592,6 +8582,23 @@ async function startNextQueuedMatrixRequest(chatId) {
 
 async function executeTool(name, input, chatId, userMessage = '', actionContext = {}) {
   try {
+    // Native Matrix email formerly armed a preview before any PDF existed.
+    // Always rebuild through the download/validation/Telegram preview workflow;
+    // an old native confirmation can never send unseen documents.
+    if (name === 'envoyer_fiche_centris_native') {
+      const num = String(input?.centris_num || '').trim();
+      if (!/^\d{7,9}$/.test(num)) return '❌ Numéro Centris invalide (7-9 chiffres).';
+      const active = pendingExternalEmailActions.get(chatId);
+      if (active?.name === name) {
+        if (active.inFlight && !actionContext.confirmedExternalEmail) return '⏳ Une action Centris est déjà en cours.';
+        pendingExternalEmailActions.delete(chatId);
+        savePendingEmailState();
+      }
+      return await executeMatrixAnnexesTool({
+        num, emailDestination: input.email, filtre: null,
+        messagePerso: input.message, chatId, userMessage: '',
+      });
+    }
     const pdAction = PIPEDRIVE_WRITE_TOOL_ACTIONS[name];
     const scheduledPipedriveAction = name === 'planifier_visite' || name === 'creer_activite';
     if (scheduledPipedriveAction && !actionContext.confirmedPipedriveActivity) {
@@ -11416,6 +11423,13 @@ async function handleEmailConfirmation(msg) {
           },
         );
         const resultText = String(result || '');
+        if (action.name === 'envoyer_fiche_centris_native' &&
+            pendingExternalEmailActions.get(chatId)?.name === 'telecharger_annexes_centris') {
+          // A fresh verified PDF preview replaced the legacy native action.
+          // Keep it armed for its own new confirmation; no send occurred.
+          await send(chatId, resultText);
+          return true;
+        }
         if (/^✅/u.test(resultText) || /\n✅/u.test(resultText)) {
           pendingExternalEmailActions.delete(chatId);
           if (action.pendingDocKey) pendingDocSends.delete(action.pendingDocKey);
@@ -12800,8 +12814,15 @@ function registerHandlers() {
     if (!process.env.CENTRIS_USER || !process.env.CENTRIS_PASS) {
       return bot.sendMessage(msg.chat.id, '❌ CENTRIS_USER/CENTRIS_PASS manquants dans Render env vars');
     }
-    if (centrisLoginInProgress) {
+    if (centrisLoginInProgress || centrisMaintenanceState.running) {
       return bot.sendMessage(msg.chat.id, '⏳ Une connexion Centris est déjà en cours. Attends son résultat ou envoie le code reçu avec /mfa 123456.');
+    }
+    try {
+      getCUA().resetCentrisLoginLimit();
+      centrisMaintenanceState.consecutiveFailures = 0;
+      saveJSON(CENTRIS_MAINTENANCE_LIMIT_FILE, { failures: 0 });
+    } catch {
+      return bot.sendMessage(msg.chat.id, '❌ Relance impossible: une connexion est en cours ou le compteur ne peut pas être enregistré.');
     }
     centrisLoginInProgress = true;
     await bot.sendMessage(msg.chat.id,
@@ -15470,11 +15491,12 @@ async function syncStatusGitHub() {
   } catch (e) { log('WARN', 'SYNC', `GitHub sync: ${e.message}`); }
 }
 
+const CENTRIS_MAINTENANCE_LIMIT_FILE = path.join(DATA_DIR, 'centris_maintenance_limit.json');
 const centrisMaintenanceState = {
   running: false,
   lastAttemptAt: 0,
   lastSuccessAt: 0,
-  consecutiveFailures: 0,
+  consecutiveFailures: Math.min(3, Math.max(0, Number(loadJSON(CENTRIS_MAINTENANCE_LIMIT_FILE, { failures: 0 }).failures) || 0)),
   lastAlertAt: 0,
   retryTimer: null,
 };
@@ -15498,6 +15520,9 @@ function scheduleCentrisMaintenanceRetry() {
 async function maintainCentrisSession(reason = 'periodic') {
   if (!centrisAutomationConfigured()) return { ok: false, skipped: 'not-configured' };
   if (centrisMaintenanceState.running) return { ok: false, skipped: 'already-running' };
+  if (centrisMaintenanceState.consecutiveFailures >= 3 || getCUA()?.getCentrisLoginLimit?.().attempts >= 3) {
+    return { ok: false, skipped: 'three-attempt-limit' };
+  }
   const failureCooldownMs = 30 * 60 * 1000;
   if (centrisMaintenanceState.consecutiveFailures > 0 &&
       Date.now() - centrisMaintenanceState.lastAttemptAt < failureCooldownMs) {
@@ -15513,6 +15538,7 @@ async function maintainCentrisSession(reason = 'periodic') {
     if (!result.ok) throw new Error(result.error || 'renouvellement Centris refusé');
     centrisMaintenanceState.lastSuccessAt = Date.now();
     centrisMaintenanceState.consecutiveFailures = 0;
+    saveJSON(CENTRIS_MAINTENANCE_LIMIT_FILE, { failures: 0 });
     if (centrisMaintenanceState.retryTimer) {
       clearTimeout(centrisMaintenanceState.retryTimer);
       centrisMaintenanceState.retryTimer = null;
@@ -15521,20 +15547,22 @@ async function maintainCentrisSession(reason = 'periodic') {
     return { ok: true, expiresAt: result.expiresAt };
   } catch (e) {
     centrisMaintenanceState.consecutiveFailures += 1;
+    saveJSON(CENTRIS_MAINTENANCE_LIMIT_FILE, { failures: centrisMaintenanceState.consecutiveFailures });
     const error = String(e?.message || e || 'erreur inconnue').substring(0, 180);
     log('WARN', 'CENTRIS', `Maintenance automatique échouée ${centrisMaintenanceState.consecutiveFailures}×: ${error}`);
     const alertCooldownMs = 6 * 60 * 60 * 1000;
     if (centrisMaintenanceState.consecutiveFailures >= 3 &&
+        !(getCUA()?.getCentrisLoginLimit?.().attempts >= 3) &&
         Date.now() - centrisMaintenanceState.lastAlertAt > alertCooldownMs) {
       centrisMaintenanceState.lastAlertAt = Date.now();
       sendTelegramWithFallback(
         `⚠️ *Centris — renouvellement automatique en attente*\n\n` +
         `Le bot a essayé ${centrisMaintenanceState.consecutiveFailures} fois sans exposer tes identifiants. ` +
-        `Il réessaiera automatiquement. Si Centris exige exceptionnellement un MFA que Gmail ou le pont Messages ne capte pas, utilise seulement \`/mfa 123456\` pendant la tentative active.`,
+        `Arrêt après trois essais. Corrige le compte Centris, puis utilise \`/centris\` pour relancer explicitement. Aucun redémarrage ne remet le compteur à zéro.`,
         { category: 'centris-auto-renewal', failures: centrisMaintenanceState.consecutiveFailures }
       ).catch(() => {});
     }
-    scheduleCentrisMaintenanceRetry();
+    if (centrisMaintenanceState.consecutiveFailures < 3 && !(getCUA()?.getCentrisLoginLimit?.().attempts >= 3)) scheduleCentrisMaintenanceRetry();
     return { ok: false, error };
   } finally {
     centrisMaintenanceState.running = false;
