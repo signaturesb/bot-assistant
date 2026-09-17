@@ -1630,6 +1630,7 @@ GESTION D'ERREURS (non négociable):
 • Session expirée → re-login auto déjà câblé (TOTP→SMS→Email Gmail cascade)
 • Bot detection → escalade Browserless stealth (rebrowser-playwright)
 • JAMAIS de succès simulé. ÉCHEC = cause technique précise + suggestion fix.
+• CENTRIS_LOGIN_STOPPED signifie que le ROBOT a atteint sa limite locale de trois essais. Ce code ne prouve aucun verrouillage du compte Centris. Ne jamais inventer un verrouillage temporaire, une obligation de changer le mot de passe ou une connexion manuelle obligatoire. Indiquer « Robot en pause après trois essais; /centris relance et vérifie la connexion ». Ne jamais promettre un envoi automatique après déblocage: un nouvel aperçu du numéro exact et du destinataire reste nécessaire.
 • Ne jamais conclure « courtier concurrent / accès restreint » sans un code HTTP 401/403 observé. Une erreur de lecture ou validation PDF est technique et doit être rapportée telle quelle; ne jamais proposer le scrape public ou Dropbox comme remplacement automatique.
 • Après un échec Centris, ne jamais créer/prétendre sauvegarder chatgpt_config.md, proposer des Custom Instructions, pousser un fichier GitHub, ni reconfigurer ChatGPT. Ces actions sont hors sujet sauf demande explicite distincte de Shawn.
 • Si les documents sont visibles dans Matrix mais qu’un téléchargement échoue, rester sur le diagnostic Matrix exact et demander/corriger la couche technique; ne jamais déclarer les documents inaccessibles à cause du courtier sans preuve 401/403.
@@ -12835,7 +12836,7 @@ function registerHandlers() {
     bot.sendChatAction(msg.chat.id, 'typing').catch(() => {});
     const stopTyping = startTypingIndicator(msg.chat.id);
     try {
-      const result = await centrisLoginDetailed();
+      const result = await centrisLoginDetailed({ forceRefresh: true });
       if (result.ok) {
         const remainingHours = Math.max(1, Math.round((result.expiresAt - Date.now()) / 3600000));
         await bot.sendMessage(msg.chat.id,
@@ -15501,6 +15502,20 @@ const centrisMaintenanceState = {
   retryTimer: null,
 };
 
+let centrisCredentialsRecovered = false;
+try {
+  centrisCredentialsRecovered = require('./lib/centris_credential_recovery').recoverCentrisCredentials(
+    DATA_DIR, process.env.CENTRIS_CREDENTIAL_REVISION, () => {
+      getCUA().resetCentrisLoginLimit();
+      centrisMaintenanceState.consecutiveFailures = 0;
+      saveJSON(CENTRIS_MAINTENANCE_LIMIT_FILE, { failures: 0 });
+    }
+  );
+  if (centrisCredentialsRecovered) log('INFO', 'CENTRIS', 'Nouveaux identifiants: relance unique autorisée, limite de trois essais conservée');
+} catch (error) {
+  log('WARN', 'CENTRIS', `Relance des identifiants impossible: ${error.code || 'recovery-failed'}`);
+}
+
 function centrisAutomationConfigured() {
   const sessionKey = String(process.env.CENTRIS_SESSION_KEY || '');
   return process.env.CENTRIS_AUTO_LOGIN !== 'false' &&
@@ -15799,7 +15814,12 @@ function startDailyTasks() {
   // client, afin qu'une action Telegram humaine garde toujours la priorité.
   if (centrisAutomationConfigured()) {
     setTimeout(async () => {
-      await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
+      const result = await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
+      // Explicit one-shot release diagnostic after credential correction only.
+      // Never sends email/Telegram and never runs again on an ordinary restart.
+      if (result.ok && centrisCredentialsRecovered && process.env.CENTRIS_SMOKE_TEST_ON_CREDENTIAL_RESET === 'true') {
+        await runCentrisReadOnlySmokeTest('credential-recovery');
+      }
     }, 60 * 1000);
     safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 90 * 60 * 1000, { timeoutMs: 120000 });
     log('OK', 'CENTRIS', 'Maintenance de session automatique activée (boot + 90 min)');
