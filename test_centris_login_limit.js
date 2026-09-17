@@ -36,6 +36,22 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'centris-limit-'));
   await assert.rejects(invalidPath.run(failure));
   assert.equal(calls, 4, 'persistence failure must prevent network call');
 
+  const { recoverCentrisCredentials } = require('./lib/centris_credential_recovery');
+  let resets = 0;
+  const reset = () => { resets++; guard.reset(); };
+  assert.equal(recoverCentrisCredentials(dir, '', reset), false);
+  assert.equal(recoverCentrisCredentials(dir, 'revision1', reset), true);
+  for (let i = 0; i < 3; i++) await assert.rejects(guard.run(failure), /network failed/);
+  assert.equal(recoverCentrisCredentials(dir, 'revision1', reset), false);
+  await assert.rejects(guard.run(failure), /STOPPED/);
+  assert.equal(resets, 1, 'same credentials must not grant more attempts on restart');
+  assert.equal(recoverCentrisCredentials(dir, 'revision2', reset), true);
+  assert.equal(guard.read().attempts, 0);
+  assert.throws(() => recoverCentrisCredentials(dir, '../invalid', reset), /INVALID/);
+  assert.throws(() => recoverCentrisCredentials(dir, 'crash', () => { throw new Error('crash'); }), /crash/);
+  assert.equal(recoverCentrisCredentials(dir, 'crash', reset), false, 'crashed recovery is consumed');
+  assert.equal(resets, 2);
+
   const cua = require('./cua_driver');
   assert.equal(cua._classifyCentrisLoginSnapshot({ url: 'https://accounts.centris.ca/account/expiring-password?secret=hidden', passwordVisible: 3, mfaVisible: 1 }), 'password-renewal');
   assert.equal(cua._classifyCentrisLoginSnapshot({ url: 'https://untrusted.invalid/account/expiring-password', passwordVisible: 3 }), 'missing');
@@ -69,6 +85,8 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'centris-limit-'));
   // Exercise the real dispatch prefix with controlled dependencies: even an old
   // confirmed native action must produce a fresh PDF preview, never a send.
   const source = fs.readFileSync(path.join(__dirname, 'bot.js'), 'utf8');
+  const command = source.slice(source.indexOf('const handleCentrisLoginCommand'), source.indexOf('const handleCentrisLoginCommand') + 3500);
+  assert.match(command, /centrisLoginDetailed\(\{ forceRefresh: true \}\)/, 'manual login must verify Matrix, not trust a cached expiry');
   const start = source.indexOf('async function executeTool(');
   const end = source.indexOf('    const pdAction =', start);
   const dispatch = source.slice(start, end) + "return 'other'; } catch(e) { throw e; } }";
