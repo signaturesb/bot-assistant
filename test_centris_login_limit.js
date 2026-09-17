@@ -39,6 +39,32 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'centris-limit-'));
   const cua = require('./cua_driver');
   assert.equal(cua._classifyCentrisLoginSnapshot({ url: 'https://accounts.centris.ca/account/expiring-password?secret=hidden', passwordVisible: 3, mfaVisible: 1 }), 'password-renewal');
   assert.equal(cua._classifyCentrisLoginSnapshot({ url: 'https://untrusted.invalid/account/expiring-password', passwordVisible: 3 }), 'missing');
+  let clicked = 0, waited = 0;
+  function noticePage(overrides = {}) {
+    return {
+      url: () => 'https://accounts.centris.ca/account/expiring-password',
+      getByRole: (role, options) => {
+        assert.equal(role, 'button'); assert.equal(options.name, 'Continuer');
+        return {
+          count: async () => 1, isVisible: async () => true, isEnabled: async () => true,
+          getAttribute: async name => ({ name: 'Action', value: '2' }[name]),
+          click: async () => { clicked++; }, ...overrides,
+        };
+      },
+      waitForURL: async predicate => {
+        assert.equal(predicate(new URL('https://accounts.centris.ca/account/expiring-password')), false);
+        assert.equal(predicate(new URL('https://matrix.centris.ca/Matrix/Recherche')), true);
+        waited++;
+      },
+    };
+  }
+  await cua._continueCentrisPasswordNotice(noticePage());
+  assert.equal(clicked, 1); assert.equal(waited, 1);
+  for (const overrides of [{ count: async () => 0 }, { count: async () => 2 }, { isEnabled: async () => false }, { getAttribute: async () => 'change-password' }]) {
+    await assert.rejects(cua._continueCentrisPasswordNotice(noticePage(overrides)), /ACTION_REQUIRED/);
+  }
+  await assert.rejects(cua._continueCentrisPasswordNotice({ ...noticePage(), url: () => 'https://untrusted.invalid/account/expiring-password' }), /UNEXPECTED_PAGE/);
+  assert.equal(clicked, 1, 'only the offered continuation action may be clicked');
 
   // Exercise the real dispatch prefix with controlled dependencies: even an old
   // confirmed native action must produce a fresh PDF preview, never a send.

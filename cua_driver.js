@@ -1674,6 +1674,25 @@ async function navigateToMatrixLogin(page) {
   throw lastError || new Error('CENTRIS_MATRIX_LOGIN_NAVIGATION_FAILED');
 }
 
+async function continueCentrisPasswordNotice(page) {
+  const url = new URL(page.url());
+  if (url.protocol !== 'https:' || url.hostname !== 'accounts.centris.ca' ||
+      !/^\/account\/expiring-password\/?$/i.test(url.pathname)) {
+    throw new Error('CENTRIS_PASSWORD_NOTICE_UNEXPECTED_PAGE');
+  }
+  // Observed Centris control: button "Continuer", name=Action, value=2.
+  // Do not submit the password-change form or infer expiry from this URL.
+  const next = page.getByRole('button', { name: 'Continuer', exact: true });
+  if (await next.count() !== 1 || !await next.isVisible() || !await next.isEnabled() ||
+      await next.getAttribute('name') !== 'Action' || await next.getAttribute('value') !== '2') {
+    throw new Error('CENTRIS_PASSWORD_NOTICE_ACTION_REQUIRED: bouton Continuer indisponible; aucune modification du mot de passe effectuée.');
+  }
+  await next.click({ timeout: 10000 });
+  await page.waitForURL(nextUrl => !/^\/account\/expiring-password\/?$/i.test(nextUrl.pathname), {
+    timeout: 15000, waitUntil: 'domcontentloaded',
+  });
+}
+
 async function submitCentrisLogin(page, user, pass) {
   // Supporte le formulaire Centris actuel (UserCode + Password) et le flux
   // Auth0 fractionné observé lors de migrations. Aucun repli vers "le premier
@@ -1682,7 +1701,12 @@ async function submitCentrisLogin(page, user, pass) {
   let authorizeRecoveryUsed = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const step = await waitForCentrisLoginStep(page, attempt === 0 ? 12000 : 8000);
-    if (step.kind === 'password-renewal') throw new Error('CENTRIS_PASSWORD_RENEWAL_REQUIRED: renouvellement du mot de passe demandé sur accounts.centris.ca. Aucun document récupéré.');
+    if (step.kind === 'password-renewal') {
+      if (submitted.has('password-notice')) throw new Error('CENTRIS_PASSWORD_NOTICE_NOT_ADVANCED');
+      submitted.add('password-notice');
+      await continueCentrisPasswordNotice(page);
+      continue;
+    }
     if (step.kind === 'authenticated') return 'authenticated';
     if (step.kind === 'mfa') return 'mfa';
     if (step.kind === 'intermediate') return 'intermediate';
@@ -5581,6 +5605,7 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
 }
 
 module.exports = {
+  _continueCentrisPasswordNotice: continueCentrisPasswordNotice,
   getCentrisLoginLimit: () => centrisLoginLimit.read(),
   resetCentrisLoginLimit: () => centrisLoginLimit.reset(),
   getCentrisListingPhotos,
