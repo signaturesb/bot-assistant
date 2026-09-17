@@ -35,6 +35,7 @@ function runScript(name, scriptPath, env = {}) {
 
 // 1. Parser tests
 runScript('Parser tests', path.join(__dirname, 'test_parser.js'));
+runScript('Email conversation scope', path.join(__dirname, 'test_email_conversation_scope.js'));
 
 // Runtime safety: crons non chevauchants, Telegram, HMAC et persistance.
 runScript('Runtime safety', path.join(__dirname, 'test_runtime_safety.js'));
