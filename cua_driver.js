@@ -1682,10 +1682,14 @@ async function continueCentrisPasswordNotice(page) {
   }
   // Observed Centris control: button "Continuer", name=Action, value=2.
   // Do not submit the password-change form or infer expiry from this URL.
-  const next = page.getByRole('button', { name: 'Continuer', exact: true });
-  if (await next.count() !== 1 || !await next.isVisible() || !await next.isEnabled() ||
-      await next.getAttribute('name') !== 'Action' || await next.getAttribute('value') !== '2') {
-    throw new Error('CENTRIS_PASSWORD_NOTICE_ACTION_REQUIRED: bouton Continuer indisponible; aucune modification du mot de passe effectuée.');
+  const next = page.locator('button[name="Action"][value="2"]');
+  await next.waitFor({ state: 'visible', timeout: 10000 }).catch(() => null);
+  const count = await next.count();
+  const visible = count === 1 && await next.isVisible();
+  const enabled = visible && await next.isEnabled();
+  const labelAccepted = visible && /^(?:Continuer|Continue)$/i.test((await next.innerText()).trim());
+  if (count !== 1 || !visible || !enabled || !labelAccepted) {
+    throw new Error(`CENTRIS_PASSWORD_NOTICE_ACTION_REQUIRED: Continuer count=${count} visible=${visible} enabled=${enabled} labelAccepted=${labelAccepted}; aucun mot de passe modifié.`);
   }
   await next.click({ timeout: 10000 });
   await page.waitForURL(nextUrl => !/^\/account\/expiring-password\/?$/i.test(nextUrl.pathname), {

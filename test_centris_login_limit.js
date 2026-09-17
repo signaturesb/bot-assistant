@@ -43,11 +43,11 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'centris-limit-'));
   function noticePage(overrides = {}) {
     return {
       url: () => 'https://accounts.centris.ca/account/expiring-password',
-      getByRole: (role, options) => {
-        assert.equal(role, 'button'); assert.equal(options.name, 'Continuer');
+      locator: selector => {
+        assert.equal(selector, 'button[name="Action"][value="2"]');
         return {
           count: async () => 1, isVisible: async () => true, isEnabled: async () => true,
-          getAttribute: async name => ({ name: 'Action', value: '2' }[name]),
+          waitFor: async () => {}, innerText: async () => 'Continuer',
           click: async () => { clicked++; }, ...overrides,
         };
       },
@@ -60,7 +60,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'centris-limit-'));
   }
   await cua._continueCentrisPasswordNotice(noticePage());
   assert.equal(clicked, 1); assert.equal(waited, 1);
-  for (const overrides of [{ count: async () => 0 }, { count: async () => 2 }, { isEnabled: async () => false }, { getAttribute: async () => 'change-password' }]) {
+  for (const overrides of [{ count: async () => 0 }, { count: async () => 2 }, { isEnabled: async () => false }, { innerText: async () => 'Modifier mon mot de passe' }]) {
     await assert.rejects(cua._continueCentrisPasswordNotice(noticePage(overrides)), /ACTION_REQUIRED/);
   }
   await assert.rejects(cua._continueCentrisPasswordNotice({ ...noticePage(), url: () => 'https://untrusted.invalid/account/expiring-password' }), /UNEXPECTED_PAGE/);
