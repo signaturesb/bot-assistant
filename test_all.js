@@ -66,6 +66,8 @@ runScript('Matrix email MIME', path.join(__dirname, 'test_matrix_email_mime.js')
 runScript('Matrix 15 required scenarios', path.join(__dirname, 'test_matrix_required_scenarios.js'));
 runScript('Tool batch write serialization', path.join(__dirname, 'test_tool_batch.js'));
 
+runScript('Centris three-attempt stop and PDF preview', path.join(__dirname, 'test_centris_login_limit.js'));
+
 // 3. Plan quotas inline test
 console.log('\n▶ Plan quotas');
 try {

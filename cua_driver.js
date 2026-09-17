@@ -32,12 +32,14 @@ const {
   writeSessionFile,
 } = require('./lib/centris_session_store');
 const { validatePdfBuffer } = require('./lib/pdf_validation');
+const { createCentrisLoginLimit } = require('./lib/centris_login_limit');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 
 const DATA_DIR       = fs.existsSync('/data') ? '/data' : '/tmp';
+const centrisLoginLimit = createCentrisLoginLimit(path.join(DATA_DIR, 'centris_login_limit.json'));
 const SESSION_FILE   = path.join(DATA_DIR, 'cua_session.json');
 const STORAGE_STATE_FILE = path.join(DATA_DIR, 'centris_storage_state.json');
 const SCREENSHOT_DIR = path.join(DATA_DIR, 'cua_screenshots');
@@ -1559,6 +1561,7 @@ function classifyCentrisLoginSnapshot(snapshot = {}) {
   const mfaVisible = Number(snapshot.mfaVisible || 0);
   const bodyText = String(snapshot.bodyText || '');
 
+  if (host === 'accounts.centris.ca' && /^\/account\/expiring-password\/?$/i.test(url.pathname)) return 'password-renewal';
   if (isCentrisIntermediateUrl(rawUrl)) return 'intermediate';
   if (isAuthenticatedMatrixPage(rawUrl, passwordVisible, bodyText)) return 'authenticated';
   if (mfaVisible && new Set(['accounts.centris.ca', 'centris-prod.ca.auth0.com']).has(host)) return 'mfa';
@@ -1679,6 +1682,7 @@ async function submitCentrisLogin(page, user, pass) {
   let authorizeRecoveryUsed = false;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const step = await waitForCentrisLoginStep(page, attempt === 0 ? 12000 : 8000);
+    if (step.kind === 'password-renewal') throw new Error('CENTRIS_PASSWORD_RENEWAL_REQUIRED: renouvellement du mot de passe demandé sur accounts.centris.ca. Aucun document récupéré.');
     if (step.kind === 'authenticated') return 'authenticated';
     if (step.kind === 'mfa') return 'mfa';
     if (step.kind === 'intermediate') return 'intermediate';
@@ -1823,6 +1827,23 @@ function loadBotCentrisCookies() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 async function loginCentris(context) {
+  return runCentrisLoginWithLimit(() => loginCentrisUnchecked(context));
+}
+
+async function runCentrisLoginWithLimit(operation) {
+  return centrisLoginLimit.run(operation, async () => {
+    const token = process.env.WEBHOOK_SECRET;
+    if (!token) return;
+    await fetch(`${process.env.BOT_URL || 'https://signaturesb-bot-s272.onrender.com'}/admin/notify`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ text: '🛑 Centris arrêté après 3 essais. Aucune autre connexion automatique ne sera tentée, même après redémarrage. Corrige le compte Centris, puis utilise /centris pour relancer explicitement. Aucun envoi client autorisé par cette relance.' }),
+      signal: AbortSignal.timeout(8000),
+    });
+  });
+}
+
+async function loginCentrisUnchecked(context) {
   const user = process.env.CENTRIS_USER;
   const pass = process.env.CENTRIS_PASS;
   if (!user || !pass) throw new Error('CENTRIS_USER / CENTRIS_PASS manquants dans env vars');
@@ -4928,6 +4949,10 @@ async function searchCentrisVendus(opts = {}) {
 
 // Login Zone Centris (différent de Matrix — portail courtier read-only)
 async function loginCentrisZone(context) {
+  return runCentrisLoginWithLimit(() => loginCentrisZoneUnchecked(context));
+}
+
+async function loginCentrisZoneUnchecked(context) {
   const user = process.env.CENTRIS_USER;
   const pass = process.env.CENTRIS_PASS;
   if (!user || !pass) throw new Error('CENTRIS_USER / CENTRIS_PASS manquants');
@@ -5556,6 +5581,8 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
 }
 
 module.exports = {
+  getCentrisLoginLimit: () => centrisLoginLimit.read(),
+  resetCentrisLoginLimit: () => centrisLoginLimit.reset(),
   getCentrisListingPhotos,
   downloadCentrisFichePDF,
   cuaGetCentrisPDF,
