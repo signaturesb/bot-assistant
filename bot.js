@@ -414,7 +414,32 @@ const claude = new Anthropic({ apiKey: API_KEY });
 const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
-const EMAIL_CONFIRMATION_VERSION = 3;
+const EMAIL_CONFIRMATION_VERSION = 4;
+const { makeEmailConversationScope, emailMatchesConversationScope } = require('./lib/email_conversation_scope');
+const EMAIL_SCOPE_FILE = path.join(DATA_DIR, 'email_conversation_scope.json');
+const emailConversationScopes = new Map(loadJSON(EMAIL_SCOPE_FILE, []));
+function recordEmailConversationScope(chatId, text) {
+  if (CONFIRM_REGEX.test(String(text || '').trim()) || /^confirme\s+\S+@\S+$/i.test(String(text || '').trim())) return;
+  const scope = makeEmailConversationScope(text);
+  emailConversationScopes.set(chatId, scope);
+  if (!safeWriteJSON(EMAIL_SCOPE_FILE, [...emailConversationScopes.entries()])) {
+    emailConversationScopes.delete(chatId);
+    throw new Error('EMAIL_SCOPE_PERSIST_FAILED');
+  }
+  // A new targeted request supersedes old, unsent drafts, including the queue.
+  // An operation already submitted to the provider must retain its receipt state.
+  if (scope.recipients.length || scope.listings.length) {
+    if (!pendingEmails.get(chatId)?.inFlight && !pendingEmails.get(chatId)?.attemptStartedAt) pendingEmails.delete(chatId);
+    const active = pendingExternalEmailActions.get(chatId);
+    if (active && !active.inFlight && !active.attemptStartedAt) {
+      pendingExternalEmailActions.delete(chatId);
+      pendingMatrixArtifacts.delete(chatId);
+    }
+    pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => Number(item.chatId) !== Number(chatId));
+    pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(item => Number(item.chatId) !== Number(chatId));
+    savePendingEmailState();
+  }
+}
 const FINAL_EMAIL_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 const MATRIX_PREVIEW_TTL_MS = 30 * 60 * 1000;
 const MATRIX_REQUEST_ID_BYTES = 8;
@@ -568,7 +593,8 @@ function deferActivePendingEmail(chatId) {
 
 function promoteNextPendingEmailDraft(chatId) {
   if (pendingEmails.has(chatId) || pendingExternalEmailActions.has(chatId)) return null;
-  const index = pendingEmailDraftQueue.findIndex(item => Number(item.chatId) === Number(chatId));
+  const index = pendingEmailDraftQueue.findIndex(item => Number(item.chatId) === Number(chatId) &&
+    emailMatchesConversationScope(emailConversationScopes.get(chatId), pendingEmailTransactionSummary('draft', item.draft), item.draft));
   if (index < 0) return null;
   const [next] = pendingEmailDraftQueue.splice(index, 1);
   pendingEmails.set(chatId, next.draft);
@@ -1630,6 +1656,7 @@ GESTION D'ERREURS (non négociable):
 • Session expirée → re-login auto déjà câblé (TOTP→SMS→Email Gmail cascade)
 • Bot detection → escalade Browserless stealth (rebrowser-playwright)
 • JAMAIS de succès simulé. ÉCHEC = cause technique précise + suggestion fix.
+• verifier_listing_centris ne crée AUCUNE transaction d'envoi: après ce seul outil, ne jamais dire « réponds envoie » ni présenter un simple inventaire comme un aperçu prêt à expédier. Pour préparer les pièces jointes à une adresse précise, appeler telecharger_annexes_centris et attendre son véritable aperçu transactionnel.
 • CENTRIS_LOGIN_STOPPED signifie que le ROBOT a atteint sa limite locale de trois essais. Ce code ne prouve aucun verrouillage du compte Centris. Ne jamais inventer un verrouillage temporaire, une obligation de changer le mot de passe ou une connexion manuelle obligatoire. Indiquer « Robot en pause après trois essais; /centris relance et vérifie la connexion ». Ne jamais promettre un envoi automatique après déblocage: un nouvel aperçu du numéro exact et du destinataire reste nécessaire.
 • Ne jamais conclure « courtier concurrent / accès restreint » sans un code HTTP 401/403 observé. Une erreur de lecture ou validation PDF est technique et doit être rapportée telle quelle; ne jamais proposer le scrape public ou Dropbox comme remplacement automatique.
 • Après un échec Centris, ne jamais créer/prétendre sauvegarder chatgpt_config.md, proposer des Custom Instructions, pousser un fichier GitHub, ni reconfigurer ChatGPT. Ces actions sont hors sujet sauf demande explicite distincte de Shawn.
@@ -10504,6 +10531,7 @@ function pickModelForMessage(userMsg) {
 
 // ─── Appel Claude (boucle agentique, prompt caching, routing auto modèle) ────
 async function callClaude(chatId, userMsg, retries = 3) {
+  recordEmailConversationScope(chatId, userMsg);
   if (!checkRateLimit()) {
     const err = new Error('Rate limit local atteint — 15 req/min'); err.status = 429;
     throw err;
@@ -11194,7 +11222,7 @@ function pendingEmailTransactionSummary(kind, action) {
     : String(action.sujet || 'Brouillon Gmail');
   const centris = kind === 'external'
     ? String(action?.input?.centris_num || action?.input?.centris || '')
-    : String(action?.centris || '');
+    : String(action?.centris || String(action?.sujet || '').match(/\b\d{7,9}\b/)?.[0] || '');
   return { to, cc, detail, centris };
 }
 
@@ -11344,6 +11372,11 @@ async function handleEmailConfirmation(msg) {
     }
     const chosen = candidates[0];
     const action = chosen.action;
+    if (!emailMatchesConversationScope(emailConversationScopes.get(chatId),
+        pendingEmailTransactionSummary(chosen.kind, action), action, repliedMessageId)) {
+      await send(chatId, '🔒 Cet aperçu ne correspond pas à ta demande actuelle (destinataire ou dossier). Aucun email envoyé. Redemande les documents avec le numéro Centris et le courriel pour créer le bon aperçu.');
+      return true;
+    }
     if (directSelection?.ok) {
       // « envoie » est l'unique confirmation exigée. On lie atomiquement cette
       // confirmation au message Telegram courant avant l'appel fournisseur.
@@ -14466,6 +14499,7 @@ function registerHandlers() {
     const directMatrixBatchRequest = parseDirectMatrixBatchRequest(text);
     const directMatrixRequest = directMatrixBatchRequest ? null : parseDirectMatrixRequest(text);
     if (directMatrixBatchRequest || directMatrixRequest) {
+      recordEmailConversationScope(chatId, text);
       const emailDestination = normalizeSingleRecipientEmail(
         directMatrixBatchRequest?.email || directMatrixRequest?.email,
       );

@@ -12,6 +12,15 @@ const {
 assert.strictEqual(assertMatrixRequestParserReady(), true, 'l’auto-test permanent du démarrage doit réussir');
 
 const expected = { centrisNum: '19465925', email: 'client@example.com', message: '' };
+for (const request of [
+  'Prépare les documents du 21461675 pour jackcanon@hotmail.com »',
+  '« Prépare les documents du 21461675 pour jackcanon@hotmail.com »',
+  'prepare les documents du 21461675 pour jackcanon@hotmail.com',
+]) {
+  assert.deepStrictEqual(parseDirectMatrixRequest(request), {
+    centrisNum: '21461675', email: 'jackcanon@hotmail.com', message: '',
+  });
+}
 
 assert.deepStrictEqual(parseDirectMatrixRequest('19465925 client@example.com'), expected);
 assert.deepStrictEqual(parseDirectMatrixRequest('#19465925 CLIENT@EXAMPLE.COM'), expected);
