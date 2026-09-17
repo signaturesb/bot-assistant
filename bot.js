@@ -15815,10 +15815,14 @@ function startDailyTasks() {
   if (centrisAutomationConfigured()) {
     setTimeout(async () => {
       const result = await maintainCentrisSession('boot-delayed').catch(() => ({ ok: false }));
-      // Explicit one-shot release diagnostic after credential correction only.
-      // Never sends email/Telegram and never runs again on an ordinary restart.
-      if (result.ok && centrisCredentialsRecovered && process.env.CENTRIS_SMOKE_TEST_ON_CREDENTIAL_RESET === 'true') {
-        await runCentrisReadOnlySmokeTest('credential-recovery');
+      // Explicit one-shot release diagnostic. Its revision does NOT reset the
+      // authentication budget. Consume before running, including on failure.
+      const diagnosticRevision = process.env.CENTRIS_SMOKE_TEST_REVISION;
+      if (result.ok && diagnosticRevision && process.env.CENTRIS_SMOKE_TEST_ON_CREDENTIAL_RESET === 'true') {
+        const runDiagnostic = require('./lib/centris_credential_recovery').recoverCentrisCredentials(
+          DATA_DIR, `diagnostic-${diagnosticRevision}`, () => {}
+        );
+        if (runDiagnostic) await runCentrisReadOnlySmokeTest('release-diagnostic');
       }
     }, 60 * 1000);
     safeCron('centris-session-maintenance', () => maintainCentrisSession('periodic'), 90 * 60 * 1000, { timeoutMs: 120000 });
