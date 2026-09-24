@@ -107,12 +107,13 @@ scenario('Échec fournisseur certain séparé de l’état incertain', () => {
   assert.match(bot, /if \(sent\.uncertain\)/);
   assert.match(bot, /Gmail a refusé.*échec confirmé/);
 });
-scenario('Redémarrage recharge seulement le cache PDF privé exact et empêche le rejeu', () => {
+scenario('Redémarrage recharge le cache exact mais révoque toute autorisation précédente', () => {
   assert.match(bot, /loadMatrixArtifactCache/);
   assert.match(bot, /restoredChatId === ALLOWED_ID/);
   assert.match(bot, /fingerprint: action\.matrixFingerprint/);
   assert.match(bot, /deliveryUncertain = Boolean\(action\.attemptStartedAt/);
-  assert.match(bot, /ambiguousAfterRestart: deliveryUncertain/);
+  assert.match(bot, /ambiguousAfterRestart: true/);
+  assert.match(bot, /pendingMatrixRequestQueue = \[\]/);
   assert.match(bot, /removeMatrixArtifactCache/);
 });
 scenario('Envoi réussi exige journal durable et preuve Gmail', () => {

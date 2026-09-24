@@ -414,30 +414,42 @@ const claude = new Anthropic({ apiKey: API_KEY });
 const bot    = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── Brouillons email en attente d'approbation ────────────────────────────────
-const EMAIL_CONFIRMATION_VERSION = 4;
-const { makeEmailConversationScope, emailMatchesConversationScope } = require('./lib/email_conversation_scope');
+const EMAIL_CONFIRMATION_VERSION = 5;
+const {
+  makeEmailConversationScope,
+  emailMatchesConversationScope,
+  shouldSupersedePendingEmail,
+} = require('./lib/email_conversation_scope');
 const EMAIL_SCOPE_FILE = path.join(DATA_DIR, 'email_conversation_scope.json');
 const emailConversationScopes = new Map(loadJSON(EMAIL_SCOPE_FILE, []));
 function recordEmailConversationScope(chatId, text) {
-  if (CONFIRM_REGEX.test(String(text || '').trim()) || /^confirme\s+\S+@\S+$/i.test(String(text || '').trim())) return;
+  if (!shouldSupersedePendingEmail(text)) return;
   const scope = makeEmailConversationScope(text);
+  // Toute nouvelle instruction remplace les anciens envois non partis, même
+  // si elle ne contient encore ni courriel ni numéro Centris. C'est la demande
+  // immédiate de Shawn qui fait autorité; jamais un deal ou aperçu historique.
+  // Une opération déjà soumise au fournisseur conserve seulement son reçu.
+  if (!pendingEmails.get(chatId)?.inFlight && !pendingEmails.get(chatId)?.attemptStartedAt) {
+    pendingEmails.delete(chatId);
+  }
+  const active = pendingExternalEmailActions.get(chatId);
+  if (active && !active.inFlight && !active.attemptStartedAt) {
+    if (active.name === 'telecharger_annexes_centris') {
+      clearMatrixTransaction(chatId, active.requestId || null);
+    } else {
+      pendingExternalEmailActions.delete(chatId);
+    }
+  }
+  pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => Number(item.chatId) !== Number(chatId));
+  pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(item => Number(item.chatId) !== Number(chatId));
+  savePendingEmailState();
+  // Persister le nouveau contexte seulement après avoir révoqué l'ancien.
+  // Ainsi, même si le disque échoue, un « envoie » suivant ne peut jamais
+  // confirmer l'ancienne transaction restée en mémoire.
   emailConversationScopes.set(chatId, scope);
   if (!safeWriteJSON(EMAIL_SCOPE_FILE, [...emailConversationScopes.entries()])) {
     emailConversationScopes.delete(chatId);
     throw new Error('EMAIL_SCOPE_PERSIST_FAILED');
-  }
-  // A new targeted request supersedes old, unsent drafts, including the queue.
-  // An operation already submitted to the provider must retain its receipt state.
-  if (scope.recipients.length || scope.listings.length) {
-    if (!pendingEmails.get(chatId)?.inFlight && !pendingEmails.get(chatId)?.attemptStartedAt) pendingEmails.delete(chatId);
-    const active = pendingExternalEmailActions.get(chatId);
-    if (active && !active.inFlight && !active.attemptStartedAt) {
-      pendingExternalEmailActions.delete(chatId);
-      pendingMatrixArtifacts.delete(chatId);
-    }
-    pendingEmailDraftQueue = pendingEmailDraftQueue.filter(item => Number(item.chatId) !== Number(chatId));
-    pendingMatrixRequestQueue = pendingMatrixRequestQueue.filter(item => Number(item.chatId) !== Number(chatId));
-    savePendingEmailState();
   }
 }
 const FINAL_EMAIL_CONFIRMATION_TTL_MS = 5 * 60 * 1000;
@@ -466,6 +478,9 @@ try {
       }
       const restored = { ...draft, inFlight: false, confirmationPromptInFlight: false };
       if (restored.attemptStartedAt) restored.deliveryUncertain = true;
+      // Un redémarrage détruit toujours l'autorisation one-shot. Le brouillon
+      // peut rester visible pour diagnostic, mais exige un nouvel aperçu.
+      restored.ambiguousAfterRestart = true;
       pendingEmails.set(Number(chatId), restored);
     }
     for (const [chatId, action] of saved.external || []) {
@@ -497,7 +512,7 @@ try {
           inFlight: false,
           confirmationPromptInFlight: false,
           deliveryUncertain,
-          ambiguousAfterRestart: deliveryUncertain,
+          ambiguousAfterRestart: true,
         };
         pendingMatrixArtifacts.set(restoredChatId, loaded.artifact);
         pendingExternalEmailActions.set(restoredChatId, restoredAction);
@@ -508,18 +523,14 @@ try {
           ...action,
           inFlight: false,
           confirmationPromptInFlight: false,
-          ambiguousAfterRestart: Boolean(action?.attemptStartedAt),
+          ambiguousAfterRestart: true,
         });
       }
     }
-    pendingEmailDraftQueue = Array.isArray(saved.queue)
-      ? saved.queue.filter(item => Number(item?.draft?.confirmationVersion || 0) === EMAIL_CONFIRMATION_VERSION).slice(-100)
-      : [];
-    pendingMatrixRequestQueue = Array.isArray(saved.matrixQueue)
-      ? saved.matrixQueue.filter(item => item && Number(item.chatId) === ALLOWED_ID &&
-          /^\d{7,9}$/.test(String(item.centrisNum || '')) &&
-          /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(item.email || ''))).slice(0, 30)
-      : [];
+    // Les files n'ont aucune autorisation après un redémarrage. Ne jamais
+    // reprendre automatiquement un ancien destinataire ou dossier.
+    pendingEmailDraftQueue = [];
+    pendingMatrixRequestQueue = [];
   }
 } catch {
   pendingEmailDraftQueue = [];
@@ -1247,6 +1258,8 @@ RÈGLE ENVOI DE DOCUMENTS — PIPEDRIVE TOUJOURS FACULTATIF:
 • Si un numéro Centris exact et un courriel sont présents dans le message ou le contexte courant, utiliser directement telecharger_annexes_centris avec ces deux valeurs. Ne jamais appeler chercher_prospect et ne jamais proposer creer_deal avant de préparer l'aperçu.
 • Si le courriel est fourni mais que la propriété n'est pas identifiable, demander seulement le numéro Centris ou l'adresse du terrain. Ne jamais demander le nom du prospect et ne jamais exiger sa création dans Pipedrive.
 • Un match Pipedrive peut enrichir un envoi, mais son absence ne doit jamais bloquer les documents, l'aperçu ou la confirmation.
+• Toute nouvelle instruction de Shawn remplace les anciens aperçus et envois non partis. Ne jamais reprendre un ancien destinataire, deal, numéro Centris, courriel ou pièce jointe pour compléter la demande courante.
+• Si la demande immédiate ne contient pas assez d'information, poser une question ciblée. Ne jamais combler le manque avec une ancienne transaction.
 
 POUR TOUT PROSPECT — WORKFLOW STANDARD:
 1. voir_prospect_complet → état complet (notes + coordonnées + activités + séquence)
@@ -10686,6 +10699,7 @@ async function callClaude(chatId, userMsg, retries = 3) {
 
 // ─── Appel Claude direct (vision/multimodal — sans historique alourdi) ────────
 async function callClaudeVision(chatId, content, contextLabel) {
+  recordEmailConversationScope(chatId, contextLabel || 'Nouvelle demande avec pièce jointe');
   // Rate limiter
   if (!checkRateLimit()) {
     const err = new Error('Rate limit local atteint'); err.status = 429;
@@ -12029,6 +12043,7 @@ function registerHandlers() {
   // Confirmer envoi docs depuis pending (zone 80-89 confirmation requise)
   bot.onText(/^envoie\s+(?:les\s+)?docs?\s+(?:à|a)\s+(\S+)/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
+    recordEmailConversationScope(msg.chat.id, msg.text || `Nouvelle demande documents pour ${match[1]}`);
     const target = match[1].toLowerCase().trim();
     // Trouver dans pendingDocSends par email exact ou nom
     let pending = null;
@@ -12905,6 +12920,7 @@ function registerHandlers() {
   // à toi → /fiche 12345678 client@gmail.com → bot fetch + envoie en 10s.
   bot.onText(/^\/fiche\s+(\d{7,9})\s+(\S+@\S+)(?:\s+(.+))?/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
+    recordEmailConversationScope(msg.chat.id, msg.text || 'Nouvelle demande /fiche');
     const num = match[1];
     const email = match[2];
     const message_perso = match[3]?.trim() || null;
@@ -13463,6 +13479,7 @@ function registerHandlers() {
   bot.onText(/^\/matrix[-_]?preview\s+(\d{7,9})\s+(\S+@\S+)(?:\s+([\s\S]+))?$/i, async (msg, match) => {
     if (!isAllowed(msg)) return;
     const chatId = msg.chat.id;
+    recordEmailConversationScope(chatId, msg.text || 'Nouvelle demande /matrix-preview');
     const num = match[1];
     const emailDestination = normalizeSingleRecipientEmail(match[2]);
     const messagePerso = String(match[3] || '').trim();
