@@ -6,6 +6,7 @@ const Anthropic   = require('@anthropic-ai/sdk');
 const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
+const os          = require('os');
 const crypto      = require('crypto');
 const cheerio     = require('cheerio');
 const { evaluateSmsHmacSelfTest, evaluateActiveTemplate } = require('./lib/preflight_checks');
@@ -305,7 +306,11 @@ process.on('unhandledRejection', reason => {
 
 // ─── Persistance ──────────────────────────────────────────────────────────────
 const HAS_PERSISTENT_DISK = fs.existsSync('/data');
-const DATA_DIR        = HAS_PERSISTENT_DISK ? '/data' : '/tmp';
+const EPHEMERAL_DATA_DIR = HAS_PERSISTENT_DISK
+  ? null
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'kira-private-'));
+if (EPHEMERAL_DATA_DIR) fs.chmodSync(EPHEMERAL_DATA_DIR, 0o700);
+const DATA_DIR        = HAS_PERSISTENT_DISK ? '/data' : EPHEMERAL_DATA_DIR;
 const GIST_WRITES_ENABLED = gistWritesEnabled(HAS_PERSISTENT_DISK, process.env.ENABLE_GIST_BACKUP);
 const GIST_RESTORE_ENABLED = String(process.env.ENABLE_GIST_RESTORE || 'true').toLowerCase() !== 'false';
 const HIST_FILE       = path.join(DATA_DIR, 'history.json');
@@ -13129,7 +13134,7 @@ function registerHandlers() {
   });
 
   // /menage — audit Pipedrive strictement lecture seule.
-  bot.onText(/^\/menage|\/m[ée]nage|\/audit|\/clean/i, async msg => {
+  bot.onText(/^(?:\/menage|\/m[ée]nage|\/audit|\/clean)(?:@\w+)?(?:\s|$)/i, async msg => {
     if (!isAllowed(msg)) return;
     await bot.sendMessage(msg.chat.id, `🔎 *Audit Pipedrive en cours...*\n_Lecture seule: aucune fusion, fermeture ou suppression._`, { parse_mode: 'Markdown' });
     try {
@@ -13296,7 +13301,7 @@ function registerHandlers() {
   // /campaigns — liste campagnes Brevo suspended + boutons inline confirm/cancel
   // Remplace le système confirmserver Mac fragile (Cloudflare tunnel volatile).
   // Bot appelle directement Brevo API → robuste, jamais down.
-  bot.onText(/^\/campaigns?\b|\/courriels?\b|\/envois?\b/i, async msg => {
+  bot.onText(/^(?:\/campaigns?|\/courriels?|\/envois?)(?:@\w+)?(?:\s|$)/i, async msg => {
     if (!isAllowed(msg)) return;
     if (!BREVO_KEY) return bot.sendMessage(msg.chat.id, '❌ BREVO_API_KEY requis');
     await bot.sendMessage(msg.chat.id, `📧 *Recherche campagnes en attente...*`, { parse_mode: 'Markdown' });
@@ -15251,7 +15256,7 @@ async function checkVeilleCampagnesBackup() {
   }
 
   // État dédup persistant
-  const STATE_FILE = require('fs').existsSync('/data') ? '/data/veille_state.json' : '/tmp/veille_state.json';
+  const STATE_FILE = path.join(DATA_DIR, 'veille_state.json');
   let state = {};
   try { state = JSON.parse(require('fs').readFileSync(STATE_FILE, 'utf8')); } catch {}
 
@@ -15345,8 +15350,8 @@ async function checkVeilleCampagnesBackup() {
   }
 
   try {
-    require('fs').mkdirSync(require('path').dirname(STATE_FILE), { recursive: true });
-    require('fs').writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
   } catch {}
 }
 
