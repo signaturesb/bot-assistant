@@ -37,6 +37,11 @@ scenario('Commande explicite numéro + courriel admissible sans dépendre du CRM
   assert.strictEqual(eligibility.eligible, true);
   assert.deepStrictEqual(eligibility.missing, []);
   assert.deepStrictEqual(eligibility.enrichmentMissing, ['nom complet', 'téléphone', 'contexte CRM']);
+  assert.match(bot, /RÈGLE ENVOI DE DOCUMENTS — PIPEDRIVE TOUJOURS FACULTATIF/);
+  assert.match(bot, /Une adresse courriel valide écrite par Shawn dans Telegram est le destinataire autoritaire/);
+  assert.match(bot, /ne jamais exiger sa création dans Pipedrive/);
+  assert.match(bot, /PIPEDRIVE EST FACULTATIF ET NE DOIT PAS ÊTRE CONSULTÉ/);
+  assert.doesNotMatch(bot, /Le système a besoin du prospect dans Pipedrive pour matcher les docs/);
 });
 scenario('Courriel invalide ou correspondance réellement ambiguë bloqués', () => {
   assert.strictEqual(matrixClientEligibility({ email: 'invalide', propertyIdentified: true }).eligible, false);
