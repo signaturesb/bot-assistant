@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 // ─── CONSTANTS — HARDCODED, ne pas modifier sauf accord Shawn ───────────
 const SHAWN_EMAILS = [
@@ -23,14 +24,19 @@ const SHAWN_EMAILS = [
   'shawnbarrette@hotmail.com',
 ];
 
-const APPROVED_DIR = '/tmp/centris_approved_sends';
-const AUDIT_LOG = '/tmp/centris_sends_audit.jsonl';
+const SEND_GUARD_RUNTIME_DIR = fs.existsSync('/data')
+  ? path.join('/data', 'send_guard')
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'centris-send-guard-'));
+const APPROVED_DIR = path.join(SEND_GUARD_RUNTIME_DIR, 'approved');
+const AUDIT_LOG = path.join(SEND_GUARD_RUNTIME_DIR, 'audit.jsonl');
 const DEDUP_WINDOW_MS = 24 * 3600 * 1000;
 const SUSPICIOUS_THRESHOLD = 3; // 3 envois même email en 1h = alerte
 const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 min pour confirmer
 const TG_POLL_INTERVAL_MS = 3000;
 
-fs.mkdirSync(APPROVED_DIR, { recursive: true });
+fs.mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 });
+fs.chmodSync(SEND_GUARD_RUNTIME_DIR, 0o700);
+fs.chmodSync(APPROVED_DIR, 0o700);
 
 // ─── Layer 0 — Whitelist check ──────────────────────────────────────────
 function isShawnEmail(email) {
@@ -91,7 +97,7 @@ function createToken(code, payload) {
     used: false,
     ...payload,
   };
-  fs.writeFileSync(tokenPath(code), JSON.stringify(tokenData, null, 2));
+  fs.writeFileSync(tokenPath(code), JSON.stringify(tokenData, null, 2), { flag: 'wx', mode: 0o600 });
   return tokenData;
 }
 

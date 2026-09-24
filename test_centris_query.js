@@ -63,7 +63,7 @@ assert.match(botSource, /successfulRequests === 0 && lastError/, 'une panne Cent
 assert.match(botSource, /if \(\/cookies\|mfa\|re-login\|auth\/i\.test/, 'une session invalide doit arrêter les tentatives OAuth répétées');
 
 const openapi = fs.readFileSync('docs/centris_action_openapi.yaml', 'utf8');
-assert.match(openapi, /https:\/\/signaturesb-bot-s272\.onrender\.com/, 'URL Render de production incorrecte');
+assert.ok(openapi.includes('https://signaturesb-bot-s272.onrender.com'), 'URL Render de production incorrecte');
 assert.match(openapi, /operationId: get_comparables/, 'operationId manquant');
 assert.match(openapi, /bearerAuth:/, 'authentification Bearer manquante');
 

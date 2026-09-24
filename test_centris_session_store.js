@@ -29,8 +29,13 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'centris-session-'));
 const encryptedFile = path.join(tmpDir, 'encrypted.json');
 writeSessionFile(encryptedFile, payload, { secret });
 assert.deepStrictEqual(readSessionFile(encryptedFile, { secret }), payload);
-assert.strictEqual(fs.statSync(encryptedFile).mode & 0o777, 0o600, 'Le fichier de session doit être privé (0600)');
-assert(!fs.readFileSync(encryptedFile, 'utf8').includes('secret-value'));
+const encryptedFd = fs.openSync(encryptedFile, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+try {
+  assert.strictEqual(fs.fstatSync(encryptedFd).mode & 0o777, 0o600, 'Le fichier de session doit être privé (0600)');
+  assert(!fs.readFileSync(encryptedFd, 'utf8').includes('secret-value'));
+} finally {
+  fs.closeSync(encryptedFd);
+}
 
 const legacyFile = path.join(tmpDir, 'legacy.json');
 fs.writeFileSync(legacyFile, JSON.stringify(payload));

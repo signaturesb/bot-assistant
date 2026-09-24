@@ -393,8 +393,13 @@ async function getMarketSnapshot({ maxAge = SNAPSHOT_TTL } = {}) {
 async function refreshMarketSnapshot({ sources = null, parallel = 3 } = {}) {
   const fc = getFC();
   if (!fc) throw new Error('firecrawl_scraper non disponible');
-  const keys = sources || Object.keys(SOURCES);
-  const result = { ts: Date.now(), updated: new Date().toISOString(), data: {}, errors: {} };
+  const sourceMap = new Map(Object.entries(SOURCES));
+  const requestedKeys = Array.isArray(sources) ? sources.map(value => String(value)) : [...sourceMap.keys()];
+  const keys = [...new Set(requestedKeys.filter(key => sourceMap.has(key)))];
+  const invalidSources = requestedKeys.filter(key => !sourceMap.has(key));
+  const dataMap = new Map();
+  const errorsMap = new Map();
+  const result = { ts: Date.now(), updated: new Date().toISOString(), data: {}, errors: {}, invalid_sources: invalidSources };
 
   // Prompts LLM ciblés par source clé — fallback intelligent si regex échoue
   const LLM_PROMPTS = {
@@ -405,44 +410,48 @@ async function refreshMarketSnapshot({ sources = null, parallel = 3 } = {}) {
     apciq_lanaudiere: 'Tu lis stats APCIQ région Lanaudière. Extrait: prix médian ($), ventes du dernier mois/trim, variation %. Format: {"prix_median":<num>,"ventes_total":<num>,"variation":<num>,"periode":"<str>"}.',
     oaciq: 'Tu lis l\'accueil OACIQ (organisme régulateur courtage QC). Liste les 5 nouveautés/avis/règlements les plus récents avec leur titre et date si dispo. Format: {"nouveautes":[{"titre":"...","date":"YYYY-MM-DD ou null"}]}.',
   };
+  const llmPromptMap = new Map(Object.entries(LLM_PROMPTS));
 
   // Run en mini-batches pour respecter quota Firecrawl
   for (let i = 0; i < keys.length; i += parallel) {
     const batch = keys.slice(i, i + parallel);
     await Promise.all(batch.map(async (key) => {
-      const src = SOURCES[key];
-      if (!src) { result.errors[key] = 'unknown source'; return; }
+      const src = sourceMap.get(key);
+      if (!src) return;
       try {
         const r = await fc.scrapUrl(src.url, src.keywords || []);
-        if (!r || !r.contenu) { result.errors[key] = 'empty content'; return; }
-        const extracted = src.extract ? src.extract(r.contenu) : { resume: r.contenu.substring(0, 1500) };
+        if (!r || !r.contenu) { errorsMap.set(key, 'empty content'); return; }
+        let extracted = src.extract ? src.extract(r.contenu) : { resume: r.contenu.substring(0, 1500) };
+        const llmPrompt = llmPromptMap.get(key);
         // Fallback LLM si valeurs clés null + prompt défini pour cette source
-        if (LLM_PROMPTS[key]) {
+        if (llmPrompt) {
           const hasNullKey = Object.values(extracted).some(v => v === null);
           if (hasNullKey) {
             try {
-              const llmData = await llmExtract(r.contenu, LLM_PROMPTS[key]);
+              const llmData = await llmExtract(r.contenu, llmPrompt);
               if (llmData) {
                 // Merge: LLM remplace null/undefined, garde le reste
+                const extractedMap = new Map(Object.entries(extracted));
                 for (const [k, v] of Object.entries(llmData)) {
-                  if (v != null && (extracted[k] == null || extracted[k] === undefined)) {
-                    extracted[k] = v;
+                  if (v != null && extractedMap.has(k) && extractedMap.get(k) == null) {
+                    extractedMap.set(k, v);
                   }
                 }
-                extracted._llm_enhanced = true;
+                extractedMap.set('_llm_enhanced', true);
+                extracted = Object.fromEntries(extractedMap);
               }
             } catch {}
           }
         }
-        result.data[key] = {
+        dataMap.set(key, {
           label: src.label,
           url: src.url,
           ...extracted,
           fromCache: !!r.fromCache,
-        };
+        });
       } catch (e) {
-        result.errors[key] = e.message?.substring(0, 200) || String(e);
-        console.warn(`[MARKET] ${key}:`, e.message);
+        errorsMap.set(key, e.message?.substring(0, 200) || String(e));
+        console.warn('[MARKET] source error:', key, e.message);
       }
     }));
   }
@@ -450,12 +459,15 @@ async function refreshMarketSnapshot({ sources = null, parallel = 3 } = {}) {
   // Merge avec ancien snapshot (sources qui ont fail gardent l'ancien)
   const old = loadSnapshot();
   if (old?.data) {
+    const oldDataMap = new Map(Object.entries(old.data));
     for (const k of keys) {
-      if (!result.data[k] && old.data[k]) {
-        result.data[k] = { ...old.data[k], _stale: true };
+      if (!dataMap.has(k) && oldDataMap.has(k)) {
+        dataMap.set(k, { ...oldDataMap.get(k), _stale: true });
       }
     }
   }
+  result.data = Object.fromEntries(dataMap);
+  result.errors = Object.fromEntries(errorsMap);
   saveSnapshot(result);
   return result;
 }

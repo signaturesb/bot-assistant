@@ -1,6 +1,14 @@
 // lead_parser.js — Parser de leads email, extrait de bot.js pour testabilité
 // Utilisé par bot.js (production) + test_parser.js (suite de tests)
 'use strict';
+const cheerio = require('cheerio');
+
+function htmlToLeadText(value, { preserveBlocks = false } = {}) {
+  const $ = cheerio.load(`<div id="lead-root">${String(value || '')}</div>`);
+  $('script,style,noscript').remove();
+  if (preserveBlocks) $('br,p,div,tr,td,li').each((_, element) => $(element).append('\n'));
+  return $('#lead-root').text();
+}
 
 // BLACKLIST: empêche le parser de capturer Shawn/RE-MAX/Signature SB comme PROSPECT.
 // Causait: emails Centris réexpédiés par Gmail ont "De: Shawn Barrette <shawn@signaturesb.com>"
@@ -158,16 +166,7 @@ function isJunkLeadEmail(subject, from, body) {
 }
 
 function parseLeadEmail(body, subject, from) {
-  let clean = (body || '')
-    .replace(/\r/g, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
-    .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s{2,}/g, ' ');
+  const clean = htmlToLeadText(body).replace(/\r/g, '').replace(/\s{2,}/g, ' ');
   // Inclut from dans la zone de recherche pour extraire l'email de l'expéditeur si pas dans le body
   const full = `${subject || ''} ${clean} ${from || ''}`;
 
@@ -257,15 +256,7 @@ async function parseLeadEmailWithAI(body, subject, from, regexResult, { apiKey, 
   if (!apiKey) return regexResult;
   const _log = logger || (() => {});
 
-  const cleanTxt = (s, max = 6000) => (s || '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>|<\/div>|<\/tr>|<\/td>|<\/li>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
-    .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
-    .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
+  const cleanTxt = (s, max = 6000) => htmlToLeadText(s, { preserveBlocks: true })
     .replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n')
     .substring(0, max);
 

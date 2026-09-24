@@ -26,6 +26,7 @@
 const fs   = require('fs');
 const path = require('path');
 const nodeCrypto = require('crypto');
+const cheerio = require('cheerio');
 const {
   readSessionFile,
   removeSessionFile,
@@ -57,6 +58,47 @@ const MATRIX_DOCUMENT_FILE_MAX_BYTES = 25 * 1024 * 1024;
 const MATRIX_DOCUMENT_TOTAL_MAX_BYTES = 120 * 1024 * 1024;
 const MATRIX_DOCUMENT_DOWNLOAD_ATTEMPTS = 3;
 const EXPLICIT_CENTRIS_SEND_RE = /^(?:envoie|envoie-le|send)[!.]?$/i;
+
+function readRegularFileNoFollow(file, maxBytes = Infinity) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('FILE_NOT_REGULAR');
+    if (stat.size > maxBytes) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
+    const buffer = fs.readFileSync(fd);
+    if (buffer.length !== stat.size) throw new Error('FILE_CHANGED_DURING_READ');
+    return { buffer, stat };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readFreshPdfCache(file, maxAgeMs, minBytes = 10000) {
+  try {
+    const loaded = readRegularFileNoFollow(file, MATRIX_DOCUMENT_FILE_MAX_BYTES);
+    if (Date.now() - loaded.stat.mtimeMs >= maxAgeMs || loaded.buffer.length <= minBytes) return null;
+    return loaded;
+  } catch (error) {
+    if (['ENOENT', 'ELOOP'].includes(error?.code)) return null;
+    throw error;
+  }
+}
+
+function writePdfCacheAtomic(file, buffer) {
+  const temp = `${file}.${process.pid}.${nodeCrypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temp, buffer, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temp, file);
+  } finally {
+    try { fs.unlinkSync(temp); } catch {}
+  }
+}
+
+function markupToText(value) {
+  const $ = cheerio.load(`<div>${String(value || '')}</div>`);
+  $('script,style,noscript').remove();
+  return $('div').first().text();
+}
 
 // Ces erreurs sont déterministes: les répéter charge Matrix sans augmenter les
 // chances de succès. Les erreurs réseau, timeouts et wrappers HTML restent, eux,
@@ -2525,18 +2567,16 @@ async function cuaGetCentrisPDF(centrisNum) {
 
   // Cache 24h
   const pdfCacheFile = path.join(PDF_DIR, `centris_${centrisNum}_fiche.pdf`);
-  if (fs.existsSync(pdfCacheFile)) {
-    const stat = fs.statSync(pdfCacheFile);
-    if (Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000 && stat.size > 10000) {
-      console.log(`[CUA] PDF en cache: ${pdfCacheFile}`);
-      return {
-        success: true,
-        buffer: fs.readFileSync(pdfCacheFile),
-        filename: `Centris_${centrisNum}_fiche.pdf`,
-        message: 'PDF depuis cache (24h)',
-        fromCache: true
-      };
-    }
+  const cachedPdf = readFreshPdfCache(pdfCacheFile, 24 * 60 * 60 * 1000);
+  if (cachedPdf) {
+    console.log(`[CUA] PDF en cache: ${pdfCacheFile}`);
+    return {
+      success: true,
+      buffer: cachedPdf.buffer,
+      filename: `Centris_${centrisNum}_fiche.pdf`,
+      message: 'PDF depuis cache (24h)',
+      fromCache: true
+    };
   }
 
   let browser = null;
@@ -2571,7 +2611,7 @@ Le PDF sera capturé automatiquement dès que le téléchargement commence.
 
     if (result.success && result.pdfBuffers.length > 0) {
       const { buffer, filename } = result.pdfBuffers[0];
-      fs.writeFileSync(pdfCacheFile, buffer);
+      writePdfCacheAtomic(pdfCacheFile, buffer);
       return {
         success: true,
         buffer,
@@ -2584,7 +2624,7 @@ Le PDF sera capturé automatiquement dès que le téléchargement commence.
     // Fallback: capture PDF via page.pdf()
     const printResult = await tryCUAPrintCapture(page, centrisNum);
     if (printResult.success) {
-      fs.writeFileSync(pdfCacheFile, printResult.buffer);
+      writePdfCacheAtomic(pdfCacheFile, printResult.buffer);
       return printResult;
     }
 
@@ -4042,9 +4082,7 @@ async function matrixDownloadBuffer(download) {
     const tempPath = path.join(PDF_DIR, `matrix_print_${Date.now()}_${nodeCrypto.randomBytes(6).toString('hex')}.pdf`);
     try {
       await download.saveAs(tempPath);
-      const stat = fs.statSync(tempPath);
-      if (stat.size > MATRIX_DOCUMENT_FILE_MAX_BYTES) throw new Error('MATRIX_DOCUMENT_TOO_LARGE');
-      return fs.readFileSync(tempPath);
+      return readRegularFileNoFollow(tempPath, MATRIX_DOCUMENT_FILE_MAX_BYTES).buffer;
     } finally {
       try { fs.unlinkSync(tempPath); } catch {}
     }
@@ -5089,7 +5127,7 @@ async function getListingBroker(centrisNum, opts = {}) {
   }
   // Strategy B — fallback Centris.ca public
   try {
-    const r = await fetch(`https://www.centris.ca/fr/properties~a-vendre/${centrisNum}`, {
+    const r = await fetch(centrisPublicListingUrl(centrisNum), {
       headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' },
       signal: AbortSignal.timeout(15000),
       redirect: 'follow',
@@ -5105,7 +5143,7 @@ async function getListingBroker(centrisNum, opts = {}) {
       const phoneMatch = (ogDesc || html).match(/(\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})/);
       return {
         name: brokerMatch?.[1]?.trim() || null,
-        agency: agencyMatch?.[1]?.replace(/<[^>]+>/g, '').trim() || null,
+        agency: agencyMatch?.[1] ? markupToText(agencyMatch[1]).trim() || null : null,
         phone: phoneMatch?.[1] || null,
         source: 'centris.ca-public',
         debug_og_title: ogTitle.substring(0, 120),
@@ -5358,11 +5396,7 @@ async function getCentrisListingPhotos(centrisNum) {
     const ogDesc = html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)/i)?.[1] || '';
     const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)/i)?.[1] || '';
     // Decode HTML entities (à é è ô etc.) — anti-fragilité Shawn 2026-06-01
-    const decodeEntities = s => String(s||'')
-      .replace(/&#x([0-9A-Fa-f]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-      .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
-      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, ' ');
+    const decodeEntities = markupToText;
     // Extract adresse complète — chercher dans body HTML (h1, h2, address tags + structured data)
     // Priorité: JSON-LD > h1/h2 > og:title fallback
     let adresseRaw = '';
@@ -5440,18 +5474,16 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
 
   // Cache 24h
   const pdfCacheFile = path.join(PDF_DIR, `centris_${centrisNum}_fiche_${format}.pdf`);
-  if (fs.existsSync(pdfCacheFile)) {
-    const stat = fs.statSync(pdfCacheFile);
-    if (Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000 && stat.size > 10000) {
-      console.log(`[FICHE-PDF] Cache hit: ${pdfCacheFile} (${Math.round(stat.size/1024)}KB)`);
-      return {
-        success: true,
-        buffer: fs.readFileSync(pdfCacheFile),
-        filename: `Fiche_Centris_${centrisNum}.pdf`,
-        fromCache: true,
-        size: stat.size,
-      };
-    }
+  const cachedPdf = readFreshPdfCache(pdfCacheFile, 24 * 60 * 60 * 1000);
+  if (cachedPdf) {
+    console.log(`[FICHE-PDF] Cache hit: ${pdfCacheFile} (${Math.round(cachedPdf.stat.size/1024)}KB)`);
+    return {
+      success: true,
+      buffer: cachedPdf.buffer,
+      filename: `Fiche_Centris_${centrisNum}.pdf`,
+      fromCache: true,
+      size: cachedPdf.stat.size,
+    };
   }
 
   const FORMAT_TITLES = {
@@ -5584,14 +5616,14 @@ async function downloadCentrisFichePDF(centrisNum, opts = {}) {
       try {
         const pdfBuffer = await page.pdf({ format: 'Letter', printBackground: true });
         if (pdfBuffer && pdfBuffer.length > 5000) {
-          fs.writeFileSync(pdfCacheFile, pdfBuffer);
+          writePdfCacheAtomic(pdfCacheFile, pdfBuffer);
           return { success: true, buffer: pdfBuffer, filename: downloadedFilename, fromCache: false, size: pdfBuffer.length, via: 'page.pdf' };
         }
       } catch {}
       throw new Error('Timeout download PDF (45s) + fallback page.pdf échoué');
     }
 
-    fs.writeFileSync(pdfCacheFile, downloadedBuffer);
+    writePdfCacheAtomic(pdfCacheFile, downloadedBuffer);
     console.log(`[FICHE-PDF] ✅ ${Math.round(downloadedBuffer.length/1024)}KB`);
     return {
       success: true,

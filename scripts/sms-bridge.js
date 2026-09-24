@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
 const HOME = os.homedir();
 const CHAT_DB = path.join(HOME, 'Library/Messages/chat.db');
@@ -66,7 +66,7 @@ function saveState(state) {
 function queryDb(sql) {
   // Use macOS built-in sqlite3 CLI (no npm dep needed)
   // -separator '|' for parsing, -readonly for safety
-  const out = execSync(`sqlite3 -separator '\\x1f' -readonly "${CHAT_DB}" "${sql.replace(/"/g, '\\"')}"`, {
+  const out = execFileSync('sqlite3', ['-separator', '\x1f', '-readonly', CHAT_DB, String(sql)], {
     encoding: 'utf8', timeout: 10000,
   });
   return out.trim().split('\n').filter(Boolean).map(line => line.split('\x1f'));

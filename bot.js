@@ -17230,9 +17230,10 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     const pattern = u.searchParams.get('pattern') || 'appeler contact|appeler prospect';
     const dry = u.searchParams.get('dry') !== '0';
     const out = { dry, pattern, total_scanned: 0, matched: 0, deleted: 0, sample: [], errors: [] };
-    let regex;
-    try { regex = new RegExp(pattern, 'i'); }
-    catch (e) { res.writeHead(400); res.end(JSON.stringify({error:`pattern invalide: ${e.message}`})); return; }
+    const subjectPhrases = String(pattern).split('|').map(value => value.trim().toLocaleLowerCase('fr-CA')).filter(Boolean);
+    if (!subjectPhrases.length || subjectPhrases.length > 10 || subjectPhrases.some(value => value.length > 80)) {
+      res.writeHead(400); res.end(JSON.stringify({ error: 'pattern invalide: 1 à 10 expressions littérales séparées par |' })); return;
+    }
     try {
       // Paginer toutes les activités du compte
       let start = 0;
@@ -17247,7 +17248,10 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
         if (allActs.length > 50000) break; // safety
       }
       out.total_scanned = allActs.length;
-      const matched = allActs.filter(a => a.subject && regex.test(a.subject));
+      const matched = allActs.filter(a => {
+        const subject = String(a.subject || '').toLocaleLowerCase('fr-CA');
+        return subjectPhrases.some(phrase => subject.includes(phrase));
+      });
       out.matched = matched.length;
       out.sample = matched.slice(0, 10).map(a => ({ id: a.id, subject: a.subject, deal_id: a.deal_id, due_date: a.due_date, done: a.done, type: a.type }));
       if (!dry) {

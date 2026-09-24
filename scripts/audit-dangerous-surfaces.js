@@ -97,10 +97,14 @@ if (!callResumeGuarded) {
 }
 
 // Inventory direct provider send surfaces. Every occurrence must be wrapped centrally.
-const gmailRe = /gmail\.googleapis\.com\/gmail\/v1\/users\/me\/messages\/send/;
-const brevoRe = /api\.brevo\.com\/v3\/(?:smtp\/email|emailCampaigns)/;
-const gmailLocs = locations(gmailRe, 'gmail send');
-const brevoLocs = locations(brevoRe, 'brevo mutative');
+const gmailLocs = lines.flatMap((line, idx) => line.includes('gmail.googleapis.com/gmail/v1/users/me/messages/send')
+  ? [{ line: idx + 1, text: line.trim().slice(0, 220), label: 'gmail send' }]
+  : []);
+const brevoLocs = lines.flatMap((line, idx) => (
+  line.includes('api.brevo.com/v3/smtp/email') || line.includes('api.brevo.com/v3/emailCampaigns')
+)
+  ? [{ line: idx + 1, text: line.trim().slice(0, 220), label: 'brevo mutative' }]
+  : []);
 if (gmailLocs.length > 0) warnings.push(`${gmailLocs.length} surface(s) Gmail messages/send directe(s) détectée(s) — vérifier wrapper central.`);
 if (brevoLocs.length > 0) warnings.push(`${brevoLocs.length} surface(s) Brevo potentiellement mutative(s) détectée(s) — vérifier wrapper central.`);
 

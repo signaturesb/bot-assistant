@@ -15,6 +15,7 @@
 const fs   = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const cheerio = require('cheerio');
 
 const DATA_DIR = fs.existsSync('/data') ? '/data' : '/tmp';
 const HISTORY_FILE = path.join(DATA_DIR, 'campaign_history.json');
@@ -140,7 +141,7 @@ function extractParagraphs(html) {
   const paragraphs = [];
   // Patterns à EXCLURE (footer, signature, contacts — doivent rester intacts)
   const FOOTER_PATTERNS = [
-    /shawn\s*barrette/i, /514[\s.\-]?927[\s.\-]?1340/, /signaturesb\.com/i,
+    /shawn\s*barrette/i, /514[\s.\-]?927[\s.\-]?1340/,
     /remax\s*prestige/i, /re\/?max\s*prestige/i, /se\s*désabonner|unsubscribe/i,
     /tous\s*droits\s*réservés|all\s*rights\s*reserved/i,
     /julie@signaturesb/i, /^bonjour\s*,?$/i,
@@ -151,10 +152,12 @@ function extractParagraphs(html) {
   while ((m = re.exec(html)) !== null) {
     const inner = m[1];
     // Strip nested tags pour mesurer texte pur
-    const textOnly = inner.replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, ' ').trim();
+    const $ = cheerio.load(`<div>${inner}</div>`);
+    $('script,style,noscript').remove();
+    const textOnly = $('div').first().text().trim();
     if (textOnly.length < 40 || !/[a-zàâéèêëïîôöùûüç]{3,}/i.test(textOnly)) continue;
     // Skip si footer/contact/signature
-    if (FOOTER_PATTERNS.some(p => p.test(textOnly))) continue;
+    if (textOnly.toLowerCase().includes('signaturesb.com') || FOOTER_PATTERNS.some(p => p.test(textOnly))) continue;
     paragraphs.push({
       html: m[0],
       inner_text_html: inner.trim(), // contenu inner avec tags inline (br, strong, etc)
