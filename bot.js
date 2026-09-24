@@ -7,6 +7,7 @@ const http        = require('http');
 const fs          = require('fs');
 const path        = require('path');
 const crypto      = require('crypto');
+const cheerio     = require('cheerio');
 const { evaluateSmsHmacSelfTest, evaluateActiveTemplate } = require('./lib/preflight_checks');
 const { AsyncLocalStorage } = require('async_hooks');
 const leadParser  = require('./lead_parser');
@@ -65,6 +66,7 @@ const { gmailBodyText, extractCentrisMfaCode } = require('./lib/centris_mfa');
 const {
   assertPublicHttpsUrl,
   validateCentrisSessionUrl,
+  validatePipedriveApiUrl,
   secretTestTarget,
   fetchWithValidatedRedirects,
 } = require('./lib/outbound_url_guard');
@@ -976,10 +978,27 @@ async function buildEmailFromMasterTpl(params = {}) {
 
 function extractEmailAddresses(value) {
   const values = Array.isArray(value) ? value : (value ? [value] : []);
-  return values.flatMap(item => {
-    const text = String(item || '').toLowerCase();
-    return text.match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/g) || [];
-  });
+  const addresses = [];
+  for (const item of values) {
+    const tokens = String(item || '').toLowerCase().split(/[\s,;<>()\[\]"']+/);
+    for (let token of tokens) {
+      token = token.replace(/^mailto:/, '').replace(/^[.:]+|[.!?:]+$/g, '');
+      if (!token || token.length > 320) continue;
+      const at = token.indexOf('@');
+      if (at <= 0 || at !== token.lastIndexOf('@')) continue;
+      const local = token.slice(0, at);
+      const domain = token.slice(at + 1);
+      if (local.length > 64 || local.startsWith('.') || local.endsWith('.') || local.includes('..')) continue;
+      if (!/^[a-z0-9.!#$%&*+/=?^_`{|}~-]+$/.test(local)) continue;
+      if (domain.length > 253 || domain.includes('..')) continue;
+      const labels = domain.split('.');
+      if (labels.length < 2 || labels.some(label => !label || label.length > 63 ||
+          !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) continue;
+      if (!/^[a-z]{2,63}$/.test(labels.at(-1))) continue;
+      addresses.push(token);
+    }
+  }
+  return addresses;
 }
 
 function isInternalEmailPayload(payload = {}) {
@@ -1137,7 +1156,8 @@ async function sendEmailLogged(opts) {
     // → notif Telegram immédiate avec to/subject/category pour qu'il sache ce qui est parti
     if (entry.outcome === 'sent' && ALLOWED_ID) {
       const SHAWN_ADDR = 'shawn@signaturesb.com';
-      const isShawnTo = entry.to.includes('shawn') || entry.to.includes('signaturesb.com');
+      const isShawnTo = extractEmailAddresses(entry.to)
+        .some(address => address === SHAWN_ADDR || address.endsWith('@signaturesb.com'));
       const ccs = (Array.isArray(entry.cc) ? entry.cc : []).map(s => String(s).toLowerCase());
       const hasShawnCc = ccs.some(c => c.includes(SHAWN_ADDR));
       const isCopyForward = entry.category === 'auto-copy-to-shawn';
@@ -3059,10 +3079,14 @@ let gistId = process.env.GIST_ID || null;
 async function initGistId() {
   const mode = GIST_WRITES_ENABLED ? 'lecture/écriture' : 'récupération seulement — /data primaire';
   if (gistId) { log('OK', 'GIST', `Configuré (${mode})`); return; }
-  if (fs.existsSync(GIST_ID_FILE)) {
+  try {
     gistId = fs.readFileSync(GIST_ID_FILE, 'utf8').trim();
-    log('OK', 'GIST', `ID local chargé (${mode})`);
-    return;
+    if (gistId) {
+      log('OK', 'GIST', `ID local chargé (${mode})`);
+      return;
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log('WARN', 'GIST', `Lecture ID local: ${error.message}`);
   }
   if (!GIST_WRITES_ENABLED) {
     log('OK', 'PERSIST', `${DATA_DIR} primaire — création/écriture Gist désactivée`);
@@ -3078,7 +3102,10 @@ async function initGistId() {
     if (!res.ok) { log('WARN', 'GIST', `Create HTTP ${res.status}`); return; }
     const data = await res.json();
     gistId = data.id;
-    try { fs.writeFileSync(GIST_ID_FILE, gistId, 'utf8'); } catch {}
+    try { fs.writeFileSync(GIST_ID_FILE, gistId, { encoding: 'utf8', flag: 'wx' }); }
+    catch (error) {
+      if (error?.code !== 'EEXIST') log('WARN', 'GIST', `Écriture ID local: ${error.message}`);
+    }
     log('OK', 'GIST', `Créé: ${gistId}`);
     if (ALLOWED_ID) bot.sendMessage(ALLOWED_ID, `🔑 *Gist créé!* Ajoute dans Render: \`GIST_ID=${gistId}\``, { parse_mode: 'Markdown' }).catch(() => {});
   } catch (e) { log('WARN', 'GIST', `Create: ${e.message}`); }
@@ -3207,12 +3234,16 @@ async function pdRequest(method, endpoint, body) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 8000);
   try {
+    if (typeof endpoint !== 'string' || !/^\/[a-z0-9_./?&=%:+,-]+$/i.test(endpoint) || endpoint.startsWith('//')) {
+      return pipedriveFailure(method, endpoint, 0, { error: 'Chemin API Pipedrive invalide' });
+    }
+    const target = validatePipedriveApiUrl(`${PD_BASE}${endpoint}${sep}api_token=${encodeURIComponent(PD_KEY)}`);
     const options = { method, signal: controller.signal, headers: {} };
     if (body !== undefined) {
       options.headers['Content-Type'] = 'application/json';
       options.body = JSON.stringify(body);
     }
-    const res = await fetch(`${PD_BASE}${endpoint}${sep}api_token=${encodeURIComponent(PD_KEY)}`, options);
+    const res = await fetch(target, options);
     const text = await res.text();
     let payload = {};
     try { payload = text ? JSON.parse(text) : {}; } catch { payload = { error: text || `HTTP ${res.status}` }; }
@@ -3254,7 +3285,11 @@ async function pdGetV2(endpoint) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 8000);
   try {
-    const res = await fetch(`${PD_V2_BASE}${endpoint}${sep}api_token=${encodeURIComponent(PD_KEY)}`, {
+    if (typeof endpoint !== 'string' || !/^\/[a-z0-9_./?&=%:+,-]+$/i.test(endpoint) || endpoint.startsWith('//')) {
+      return pipedriveFailure('GET', endpoint, 0, { error: 'Chemin API Pipedrive invalide' });
+    }
+    const target = validatePipedriveApiUrl(`${PD_V2_BASE}${endpoint}${sep}api_token=${encodeURIComponent(PD_KEY)}`);
+    const res = await fetch(target, {
       method: 'GET',
       signal: controller.signal,
     });
@@ -5664,17 +5699,11 @@ function gmailExtractBody(payload) {
   const { plain, html } = gmailWalkParts(payload);
   if (plain && plain.length > 20) return plain;
   if (html) {
-    return html
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/p>|<\/div>|<\/tr>|<\/td>|<\/li>/gi, '\n')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&#39;|&rsquo;|&lsquo;/g, "'")
-      .replace(/&quot;|&ldquo;|&rdquo;/g, '"')
-      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    const $ = cheerio.load(html);
+    $('script, style, noscript').remove();
+    $('br, p, div, tr, td, li').append('\n');
+    return $.root().text()
+      .replace(/\u00a0/g, ' ')
       .replace(/[ \t]+/g, ' ')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
@@ -6777,7 +6806,10 @@ async function centrisOAuthLoginWithMFA(opts = {}) {
     }
   };
   const cookieStr = () => Object.entries(COOKIES).map(([k, v]) => `${k}=${v}`).join('; ');
-  const decode = s => String(s || '').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#x2f;/gi, '/').replace(/&#x3d;/gi, '=');
+  const decode = s => String(s || '').replace(/&(amp|quot|#x2f|#x3d);/gi, entity => {
+    const key = entity.toLowerCase();
+    return ({ '&amp;': '&', '&quot;': '"', '&#x2f;': '/', '&#x3d;': '=' })[key] || entity;
+  });
   const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36';
   const HD = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9', 'Accept-Language': 'fr-CA,fr;q=0.9' };
   const fOpts = (extra = {}) => ({ headers: { ...HD, ...(extra.headers || {}), 'Cookie': cookieStr() }, ...extra });
@@ -12495,7 +12527,7 @@ function registerHandlers() {
   //   • Deals à risque (stagnants depuis X jours)
   //   • Opportunités cross-sell (matchs récurrents)
   //   • Actions recommandées immédiates
-  bot.onText(/^\/insights|\/strategie|\/intelligence/i, async msg => {
+  bot.onText(/^(?:\/insights|\/strategie|\/intelligence)(?:@\w+)?(?:\s|$)/i, async msg => {
     if (!isAllowed(msg)) return;
     if (!PD_KEY) return bot.sendMessage(msg.chat.id, '❌ PIPEDRIVE_API_KEY requis pour /insights');
     await bot.sendMessage(msg.chat.id, `🧠 *Analyse stratégique en cours...*\n_(Pipedrive + audit log + mémoire)_`, { parse_mode: 'Markdown' });

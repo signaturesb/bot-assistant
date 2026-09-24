@@ -1,10 +1,13 @@
 'use strict';
 const assert = require('assert');
-const { parseStrictHttpsUrl, isPrivateAddress, assertPublicHttpsUrl, validateCentrisSessionUrl, secretTestTarget, fetchWithValidatedRedirects } = require('./lib/outbound_url_guard');
+const { parseStrictHttpsUrl, isPrivateAddress, assertPublicHttpsUrl, validateCentrisSessionUrl, validatePipedriveApiUrl, secretTestTarget, fetchWithValidatedRedirects } = require('./lib/outbound_url_guard');
 async function run() {
   assert.strictEqual(validateCentrisSessionUrl('https://matrix.centris.ca/Matrix/Home').hostname, 'matrix.centris.ca');
   assert.strictEqual(validateCentrisSessionUrl('https://zone.centris.ca/doc').hostname, 'zone.centris.ca');
   for (const bad of ['http://matrix.centris.ca/', 'https://matrix.centris.ca.evil.test/', 'https://user:pass@matrix.centris.ca/', 'https://127.0.0.1/', 'https://matrix.centris.ca:8443/', 'https://accounts.centris.ca/']) assert.throws(() => validateCentrisSessionUrl(bad));
+  assert.strictEqual(validatePipedriveApiUrl('https://api.pipedrive.com/v1/deals?limit=10').hostname, 'api.pipedrive.com');
+  assert.strictEqual(validatePipedriveApiUrl('https://api.pipedrive.com/api/v2/activities').pathname, '/api/v2/activities');
+  for (const bad of ['http://api.pipedrive.com/v1/deals', 'https://api.pipedrive.com.evil.test/v1/deals', 'https://api.pipedrive.com/private', 'https://127.0.0.1/v1/deals']) assert.throws(() => validatePipedriveApiUrl(bad));
   for (const address of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.2', '::1']) assert.strictEqual(isPrivateAddress(address), true);
   assert.strictEqual(isPrivateAddress('8.8.8.8'), false);
   assert.strictEqual(isPrivateAddress('2606:4700:4700::1111'), false);
