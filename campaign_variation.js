@@ -157,7 +157,9 @@ function extractParagraphs(html) {
     const textOnly = $('div').first().text().trim();
     if (textOnly.length < 40 || !/[a-zàâéèêëïîôöùûüç]{3,}/i.test(textOnly)) continue;
     // Skip si footer/contact/signature
-    if (textOnly.toLowerCase().includes('signaturesb.com') || FOOTER_PATTERNS.some(p => p.test(textOnly))) continue;
+    const footerWords = textOnly.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(/\s+/);
+    const hasSignatureDomain = footerWords.some((word, index) => word === 'signaturesb' && footerWords[index + 1] === 'com');
+    if (hasSignatureDomain || FOOTER_PATTERNS.some(p => p.test(textOnly))) continue;
     paragraphs.push({
       html: m[0],
       inner_text_html: inner.trim(), // contenu inner avec tags inline (br, strong, etc)
