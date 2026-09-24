@@ -33,6 +33,7 @@ const {
 } = require('./lib/centris_session_store');
 const { validatePdfBuffer } = require('./lib/pdf_validation');
 const { createCentrisLoginLimit } = require('./lib/centris_login_limit');
+const { centrisPublicListingUrl } = require('./lib/outbound_url_guard');
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIG
@@ -5321,7 +5322,7 @@ async function shareCentrisZoneDocuments(opts = {}) {
  */
 async function getCentrisListingPhotos(centrisNum) {
   try {
-    const url = `https://www.centris.ca/fr/properties~a-vendre/${centrisNum}`;
+    const url = centrisPublicListingUrl(centrisNum);
     const r = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',

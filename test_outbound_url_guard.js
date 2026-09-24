@@ -1,6 +1,6 @@
 'use strict';
 const assert = require('assert');
-const { parseStrictHttpsUrl, isPrivateAddress, assertPublicHttpsUrl, validateCentrisSessionUrl, validatePipedriveApiUrl, secretTestTarget, fetchWithValidatedRedirects } = require('./lib/outbound_url_guard');
+const { parseStrictHttpsUrl, isPrivateAddress, assertPublicHttpsUrl, validateCentrisSessionUrl, validatePipedriveApiUrl, validateBrevoApiUrl, brevoCampaignUrl, validateCentrisPublicListingUrl, centrisPublicListingUrl, secretTestTarget, fetchWithValidatedRedirects } = require('./lib/outbound_url_guard');
 async function run() {
   assert.strictEqual(validateCentrisSessionUrl('https://matrix.centris.ca/Matrix/Home').hostname, 'matrix.centris.ca');
   assert.strictEqual(validateCentrisSessionUrl('https://zone.centris.ca/doc').hostname, 'zone.centris.ca');
@@ -8,6 +8,13 @@ async function run() {
   assert.strictEqual(validatePipedriveApiUrl('https://api.pipedrive.com/v1/deals?limit=10').hostname, 'api.pipedrive.com');
   assert.strictEqual(validatePipedriveApiUrl('https://api.pipedrive.com/api/v2/activities').pathname, '/api/v2/activities');
   for (const bad of ['http://api.pipedrive.com/v1/deals', 'https://api.pipedrive.com.evil.test/v1/deals', 'https://api.pipedrive.com/private', 'https://127.0.0.1/v1/deals']) assert.throws(() => validatePipedriveApiUrl(bad));
+  assert.strictEqual(brevoCampaignUrl('12345').toString(), 'https://api.brevo.com/v3/emailCampaigns/12345');
+  assert.strictEqual(brevoCampaignUrl(12345, 'sendTest').pathname, '/v3/emailCampaigns/12345/sendTest');
+  for (const bad of ['https://evil.test/v3/emailCampaigns/1', 'https://api.brevo.com/v3/emailCampaigns/abc', 'https://api.brevo.com/v3/emailCampaigns/1/private']) assert.throws(() => validateBrevoApiUrl(bad));
+  for (const badId of ['', '0', '-1', '1/path', '1?next=evil', '1e2']) assert.throws(() => brevoCampaignUrl(badId));
+  assert.strictEqual(centrisPublicListingUrl('15520946').pathname, '/fr/properties~a-vendre/15520946');
+  for (const bad of ['https://evil.test/fr/properties~a-vendre/15520946', 'https://www.centris.ca/fr/properties~a-vendre/abc', 'https://www.centris.ca/fr/properties~a-vendre/15520946?next=evil']) assert.throws(() => validateCentrisPublicListingUrl(bad));
+  for (const badId of ['', '../secret', '12345', '12345678901']) assert.throws(() => centrisPublicListingUrl(badId));
   for (const address of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.2', '::1']) assert.strictEqual(isPrivateAddress(address), true);
   assert.strictEqual(isPrivateAddress('8.8.8.8'), false);
   assert.strictEqual(isPrivateAddress('2606:4700:4700::1111'), false);

@@ -68,6 +68,7 @@ const {
   assertPublicHttpsUrl,
   validateCentrisSessionUrl,
   validatePipedriveApiUrl,
+  brevoCampaignUrl,
   secretTestTarget,
   fetchWithValidatedRedirects,
 } = require('./lib/outbound_url_guard');
@@ -11869,7 +11870,7 @@ function registerHandlers() {
         if (action === 'cmp_preview') {
           await bot.answerCallbackQuery(cbq.id, { text: '👁 Récupération preview...' });
           try {
-            const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+            const r = await fetch(brevoCampaignUrl(campaignId), {
               headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
             });
             const c = await r.json();
@@ -11901,7 +11902,7 @@ function registerHandlers() {
             await bot.answerCallbackQuery(cbq.id, { text: '⏳ Confirmation...' });
             try {
               // Une confirmation n'est valide que pour l'aperçu exact envoyé par courriel.
-              const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+              const det = await fetch(brevoCampaignUrl(campaignId), {
                 headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000),
               }).then(r => r.json());
               if (det.sentDate || ['sent', 'queued', 'in_process'].includes(det.status)) {
@@ -11947,7 +11948,7 @@ function registerHandlers() {
                 auditLogEvent('campaign', 'confirm-blocked-schedule-past', { campaignId, scheduledAt: sched });
                 return;
               }
-              const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}`, {
+              const r = await fetch(brevoCampaignUrl(campaignId), {
                 method: 'PUT',
                 headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ scheduledAt: sched }),
@@ -11974,7 +11975,7 @@ function registerHandlers() {
           } else { // cmp_cancel
             await bot.answerCallbackQuery(cbq.id, { text: '🚫 Annulation...' });
             try {
-              const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/status`, {
+              const r = await fetch(brevoCampaignUrl(campaignId, 'status'), {
                 method: 'PUT',
                 headers: { 'api-key': BREVO_KEY, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ status: 'suspended' }),
@@ -14433,7 +14434,7 @@ function registerHandlers() {
     if (!isAllowed(msg)) return;
     const id = match[1];
     try {
-      const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/status`, {
+      const r = await fetch(brevoCampaignUrl(id, 'status'), {
         method: 'PUT',
         headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'suspended' }),
@@ -15167,7 +15168,7 @@ async function isCampaignApproved(c) {
   const approval = campaignApprovals.approved[String(c.id)];
   if (!approval?.hash) return false;
   try {
-    const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${c.id}`, {
+    const r = await fetch(brevoCampaignUrl(c.id), {
       headers: { 'api-key': BREVO_KEY, accept: 'application/json' },
       signal: AbortSignal.timeout(10000),
     });
@@ -15206,7 +15207,7 @@ async function safetyCheckCampagnes() {
     for (const c of upcoming) {
       if (await isCampaignApproved(c)) continue;
       const sched = new Date(c.scheduledAt).toLocaleString('fr-CA', { timeZone: 'America/Toronto', dateStyle: 'short', timeStyle: 'short' });
-      const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${c.id}/status`, {
+      const sr = await fetch(brevoCampaignUrl(c.id, 'status'), {
         method: 'PUT',
         headers: { 'api-key': BREVO_KEY, 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'suspended' }),
@@ -15270,7 +15271,7 @@ async function checkVeilleCampagnesBackup() {
     let previewError = null;
     let campFull = null;
     try {
-      const detRes = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}`, {
+      const detRes = await fetch(brevoCampaignUrl(camp.id), {
         headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(15000)
       });
       campFull = detRes.ok ? await detRes.json() : null;
@@ -15317,7 +15318,7 @@ async function checkVeilleCampagnesBackup() {
     } catch (e) { log('WARN', 'VEILLE', `preview-gmail err: ${e.message}`); previewError = e.message?.substring(0, 80); }
 
     // 2. Notif Telegram
-    const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${camp.id}`, {
+    const det = await fetch(brevoCampaignUrl(camp.id), {
       headers: { 'api-key': BREVO_KEY }, signal: AbortSignal.timeout(10000)
     }).then(r => r.json()).catch(() => ({}));
     const segMatch = (camp.name || '').match(/\[(?:AUTO|REENG|TERRAINS)\]\s*([^·\d][^·]*?)(?:\s*[·\d]|$)/);
@@ -16933,7 +16934,7 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
       }
       // Brevo API call
       const newStatus = action === 'confirm' ? 'queued' : 'suspended';
-      const brevoRes = await fetch(`https://api.brevo.com/v3/emailCampaigns/${campaignId}/status`, {
+      const brevoRes = await fetch(brevoCampaignUrl(campaignId, 'status'), {
         method: 'PUT',
         headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
         body: JSON.stringify({ status: newStatus }),
@@ -17923,13 +17924,13 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
         return;
       }
       // Get campaign details
-      const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const det = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (det.ok) {
         const data = await det.json();
         out.campaign = { name: data.name, subject: data.subject, status: data.status, scheduledAt: data.scheduledAt, recipients: data.recipients };
       }
       // Send test
-      const tr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/sendTest`, {
+      const tr = await fetch(brevoCampaignUrl(id, 'sendTest'), {
         method: 'POST',
         headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type':'application/json' },
         body: JSON.stringify({ emailTo: [to] }),
@@ -18000,7 +18001,7 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
     const out = { id, sent: false, before: null, after: null, dedup_blocked: false, errors: [] };
     try {
       // 1. Get current state
-      const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const det = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!det.ok) {
         out.errors.push(`Brevo GET HTTP ${det.status}`);
         res.writeHead(200, { 'content-type':'application/json' }); res.end(JSON.stringify(out, null, 2)); return;
@@ -18032,7 +18033,7 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       reg[dedupKey] = { sentAt: new Date().toISOString(), name: beforeData.name, by: 'admin-endpoint' };
       saveJSON(SEND_REGISTRY, reg);
       // 5. Send NOW
-      const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/sendNow`, {
+      const sr = await fetch(brevoCampaignUrl(id, 'sendNow'), {
         method: 'POST',
         headers: { 'api-key': process.env.BREVO_API_KEY }
       });
@@ -18047,7 +18048,7 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       } else {
         // 🚀 Cc Shawn auto (règle 2026-05-13): sendTest parallèle pour copie identique
         const shawnCc = process.env.SHAWN_EMAIL || 'shawn@signaturesb.com';
-        fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/sendTest`, {
+        fetch(brevoCampaignUrl(id, 'sendTest'), {
           method: 'POST',
           headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json' },
           body: JSON.stringify({ emailTo: [shawnCc] }),
@@ -18058,7 +18059,7 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
         auditLogEvent('campaign', 'sent-now', { id, name: beforeData.name, by: 'admin-endpoint', cc_shawn: true });
       }
       // 6. Vérifier état après
-      const after = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const after = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (after.ok) {
         const afterData = await after.json();
         out.after = { status: afterData.status, sentDate: afterData.sentDate };
@@ -18097,7 +18098,7 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
       }
       for (const cid of campaignIds) {
         try {
-          const det = await fetch(`https://api.brevo.com/v3/emailCampaigns/${cid}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+          const det = await fetch(brevoCampaignUrl(cid), { headers: { 'api-key': process.env.BREVO_API_KEY } });
           if (!det.ok) { out.errors.push(`#${cid}: GET HTTP ${det.status}`); continue; }
           const data = await det.json();
           const html = data.htmlContent || '';
@@ -18126,7 +18127,7 @@ ${!process.env.OPENAI_API_KEY ? `<div style="background:#5c1a1a;border:1px solid
           if (replaced === 0) { item.skipped = 'no base64 logos found'; out.processed.push(item); continue; }
           if (!dry) {
             // PUT update HTML (Brevo API)
-            const pr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${cid}`, {
+            const pr = await fetch(brevoCampaignUrl(cid), {
               method: 'PUT',
               headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
               body: JSON.stringify({ htmlContent: newHtml }),
@@ -18256,7 +18257,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       const variation = require('./campaign_variation');
       const mi = require('./market_intelligence');
       // 1. Fetch campagne actuelle
-      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const r1 = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
       const audience = variation.detectAudience(camp.name);
@@ -18315,7 +18316,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       if (dry) { res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return; }
       // 4. PUT update si changement
       if (subject_changed || html_changed) {
-        const r2 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, {
+        const r2 = await fetch(brevoCampaignUrl(id), {
           method: 'PUT',
           headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
           body: JSON.stringify({
@@ -18353,7 +18354,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     const id = u.searchParams.get('id');
     if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
     try {
-      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const r1 = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
       // Extract taux patterns (X.X% ou X,X%)
@@ -18406,7 +18407,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
     try {
       // 1. Fetch campagne Brevo (subject + htmlContent)
-      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const r1 = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
       // Subject avec timestamp + version pour distinguer plusieurs previews
@@ -18483,7 +18484,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
     try {
       // 1. Fetch full campagne pour récupérer subject + htmlContent + sender
-      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const r1 = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
       // Brevo refuse sender avec BOTH id AND email → garder seulement email + name
@@ -18589,7 +18590,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     if (!id || !fromText || !toText) { res.writeHead(400); res.end(JSON.stringify({error: 'id+from+to requis'})); return; }
     try {
       // 1. Fetch campagne
-      const r1 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const r1 = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (!r1.ok) { res.writeHead(r1.status); res.end(await r1.text()); return; }
       const camp = await r1.json();
       const oldSubject = camp.subject || '';
@@ -18623,7 +18624,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
       if (dry) { res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return; }
       // 2. PUT update si changement
       if (!subjectChanged && !htmlChanged) { out.note = 'Aucun changement nécessaire'; res.writeHead(200, {'content-type':'application/json'}); res.end(JSON.stringify(out, null, 2)); return; }
-      const r2 = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, {
+      const r2 = await fetch(brevoCampaignUrl(id), {
         method: 'PUT',
         headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
         body: JSON.stringify({ subject: newSubject, htmlContent: newHtml }),
@@ -18664,7 +18665,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     const id = u.searchParams.get('id');
     if (!id) { res.writeHead(400); res.end(JSON.stringify({error:'?id=N requis'})); return; }
     try {
-      const r = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY, 'accept':'application/json' } });
+      const r = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY, 'accept':'application/json' } });
       const data = await r.json();
       res.writeHead(r.status, { 'content-type':'application/json' });
       res.end(JSON.stringify(data, null, 2));
@@ -18684,23 +18685,23 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
     const out = { id, action, before: null, after: null, errors: [] };
     try {
       // Get current state
-      const before = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const before = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       const beforeData = await before.json();
       out.before = { status: beforeData.status, scheduledAt: beforeData.scheduledAt, name: beforeData.name, subject: beforeData.subject };
       // Cancel
       if (action === 'delete') {
-        const dr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { method: 'DELETE', headers: { 'api-key': process.env.BREVO_API_KEY } });
+        const dr = await fetch(brevoCampaignUrl(id), { method: 'DELETE', headers: { 'api-key': process.env.BREVO_API_KEY } });
         out.deletedHttp = dr.status;
       } else {
         // Suspend = set status to "draft" via Brevo API (annule schedule)
-        const sr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/status`, {
+        const sr = await fetch(brevoCampaignUrl(id, 'status'), {
           method: 'PUT',
           headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type':'application/json' },
           body: JSON.stringify({ status: 'suspended' })
         });
         if (!sr.ok) {
           // Fallback: try setting back to draft
-          const dr = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}/status`, {
+          const dr = await fetch(brevoCampaignUrl(id, 'status'), {
             method: 'PUT',
             headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type':'application/json' },
             body: JSON.stringify({ status: 'draft' })
@@ -18710,7 +18711,7 @@ Met null pour les taux non trouvés. Pas de texte autour du JSON.`;
         } else { out.suspendedHttp = sr.status; }
       }
       // Verify after
-      const after = await fetch(`https://api.brevo.com/v3/emailCampaigns/${id}`, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+      const after = await fetch(brevoCampaignUrl(id), { headers: { 'api-key': process.env.BREVO_API_KEY } });
       if (after.ok) {
         const afterData = await after.json();
         out.after = { status: afterData.status, scheduledAt: afterData.scheduledAt };
