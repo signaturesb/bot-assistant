@@ -20,3 +20,5 @@ services:
         sync: false
       - key: SENTRY_ENVIRONMENT
         value: production
+      - key: MUSE_CONNECTOR_TOKEN
+        sync: false

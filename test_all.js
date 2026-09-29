@@ -44,6 +44,7 @@ runScript('Connection monitoring', path.join(__dirname, 'test_connection_monitor
 // Preflight: ne pas confondre route campagne 410/HMAC SMS ni backup/template actif.
 runScript('Preflight alerts', path.join(__dirname, 'test_preflight_alerts.js'));
 runScript('Deployment truth guard', path.join(__dirname, 'test_deployment_truth_guard.js'));
+runScript('Muse MCP connector', path.join(__dirname, 'test_muse_connector.js'));
 
 // Dates/heures Toronto: calcul déterministe et contradictions bloquées.
 runScript('Calendar guard', path.join(__dirname, 'test_calendar_guard.js'));

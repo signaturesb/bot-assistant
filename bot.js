@@ -53,6 +53,7 @@ const { requirePipedriveWriteIntent } = require('./lib/pipedrive_write_guard');
 const { normalizeScheduledAction, addDays } = require('./lib/calendar_guard');
 const { messageExplicitlyAuthorizesGitHubWrite, verifyProtectedStateWrite } = require('./lib/deployment_truth_guard');
 const { isAdminAuthorized } = require('./lib/admin_auth');
+const { handleMuseMcpRequest } = require('./lib/muse_connector');
 const {
   createNonOverlappingRunner,
   telegramPlainText,
@@ -16735,6 +16736,15 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ commit, branch: process.env.RENDER_GIT_BRANCH, uptime_sec: uptimeS, model: currentModel, tools: TOOLS.length }));
+    return;
+  }
+
+  // Connecteur MCP Muse: secret dédié, lecture seule et aucun accès admin.
+  // Ne jamais réutiliser WEBHOOK_SECRET, PIPEDRIVE_API_KEY ou une clé fournisseur.
+  if (url === '/mcp') {
+    await handleMuseMcpRequest(req, res, {
+      commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown',
+    });
     return;
   }
 
