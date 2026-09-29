@@ -16723,6 +16723,34 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     return;
   }
 
+  // Découverte publique minimale pour les clients MCP. Aucun secret ni état
+  // client n'est exposé; l'appel réel reste protégé par le jeton Muse dédié.
+  if (req.method === 'GET' && (url === '/.well-known/mcp.json' || url === '/.well-known/mcp')) {
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'public, max-age=300',
+    });
+    res.end(JSON.stringify({
+      name: 'Kira — Signature SB',
+      transport: 'streamable-http',
+      endpoint: 'https://signaturesb-bot-s272.onrender.com/mcp',
+      authentication: ['Bearer', 'X-API-Key'],
+      mode: 'read_only',
+    }));
+    return;
+  }
+
+  // Muse peut enregistrer soit l'URL de base, soit l'URL MCP canonique.
+  // Les trois chemins utilisent exactement le même secret dédié et restent
+  // strictement en lecture seule.
+  if ((req.method === 'POST' && (url === '/' || url === '')) ||
+      url === '/mcp' || url === '/muse/mcp') {
+    await handleMuseMcpRequest(req, res, {
+      commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown',
+    });
+    return;
+  }
+
   // Root '/' uniquement — PAS un catch-all (sinon ça mange les /admin/*)
   if (req.method === 'GET' && (url === '/' || url === '')) {
     const commit = (process.env.RENDER_GIT_COMMIT || 'unknown').substring(0, 7);
@@ -16736,15 +16764,6 @@ h2{color:#aa0721;font-size:11px;text-transform:uppercase;letter-spacing:3px;marg
     const uptimeS = Math.floor((Date.now() - metrics.startedAt) / 1000);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ commit, branch: process.env.RENDER_GIT_BRANCH, uptime_sec: uptimeS, model: currentModel, tools: TOOLS.length }));
-    return;
-  }
-
-  // Connecteur MCP Muse: secret dédié, lecture seule et aucun accès admin.
-  // Ne jamais réutiliser WEBHOOK_SECRET, PIPEDRIVE_API_KEY ou une clé fournisseur.
-  if (url === '/mcp') {
-    await handleMuseMcpRequest(req, res, {
-      commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'unknown',
-    });
     return;
   }
 
