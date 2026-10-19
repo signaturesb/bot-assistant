@@ -22,7 +22,7 @@
     "preflight": "npm run validate && npm run security-status"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.133.0",
+    "@anthropic-ai/sdk": "^0.135.0",
     "better-sqlite3": "^12.11.1",
     "cheerio": "^1.2.0",
     "compression": "^1.8.2",
@@ -36,11 +36,11 @@
     "p-limit": "^7.3.3",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5",
-    "playwright-core": "^1.64.0",
+    "playwright-core": "^1.64.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "rebrowser-playwright": "^1.52.0",
-    "zod": "^4.6.5"
+    "zod": "^4.6.7"
   },
   "overrides": {
     "form-data": "^4.0.4",
