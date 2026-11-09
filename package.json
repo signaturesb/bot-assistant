@@ -32,14 +32,14 @@
     "helmet": "^8.3.0",
     "lru-cache": "^11.5.3",
     "node-telegram-bot-api": "^0.67.0",
-    "otpauth": "^9.5.2",
+    "otpauth": "^9.6.0",
     "p-limit": "^7.3.3",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5",
-    "playwright-core": "^1.64.1",
+    "playwright-core": "^1.65.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "rebrowser-playwright": "^1.64.101",
+    "rebrowser-playwright": "^1.64.102",
     "zod": "^4.6.7"
   },
   "overrides": {
